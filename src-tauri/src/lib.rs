@@ -2297,7 +2297,7 @@ fn tracked_worktree_matches_head(root: &Path) -> Result<bool, String> {
         entries.push((
             path.to_string(),
             object.to_string(),
-            mode == "120000",
+            mode.to_string(),
             tag.eq_ignore_ascii_case("s"),
         ));
     }
@@ -2341,7 +2341,7 @@ fn tracked_worktree_matches_head(root: &Path) -> Result<bool, String> {
         Ok(hash.finalize().to_vec())
     }
 
-    for (path, object, symlink, sparse) in entries {
+    for (path, object, mode, sparse) in entries {
         let file = root.join(&path);
         let metadata = match std::fs::symlink_metadata(&file) {
             Ok(metadata) => metadata,
@@ -2349,11 +2349,23 @@ fn tracked_worktree_matches_head(root: &Path) -> Result<bool, String> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(format!("Cannot inspect tracked worktree content: {error}")),
         };
-        if symlink != metadata.file_type().is_symlink() && !metadata.is_file() {
-            return Ok(false);
-        }
-        if !metadata.is_file() && !metadata.file_type().is_symlink() {
-            return Ok(false);
+        match mode.as_str() {
+            "120000" if metadata.file_type().is_symlink() => {}
+            "100644" | "100755" if metadata.file_type().is_file() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let executable = metadata.permissions().mode() & 0o100 != 0;
+                    if executable != (mode == "100755") {
+                        return Ok(false);
+                    }
+                }
+                #[cfg(not(unix))]
+                if mode == "100755" {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
         }
         let actual = if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(&file)
@@ -6537,6 +6549,63 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("modified or untracked files"), "{error}");
         assert_eq!(fs::read_to_string(&tracked).unwrap(), "private edits\n");
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_content_check_rejects_symlink_replaced_by_equal_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-removal-tracked-link-type");
+        let link = Path::new(&worktree).join("link");
+        symlink("tracked.txt", &link).unwrap();
+        git(&worktree, &["add", "link"]);
+        git(&worktree, &["update-index", "--assume-unchanged", "link"]);
+        assert!(super::tracked_worktree_matches_head(Path::new(&worktree)).unwrap());
+
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "tracked.txt").unwrap();
+        assert!(!super::tracked_worktree_matches_head(Path::new(&worktree)).unwrap());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "tracked.txt");
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_removal_preserves_hidden_executable_mode_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-tracked-mode");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        let tracked = Path::new(&worktree).join("tracked.txt");
+        let mut permissions = fs::metadata(&tracked).unwrap().permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(&tracked, permissions).unwrap();
+        git(
+            &worktree,
+            &["update-index", "--assume-unchanged", "tracked.txt"],
+        );
+        assert!(!super::tracked_worktree_matches_head(Path::new(&worktree)).unwrap());
+        let (_, dirty) = worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
+        assert!(dirty);
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+        let error = remove_worktree_guarded(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+        )
+        .unwrap_err();
+        assert!(error.contains("modified or untracked files"), "{error}");
+        assert_eq!(fs::read_to_string(&tracked).unwrap(), "before\n");
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

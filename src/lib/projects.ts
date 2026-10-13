@@ -665,12 +665,46 @@ function sameSavedValue(left: unknown, right: unknown): boolean {
   );
 }
 
+function mergePendingCleanup(
+  saved: PendingWorktreeCleanup,
+  incoming: PendingWorktreeCleanup,
+  path: string,
+): PendingWorktreeCleanup {
+  const merged: PendingWorktreeCleanup = { ...saved };
+  for (const key of Object.keys(incoming)) {
+    if (key === 'selectedWorktreeCleanupConfirmed' || key === 'selectedStorageCleanupConfirmed')
+      continue;
+    const value: unknown = Reflect.get(incoming, key);
+    if (value === undefined) continue;
+    const existing: unknown = Reflect.get(saved, key);
+    if (existing !== undefined && !sameSavedValue(existing, value))
+      throw new Error(`Cannot merge conflicting saved worktrees at ${path}`);
+    if (existing === undefined) Object.assign(merged, { [key]: value });
+  }
+  // Any disjoint evidence changes what was attested before these aliases merged.
+  // Require fresh confirmation after combining their recovery inventory.
+  const sameEvidence = sameSavedValue(saved, incoming);
+  merged.selectedWorktreeCleanupConfirmed =
+    sameEvidence && saved.selectedWorktreeCleanupConfirmed === true ? true : undefined;
+  merged.selectedStorageCleanupConfirmed =
+    sameEvidence && saved.selectedStorageCleanupConfirmed === true ? true : undefined;
+  return merged;
+}
+
 function mergeSavedWorktrees(saved: ProjectWorktree, incoming: ProjectWorktree): ProjectWorktree {
   const merged = { ...saved };
   for (const key of Object.keys(incoming)) {
     const value: unknown = Reflect.get(incoming, key);
     if (value === undefined) continue;
     const existing: unknown = Reflect.get(saved, key);
+    if (key === 'pendingCleanup' && saved.pendingCleanup && incoming.pendingCleanup) {
+      merged.pendingCleanup = mergePendingCleanup(
+        saved.pendingCleanup,
+        incoming.pendingCleanup,
+        incoming.path,
+      );
+      continue;
+    }
     if (existing !== undefined && !sameSavedValue(existing, value))
       throw new Error(`Cannot merge conflicting saved worktrees at ${incoming.path}`);
     if (existing === undefined) Object.assign(merged, { [key]: value });

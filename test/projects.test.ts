@@ -219,6 +219,77 @@ await test('canonicalizing duplicate worktrees preserves every saved field or re
       canonical: { ...shared, origin: { sessionTitle: 'Child', ...origin } },
       expected: { ...shared, origin },
     },
+    {
+      name: 'disjoint pending storage and mark inventory merge without carrying confirmation',
+      alias: {
+        ...shared,
+        pendingCleanup: {
+          originalPath: '/shared',
+          recoveryPath: '/shared',
+          sizeBytes: 12,
+          reason: pendingCleanup.reason,
+          storagePaths: pendingCleanup.storagePaths,
+          storageKeys: pendingCleanup.storageKeys,
+          selectedStorageCleanupConfirmed: true,
+        },
+      },
+      canonical: {
+        ...shared,
+        pendingCleanup: {
+          originalPath: '/shared',
+          recoveryPath: '/shared',
+          sizeBytes: 12,
+          reason: pendingCleanup.reason,
+          registeredWorktreesAtMark: pendingCleanup.registeredWorktreesAtMark,
+          selectedWorktreeCleanupConfirmed: true,
+        },
+      },
+      expected: {
+        ...shared,
+        pendingCleanup: {
+          originalPath: '/shared',
+          recoveryPath: '/shared',
+          sizeBytes: 12,
+          reason: pendingCleanup.reason,
+          storagePaths: pendingCleanup.storagePaths,
+          storageKeys: pendingCleanup.storageKeys,
+          registeredWorktreesAtMark: pendingCleanup.registeredWorktreesAtMark,
+        },
+      },
+    },
+    {
+      name: 'matching pending attestations remain valid',
+      alias: { ...shared, pendingCleanup },
+      canonical: { ...shared, pendingCleanup: { ...pendingCleanup } },
+      expected: { ...shared, pendingCleanup },
+    },
+    {
+      name: 'matching confirmations are cleared when storage evidence is added',
+      alias: { ...shared, pendingCleanup },
+      canonical: {
+        ...shared,
+        pendingCleanup: {
+          originalPath: '/shared',
+          recoveryPath: '/shared',
+          sizeBytes: 12,
+          reason: pendingCleanup.reason,
+          selectedWorktreeCleanupConfirmed: true,
+          selectedStorageCleanupConfirmed: true,
+        },
+      },
+      expected: {
+        ...shared,
+        pendingCleanup: {
+          originalPath: '/shared',
+          recoveryPath: '/shared',
+          sizeBytes: 12,
+          reason: pendingCleanup.reason,
+          storagePaths: pendingCleanup.storagePaths,
+          storageKeys: pendingCleanup.storageKeys,
+          registeredWorktreesAtMark: pendingCleanup.registeredWorktreesAtMark,
+        },
+      },
+    },
   ];
   for (const { name, alias, canonical, expected } of cases) {
     const catalog = loadProjectCatalog(
@@ -257,14 +328,6 @@ await test('canonicalizing duplicate worktrees preserves every saved field or re
     {
       name: 'storage key',
       alias: { ...shared, pendingCleanup: { ...pendingCleanup, storageKeys: ['b'.repeat(64)] } },
-      canonical: { ...shared, pendingCleanup },
-    },
-    {
-      name: 'selected cleanup confirmation',
-      alias: {
-        ...shared,
-        pendingCleanup: { ...pendingCleanup, selectedStorageCleanupConfirmed: undefined },
-      },
       canonical: { ...shared, pendingCleanup },
     },
     {
