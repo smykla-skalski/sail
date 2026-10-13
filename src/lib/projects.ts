@@ -27,6 +27,7 @@ export type PendingWorktreeCleanup = {
   reason: string;
   storagePaths?: string[];
   storageKeys?: string[];
+  selectedWorktreeCleanupConfirmed?: boolean;
   selectedStorageCleanupConfirmed?: boolean;
   registeredWorktreesAtMark?: { path: string; generation: string | null }[];
 };
@@ -40,6 +41,7 @@ export function movePendingWorktreeCleanup(
   return {
     ...pending,
     recoveryPath,
+    selectedWorktreeCleanupConfirmed: undefined,
     registeredWorktreesAtMark: pending.registeredWorktreesAtMark?.map((entry) =>
       entry.path === previousPath && entry.generation === generation
         ? { ...entry, path: recoveryPath }
@@ -169,6 +171,7 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
             reason,
             storagePaths,
             storageKeys,
+            selectedWorktreeCleanupConfirmed,
             selectedStorageCleanupConfirmed,
             registeredWorktreesAtMark,
           } = entry.pendingCleanup;
@@ -203,6 +206,9 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
                 : {}),
               ...(selectedStorageCleanupConfirmed === true
                 ? { selectedStorageCleanupConfirmed: true }
+                : {}),
+              ...(selectedWorktreeCleanupConfirmed === true
+                ? { selectedWorktreeCleanupConfirmed: true }
                 : {}),
               ...(Array.isArray(registeredWorktreesAtMark) &&
               registeredWorktreesAtMark.length > 0 &&

@@ -216,6 +216,7 @@ await test('keeps the mark-time Git inventory across restart and recovery moves'
     recoveryPath: '/worktrees/parent',
     sizeBytes: 0,
     reason: 'Awaiting explicit confirmation.',
+    selectedWorktreeCleanupConfirmed: true,
     registeredWorktreesAtMark: [
       { path: '/repo', generation: testGeneration(1) },
       { path: '/worktrees/parent', generation },
@@ -224,6 +225,7 @@ await test('keeps the mark-time Git inventory across restart and recovery moves'
   });
   const restarted = loadProjectCatalog(JSON.stringify(marked), '/repo');
   const pending = restarted.worktrees['/repo'][0].pendingCleanup!;
+  assert.equal(pending.selectedWorktreeCleanupConfirmed, true);
   const current = [
     { path: '/repo', generation: testGeneration(1) },
     { path: '/worktrees/parent', generation },
@@ -236,6 +238,7 @@ await test('keeps the mark-time Git inventory across restart and recovery moves'
     '/worktrees/moved-parent',
     generation,
   );
+  assert.equal(moved.selectedWorktreeCleanupConfirmed, undefined);
   const recovered = markWorktreeCleanupPending(
     restarted,
     '/repo',

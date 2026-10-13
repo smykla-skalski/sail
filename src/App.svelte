@@ -9366,12 +9366,16 @@
               const absent = paths.length
                 ? await invoke<boolean>('pending_cleanup_paths_absent', { paths })
                 : true;
-              if (absent && pending.selectedStorageCleanupConfirmed) {
+              if (
+                absent &&
+                (pending.selectedWorktreeCleanupConfirmed ||
+                  pending.selectedStorageCleanupConfirmed)
+              ) {
                 return {
                   entry,
                   pending,
                   sizeBytes: null,
-                  reason: 'Confirmed selected storage cleanup completed after interruption.',
+                  reason: 'Confirmed selected cleanup completed after interruption.',
                   completed: true,
                 };
               }
@@ -9763,6 +9767,18 @@
         error = `A new descendant appeared under “${target.branch}”. Remaining worktrees were kept.`;
         return;
       }
+      const previousCatalog = projectCatalog;
+      const confirmedRecovery = { ...recovery, selectedWorktreeCleanupConfirmed: true };
+      try {
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, target.path, confirmedRecovery),
+        );
+      } catch (cause) {
+        saveProjectCatalog(previousCatalog);
+        throw new Error(`Could not record selected worktree confirmation: ${describe(cause)}`, {
+          cause,
+        });
+      }
       const removed = await deleteProjectWorktreeOnce(
         repository,
         target.path,
@@ -9771,7 +9787,7 @@
         false,
         preview[0],
         true,
-        pendingExpectedRegisteredWorktrees(recovery, current),
+        pendingExpectedRegisteredWorktrees(confirmedRecovery, current),
         true,
       );
       if (removed) {
@@ -9786,12 +9802,31 @@
           (item) => item.path === target.path && item.pendingCleanup,
         );
         if (retained?.pendingCleanup) {
-          saveProjectCatalog(
-            markWorktreeCleanupPending(projectCatalog, repository, target.path, {
+          let stillRegistered = false;
+          try {
+            stillRegistered = (
+              await invoke<RegisteredWorktree[]>('repository_worktrees', {
+                repository,
+              })
+            ).some(
+              (worktree) =>
+                worktree.path === target.path && worktree.generation === target.generation,
+            );
+          } catch {
+            // Keep the confirmation receipt when native state cannot be verified.
+          }
+          const pendingAfterRefusal = markWorktreeCleanupPending(
+            projectCatalog,
+            repository,
+            target.path,
+            {
               ...retained.pendingCleanup,
+              ...(stillRegistered ? { selectedWorktreeCleanupConfirmed: undefined } : {}),
               reason: error,
-            }),
+            },
           );
+          if (stillRegistered) await saveProjectCatalogDurably(pendingAfterRefusal);
+          else saveProjectCatalog(pendingAfterRefusal);
         }
       }
     } finally {

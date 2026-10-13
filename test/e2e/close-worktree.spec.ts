@@ -34,6 +34,30 @@ async function captureDescendantPreviewTheme(theme: 'light' | 'dark') {
   }, Promise.resolve());
 }
 
+async function openPendingConfirmation(path: string, buttonLabel: string) {
+  const dialog = $('dialog.confirmation-dialog[open]');
+  const button = $(`[data-pending-worktree="${path}"]`).$(`button=${buttonLabel}`);
+  await browser.waitUntil(
+    async () => {
+      if (await dialog.isExisting()) return true;
+      await button.click();
+      try {
+        await browser.waitUntil(() => dialog.isExisting(), { timeout: 1500, interval: 100 });
+        return true;
+      } catch {
+        const alert = $('.app-shell [role="alert"]');
+        if (
+          (await alert.isExisting()) &&
+          (await alert.getText()).includes('A worktree operation is in progress')
+        )
+          return false;
+        throw new Error(`Pending confirmation did not open for ${path}`);
+      }
+    },
+    { timeout: 20000, interval: 100 },
+  );
+}
+
 describe('close worktree shortcut', () => {
   const repository = realpathSync(mkdtempSync(join(tmpdir(), 'sail-close-worktree-')));
   const worktrees = realpathSync(mkdtempSync(join(tmpdir(), 'sail-close-worktree-trees-')));
@@ -138,9 +162,7 @@ describe('close worktree shortcut', () => {
   };
 
   async function retryPendingStorage(path: string) {
-    await $(`[data-pending-worktree="${path}"]`)
-      .$('button=Retry selected storage cleanup…')
-      .click();
+    await openPendingConfirmation(path, 'Retry selected storage cleanup…');
     await diagnose(`Selected storage dialog ${path}`, async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
@@ -154,7 +176,7 @@ describe('close worktree shortcut', () => {
   }
 
   async function cleanPending(path: string, expectedSize?: number) {
-    await $(`[data-pending-worktree="${path}"]`).$('button=Clean up this worktree…').click();
+    await openPendingConfirmation(path, 'Clean up this worktree…');
     await diagnose(`Pending cleanup dialog ${path}`, async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
@@ -640,7 +662,7 @@ describe('close worktree shortcut', () => {
     await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(parent)));
     git('worktree', 'add', '-q', '-b', 'inventory-new-child', child);
-    await $(`[data-pending-worktree="${parent}"]`).$('button=Clean up this worktree…').click();
+    await openPendingConfirmation(parent, 'Clean up this worktree…');
     await $('dialog.confirmation-dialog[open]').$('button=Remove this worktree').click();
     await expect($('.app-shell [role="alert"]')).toHaveText(
       expect.stringContaining('registered worktree is not in this catalog'),
@@ -1044,5 +1066,80 @@ describe('close worktree shortcut', () => {
         (entry) => entry.path === original && entry.generation === generation,
       ),
     ).toBe(true);
+  });
+
+  it('settles a confirmed checkout removed before its catalog update after restart', async () => {
+    const path = join(worktrees, 'interrupted-confirmed');
+    git('worktree', 'add', '-q', '-b', 'interrupted-confirmed', path);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = registered.find((item) => item.path === path)?.generation;
+    if (!generation) throw new Error('Missing confirmed worktree generation');
+    await select(repository, false);
+    await browser.execute(
+      (repo, selected, identity) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push({
+          path: selected,
+          branch: 'interrupted-confirmed',
+          generation: identity,
+          pendingCleanup: {
+            originalPath: selected,
+            recoveryPath: selected,
+            sizeBytes: 0,
+            reason: 'Unused cleanup was confirmed before interruption.',
+            selectedWorktreeCleanupConfirmed: true,
+          },
+        });
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      path,
+      generation,
+    );
+    const [preview] = await browser.tauri.execute(
+      async ({ core }, input) =>
+        core.invoke<
+          { path: string; branch: string | null; revision: string; generation: string | null }[]
+        >('worktree_removal_preview', { repository: input.repository, paths: [input.path] }),
+      { repository, path },
+    );
+    if (!preview || preview.generation !== generation)
+      throw new Error('Confirmed checkout changed before native removal');
+    await browser.tauri.execute(
+      async ({ core }, input) =>
+        core.invoke('delete_worktree', {
+          request: {
+            repository: input.repository,
+            worktree: input.path,
+            force: false,
+            expectedRevision: input.preview.revision,
+            expectedBranch: input.preview.branch,
+            expectedGeneration: input.preview.generation,
+            expectedRegisteredWorktrees: input.registered.map((item) => ({
+              path: item.path,
+              generation: item.generation,
+            })),
+            confirmedUnused: true,
+          },
+        }),
+      { repository, path, preview, registered },
+    );
+    expect(existsSync(path)).toBe(false);
+    expect(git('worktree', 'list')).not.toContain(path);
+    // Reload before Sail can persist the success response. The saved catalog still has the row.
+    await browser.refresh();
+    await diagnose('Interrupted confirmed row', () =>
+      expect($(`[data-pending-worktree="${path}"]`)).toBeDisplayed(),
+    );
+    await $(`[data-pending-worktree="${path}"]`).$('button=Recheck worktree').click();
+    await diagnose('Interrupted confirmed cleanup settlement', () =>
+      browser.waitUntil(async () => !(await catalogPaths()).includes(path)),
+    );
   });
 });
