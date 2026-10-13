@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getSetting, setSetting, setTranscriptSetting } from './settings.ts';
 import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
+import { sessionTasks } from './session-tasks.ts';
 import { forgetPlanningState } from './planning-state.ts';
 import { toolCommand } from './tool-display.ts';
 import {
@@ -1138,9 +1139,7 @@ async function limitedPrompt(
   if (slotHeld) {
     if (workspaceTurns.get(turnId)?.cancelled) throw new Error('Agent turn was cancelled.');
     await archiveOwnedPrompt(agent, directory, sessionId, turnId, text);
-    return invoke<AcpPromptOutcome>('acp_prompt', {
-      params: { agent, directory, sessionId, text, turnId, imagePaths },
-    });
+    return taskPrompt(agent, directory, sessionId, text, turnId, imagePaths);
   }
   const queueId = queuedPromptKey(agent, directory, sessionId, turnId);
   const pending = { agent, directory, sessionId, cancelled: false };
@@ -1150,12 +1149,34 @@ async function limitedPrompt(
     release = await acquireTurnSlot(queueId, onQueue, directory);
     if (pending.cancelled) throw new Error('Agent turn was cancelled.');
     await archiveOwnedPrompt(agent, directory, sessionId, turnId, text);
+    return await taskPrompt(agent, directory, sessionId, text, turnId, imagePaths);
+  } finally {
+    queuedPrompts.delete(queueId);
+    release?.();
+  }
+}
+
+async function taskPrompt(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+  text: string,
+  turnId: string,
+  imagePaths: string[],
+): Promise<AcpPromptOutcome> {
+  const scope = { agent, directory, sessionId };
+  const prior = sessionTasks().snapshot(scope);
+  if (prior.turnId && prior.turnId !== turnId) {
+    const runtime = (await acp.activity(directory))[agent];
+    await sessionTasks().reconcile(scope, runtime?.activeTurns[sessionId] ?? null, prior.revision);
+  }
+  await sessionTasks().start(scope, turnId);
+  try {
     return await invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
   } finally {
-    queuedPrompts.delete(queueId);
-    release?.();
+    await sessionTasks().finish(scope, turnId);
   }
 }
 
@@ -1223,6 +1244,7 @@ export const acp = {
   forget: async (agent: AgentId, directory: string, sessionId: string) => {
     cancelSessionQueues(agent, directory, sessionId);
     await invoke<void>('acp_forget_session', { agent, directory, sessionId });
+    await sessionTasks().forget({ agent, directory, sessionId });
     forgetSessionState(agent, directory, sessionId);
     forgetPlanningState({ agent, directory, sessionId });
     acpPlans().forget({ agent, directory, sessionId });

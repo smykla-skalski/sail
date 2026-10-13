@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import {
+  commitSetting,
+  getSetting,
+  initializeSettings,
+  setSettingDurable,
+} from '../src/lib/settings.ts';
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -29,12 +35,21 @@ class MemoryStorage implements Storage {
   }
 }
 
-void test('a durable catalog retry persists the same value after a failed write', async () => {
+const globals = ['isTauri', 'window', 'localStorage'] as const;
+
+function restoreGlobals(originals: (PropertyDescriptor | undefined)[]): void {
+  globals.forEach((key, index) => {
+    const original = originals[index];
+    if (original) Object.defineProperty(globalThis, key, original);
+    else Reflect.deleteProperty(globalThis, key);
+  });
+}
+
+await test('a durable catalog retry persists the same value after a failed write', async () => {
   const storage = new MemoryStorage();
   storage.setItem('sail-settings-migrated-v1', '1');
   const writes: string[] = [];
   let fail = true;
-  const globals = ['isTauri', 'window', 'localStorage'] as const;
   const originals = globals.map((key) => Object.getOwnPropertyDescriptor(globalThis, key));
   Object.defineProperty(globalThis, 'isTauri', { configurable: true, value: true });
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
@@ -58,17 +73,61 @@ void test('a durable catalog retry persists the same value after a failed write'
   });
 
   try {
-    const { initializeSettings, setSettingDurable } = await import('../src/lib/settings.ts');
     await initializeSettings();
     await assert.rejects(setSettingDurable('sai-project-catalog', 'pending'), /disk write failed/);
     await setSettingDurable('sai-project-catalog', 'pending');
     assert.deepEqual(writes, ['sai-project-catalog:pending', 'sai-project-catalog:pending']);
     assert.equal(storage.getItem('sai-project-catalog'), 'pending');
   } finally {
-    globals.forEach((key, index) => {
-      const original = originals[index];
-      if (original) Object.defineProperty(globalThis, key, original);
-      else Reflect.deleteProperty(globalThis, key);
-    });
+    restoreGlobals(originals);
+  }
+});
+
+await test('durable settings publish only after storage succeeds and preserve the previous value on failure', async () => {
+  const storage = new MemoryStorage();
+  storage.setItem('sail-settings-migrated-v1', '1');
+  let fail = false;
+  let release!: () => void;
+  let diskValue = 'previous';
+  const originals = globals.map((key) => Object.getOwnPropertyDescriptor(globalThis, key));
+  Object.defineProperty(globalThis, 'isTauri', { configurable: true, value: true });
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string, args?: { value: string }) => {
+          if (command === 'load_settings') return { 'sai-session-tasks': diskValue };
+          if (command !== 'save_setting' || !args)
+            throw new Error(`Unexpected command: ${command}`);
+          if (fail) throw new Error('disk full');
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          diskValue = args.value;
+          return undefined;
+        },
+      },
+    },
+  });
+
+  try {
+    await initializeSettings();
+    const pending = commitSetting('sai-session-tasks', 'next');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getSetting('sai-session-tasks'), 'previous');
+    assert.equal(storage.getItem('sai-session-tasks'), 'previous');
+    release();
+    await pending;
+    assert.equal(getSetting('sai-session-tasks'), 'next');
+    assert.equal(diskValue, 'next');
+
+    fail = true;
+    await assert.rejects(commitSetting('sai-session-tasks', 'rejected'), /disk full/);
+    assert.equal(getSetting('sai-session-tasks'), 'next');
+    assert.equal(storage.getItem('sai-session-tasks'), 'next');
+    assert.equal(diskValue, 'next');
+  } finally {
+    restoreGlobals(originals);
   }
 });
