@@ -1844,13 +1844,22 @@ mod tests {
         let snapshot = vec![finished.clone(), stale.clone()];
         fs::remove_file(finished).unwrap();
 
-        recover_stale_private_locks_from_snapshot(
-            &fixture.cache,
-            &fixture.task,
-            &overlay.git_dir,
-            snapshot,
-        )
-        .unwrap();
+        // Recovery leaves locks intact while a Git writer or storage lease is
+        // still active. A concurrent test run can observe that short window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stale.exists() {
+            recover_stale_private_locks_from_snapshot(
+                &fixture.cache,
+                &fixture.task,
+                &overlay.git_dir,
+                snapshot.clone(),
+            )
+            .unwrap();
+            if !stale.exists() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         assert!(!stale.exists());
         overlay_git(&overlay, &["update-ref", "refs/heads/stale", "HEAD"]);
