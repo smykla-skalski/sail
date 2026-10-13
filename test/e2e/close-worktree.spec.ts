@@ -607,6 +607,52 @@ describe('close worktree shortcut', () => {
     git('worktree', 'add', '-q', first, 'first');
   });
 
+  it('keeps a pending parent when another instance registers an unseen child', async () => {
+    const parent = join(worktrees, 'inventory-parent');
+    const child = join(worktrees, 'inventory-new-child');
+    git('worktree', 'add', '-q', '-b', 'inventory-parent', parent);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = registered.find((item) => item.path === parent)?.generation;
+    if (!generation) throw new Error('Missing pending parent generation');
+    await select(first, false);
+    await browser.execute(
+      (repo, path, identity) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push({ path, branch: 'inventory-parent', generation: identity });
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      parent,
+      generation,
+    );
+    await browser.refresh();
+    await diagnose('Pending parent row', () =>
+      expect($(`.project-worktree-select[title="${parent}"]`)).toBeDisplayed(),
+    );
+    await $(`.project-worktree-select[title="${parent}"]`).click({ button: 'right' });
+    await $('[aria-label="Delete worktree inventory-parent"]').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
+    await browser.waitUntil(async () => !!(await pendingCleanup(parent)));
+    git('worktree', 'add', '-q', '-b', 'inventory-new-child', child);
+    await $(`[data-pending-worktree="${parent}"]`).$('button=Clean up this worktree…').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Remove this worktree').click();
+    await expect($('.app-shell [role="alert"]')).toHaveText(
+      expect.stringContaining('registered worktree is not in this catalog'),
+    );
+    expect(existsSync(parent)).toBe(true);
+    expect(existsSync(child)).toBe(true);
+    expect(await pendingCleanup(parent)).toBeDefined();
+    git('worktree', 'remove', child);
+    await cleanPending(parent);
+    await browser.waitUntil(() => !existsSync(parent));
+  });
+
   it('previews Sail descendants, preserves them pending, and cleans selected checkouts leaves first', async () => {
     const child = join(worktrees, 'child');
     const grandchild = join(worktrees, 'grandchild');
@@ -940,5 +986,63 @@ describe('close worktree shortcut', () => {
     expect(existsSync(recovery)).toBe(true);
     git('worktree', 'remove', recovery);
     git('worktree', 'remove', original);
+  });
+
+  it('follows a pending checkout moved with Git after recheck and restart', async () => {
+    const original = join(worktrees, 'moved-pending-original');
+    const moved = join(worktrees, 'moved-pending-new');
+    git('worktree', 'add', '-q', '-b', 'moved-pending', original);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = registered.find((item) => item.path === original)?.generation;
+    if (!generation) throw new Error('Missing movable worktree generation');
+    await select(repository, false);
+    await browser.execute(
+      (repo, path, identity) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push({ path, branch: 'moved-pending', generation: identity });
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      original,
+      generation,
+    );
+    await browser.refresh();
+    await diagnose('Movable worktree row', () =>
+      expect($(`.project-worktree-select[title="${original}"]`)).toBeDisplayed(),
+    );
+    await $(`.project-worktree-select[title="${original}"]`).click({ button: 'right' });
+    await $('[aria-label="Delete worktree moved-pending"]').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
+    await browser.waitUntil(async () => !!(await pendingCleanup(original)));
+    git('worktree', 'move', original, moved);
+    await $(`[data-pending-worktree="${original}"]`).$('button=Recheck worktree').click();
+    await diagnose('Moved pending row', () =>
+      browser.waitUntil(async () => (await pendingCleanup(moved))?.recoveryPath === moved),
+    );
+    await browser.refresh();
+    await diagnose('Moved row after restart', () =>
+      expect($(`[data-pending-worktree="${moved}"]`)).toBeDisplayed(),
+    );
+    await $(`[data-pending-worktree="${moved}"]`).$('button=Clean up this worktree…').click();
+    await diagnose('Restored original row', () =>
+      browser.waitUntil(async () => (await pendingCleanup(original))?.recoveryPath === original),
+    );
+    expect(existsSync(original)).toBe(true);
+    expect(existsSync(moved)).toBe(false);
+    await browser.refresh();
+    await diagnose('Restored row after restart', () =>
+      expect($(`[data-pending-worktree="${original}"]`)).toBeDisplayed(),
+    );
+    expect(
+      (await pendingCleanup(original))?.registeredWorktreesAtMark?.some(
+        (entry) => entry.path === original && entry.generation === generation,
+      ),
+    ).toBe(true);
   });
 });

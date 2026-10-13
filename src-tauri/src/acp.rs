@@ -7132,7 +7132,10 @@ mod session_config_tests {
 
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 2 & wait; exec sleep 10"])
+            .args([
+                "-c",
+                "sleep 30 & worker=$!; read signal; kill \"$worker\"; wait \"$worker\" 2>/dev/null; exec sleep 10",
+            ])
             .stdin(Stdio::piped());
         unsafe {
             command.pre_exec(|| {
@@ -7163,6 +7166,7 @@ mod session_config_tests {
         start_temp_cleanup_watcher(&runtime).unwrap();
         runtime.clear_idle_temp(true).unwrap();
         assert!(artifact.exists());
+        runtime.input.lock().unwrap().write_all(b"\n").unwrap();
 
         for _ in 0..100 {
             if !artifact.exists() {

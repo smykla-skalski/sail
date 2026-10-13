@@ -4005,7 +4005,13 @@ mod tests {
         worker.wait().unwrap();
         lease.release_clean().unwrap();
         drop(lease);
-        retry_cleanup(&fixture.cache);
+        for _ in 0..100 {
+            retry_cleanup(&fixture.cache);
+            if !directory.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(!directory.exists());
     }
 

@@ -584,6 +584,8 @@
     assignRepository,
     loadProjectCatalog,
     markWorktreeCleanupPending,
+    movePendingWorktreeCleanup,
+    pendingExpectedRegisteredWorktrees,
     owningRepository,
     removeRepository,
     removeWorktree,
@@ -5405,6 +5407,12 @@
                 originalPath: worktree.path,
                 recoveryPath: worktree.path,
                 sizeBytes: state?.sizeBytes ?? null,
+                registeredWorktreesAtMark: registered.map(
+                  ({ path: registeredPath, generation }) => ({
+                    path: registeredPath,
+                    generation,
+                  }),
+                ),
                 reason:
                   previewFailure ??
                   (state.inspectionError
@@ -9226,6 +9234,10 @@
           originalPath: worktree.path,
           recoveryPath: worktree.path,
           sizeBytes: state.sizeBytes,
+          registeredWorktreesAtMark: registered.map(({ path: registeredPath, generation }) => ({
+            path: registeredPath,
+            generation,
+          })),
           reason,
         },
         state.generation,
@@ -9280,7 +9292,12 @@
             const recoveryPath = recovered[0].path;
             return {
               entry,
-              pending: { ...pending, recoveryPath },
+              pending: movePendingWorktreeCleanup(
+                pending,
+                entry.path,
+                recoveryPath,
+                entry.generation!,
+              ),
               sizeBytes,
               reason: `The interrupted cleanup left the same Git generation registered at ${recoveryPath}. Review this recovery checkout before retrying.`,
               completed: false,
@@ -9291,7 +9308,12 @@
             if (moved) {
               return {
                 entry,
-                pending,
+                pending: movePendingWorktreeCleanup(
+                  pending,
+                  entry.path,
+                  moved.path,
+                  entry.generation,
+                ),
                 sizeBytes,
                 reason: `The same Git generation is registered at ${moved.path}. Its files were kept; inspect the moved checkout.`,
                 completed: false,
@@ -9396,6 +9418,7 @@
       let catalog = projectCatalog;
       const completedPaths: string[] = [];
       let confirmedStorageRechecked = false;
+      let recoveryPathChanged = false;
       for (const { entry, pending, sizeBytes, reason, completed } of updates) {
         const currentEntry = catalog.worktrees[repository]?.find(
           (worktree) =>
@@ -9410,6 +9433,7 @@
           catalog = removeWorktree(catalog, repository, entry.path);
           continue;
         }
+        if (pending.recoveryPath !== entry.path) recoveryPathChanged = true;
         catalog = markWorktreeCleanupPending(catalog, repository, entry.path, {
           ...pending,
           sizeBytes,
@@ -9422,7 +9446,7 @@
           Promise.resolve(),
         );
       }
-      if (completedPaths.length || confirmedStorageRechecked) {
+      if (completedPaths.length || confirmedStorageRechecked || recoveryPathChanged) {
         const previousCatalog = projectCatalog;
         try {
           await saveProjectCatalogDurably(catalog);
@@ -9662,10 +9686,14 @@
           originalPath: recovery.originalPath,
           expectedGeneration: pending[0].generation,
         });
-        saveProjectCatalog(
+        await saveProjectCatalogDurably(
           markWorktreeCleanupPending(projectCatalog, repository, recovery.recoveryPath, {
-            ...recovery,
-            recoveryPath: recovery.originalPath,
+            ...movePendingWorktreeCleanup(
+              recovery,
+              recovery.recoveryPath,
+              recovery.originalPath,
+              pending[0].generation!,
+            ),
             reason:
               'Restored to its original path. Recheck and confirm it is unused before cleanup.',
           }),
@@ -9714,6 +9742,23 @@
     deletingWorktreeRepositories.add(repository);
     try {
       const current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      const catalogued = new Map(
+        (projectCatalog.worktrees[repository] ?? []).map((worktree) => [
+          worktree.path,
+          worktree.generation,
+        ]),
+      );
+      if (
+        recovery.registeredWorktreesAtMark &&
+        current.some(
+          (worktree) =>
+            worktree.path !== repository && catalogued.get(worktree.path) !== worktree.generation,
+        )
+      ) {
+        error =
+          'A registered worktree is not in this catalog. Refresh or adopt it before selected cleanup.';
+        return;
+      }
       if (worktreeDescendants(projectCatalog, repository, current, target.path).length) {
         error = `A new descendant appeared under “${target.branch}”. Remaining worktrees were kept.`;
         return;
@@ -9726,7 +9771,7 @@
         false,
         preview[0],
         true,
-        registered,
+        pendingExpectedRegisteredWorktrees(recovery, current),
         true,
       );
       if (removed) {
@@ -9940,6 +9985,7 @@
             repository,
             path,
             {
+              ...prior?.pendingCleanup,
               ...storage,
               originalPath: prior?.pendingCleanup?.originalPath ?? storage.originalPath,
             },
@@ -9958,10 +10004,16 @@
             projectCatalog,
             repository,
             path,
-            {
-              ...recovery,
-              originalPath: prior?.pendingCleanup?.originalPath ?? recovery.originalPath,
-            },
+            movePendingWorktreeCleanup(
+              {
+                ...prior?.pendingCleanup,
+                ...recovery,
+                originalPath: prior?.pendingCleanup?.originalPath ?? recovery.originalPath,
+              },
+              path,
+              recovery.recoveryPath,
+              expected?.generation ?? prior?.generation ?? '',
+            ),
             expected?.generation ?? prior?.generation ?? undefined,
           ),
         );

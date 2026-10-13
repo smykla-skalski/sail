@@ -28,7 +28,38 @@ export type PendingWorktreeCleanup = {
   storagePaths?: string[];
   storageKeys?: string[];
   selectedStorageCleanupConfirmed?: boolean;
+  registeredWorktreesAtMark?: { path: string; generation: string | null }[];
 };
+
+export function movePendingWorktreeCleanup(
+  pending: PendingWorktreeCleanup,
+  previousPath: string,
+  recoveryPath: string,
+  generation: string,
+): PendingWorktreeCleanup {
+  return {
+    ...pending,
+    recoveryPath,
+    registeredWorktreesAtMark: pending.registeredWorktreesAtMark?.map((entry) =>
+      entry.path === previousPath && entry.generation === generation
+        ? { ...entry, path: recoveryPath }
+        : entry,
+    ),
+  };
+}
+
+export function pendingExpectedRegisteredWorktrees<
+  T extends { path: string; generation: string | null },
+>(pending: PendingWorktreeCleanup, current: T[]): T[] {
+  if (!pending.registeredWorktreesAtMark) return current;
+  const marked = new Map(
+    pending.registeredWorktreesAtMark.map((entry) => [entry.path, entry.generation]),
+  );
+  return current.filter(
+    (entry) => marked.has(entry.path) && marked.get(entry.path) === entry.generation,
+  );
+}
+
 export type SelectedRemovedWorktreeStorage = {
   cacheKey: string;
   path: string;
@@ -139,6 +170,7 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
             storagePaths,
             storageKeys,
             selectedStorageCleanupConfirmed,
+            registeredWorktreesAtMark,
           } = entry.pendingCleanup;
           if (
             typeof originalPath === 'string' &&
@@ -171,6 +203,19 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
                 : {}),
               ...(selectedStorageCleanupConfirmed === true
                 ? { selectedStorageCleanupConfirmed: true }
+                : {}),
+              ...(Array.isArray(registeredWorktreesAtMark) &&
+              registeredWorktreesAtMark.length > 0 &&
+              registeredWorktreesAtMark.every(
+                (item) =>
+                  isRecord(item) &&
+                  typeof item.path === 'string' &&
+                  !!item.path &&
+                  (item.generation === null || validGeneration(item.generation)),
+              ) &&
+              new Set(registeredWorktreesAtMark.map((item) => item.path)).size ===
+                registeredWorktreesAtMark.length
+                ? { registeredWorktreesAtMark }
                 : {}),
             };
         }
