@@ -4456,7 +4456,11 @@ mod tests {
         assert!(!cache_status(&fixture.cache, &fixture.first, &[])
             .iter()
             .any(|item| item.worktree == other_root));
-        let status = cache_status(&fixture.cache, &fixture.first, &[other.first.clone()]);
+        let status = cache_status(
+            &fixture.cache,
+            &fixture.first,
+            std::slice::from_ref(&other.first),
+        );
         let unused = status
             .iter()
             .find(|item| item.worktree == other_root)
