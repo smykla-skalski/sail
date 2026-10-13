@@ -3590,6 +3590,8 @@ pub fn run() {
             diagnostics::diagnostic_event,
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
+            worktree_cache_status,
+            set_worktree_cache_limit,
             clean_pending_worktree_temp,
             settings::reset_test_settings,
             settings::load_settings,
@@ -3828,6 +3830,39 @@ async fn retry_worktree_storage_cleanup(
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn worktree_cache_status(
+    app: tauri::AppHandle,
+    current_worktree: String,
+) -> Result<Vec<worktree_storage::CacheUsage>, String> {
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        worktree_storage::cache_status(&cache, Path::new(&current_worktree))
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_worktree_cache_limit(
+    app: tauri::AppHandle,
+    worktree: String,
+    limit_bytes: u64,
+) -> Result<(), String> {
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        worktree_storage::set_cache_limit(&cache, Path::new(&worktree), limit_bytes)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
