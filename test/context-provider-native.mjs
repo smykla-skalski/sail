@@ -97,6 +97,7 @@ let appPid;
 
 function makeProject(directory, command, blockInput = false) {
   mkdirSync(join(directory, '.sail'), { recursive: true });
+  writeFileSync(join(directory, '.sail/strict-provider-lifecycle'), 'require MCP handshake');
   writeFileSync(
     join(directory, '.sail', 'worktree.json'),
     '{"context":{"manifest":".sail/context.json"}}',
@@ -195,7 +196,15 @@ function startClient(directory) {
           assert.equal(response.id, id);
           return response;
         });
-      return readResponse().finally(() => controller.abort());
+      return readResponse()
+        .then((response) => {
+          if (method === 'initialize' && response.result)
+            child.stdin.write(
+              JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n',
+            );
+          return response;
+        })
+        .finally(() => controller.abort());
     },
     waitForExit: () =>
       Promise.race([
@@ -372,10 +381,10 @@ try {
   assert.ok(Date.now() - blockedStart < 10_000, 'cancellation interrupts a blocked stdin write');
   await waitForProcessExit(blockedPid);
   rmSync(join(blocked, '.sail/block-provider-stdin'));
-  const recovered = startClient(blocked);
-  const recoveredPid = (await recovered.request(23, 'initialize')).result.pid;
+  const recoveredPid = (await blockedPeer.request(24)).result.pid;
   assert.notEqual(recoveredPid, blockedPid);
-  assert.equal((await blockedPeer.request(24)).result.pid, recoveredPid);
+  const recovered = startClient(blocked);
+  assert.equal((await recovered.request(23, 'initialize')).result.pid, recoveredPid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),

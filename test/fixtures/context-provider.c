@@ -18,8 +18,13 @@ int main(void) {
     char *line = NULL;
     size_t capacity = 0;
     int initialization_count = 0;
+    int initialized = 0;
     while (getline(&line, &capacity, stdin) != -1) {
         if (strstr(line, "\"method\":\"initialize\"")) initialization_count++;
+        if (strstr(line, "\"method\":\"notifications/initialized\"")) {
+            initialized = initialization_count == 1;
+            continue;
+        }
         if (strstr(line, "\"method\":\"slow\"")) {
             sleep(2);
         }
@@ -32,12 +37,19 @@ int main(void) {
         long value = strtol(id + 1, &end, 10);
         if (end == id + 1) continue;
         if (strstr(line, "\"method\":\"invalid-slow\"")) {
+            if (!write_marker("protocol-fault-ready")) return 1;
             sleep(1);
             puts("invalid provider response");
             fflush(stdout);
             continue;
         }
         int tool_call = strstr(line, "\"method\":\"tools/call\"") != NULL;
+        if (access(".sail/strict-provider-lifecycle", F_OK) == 0 &&
+            (tool_call || strstr(line, "\"method\":\"tools/list\"")) &&
+            (!initialized || initialization_count != 1)) {
+            fputs("provider requires initialize and notifications/initialized before tools\n", stderr);
+            return 1;
+        }
         int cancelled = strstr(line, "\"method\":\"wait-for-cancel\"") != NULL ||
             (tool_call && strstr(line, "\"name\":\"fixture_wait_cancel\""));
         if (strstr(line, "\"method\":\"server-ping\"") ||

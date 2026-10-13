@@ -1020,8 +1020,19 @@ static PROVIDERS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<P
 static PROVIDER_STOPPED: std::sync::Condvar = std::sync::Condvar::new();
 
 #[cfg(target_os = "macos")]
-static ACTIVE_SESSIONS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
-    std::sync::OnceLock::new();
+static ACTIVE_SESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<String, Option<SessionInitialization>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct SessionInitialization {
+    project: String,
+    fingerprint: String,
+    request: serde_json::Value,
+    protocol_version: String,
+    initialized: bool,
+}
 
 #[cfg(target_os = "macos")]
 struct ProviderCancellation {
@@ -1071,8 +1082,8 @@ fn take_cancellations(
 }
 
 #[cfg(target_os = "macos")]
-fn active_sessions() -> &'static std::sync::Mutex<HashSet<String>> {
-    ACTIVE_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+fn active_sessions() -> &'static std::sync::Mutex<BTreeMap<String, Option<SessionInitialization>>> {
+    ACTIVE_SESSIONS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(target_os = "macos")]
@@ -1080,7 +1091,7 @@ fn session_is_active(capability: Option<&str>) -> Result<bool, String> {
     let sessions = active_sessions()
         .lock()
         .map_err(|error| error.to_string())?;
-    Ok(capability.is_none_or(|capability| sessions.contains(capability)))
+    Ok(capability.is_none_or(|capability| sessions.contains_key(capability)))
 }
 
 #[cfg(target_os = "macos")]
@@ -1099,9 +1110,13 @@ pub unsafe extern "C" fn sail_context_session_activate(
     if capability.len() != 64 {
         return false;
     }
-    active_sessions()
-        .lock()
-        .is_ok_and(|mut sessions| sessions.insert(capability.into()))
+    active_sessions().lock().is_ok_and(|mut sessions| {
+        if sessions.contains_key(capability) {
+            return false;
+        }
+        sessions.insert(capability.into(), None);
+        true
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1428,6 +1443,22 @@ fn provider_request_at(
     {
         return Err("Invalid context MCP JSON-RPC request.".into());
     }
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    if method == "initialize" {
+        request
+            .get("params")
+            .and_then(|params| params.get("protocolVersion"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|version| !version.is_empty())
+            .ok_or("MCP initialize request has no protocol version.")?;
+        request
+            .get("id")
+            .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+            .ok_or("MCP initialize request has no valid ID.")?;
+    }
     let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
     let key = project_key(&canonical)?;
     if is_cancellation(&request) {
@@ -1525,43 +1556,131 @@ fn provider_request_at(
         return Err("Context session revoked before provider request.".into());
     }
     let process = provider.as_mut().ok_or("Provider unavailable.")?;
-    let method = request
-        .get("method")
-        .and_then(|value| value.as_str())
-        .unwrap();
-    if method == "initialize" {
-        if let Some(result) = &process.initialization {
+    let saved = capability
+        .map(|capability| {
+            active_sessions()
+                .lock()
+                .map_err(|error| error.to_string())
+                .map(|sessions| sessions.get(capability).and_then(Option::as_ref).cloned())
+        })
+        .transpose()?
+        .flatten()
+        .filter(|saved| saved.project == key && saved.fingerprint == expected);
+    let response = (|| -> Result<Option<String>, String> {
+        if method == "initialize" {
             let id = request
                 .get("id")
                 .ok_or("MCP initialize request has no ID.")?;
-            return Ok(Some(
-                serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
-            ));
+            if let Some(result) = &process.initialization {
+                return Ok(Some(
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
+                ));
+            }
+        } else if process.initialization.is_none() {
+            if let Some(saved) = &saved {
+                let mut initialize = saved.request.clone();
+                initialize["params"]["protocolVersion"] = serde_json::json!(saved.protocol_version);
+                exchange_provider_request(
+                    process,
+                    &key,
+                    capability,
+                    &initialize,
+                    &initialize.to_string(),
+                )?;
+                if process
+                    .initialization
+                    .as_ref()
+                    .and_then(|result| result.get("protocolVersion"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(saved.protocol_version.as_str())
+                {
+                    return Err(
+                        "Replacement provider changed the negotiated MCP protocol version.".into(),
+                    );
+                }
+                if saved.initialized {
+                    let initialized =
+                        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+                    exchange_provider_request(
+                        process,
+                        &key,
+                        capability,
+                        &initialized,
+                        &initialized.to_string(),
+                    )?;
+                }
+            }
+        }
+        if method == "notifications/initialized" && process.initialized_notification_sent {
+            return Ok(None);
+        }
+        exchange_provider_request(process, &key, capability, &request, message)
+    })();
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let detail = process.error(&error);
+            provider.take();
+            drop(provider);
+            forget_provider(&key, &slot);
+            return Err(detail);
+        }
+    };
+    if let Some(capability) = capability {
+        let mut sessions = active_sessions()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let initialization = sessions
+            .get_mut(capability)
+            .ok_or("Context session revoked after provider response.")?;
+        if method == "initialize" {
+            if let Some(result) = &process.initialization {
+                *initialization = Some(SessionInitialization {
+                    project: key,
+                    fingerprint: expected.into(),
+                    request,
+                    protocol_version: result["protocolVersion"]
+                        .as_str()
+                        .ok_or("Provider protocol version missing.")?
+                        .into(),
+                    initialized: false,
+                });
+            }
+        } else if method == "notifications/initialized" {
+            if let Some(initialization) = initialization {
+                initialization.initialized = true;
+            }
         }
     }
-    if method == "notifications/initialized" && process.initialized_notification_sent {
-        return Ok(None);
-    }
-    if let Err(error) =
-        write_provider_request_checked(&mut process.stdin, message, Duration::from_secs(30), || {
-            if !session_active()? {
-                return Err("Context session revoked during provider stdin write.".into());
-            }
-            if request
-                .get("id")
-                .is_some_and(|id| !take_cancellations(&key, capability, id).is_empty())
-            {
-                return Err("Provider request cancelled while writing stdin.".into());
-            }
-            Ok(())
-        })
-    {
-        let detail = process.error(&error);
-        provider.take();
-        drop(provider);
-        forget_provider(&key, &slot);
-        return Err(detail);
-    }
+    Ok(response)
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_provider_request(
+    process: &mut ProviderProcess,
+    key: &str,
+    capability: Option<&str>,
+    request: &serde_json::Value,
+    message: &str,
+) -> Result<Option<String>, String> {
+    use std::time::Duration;
+    let session_active = || session_is_active(capability);
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("MCP method missing.")?;
+    write_provider_request_checked(&mut process.stdin, message, Duration::from_secs(30), || {
+        if !session_active()? {
+            return Err("Context session revoked during provider stdin write.".into());
+        }
+        if request
+            .get("id")
+            .is_some_and(|id| !take_cancellations(key, capability, id).is_empty())
+        {
+            return Err("Provider request cancelled while writing stdin.".into());
+        }
+        Ok(())
+    })?;
     if request.get("id").is_none() {
         if method == "notifications/initialized" {
             process.initialized_notification_sent = true;
@@ -1641,7 +1760,7 @@ fn provider_request_at(
             if !session_active()? {
                 return Err("Context session revoked before provider response.".into());
             }
-            for notification in take_cancellations(&key, capability, &request_id) {
+            for notification in take_cancellations(key, capability, &request_id) {
                 write_provider_request(&mut process.stdin, &notification, Duration::from_secs(1))?;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1665,16 +1784,7 @@ fn provider_request_at(
             }
         }
     })();
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            let detail = process.error(&error);
-            provider.take();
-            drop(provider);
-            forget_provider(&key, &slot);
-            return Err(detail);
-        }
-    };
+    let response = response?;
     if method == "initialize" {
         if let Some(result) = response
             .lines()
@@ -1682,6 +1792,13 @@ fn provider_request_at(
             .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .and_then(|value| value.get("result").cloned())
         {
+            if result
+                .get("protocolVersion")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("Provider initialize response has no protocol version.".into());
+            }
             process.initialization = Some(result);
         }
     }
@@ -2003,7 +2120,7 @@ mod tests {
                 &repository.0,
                 &fingerprint,
                 None,
-                &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"initialize"}}"#),
+                &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"initialize","params":{{"protocolVersion":"2025-06-18"}}}}"#),
                 &store_path,
                 &repository.0.join("data"),
             )
@@ -2017,6 +2134,141 @@ mod tests {
         assert_eq!(first["result"]["pid"], second["result"]["pid"]);
         assert_eq!(first["result"]["initializeCount"], 1);
         assert_eq!(second["result"]["initializeCount"], 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn surviving_session_reinitializes_a_strict_replacement_provider() {
+        let repository = Repository::new("runtime-survivor-initialize");
+        repository.write(".sail/strict-provider-lifecycle", "require MCP handshake");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let first = ActiveSession::new();
+        let survivor = ActiveSession::new();
+        let call = |capability: &str, request: serde_json::Value| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(capability),
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}});
+        let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        for session in [&first.0, &survivor.0] {
+            call(session, initialize.clone()).unwrap();
+            call(session, initialized.clone()).unwrap();
+        }
+        let first_response: serde_json::Value = serde_json::from_str(
+            &call(
+                &survivor.0,
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(call(
+            &first.0,
+            json!({"jsonrpc":"2.0","id":3,"method":"invalid-slow"})
+        )
+        .unwrap_err()
+        .contains("invalid JSON-RPC"));
+        drop(first);
+        let recovered: serde_json::Value = serde_json::from_str(
+            &call(
+                &survivor.0,
+                json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(first_response["result"]["pid"], recovered["result"]["pid"]);
+        assert_eq!(recovered["result"]["initializeCount"], 1);
+        assert_eq!(recovered["result"]["tools"][0]["name"], "fixture_ping");
+        let slot = PROVIDERS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        {
+            let mut provider = slot.lock().unwrap();
+            let child = &mut provider.as_mut().unwrap().child;
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        let restarted: serde_json::Value = serde_json::from_str(
+            &call(
+                &survivor.0,
+                json!({"jsonrpc":"2.0","id":5,"method":"tools/list"}),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(recovered["result"]["pid"], restarted["result"]["pid"]);
+        assert_eq!(restarted["result"]["initializeCount"], 1);
+        assert_eq!(restarted["result"]["tools"][0]["name"], "fixture_ping");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_provider_returns_its_actual_protocol_fallback_and_rejects_invalid_initialization() {
+        let repository = Repository::new("runtime-protocol-fallback");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |request: serde_json::Value| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let first: serde_json::Value = serde_json::from_str(&call(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&call(json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2024-11-05"}})).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            second["result"]["protocolVersion"],
+            first["result"]["protocolVersion"]
+        );
+        assert_eq!(second["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(second["result"]["initializeCount"], 1);
+        assert_eq!(second["result"]["pid"], first["result"]["pid"]);
+        for version in [serde_json::Value::Null, json!(1), json!("")] {
+            assert!(call(json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":version}})).unwrap_err().contains("no protocol version"));
+        }
+        let third: serde_json::Value = serde_json::from_str(&call(json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap().unwrap()).unwrap();
+        assert_eq!(third["result"]["pid"], first["result"]["pid"]);
     }
 
     #[cfg(target_os = "macos")]
@@ -2082,17 +2334,33 @@ mod tests {
             Ok((fingerprint, true))
         })
         .unwrap();
+        let owner = ActiveSession::new();
         let call = |id, method| {
-            let request = json!({"jsonrpc":"2.0","id":id,"method":method}).to_string();
+            let request = if method == "initialize" {
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":{"protocolVersion":"2025-06-18"}})
+            } else {
+                json!({"jsonrpc":"2.0","id":id,"method":method})
+            }.to_string();
             provider_request_at(
                 &repository.0,
                 &fingerprint,
-                None,
+                Some(&owner.0),
                 &request,
                 &store_path,
                 &repository.0.join("data"),
             )
         };
+
+        call(0, "initialize").unwrap();
+        provider_request_at(
+            &repository.0,
+            &fingerprint,
+            Some(&owner.0),
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &store_path,
+            &repository.0.join("data"),
+        )
+        .unwrap();
 
         std::thread::scope(|scope| {
             let failing = scope.spawn(|| call(1, "invalid-slow"));
@@ -2110,6 +2378,18 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             };
+            let ready = repository
+                .0
+                .join("data")
+                .join(&key)
+                .join("protocol-fault-ready");
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                ready.exists(),
+                "Protocol-fault request did not reach the provider"
+            );
             let queued = scope.spawn(|| call(2, "slow"));
             while std::sync::Arc::strong_count(&slot) < 4 && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2217,6 +2497,11 @@ mod tests {
         };
         let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"sail-test","version":"1.0"}}}"#;
         let first = call(initialize, &owner.0).unwrap().unwrap();
+        call(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &owner.0,
+        )
+        .unwrap();
         let first: serde_json::Value = serde_json::from_str(&first).unwrap();
         let marker = repository.0.join("data").join(key).join("blocked-input");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2235,8 +2520,14 @@ mod tests {
             let result = pending.join().unwrap();
             let elapsed = start.elapsed();
             fs::remove_file(repository.0.join(".sail/block-provider-stdin")).unwrap();
-            let replacement = call(initialize, &peer.0).unwrap().unwrap();
+            let replacement = call(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+                &owner.0,
+            )
+            .unwrap()
+            .unwrap();
             let replacement: serde_json::Value = serde_json::from_str(&replacement).unwrap();
+            call(initialize, &peer.0).unwrap();
             let adjacent = call(
                 r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
                 &owner.0,
@@ -2414,7 +2705,7 @@ mod tests {
                     &repository.0,
                     &fingerprint,
                     None,
-                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
                     &store_path,
                     &repository.0.join("data"),
                 );
