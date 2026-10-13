@@ -55,12 +55,13 @@ async function openPendingConfirmation(path: string, buttonLabel: string) {
         return true;
       } catch {
         const alert = $('.app-shell [role="alert"]');
-        if (
-          (await alert.isExisting()) &&
-          (await alert.getText()).includes('A worktree operation is in progress')
-        )
-          return false;
-        throw new Error(`Pending confirmation did not open for ${path}`);
+        const message = (await alert.isExisting()) ? await alert.getText() : '<no error alert>';
+        if (message.includes('A worktree operation is in progress')) return false;
+        const row = $(`[data-pending-worktree="${path}"]`);
+        const rowText = (await row.isExisting()) ? await row.getText() : '<pending row absent>';
+        throw new Error(
+          `Pending confirmation did not open for ${path}: alert=${message}; row=${rowText}`,
+        );
       }
     },
     { timeout: 20000, interval: 100 },
@@ -1148,7 +1149,11 @@ describe('close worktree shortcut', () => {
     await browser.execute(() => {
       document.documentElement.style.zoom = '';
     });
-    await dialog.$('button=Cancel').click();
+    await diagnose('Descendant preview cancel', async () => {
+      const currentDialog = $('dialog.confirmation-dialog[open]');
+      await expect(currentDialog).toExist();
+      await currentDialog.$('button=Cancel').click();
+    });
     expect(existsSync(first)).toBe(true);
     expect(existsSync(child)).toBe(true);
     expect(existsSync(grandchild)).toBe(true);

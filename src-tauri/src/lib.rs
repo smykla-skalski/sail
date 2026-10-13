@@ -2460,25 +2460,30 @@ async fn delete_worktree(
                             }
                         }
                     }
-                    remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
-                        ensure_expected_worktree_generation(
-                            &directory,
-                            expected_generation.as_deref(),
-                        )?;
-                        remove_worktree_guarded_with_hook(
-                            checked,
-                            worktree,
-                            force,
-                            expected_revision.as_deref(),
-                            expected_branch.as_deref(),
-                            expected_generation.as_deref(),
-                            || {
-                                removed_from_git = true;
-                                Ok(())
-                            },
-                        )?;
-                        Ok(None)
-                    })
+                    remove_worktree_then_private_data_many(
+                        &cache_directory,
+                        &managed_data,
+                        expected_revision.is_some() && expected_generation.is_some(),
+                        || {
+                            ensure_expected_worktree_generation(
+                                &directory,
+                                expected_generation.as_deref(),
+                            )?;
+                            remove_worktree_guarded_with_hook(
+                                checked,
+                                worktree,
+                                force,
+                                expected_revision.as_deref(),
+                                expected_branch.as_deref(),
+                                expected_generation.as_deref(),
+                                || {
+                                    removed_from_git = true;
+                                    Ok(())
+                                },
+                            )?;
+                            Ok(None)
+                        },
+                    )
                 },
             )
         })();
@@ -2635,6 +2640,7 @@ async fn retry_removed_worktree_overlay_cleanup(
 fn remove_worktree_then_private_data_many<T>(
     cache_directory: &Path,
     managed_data: &[PathBuf],
+    require_private_cleanup: bool,
     remove_worktree: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let result = remove_worktree()?;
@@ -2645,6 +2651,9 @@ fn remove_worktree_then_private_data_many<T>(
             "worktree_private_cleanup_pending",
             serde_json::json!({"error": error}),
         );
+        if require_private_cleanup {
+            return Err(error);
+        }
     }
     Ok(result)
 }
@@ -5747,7 +5756,7 @@ mod tests {
         let (root, repository, worktree, _) = ignored_archive_fixture("sail-delete-cache-test");
         let cache = root.join("cache");
         let (data, lease) = worktree_storage::register(&cache, Path::new(&worktree)).unwrap();
-        remove_worktree_then_private_data_many(&cache, std::slice::from_ref(&data), || {
+        remove_worktree_then_private_data_many(&cache, std::slice::from_ref(&data), false, || {
             remove_worktree(repository.clone(), worktree.clone(), Some(true), None, None)
         })
         .unwrap();
@@ -5760,8 +5769,49 @@ mod tests {
         remove_worktree_then_private_data_many(
             &cache,
             &[data.clone(), cache.join("already-removed")],
+            false,
             || remove_worktree(repository, worktree, Some(true), None, None),
         )
+        .unwrap();
+        assert!(!data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_deletion_reports_private_storage_reacquired_after_unused_check() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-selected-delete-cache-test");
+        let cache = root.join("cache");
+        let (data, lease) = worktree_storage::register(&cache, Path::new(&worktree)).unwrap();
+        lease.release_clean().unwrap();
+        worktree_storage::ensure_ready_before_worktree_removal(&cache, std::slice::from_ref(&data))
+            .unwrap();
+        let (registered, rival_lease) =
+            worktree_storage::register(&cache, Path::new(&worktree)).unwrap();
+        assert_eq!(registered, data);
+        let error = remove_worktree_then_private_data_many(
+            &cache,
+            std::slice::from_ref(&data),
+            true,
+            || remove_worktree(repository.clone(), worktree.clone(), Some(true), None, None),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("another Sail process is still using it"),
+            "{error}"
+        );
+        assert!(
+            !Path::new(&worktree).exists(),
+            "Git removal already completed"
+        );
+        assert!(data.is_dir(), "Active private data must remain pending");
+        assert!(worktree_storage::cleanup_status(&cache)
+            .iter()
+            .any(|pending| pending.reason == "active-use"));
+        rival_lease.release_clean().unwrap();
+        remove_worktree_then_private_data_many(&cache, std::slice::from_ref(&data), true, || {
+            Ok::<_, String>(())
+        })
         .unwrap();
         assert!(!data.exists());
         fs::remove_dir_all(root).unwrap();
