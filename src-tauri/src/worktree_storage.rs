@@ -1096,6 +1096,96 @@ fn cache_candidates(
     Ok(candidates)
 }
 
+#[cfg(unix)]
+fn remove_cache_entry_at(parent: &nix::dir::Dir, name: &std::ffi::OsStr) -> Result<(), String> {
+    use nix::dir::Dir;
+    use nix::errno::Errno;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use std::os::unix::ffi::OsStrExt;
+
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut child = match Dir::openat(parent, name, flags, Mode::empty()) {
+        Ok(child) => child,
+        Err(Errno::ENOTDIR | Errno::ELOOP) => {
+            return unlinkat(parent, name, UnlinkatFlags::NoRemoveDir)
+                .map_err(|error| error.to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut names = Vec::new();
+    for entry in child.iter() {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsStr::from_bytes(name).to_os_string());
+        }
+    }
+    for name in names {
+        remove_cache_entry_at(&child, &name)?;
+    }
+    drop(child);
+    unlinkat(parent, name, UnlinkatFlags::RemoveDir).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn remove_cache_candidate(
+    cache_directory: &Path,
+    data_directory: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    use nix::dir::Dir;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+
+    let data_root = cache_directory.join("terminal-worktrees");
+    if data_directory.parent() != Some(data_root.as_path()) {
+        return Err("Cache owner is outside its storage root.".into());
+    }
+    let data_name = data_directory
+        .file_name()
+        .ok_or("Cache owner has no name.")?;
+    let root = path.parent().ok_or("Cache entry has no parent.")?;
+    if root.parent() != Some(data_directory) {
+        return Err("Cache entry is outside its owner directory.".into());
+    }
+    let root_name = root.file_name().ok_or("Cache root has no name.")?;
+    if root_name != "build" && root_name != "cache" {
+        return Err("Cache entry has an unknown root.".into());
+    }
+    let name = path.file_name().ok_or("Cache entry has no name.")?;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let cache = Dir::open(cache_directory, flags, Mode::empty())
+        .map_err(|error| format!("Cache storage root changed during cleanup: {error}"))?;
+    let owners = Dir::openat(&cache, "terminal-worktrees", flags, Mode::empty())
+        .map_err(|error| format!("Cache owner root changed during cleanup: {error}"))?;
+    let data = Dir::openat(&owners, data_name, flags, Mode::empty())
+        .map_err(|error| format!("Cache owner changed during cleanup: {error}"))?;
+    let root = Dir::openat(&data, root_name, flags, Mode::empty())
+        .map_err(|error| format!("Cache root changed during cleanup: {error}"))?;
+    remove_cache_entry_at(&root, name)
+}
+
+#[cfg(not(unix))]
+fn remove_cache_candidate(
+    _cache_directory: &Path,
+    data_directory: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let root = path.parent().ok_or("Cache entry has no parent.")?;
+    if root.parent() != Some(data_directory)
+        || !fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_dir())
+    {
+        return Err("Cache root changed during cleanup.".into());
+    }
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        fs::remove_dir_all(path).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(path).map_err(|error| error.to_string())
+    }
+}
+
 fn read_cache_limit(data_directory: &Path) -> Result<u64, String> {
     let path = data_directory.join(CACHE_LIMIT_FILE);
     let metadata = match fs::symlink_metadata(&path) {
@@ -1218,11 +1308,7 @@ fn trim_cache_inner(cache_directory: &Path, data_directory: &Path) -> Result<(),
         ) {
             continue;
         }
-        let result = if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
-        };
+        let result = remove_cache_candidate(cache_directory, data_directory, &path);
         if let Err(error) = result {
             let reason = format!("cache-removal-failed: {error}");
             return Err(reason);
@@ -4535,6 +4621,45 @@ mod tests {
         trim_cache(&fixture.cache, &directory).unwrap();
         assert_eq!(
             fs::read(parked.join("build/cargo-target/artifact")).unwrap(),
+            b"keep this"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_cache_root_cannot_delete_external_data() {
+        use nix::dir::Dir;
+        use nix::fcntl::OFlag;
+        use nix::sys::stat::Mode;
+        use std::os::unix::fs::symlink;
+
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let build = directory.join("build");
+        let candidate = build.join("cargo-target");
+        fs::create_dir_all(&candidate).unwrap();
+        fs::write(candidate.join("artifact"), b"cache").unwrap();
+        let outside = fixture.root.join("outside");
+        let outside_candidate = outside.join("cargo-target");
+        fs::create_dir_all(&outside_candidate).unwrap();
+        fs::write(outside_candidate.join("artifact"), b"keep this").unwrap();
+        symlink(&outside_candidate, candidate.join("outside-link")).unwrap();
+
+        let held_build = Dir::open(
+            &build,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        fs::rename(&build, directory.join("build-original")).unwrap();
+        symlink(&outside, &build).unwrap();
+        remove_cache_entry_at(&held_build, std::ffi::OsStr::new("cargo-target")).unwrap();
+        assert!(!directory.join("build-original/cargo-target").exists());
+        assert!(remove_cache_candidate(&fixture.cache, &directory, &candidate).is_err());
+        assert_eq!(
+            fs::read(outside_candidate.join("artifact")).unwrap(),
             b"keep this"
         );
     }

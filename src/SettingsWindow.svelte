@@ -269,7 +269,7 @@
       worktreeStorageError = `Private agent storage status: ${String(cause)}`;
     } finally {
       worktreeStorageLoading = false;
-      if (snapshot?.directory !== worktreeStorageDirectory) void refreshWorktreeStorage();
+      if ((snapshot?.directory ?? '') !== worktreeStorageDirectory) void refreshWorktreeStorage();
     }
   }
 
