@@ -14,7 +14,7 @@ describe('reported agent focus', () => {
     execFileSync('git', ['init', '-q', repository]);
   });
 
-  it('shows source and report time across session Tasks, overview, and compact Agents rows', async () => {
+  beforeEach(async () => {
     await browser.execute((directory) => {
       localStorage.setItem('sai-directory', directory);
       localStorage.setItem(
@@ -24,16 +24,22 @@ describe('reported agent focus', () => {
       localStorage.removeItem('sail-agent-threads');
       localStorage.removeItem('sai-thread-attention');
       localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sai-hidden-sidebar-threads');
     }, realpathSync(repository));
     await browser.refresh();
     await chooseTopbarAction('New agent', 'Claude');
     const auth = $('.agent-auth');
     if (await auth.isExisting()) await auth.$('button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer [data-pane-prompt]').setValue('Report session focus');
-    await $('.agent-actions button:last-child').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
     await $('button[role="tab"]*=Tasks').click();
+  });
+
+  it('shows source and report time across session Tasks, overview, and compact Agents rows', async () => {
+    await $('.agent-composer [data-pane-prompt]').setValue('Report session focus');
+    const send = $('.agent-actions button:last-child');
+    await send.waitForEnabled();
+    await send.click();
     const panel = $('#session-details [aria-label="Session tasks"]');
     await expect(panel).toHaveText(expect.stringContaining('Observed status'));
     await expect(panel.$('[data-focus-source="Agent report"]')).toHaveText(
@@ -59,6 +65,7 @@ describe('reported agent focus', () => {
       expect.stringContaining('Test live tasks'),
     );
     await browser.keys('Escape');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await browser.waitUntil(
       async () => (await $$('[data-focus-source="Agent report"]')).length === 0,
       { timeout: 25_000 },
@@ -66,7 +73,9 @@ describe('reported agent focus', () => {
   });
   it('suppresses current focus while an elicitation form waits for input', async () => {
     await $('.agent-composer [data-pane-prompt]').setValue('Report focus then ask');
-    await $('.agent-actions button:last-child').click();
+    const send = $('.agent-actions button:last-child');
+    await send.waitForEnabled();
+    await send.click();
     const panel = $('#session-details [aria-label="Session tasks"]');
     await expect(panel.$('[data-focus-source="Agent report"]')).toExist();
     await expect($('[aria-label="Agent question"]')).toBeDisplayed();
@@ -74,6 +83,6 @@ describe('reported agent focus', () => {
     await expect(panel).toHaveText(expect.stringContaining('Waiting for input'));
     await expect(panel).not.toHaveText(expect.stringContaining('Current focus'));
     await expect(panel.$('[data-focus-source="Agent report"]')).not.toExist();
-    await $('[aria-label="Agent question"] button*=Decline').click();
+    await $('[aria-label="Agent question"]').$('button*=Decline').click();
   });
 });
