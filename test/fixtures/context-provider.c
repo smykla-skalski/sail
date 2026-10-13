@@ -44,6 +44,10 @@ int main(void) {
             continue;
         }
         int tool_call = strstr(line, "\"method\":\"tools/call\"") != NULL;
+        int idle_ping = strstr(line, "\"method\":\"idle-ping\"") != NULL ||
+            (tool_call && strstr(line, "\"name\":\"fixture_idle_ping\""));
+        int progress = strstr(line, "\"method\":\"many-progress\"") != NULL ||
+            (tool_call && strstr(line, "\"name\":\"fixture_many_progress\""));
         if (access(".sail/strict-provider-lifecycle", F_OK) == 0 &&
             (tool_call || strstr(line, "\"method\":\"tools/list\"")) &&
             (!initialized || initialization_count != 1)) {
@@ -69,6 +73,13 @@ int main(void) {
             if (getline(&line, &capacity, stdin) == -1 ||
                 !strstr(line, "\"method\":\"notifications/cancelled\"")) return 1;
         }
+        if (progress) {
+            for (int count = 0; count < 160; count++) {
+                printf("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\","
+                       "\"params\":{\"progressToken\":\"fixture\",\"progress\":%d,\"total\":160}}\n", count);
+                fflush(stdout);
+            }
+        }
         const char *result = "";
         if (cancelled) {
             result = strstr(line, "\"reason\":\"owner\"")
@@ -81,6 +92,8 @@ int main(void) {
             result = ",\"tools\":[{\"name\":\"fixture_ping\",\"description\":\"Reply from the fixture\","
                      "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_server_ping\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_idle_ping\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_many_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_wait_cancel\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
         } else if (tool_call) {
             result = ",\"content\":[{\"type\":\"text\",\"text\":\"fixture reply\"}],\"isError\":false";
@@ -88,6 +101,14 @@ int main(void) {
         printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d%s}}\n",
                value, (long)getpid(), initialization_count, result);
         fflush(stdout);
+        if (idle_ping) {
+            puts("{\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"ping\"}");
+            fflush(stdout);
+            if (getline(&line, &capacity, stdin) == -1 ||
+                !strstr(line, "\"id\":999") || !strstr(line, "\"result\":{}") ||
+                strstr(line, "\"error\"")) return 1;
+            if (!write_marker("idle-ping-replied")) return 1;
+        }
         if (initialization_count && access(".sail/block-provider-stdin", F_OK) == 0) {
             if (!write_marker("blocked-input")) return 1;
             for (;;) pause();

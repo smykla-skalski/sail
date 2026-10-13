@@ -1035,8 +1035,9 @@ struct ProviderProcess {
     initialization: Option<serde_json::Value>,
     initialized_notification_sent: bool,
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    stdin: std::sync::Arc<std::sync::Mutex<std::process::ChildStdin>>,
     stdout: Option<std::io::BufReader<std::process::ChildStdout>>,
+    output: Option<ProviderOutput>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
     staged_executable: Option<StagedExecutable>,
 }
@@ -1332,15 +1333,6 @@ fn make_provider_stdin_nonblocking(stdin: &impl std::os::fd::AsRawFd) -> Result<
 }
 
 #[cfg(target_os = "macos")]
-fn write_provider_request(
-    stdin: &mut std::process::ChildStdin,
-    message: &str,
-    timeout: std::time::Duration,
-) -> Result<(), String> {
-    write_provider_request_checked(stdin, message, timeout, || Ok(()))
-}
-
-#[cfg(target_os = "macos")]
 fn write_provider_request_checked(
     stdin: &mut impl std::io::Write,
     message: &str,
@@ -1348,6 +1340,7 @@ fn write_provider_request_checked(
     mut check: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
+    let message = message.trim_end_matches(['\r', '\n']);
     for bytes in [message.as_bytes(), b"\n".as_slice()] {
         let mut remaining = bytes;
         while !remaining.is_empty() {
@@ -1498,8 +1491,9 @@ fn spawn_provider(
         initialization: None,
         initialized_notification_sent: false,
         child,
-        stdin,
+        stdin: std::sync::Arc::new(std::sync::Mutex::new(stdin)),
         stdout: Some(std::io::BufReader::new(stdout)),
+        output: None,
         stderr_tail,
         staged_executable: staged,
     })
@@ -1654,9 +1648,14 @@ fn provider_request_with_notifications_at(
     }
     let current = locked_store(store_path, |store| Ok((status(&canonical, store), false)))?;
     if current.state != "approved" || current.fingerprint.as_deref() != Some(expected) {
-        provider.take();
-        drop(provider);
-        forget_provider(&key, &slot);
+        if provider
+            .as_ref()
+            .is_none_or(|process| process.fingerprint == expected)
+        {
+            provider.take();
+            drop(provider);
+            forget_provider(&key, &slot);
+        }
         return Err("Context approval changed or was revoked.".into());
     }
     let stale = provider.as_mut().is_some_and(|current| {
@@ -1790,6 +1789,109 @@ fn provider_request_with_notifications_at(
 }
 
 #[cfg(target_os = "macos")]
+enum ProviderEvent {
+    Notification(String),
+    Response(String),
+    Failure(String),
+}
+
+#[cfg(target_os = "macos")]
+struct ProviderOutput(std::sync::mpsc::Receiver<ProviderEvent>);
+
+#[cfg(target_os = "macos")]
+fn write_shared_provider_request(
+    stdin: &std::sync::Mutex<std::process::ChildStdin>,
+    message: &str,
+    timeout: std::time::Duration,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        check()?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Provider stdin write timed out.".into());
+        }
+        match stdin.try_lock() {
+            Ok(mut stdin) => {
+                return write_provider_request_checked(&mut *stdin, message, remaining, check);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
+    if process.output.is_some() {
+        return Ok(());
+    }
+    let mut reader = process
+        .stdout
+        .take()
+        .ok_or("Provider output unavailable.")?;
+    let stdin = process.stdin.clone();
+    let (send, receive) = std::sync::mpsc::sync_channel(32);
+    process.output = Some(ProviderOutput(receive));
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            loop {
+                let line = read_bounded_line(&mut reader, 1024 * 1024)?;
+                let value: serde_json::Value = serde_json::from_str(line.trim_end())
+                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                if !value.is_object()
+                    || value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
+                {
+                    return Err("Provider returned invalid JSON-RPC.".into());
+                }
+                let event =
+                    if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
+                        if value.get("result").is_some() || value.get("error").is_some() {
+                            return Err("Provider returned an invalid JSON-RPC request.".into());
+                        }
+                        if let Some(id) = value.get("id") {
+                            if !(id.is_string() || id.is_i64() || id.is_u64()) {
+                                return Err("Provider returned an invalid JSON-RPC request.".into());
+                            }
+                            if method != "ping" {
+                                return Err(format!(
+                                    "Provider requested unsupported MCP method: {method}."
+                                ));
+                            }
+                            let reply = serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}})
+                                .to_string();
+                            write_shared_provider_request(
+                                &stdin,
+                                &reply,
+                                std::time::Duration::from_secs(1),
+                                || Ok(()),
+                            )?;
+                            continue;
+                        }
+                        ProviderEvent::Notification(line)
+                    } else {
+                        if value.get("id").is_none()
+                            || (value.get("result").is_none() && value.get("error").is_none())
+                        {
+                            return Err("Provider returned an invalid response.".into());
+                        }
+                        ProviderEvent::Response(line)
+                    };
+                send.send(event)
+                    .map_err(|_| "Provider request was stopped.".to_string())?;
+            }
+        })();
+        if let Err(error) = result {
+            let _ = send.send(ProviderEvent::Failure(error));
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn exchange_provider_request(
     process: &mut ProviderProcess,
     key: &str,
@@ -1804,7 +1906,7 @@ fn exchange_provider_request(
         .get("method")
         .and_then(serde_json::Value::as_str)
         .ok_or("MCP method missing.")?;
-    write_provider_request_checked(&mut process.stdin, message, Duration::from_secs(30), || {
+    write_shared_provider_request(&process.stdin, message, Duration::from_secs(30), || {
         if !session_active()? {
             return Err("Context session revoked during provider stdin write.".into());
         }
@@ -1822,116 +1924,69 @@ fn exchange_provider_request(
         }
         return Ok(None);
     }
-    let reader = process
-        .stdout
-        .take()
+    start_provider_output(process)?;
+    let output = process
+        .output
+        .as_ref()
         .ok_or("Provider output unavailable.")?;
-    let (send, receive) = std::sync::mpsc::sync_channel(1);
-    enum ResponseEvent {
-        Ping(serde_json::Value),
-        Notification(String),
-        Finished(
-            Result<String, String>,
-            std::io::BufReader<std::process::ChildStdout>,
-        ),
-    }
-    let request_id = request.get("id").cloned().ok_or("MCP request has no ID.")?;
-    let response_id = request_id.clone();
-    std::thread::spawn(move || {
-        let mut reader = reader;
-        let result = (|| -> Result<String, String> {
-            let mut bytes = 0;
-            for _ in 0..32 {
-                let line = read_bounded_line(&mut reader, 1024 * 1024 - bytes)?;
-                let value: serde_json::Value = serde_json::from_str(line.trim_end())
-                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
-                if value.get("jsonrpc").and_then(|version| version.as_str()) != Some("2.0") {
-                    return Err("Provider returned invalid JSON-RPC.".into());
-                }
-                if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
-                    if let Some(id) = value.get("id") {
-                        if !(id.is_string() || id.is_i64() || id.is_u64())
-                            || value.get("result").is_some()
-                            || value.get("error").is_some()
-                        {
-                            return Err("Provider returned an invalid JSON-RPC request.".into());
-                        }
-                        if method != "ping" {
-                            return Err(format!(
-                                "Provider requested unsupported MCP method: {method}."
-                            ));
-                        }
-                        send.send(ResponseEvent::Ping(id.clone()))
-                            .map_err(|_| "Provider request was stopped.".to_string())?;
-                        continue;
+    let request_id = request.get("id").ok_or("MCP request has no ID.")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut buffered = String::new();
+    let response = loop {
+        if !session_active()? {
+            return Err("Context session revoked before provider response.".into());
+        }
+        for notification in take_cancellations(key, capability, request_id) {
+            write_shared_provider_request(
+                &process.stdin,
+                &notification,
+                Duration::from_secs(1),
+                || {
+                    if session_active()? {
+                        Ok(())
+                    } else {
+                        Err("Context session revoked during provider cancellation.".into())
                     }
+                },
+            )?;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Provider response timed out.".into());
+        }
+        match output
+            .0
+            .recv_timeout(remaining.min(Duration::from_millis(10)))
+        {
+            Ok(ProviderEvent::Notification(message)) => {
+                if let Some(notify) = &mut notify {
+                    notify(&message)?;
+                } else {
+                    if buffered.len() + message.len() > 1024 * 1024 {
+                        return Err("Buffered provider output exceeds 1 MiB.".into());
+                    }
+                    buffered.push_str(&message);
                 }
-                let matched = value.get("id") == Some(&response_id);
-                if value.get("id").is_some() && !matched {
+            }
+            Ok(ProviderEvent::Response(message)) => {
+                let value: serde_json::Value = serde_json::from_str(message.trim_end())
+                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                if value.get("id") != Some(request_id) {
                     return Err("Provider response ID did not match the request.".into());
                 }
-                if matched && value.get("result").is_none() && value.get("error").is_none() {
-                    return Err("Provider returned a request instead of a response.".into());
+                if buffered.len() + message.len() > 1024 * 1024 {
+                    return Err("Buffered provider output exceeds 1 MiB.".into());
                 }
-                if !matched
-                    && value
-                        .get("method")
-                        .and_then(|method| method.as_str())
-                        .is_none()
-                {
-                    return Err("Provider returned an invalid notification.".into());
-                }
-                bytes += line.len();
-                if matched {
-                    return Ok(line);
-                }
-                send.send(ResponseEvent::Notification(line))
-                    .map_err(|_| "Provider request was stopped.".to_string())?;
+                buffered.push_str(&message);
+                break buffered;
             }
-            Err("Provider sent too many messages before its response.".into())
-        })();
-        let _ = send.send(ResponseEvent::Finished(result, reader));
-    });
-    let response = (|| -> Result<String, String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut buffered = String::new();
-        loop {
-            if !session_active()? {
-                return Err("Context session revoked before provider response.".into());
-            }
-            for notification in take_cancellations(key, capability, &request_id) {
-                write_provider_request(&mut process.stdin, &notification, Duration::from_secs(1))?;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err("Provider response timed out.".into());
-            }
-            match receive.recv_timeout(remaining.min(Duration::from_millis(10))) {
-                Ok(ResponseEvent::Ping(id)) => {
-                    let reply =
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string();
-                    write_provider_request(&mut process.stdin, &reply, Duration::from_secs(1))?;
-                }
-                Ok(ResponseEvent::Notification(message)) => {
-                    if let Some(notify) = &mut notify {
-                        notify(&message)?;
-                    } else {
-                        buffered.push_str(&message);
-                    }
-                }
-                Ok(ResponseEvent::Finished(response, reader)) => {
-                    process.stdout = Some(reader);
-                    buffered.push_str(&response?);
-                    return Ok(buffered);
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("Provider response reader stopped.".into());
-                }
+            Ok(ProviderEvent::Failure(error)) => return Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Provider response reader stopped.".into());
             }
         }
-    })();
-    let response = response?;
+    };
     if method == "initialize" {
         if let Some(result) = response
             .lines()
@@ -2208,10 +2263,11 @@ mod tests {
         let mut provider =
             spawn_provider(&repository.0, &current, &repository.0.join("data")).unwrap();
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"write"}"#;
-        write_provider_request(
-            &mut provider.stdin,
+        write_shared_provider_request(
+            &provider.stdin,
             request,
             std::time::Duration::from_secs(1),
+            || Ok(()),
         )
         .unwrap();
         let response = read_bounded_line(provider.stdout.as_mut().unwrap(), 1024)
@@ -2493,6 +2549,219 @@ mod tests {
             .join()
             .unwrap();
         assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stdio_notification_batches_have_exactly_one_trailing_newline() {
+        let first =
+            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"data":"first"}})
+                .to_string();
+        let second =
+            json!({"jsonrpc":"2.0","method":"notifications/message","params":{"data":"second"}})
+                .to_string();
+        for (name, suffix) in [
+            ("no terminator", ""),
+            ("one LF", "\n"),
+            ("CRLF", "\r\n"),
+            ("duplicate LF", "\n\n"),
+        ] {
+            let mut output = Vec::new();
+            write_provider_request_checked(
+                &mut output,
+                &format!("{first}\n{second}{suffix}"),
+                std::time::Duration::from_secs(1),
+                || Ok(()),
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(
+                output,
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"data\":\"first\"}}\n\
+                 {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"data\":\"second\"}}\n",
+                "{name}",
+            );
+            let frames: Vec<_> = output.split_terminator('\n').collect();
+            assert_eq!(frames.len(), 2);
+            for frame in frames {
+                assert!(serde_json::from_str::<serde_json::Value>(frame).is_ok());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_provider_ping_is_answered_without_another_client_request() {
+        let repository = Repository::new("runtime-idle-ping");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |id, method: &str| {
+            let request = json!({"jsonrpc":"2.0","id":id,"method":method}).to_string();
+            let response = provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap();
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        let response = call(1, "idle-ping");
+        let marker = repository
+            .0
+            .join("data")
+            .join(key)
+            .join("idle-ping-replied");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "Idle server ping received no reply");
+        assert_eq!(
+            call(2, "tools/list")["result"]["pid"],
+            response["result"]["pid"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn progress_stream_exceeding_32_messages_reaches_its_result() {
+        let repository = Repository::new("runtime-many-progress");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"many-progress","params":{"_meta":{"progressToken":"fixture"}}}).to_string();
+        let mut count = 0;
+        let mut notify = |message: &str| {
+            let value: serde_json::Value = serde_json::from_str(message).unwrap();
+            assert_eq!(value["method"], "notifications/progress");
+            assert_eq!(value["params"]["progressToken"], "fixture");
+            assert_eq!(value["params"]["progress"], count);
+            count += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(())
+        };
+        let response = provider_request_with_notifications_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            &request,
+            &store_path,
+            &repository.0.join("data"),
+            Some(&mut notify),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 160);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 1);
+        let next = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &store_path,
+            &repository.0.join("data"),
+        )
+        .unwrap()
+        .unwrap();
+        let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(next["result"]["pid"], response["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn delayed_authorized_worker_preserves_a_reapproved_provider() {
+        let repository = Repository::new("runtime-delayed-old-worker");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let approve_current = || {
+            locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap()
+        };
+        let original = approve_current();
+        let owner = ActiveSession::new();
+        let call = |fingerprint: &str, capability| {
+            provider_request_at(
+                &repository.0,
+                fingerprint,
+                capability,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let first = call(&original, Some(owner.0.as_str())).unwrap().unwrap();
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        std::thread::scope(|scope| {
+            let (authorized, ready) = std::sync::mpsc::sync_channel(1);
+            let (resume, suspended) = std::sync::mpsc::sync_channel(1);
+            let repository = &repository;
+            let store_path = &store_path;
+            let owner = &owner;
+            let original = &original;
+            let old = scope.spawn(move || {
+                assert!(session_is_active(Some(&owner.0)).unwrap());
+                assert_eq!(
+                    locked_store(&store_path, |store| Ok((
+                        status(&repository.0, store).fingerprint,
+                        false
+                    )))
+                    .unwrap(),
+                    Some(original.to_owned()),
+                );
+                authorized.send(()).unwrap();
+                suspended.recv().unwrap();
+                call(&original, Some(owner.0.as_str()))
+            });
+            ready.recv().unwrap();
+            repository.write(".sail/context.json", r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["search"]}]}"#);
+            repository.commit();
+            let replacement = approve_current();
+            assert_ne!(&replacement, original);
+            let latest = call(&replacement, None).unwrap().unwrap();
+            let latest: serde_json::Value = serde_json::from_str(&latest).unwrap();
+            assert_ne!(latest["result"]["pid"], first["result"]["pid"]);
+            resume.send(()).unwrap();
+            assert!(old
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .contains("approval changed"));
+            let preserved = call(&replacement, None).unwrap().unwrap();
+            let preserved: serde_json::Value = serde_json::from_str(&preserved).unwrap();
+            assert_eq!(latest["result"]["pid"], preserved["result"]["pid"]);
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -3004,8 +3273,9 @@ mod tests {
                 initialization: None,
                 initialized_notification_sent: false,
                 stdout: Some(std::io::BufReader::new(child.stdout.take().unwrap())),
+                output: None,
                 child,
-                stdin,
+                stdin: std::sync::Arc::new(std::sync::Mutex::new(stdin)),
                 stderr_tail: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
                 )),
@@ -3063,10 +3333,11 @@ mod tests {
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         make_provider_stdin_nonblocking(&stdin).unwrap();
-        let error = write_provider_request(
+        let error = write_provider_request_checked(
             &mut stdin,
             &"x".repeat(900_000),
             std::time::Duration::from_millis(50),
+            || Ok(()),
         )
         .unwrap_err();
         child.kill().unwrap();

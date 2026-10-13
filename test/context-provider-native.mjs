@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { spawn, execFileSync, spawnSync } from 'node:child_process';
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  readdirSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -346,6 +348,31 @@ try {
   });
   assert.equal(pinged.result.pid, a.result.pid);
   assert.equal(pinged.result.content[0].text, 'fixture reply');
+  const idlePinged = await first.request(31, 'tools/call', {
+    name: 'fixture_idle_ping',
+    arguments: {},
+  });
+  assert.equal(idlePinged.result.pid, a.result.pid);
+  const idleReply = () =>
+    readdirSync(config, { withFileTypes: true }).some(
+      (entry) => entry.isDirectory() && existsSync(join(config, entry.name, 'idle-ping-replied')),
+    );
+  const idleDeadline = Date.now() + 5_000;
+  while (!idleReply() && Date.now() < idleDeadline) await delay(10);
+  assert.ok(idleReply(), 'provider ping receives a reply while all clients are idle');
+  let progressCount = 0;
+  const progressed = await first.request(
+    32,
+    'tools/call',
+    { name: 'fixture_many_progress', arguments: {}, _meta: { progressToken: 'fixture' } },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/progress');
+      assert.equal(notification.params.progressToken, 'fixture');
+      assert.equal(notification.params.progress, progressCount++);
+    },
+  );
+  assert.equal(progressCount, 160);
+  assert.equal(progressed.result.pid, a.result.pid);
   const cancellationStart = Date.now();
   let notificationReceived;
   const notified = new Promise((resolve) => {
