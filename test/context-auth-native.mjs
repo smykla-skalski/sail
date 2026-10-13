@@ -96,6 +96,21 @@ let appPid;
 let appLaunched = false;
 const probes = [];
 
+function replaceBundle(replacement, backupName) {
+  const staged = join(scratch, 'replacement.app');
+  run('ditto', [replacement, staged]);
+  run('codesign', ['--verify', '--deep', '--strict', staged]);
+  const previous = join(scratch, backupName);
+  renameSync(app, previous);
+  try {
+    renameSync(staged, app);
+  } catch (error) {
+    renameSync(previous, app);
+    throw error;
+  }
+  return previous;
+}
+
 function makeProject(path) {
   mkdirSync(join(path, '.sail'), { recursive: true });
   writeFileSync(
@@ -303,11 +318,17 @@ try {
 
   run('codesign', ['--force', '--deep', '--sign', '-', copied]);
   run('codesign', ['--verify', '--deep', '--strict', copied]);
-  expectFailure(
-    join(copied, 'Contents', 'MacOS', 'sail'),
-    ['--context-auth-probe', project],
-    /(?:Sail client|Context service) signature or path rejected/,
-  );
+  const signedOriginal = replaceBundle(copied, 'signed-original.app');
+  try {
+    expectFailure(
+      binary,
+      ['--context-auth-probe', project],
+      /Context service signature or path rejected/,
+    );
+  } finally {
+    rmSync(app, { recursive: true });
+    renameSync(signedOriginal, app);
+  }
   console.log('PASS: differently signed client rejected');
 
   writeFileSync(provider, '#!/bin/sh\nexit 1\n');
@@ -346,7 +367,6 @@ try {
   const fourth = openProbe(project);
   assert.equal(await fourth.line(), 'opened');
   assert.equal(await fourth.check(), 'authorized');
-  fourth.close();
   console.log('PASS: service restart invalidates old capability and admits new session');
 
   const upgrade = process.env.SAIL_CONTEXT_AUTH_UPGRADE_APP;
@@ -370,9 +390,7 @@ try {
     assert.equal(after.team, before.team);
     assert.ok(before.hash && after.hash);
     assert.notEqual(after.hash, before.hash);
-    const previous = join(scratch, 'previous.app');
-    renameSync(app, previous);
-    run('ditto', [upgrade, app]);
+    replaceBundle(upgrade, 'previous.app');
   } else {
     assert.ok(
       process.env.APPLE_SIGNING_IDENTITY,
@@ -396,12 +414,16 @@ try {
     ]);
   }
   run('codesign', ['--verify', '--deep', '--strict', app]);
+  assert.match(await fourth.check(), /^rejected:/);
+  fourth.close();
   expectFailure(
     binary,
     ['--context-auth-probe', project],
     /Context service (signature or path rejected|unavailable or stale after upgrade)/,
   );
-  console.log('PASS: upgraded app rejects the stale signed service');
+  console.log(
+    'PASS: signed upgrade invalidates the existing session and rejects the stale service',
+  );
 } finally {
   for (const probe of probes) if (!probe.killed) probe.kill('SIGTERM');
   let cleanupError;
