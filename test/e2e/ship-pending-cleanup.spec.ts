@@ -22,6 +22,30 @@ async function diagnose<T>(label: string, step: () => Promise<T>): Promise<T> {
   }
 }
 
+async function openPendingConfirmation(path: string, buttonLabel: string) {
+  const dialog = $('dialog.confirmation-dialog[open]');
+  const button = $(`[data-pending-worktree="${path}"]`).$(`button=${buttonLabel}`);
+  await browser.waitUntil(
+    async () => {
+      if (await dialog.isExisting()) return true;
+      await button.click();
+      try {
+        await browser.waitUntil(() => dialog.isExisting(), { timeout: 1500, interval: 100 });
+        return true;
+      } catch {
+        const alert = $('.app-shell [role="alert"]');
+        if (
+          (await alert.isExisting()) &&
+          (await alert.getText()).includes('A worktree operation is in progress')
+        )
+          return false;
+        throw new Error(`Pending confirmation did not open for ${path}`);
+      }
+    },
+    { timeout: 20000, interval: 100 },
+  );
+}
+
 describe('merged Ship pending cleanup', () => {
   const repository = realpathSync(mkdtempSync(join(tmpdir(), 'sail-ship-pending-')));
   const worktrees = realpathSync(mkdtempSync(join(tmpdir(), 'sail-ship-pending-trees-')));
@@ -68,7 +92,7 @@ describe('merged Ship pending cleanup', () => {
   };
 
   async function cleanPending(path: string): Promise<boolean> {
-    await $(`[data-pending-worktree="${path}"]`).$('button=Clean up this worktree…').click();
+    await openPendingConfirmation(path, 'Clean up this worktree…');
     await diagnose('Pending cleanup dialog', async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
@@ -89,9 +113,7 @@ describe('merged Ship pending cleanup', () => {
     );
     if ((await pendingCleanup(path))?.reason.includes('Cleanup stopped')) return false;
     if ((await pendingCleanup(path))?.storagePaths?.length) {
-      await $(`[data-pending-worktree="${path}"]`)
-        .$('button=Retry selected storage cleanup…')
-        .click();
+      await openPendingConfirmation(path, 'Retry selected storage cleanup…');
       await diagnose('Selected storage dialog', async () => {
         const dialog = $('dialog.confirmation-dialog[open]');
         await expect(dialog).toExist();

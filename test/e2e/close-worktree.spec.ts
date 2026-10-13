@@ -58,6 +58,32 @@ async function openPendingConfirmation(path: string, buttonLabel: string) {
   );
 }
 
+async function openRemovalConfirmation(path: string, branch: string) {
+  const dialog = $('dialog.confirmation-dialog[open]');
+  await browser.waitUntil(
+    async () => {
+      if (await dialog.isExisting()) return true;
+      await $(`.project-worktree-select[title="${path}"]`).click({ button: 'right' });
+      await $(`[aria-label="Delete worktree ${branch}"]`).click();
+      try {
+        await browser.waitUntil(() => dialog.isExisting(), { timeout: 1500, interval: 100 });
+        return true;
+      } catch {
+        const alert = $('.app-shell [role="alert"]');
+        const message = (await alert.isExisting()) ? await alert.getText() : '<no error alert>';
+        if (
+          message.includes('A worktree operation is in progress') ||
+          message.includes('Another worktree deletion is in progress') ||
+          message.includes('A worktree is being created')
+        )
+          return false;
+        throw new Error(`Removal confirmation did not open for ${path}: ${message}`);
+      }
+    },
+    { timeout: 20000, interval: 100 },
+  );
+}
+
 describe('close worktree shortcut', () => {
   const repository = realpathSync(mkdtempSync(join(tmpdir(), 'sail-close-worktree-')));
   const worktrees = realpathSync(mkdtempSync(join(tmpdir(), 'sail-close-worktree-trees-')));
@@ -1038,8 +1064,7 @@ describe('close worktree shortcut', () => {
     await diagnose('Movable worktree row', () =>
       expect($(`.project-worktree-select[title="${original}"]`)).toBeDisplayed(),
     );
-    await $(`.project-worktree-select[title="${original}"]`).click({ button: 'right' });
-    await $('[aria-label="Delete worktree moved-pending"]').click();
+    await openRemovalConfirmation(original, 'moved-pending');
     await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(original)));
     git('worktree', 'move', original, moved);
@@ -1066,6 +1091,80 @@ describe('close worktree shortcut', () => {
         (entry) => entry.path === original && entry.generation === generation,
       ),
     ).toBe(true);
+  });
+
+  it('keeps a staged child recovery when its parent is marked pending', async () => {
+    const parent = join(worktrees, 'staged-child-parent');
+    const original = join(worktrees, 'staged-child-original');
+    const recovery = join(worktrees, 'staged-child-recovery');
+    git('worktree', 'add', '-q', '-b', 'staged-child-parent', parent);
+    git('worktree', 'add', '-q', '-b', 'staged-child', original);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const parentGeneration = registered.find((item) => item.path === parent)?.generation;
+    const childGeneration = registered.find((item) => item.path === original)?.generation;
+    if (!parentGeneration || !childGeneration) throw new Error('Missing staged child identities');
+    await select(repository, false);
+    git('worktree', 'move', original, recovery);
+    await browser.execute(
+      (repo, source, originalPath, recoveryPath, sourceGeneration, generation) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push(
+          { path: source, branch: 'staged-child-parent', generation: sourceGeneration },
+          {
+            path: recoveryPath,
+            branch: 'staged-child',
+            generation,
+            origin: {
+              sourcePath: source,
+              sourceGeneration,
+              agent: 'codex',
+              sessionId: 'staged-child-session',
+              sessionTitle: 'Staged child',
+            },
+            pendingCleanup: {
+              originalPath,
+              recoveryPath,
+              sizeBytes: 0,
+              reason: 'Interrupted cleanup left this checkout at its recovery path.',
+            },
+          },
+        );
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      parent,
+      original,
+      recovery,
+      parentGeneration,
+      childGeneration,
+    );
+    await browser.refresh();
+    await diagnose('Parent with staged child', () =>
+      expect($(`.project-worktree-select[title="${parent}"]`)).toBeDisplayed(),
+    );
+    await openRemovalConfirmation(parent, 'staged-child-parent');
+    await expect($('dialog.confirmation-dialog[open]')).toHaveText(
+      expect.stringContaining(recovery),
+    );
+    await $('dialog.confirmation-dialog[open]').$('button=Mark 2 pending').click();
+    await browser.waitUntil(async () => !!(await pendingCleanup(parent)));
+    expect((await pendingCleanup(recovery))?.originalPath).toBe(original);
+    await browser.refresh();
+    expect((await pendingCleanup(recovery))?.originalPath).toBe(original);
+    await $(`[data-pending-worktree="${recovery}"]`).$('button=Clean up this worktree…').click();
+    await diagnose('Child restored after parent mark', () =>
+      browser.waitUntil(async () => (await pendingCleanup(original))?.recoveryPath === original),
+    );
+    expect(existsSync(original)).toBe(true);
+    expect(existsSync(recovery)).toBe(false);
+    git('worktree', 'remove', original);
+    git('worktree', 'remove', parent);
   });
 
   it('settles a confirmed checkout removed before its catalog update after restart', async () => {

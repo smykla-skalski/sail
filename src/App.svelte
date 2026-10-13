@@ -9218,6 +9218,9 @@
     }
     let pendingCatalog = projectCatalog;
     for (const [index, worktree] of targets.entries()) {
+      // A pending descendant may already be staged at a recovery path. Its
+      // original path and removal snapshot must survive marking its parent.
+      if (worktree.pendingCleanup) continue;
       const state = preview[index];
       const reason = state.inspectionError
         ? `Cannot verify checkout contents: ${state.inspectionError}`
