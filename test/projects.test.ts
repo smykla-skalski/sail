@@ -10,7 +10,6 @@ import {
   markWorktreeCleanupPending,
   movePendingWorktreeCleanup,
   owningRepository,
-  pendingExpectedRegisteredWorktrees,
   removeRepository,
   removeWorktree,
   reconcileSelectedRemovedWorktreeStorage,
@@ -274,7 +273,6 @@ await test('keeps a removed checkout visible while its private storage remains p
 await test('keeps the mark-time Git inventory across restart and recovery moves', () => {
   const generation = testGeneration(44);
   const unrelated = testGeneration(45);
-  const added = testGeneration(46);
   const catalog = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
     path: '/worktrees/parent',
     branch: 'parent',
@@ -295,12 +293,10 @@ await test('keeps the mark-time Git inventory across restart and recovery moves'
   const restarted = loadProjectCatalog(JSON.stringify(marked), '/repo');
   const pending = restarted.worktrees['/repo'][0].pendingCleanup!;
   assert.equal(pending.selectedWorktreeCleanupConfirmed, true);
-  const current = [
-    { path: '/repo', generation: testGeneration(1) },
-    { path: '/worktrees/parent', generation },
-    { path: '/worktrees/new-child', generation: added },
-  ];
-  assert.deepEqual(pendingExpectedRegisteredWorktrees(pending, current), current.slice(0, 2));
+  assert.deepEqual(
+    pending.registeredWorktreesAtMark?.map((entry) => entry.path),
+    ['/repo', '/worktrees/parent', '/worktrees/unrelated'],
+  );
   const moved = movePendingWorktreeCleanup(
     pending,
     '/worktrees/parent',
@@ -318,12 +314,10 @@ await test('keeps the mark-time Git inventory across restart and recovery moves'
   const durable = loadProjectCatalog(JSON.stringify(recovered), '/repo');
   assert.equal(durable.worktrees['/repo'][0].path, '/worktrees/moved-parent');
   assert.deepEqual(
-    pendingExpectedRegisteredWorktrees(durable.worktrees['/repo'][0].pendingCleanup!, [
-      { path: '/repo', generation: testGeneration(1) },
-      { path: '/worktrees/moved-parent', generation },
-      { path: '/worktrees/new-child', generation: added },
-    ]).map((entry) => entry.path),
-    ['/repo', '/worktrees/moved-parent'],
+    durable.worktrees['/repo'][0].pendingCleanup?.registeredWorktreesAtMark?.map(
+      (entry) => entry.path,
+    ),
+    ['/repo', '/worktrees/moved-parent', '/worktrees/unrelated'],
   );
 });
 

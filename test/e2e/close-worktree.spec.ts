@@ -351,50 +351,65 @@ describe('close worktree shortcut', () => {
       await $('.settings-window').$('button=Agents').click();
       const selector = `li[data-pending-temp-owner="${path}"]`;
       await browser.waitUntil(async () => (await $$(selector)).length > 0);
-      const rows = await $$(selector);
-      const pending = await Promise.all(
-        Array.from({ length: rows.length }, async (_, index) => ({
-          row: rows[index],
-          reason: await rows[index].getText(),
-          tempPath: await rows[index].getAttribute('data-pending-temp-path'),
-        })),
-      );
-      if (
-        pending.some(({ reason }) =>
-          /turn-temp-process-active|turn-temp-owner-unverified-active/.test(reason),
-        )
-      )
-        throw new Error(
-          `Selected temporary data still has an active owner: ${pending.map(({ reason }) => reason).join('; ')}`,
+      async function clearOne(attempt: number): Promise<void> {
+        if (attempt >= 8)
+          throw new Error(
+            'Selected temporary data required more than eight explicit confirmations',
+          );
+        const rows = await $$(selector);
+        if (rows.length === 0) return;
+        const pending = await Promise.all(
+          Array.from({ length: rows.length }, async (_, index) => ({
+            row: rows[index],
+            reason: await rows[index].getText(),
+            tempPath: await rows[index].getAttribute('data-pending-temp-path'),
+          })),
         );
-      const canClean = await Promise.all(
-        pending.map((item) => item.row.$('button=Clean after checking unused').isExisting()),
-      );
-      const item = pending[canClean.findIndex(Boolean)];
-      if (!item?.tempPath)
-        throw new Error('Selected unused temporary data has no verified cleanup action');
-      await expect(item.row).toHaveText(expect.stringContaining(`Owner worktree: ${path}`));
-      await expect(item.row).toHaveText(
-        expect.stringContaining(`Temporary data: ${item.tempPath}`),
-      );
-      await expect(item.row).toHaveText(expect.stringContaining('Pending reason:'));
-      await expect(item.row).toHaveText(expect.stringContaining('Retained size:'));
-      await item.row.$('button=Clean after checking unused').click();
-      const confirmation = $('dialog.confirmation-dialog[open]');
-      await expect(confirmation).toHaveText(expect.stringContaining(`Owner worktree: ${path}`));
-      await expect(confirmation).toHaveText(
-        expect.stringContaining(`Temporary data: ${item.tempPath}`),
-      );
-      await expect(confirmation).toHaveText(
-        expect.stringContaining('no other process will write to, move, or replace it'),
-      );
-      await confirmation.$('button=Remove selected temporary data').click();
-      await browser.waitUntil(async () => {
+        if (
+          pending.some(({ reason }) =>
+            /turn-temp-process-active|turn-temp-owner-unverified-active/.test(reason),
+          )
+        )
+          throw new Error(
+            `Selected temporary data still has an active owner: ${pending.map(({ reason }) => reason).join('; ')}`,
+          );
+        const canClean = await Promise.all(
+          pending.map((item) => item.row.$('button=Clean after checking unused').isExisting()),
+        );
+        const item = pending[canClean.findIndex(Boolean)];
+        if (!item?.tempPath)
+          throw new Error('Selected unused temporary data has no verified cleanup action');
+        await expect(item.row).toHaveText(expect.stringContaining(`Owner worktree: ${path}`));
+        await expect(item.row).toHaveText(
+          expect.stringContaining(`Temporary data: ${item.tempPath}`),
+        );
+        await expect(item.row).toHaveText(expect.stringContaining('Pending reason:'));
+        await expect(item.row).toHaveText(expect.stringContaining('Retained size:'));
+        await item.row.$('button=Clean after checking unused').click();
+        const confirmation = $('dialog.confirmation-dialog[open]');
+        await expect(confirmation).toHaveText(expect.stringContaining(`Owner worktree: ${path}`));
+        await expect(confirmation).toHaveText(
+          expect.stringContaining(`Temporary data: ${item.tempPath}`),
+        );
+        await expect(confirmation).toHaveText(
+          expect.stringContaining('no other process will write to, move, or replace it'),
+        );
+        await confirmation.$('button=Remove selected temporary data').click();
+        await browser.waitUntil(async () => {
+          const error = $('.settings-window .runtime-diagnostic[role="alert"]');
+          const remainingRows = await $$(selector);
+          const remaining = await Promise.all(
+            Array.from({ length: remainingRows.length }, (_, index) =>
+              remainingRows[index].getAttribute('data-pending-temp-path'),
+            ),
+          );
+          return !remaining.includes(item.tempPath) || (await error.isExisting());
+        });
         const error = $('.settings-window .runtime-diagnostic[role="alert"]');
-        return (await $$(selector)).length === 0 || (await error.isExisting());
-      });
-      const error = $('.settings-window .runtime-diagnostic[role="alert"]');
-      if (await error.isExisting()) throw new Error(await error.getText());
+        if (await error.isExisting()) throw new Error(await error.getText());
+        await clearOne(attempt + 1);
+      }
+      await clearOne(0);
     } finally {
       await returnToWorkspace();
     }
@@ -540,12 +555,38 @@ describe('close worktree shortcut', () => {
     await openRemovalConfirmation(eligible, 'eligible-selected');
     await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(eligible)));
+    const unrelatedAfterMark = join(worktrees, 'unrelated-after-mark');
+    git('worktree', 'add', '-q', '-b', 'unrelated-after-mark', unrelatedAfterMark);
+    await carryTaskRegisteredWorktrees();
+    await browser.refresh();
+    await expect($(`.project-worktree-select[title="${unrelatedAfterMark}"]`)).toBeDisplayed();
+    expect(
+      (await pendingCleanup(eligible))?.registeredWorktreesAtMark?.some(
+        (worktree) => worktree.path === unrelatedAfterMark,
+      ),
+    ).toBe(false);
     expect(await cleanPending(eligible)).toBe(false);
     expect(existsSync(eligible)).toBe(true);
     await cleanUnusedSelectedTemp(eligible);
     expect(await cleanPending(eligible, undefined, true)).toBe(true);
     expect(existsSync(eligible)).toBe(false);
     expect(git('worktree', 'list')).not.toContain(eligible);
+    expect(existsSync(unrelatedAfterMark)).toBe(true);
+    expect(git('worktree', 'list')).toContain(unrelatedAfterMark);
+    expect(await catalogPaths()).toEqual([first, second, unrelatedAfterMark]);
+    git('worktree', 'remove', unrelatedAfterMark);
+    await browser.execute(
+      (repo, path) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo] = catalog.worktrees[repo].filter(
+          (worktree: { path: string }) => worktree.path !== path,
+        );
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      unrelatedAfterMark,
+    );
+    await browser.refresh();
     expect(await catalogPaths()).toEqual([first, second]);
   });
 

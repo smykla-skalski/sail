@@ -50,18 +50,6 @@ export function movePendingWorktreeCleanup(
   };
 }
 
-export function pendingExpectedRegisteredWorktrees<
-  T extends { path: string; generation: string | null },
->(pending: PendingWorktreeCleanup, current: T[]): T[] {
-  if (!pending.registeredWorktreesAtMark) return current;
-  const marked = new Map(
-    pending.registeredWorktreesAtMark.map((entry) => [entry.path, entry.generation]),
-  );
-  return current.filter(
-    (entry) => marked.has(entry.path) && marked.get(entry.path) === entry.generation,
-  );
-}
-
 export type SelectedRemovedWorktreeStorage = {
   cacheKey: string;
   path: string;

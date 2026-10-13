@@ -586,7 +586,6 @@
     markNewWorktreeCleanupPending,
     markWorktreeCleanupPending,
     movePendingWorktreeCleanup,
-    pendingExpectedRegisteredWorktrees,
     owningRepository,
     removeRepository,
     removeWorktree,
@@ -9843,7 +9842,7 @@
         false,
         preview[0],
         true,
-        pendingExpectedRegisteredWorktrees(confirmedRecovery, current),
+        current,
         true,
       );
       if (removed) {
