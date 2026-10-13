@@ -387,7 +387,9 @@ try {
     process.exitCode = 1;
   }
   try {
-    assert.equal(run(binary, ['--context-auth-service-status-probe']), '0');
+    const status = JSON.parse(run(binary, ['--context-auth-service-status-probe']));
+    assert.equal(status.status, 0);
+    assert.equal(status.label, label);
   } catch {
     console.error('Private provider service did not confirm unregistered cleanup');
     process.exitCode = 1;
