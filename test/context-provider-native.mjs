@@ -323,6 +323,12 @@ try {
   assert.equal(a.result.initializeCount, 1);
   assert.equal(b.result.initializeCount, 1, 'second agent reuses the provider handshake');
   assert.equal(c.result.initializeCount, 1);
+  assert.equal(run(binary, ['--context-auth-replay-probe', project]), 'replay-rejected');
+  assert.equal(
+    (await second.request(30)).result.pid,
+    a.result.pid,
+    'invalid capability preserves the healthy provider',
+  );
   const forwarded = await Promise.all([first.request(12), second.request(13), peer.request(14)]);
   for (const response of forwarded) {
     assert.equal(response.result.pid, a.result.pid);
@@ -432,20 +438,27 @@ try {
   ]);
   await assert.rejects(first.request(4));
   await first.waitForExit();
-  await assert.rejects(second.request(5));
-  await second.waitForExit();
-  await assert.rejects(peer.request(15));
-  await peer.waitForExit();
-  assert.match(first.stderr(), /revoked|approval changed/i);
   await waitForProcessExit(a.result.pid);
+  assert.match(first.stderr(), /revoked|approval changed/i);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
     'approved',
   );
   const third = startClient(project);
+  await third.request(31, 'initialize');
   const replacementSession = await third.request(6);
   assert.equal(replacementSession.id, 6);
+  await assert.rejects(second.request(5));
+  await second.waitForExit();
+  assert.equal(
+    (await third.request(32)).result.pid,
+    replacementSession.result.pid,
+    'stale session preserves the reapproved provider',
+  );
+  await assert.rejects(peer.request(15));
+  await peer.waitForExit();
+  assert.equal((await third.request(33)).result.pid, replacementSession.result.pid);
   copyFileSync('/usr/bin/false', join(root, 'replacement'));
   renameSync(join(root, 'replacement'), provider);
   await assert.rejects(third.request(7));

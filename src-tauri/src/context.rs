@@ -1180,6 +1180,47 @@ pub unsafe extern "C" fn sail_context_provider_stop(key: *const std::ffi::c_char
 }
 
 #[cfg(target_os = "macos")]
+fn stop_provider_if_fingerprint(key: &str, expected: &str) -> Option<std::thread::JoinHandle<()>> {
+    let slot = PROVIDERS.get()?.lock().ok()?.get(key)?.as_ref()?.clone();
+    let key = key.to_owned();
+    let expected = expected.to_owned();
+    Some(std::thread::spawn(move || {
+        let Ok(mut provider) = slot.lock() else {
+            return;
+        };
+        if !provider
+            .as_ref()
+            .is_some_and(|process| process.fingerprint == expected)
+        {
+            return;
+        }
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+    }))
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// Both pointers must reference valid NUL-terminated strings.
+pub unsafe extern "C" fn sail_context_provider_stop_if_fingerprint(
+    key: *const std::ffi::c_char,
+    expected: *const std::ffi::c_char,
+) {
+    if key.is_null() || expected.is_null() {
+        return;
+    }
+    let (Ok(key), Ok(expected)) = (
+        unsafe { std::ffi::CStr::from_ptr(key) }.to_str(),
+        unsafe { std::ffi::CStr::from_ptr(expected) }.to_str(),
+    ) else {
+        return;
+    };
+    let _ = stop_provider_if_fingerprint(key, expected);
+}
+
+#[cfg(target_os = "macos")]
 fn forget_provider(key: &str, slot: &ProviderSlot) {
     if let Some(providers) = PROVIDERS.get() {
         if let Ok(mut providers) = providers.lock() {
@@ -2269,6 +2310,66 @@ mod tests {
         }
         let third: serde_json::Value = serde_json::from_str(&call(json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap().unwrap()).unwrap();
         assert_eq!(third["result"]["pid"], first["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fingerprint_scoped_stop_preserves_a_reapproved_provider() {
+        let repository = Repository::new("runtime-scoped-stop");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let approve_current = || {
+            locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap()
+        };
+        let original = approve_current();
+        let call = |fingerprint: &str| {
+            let response = provider_request_at(&repository.0, fingerprint, None,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                &store_path, &repository.0.join("data")).unwrap().unwrap();
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["result"]["pid"].clone()
+        };
+        let original_pid = call(&original);
+        stop_provider_if_fingerprint(&key, "unrelated")
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(call(&original), original_pid);
+        repository.write(".sail/context.json", r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["search"]}]}"#);
+        repository.commit();
+        let replacement = approve_current();
+        assert_ne!(original, replacement);
+        let replacement_pid = call(&replacement);
+        assert_ne!(original_pid, replacement_pid);
+        stop_provider_if_fingerprint(&key, &original)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(call(&replacement), replacement_pid);
+        assert!(provider_request_at(
+            &repository.0,
+            &replacement,
+            Some(&"0".repeat(64)),
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &store_path,
+            &repository.0.join("data")
+        )
+        .unwrap_err()
+        .contains("session revoked"));
+        assert_eq!(call(&replacement), replacement_pid);
+        stop_provider_if_fingerprint(&key, &replacement)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
     }
 
     #[cfg(target_os = "macos")]

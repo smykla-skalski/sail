@@ -156,6 +156,7 @@ function callContextProvider(server, callback) {
   let output = '';
   let stderr = '';
   let settled = false;
+  let initialized = false;
   const finish = (result) => {
     if (settled) return;
     settled = true;
@@ -172,6 +173,17 @@ function callContextProvider(server, callback) {
       output = output.slice(index + 1);
       try {
         const response = JSON.parse(line);
+        if (response.id === 1 && !initialized) {
+          if (response.error || !response.result?.protocolVersion) {
+            finish({ error: 'Context provider initialization failed' });
+            continue;
+          }
+          initialized = true;
+          child.stdin.write(
+            `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`,
+          );
+          child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
+        }
         if (response.id === 2) finish(response);
       } catch {
         continue;
@@ -196,7 +208,6 @@ function callContextProvider(server, callback) {
       },
     })}\n`,
   );
-  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
 }
 
 function terminalRequest(method, params, callback) {

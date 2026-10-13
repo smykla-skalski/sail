@@ -9,6 +9,7 @@ extern bool sail_context_provider_request(const char *directory, const char *exp
                                           const char *capability, const char *request,
                                           char *output, size_t length);
 extern void sail_context_provider_stop(const char *projectKey);
+extern void sail_context_provider_stop_if_fingerprint(const char *projectKey, const char *expected);
 extern bool sail_context_session_activate(const char *capability);
 extern void sail_context_session_deactivate(const char *capability);
 
@@ -23,6 +24,14 @@ static void closeSession(NSMutableDictionary<NSValue *, NSDictionary *> *session
         if ([other[@"projectKey"] isEqualToString:projectKey]) return;
     }
     sail_context_provider_stop(projectKey.UTF8String);
+}
+
+static void stopInvalidatedProvider(NSDictionary *session, NSDictionary *binding) {
+    NSString *projectKey = session[@"projectKey"];
+    NSString *fingerprint = session[@"fingerprint"];
+    if (projectKey && fingerprint && ![binding[@"projectKey"] isEqualToString:projectKey]) {
+        sail_context_provider_stop_if_fingerprint(projectKey.UTF8String, fingerprint.UTF8String);
+    }
 }
 
 static NSString *serviceLabel(void) {
@@ -169,6 +178,9 @@ int sail_context_service_main(void) {
                     } else if ([op isEqualToString:@"check"]) {
                         NSString *capability = field(message, "capability");
                         NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                        if (session && equalCapability(capability, session[@"capability"])) {
+                            stopInvalidatedProvider(session, binding);
+                        }
                         if (session && equalCapability(capability, session[@"capability"]) &&
                             [binding[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
                             xpc_dictionary_set_bool(reply, "authorized", true);
@@ -179,6 +191,9 @@ int sail_context_service_main(void) {
                     } else if ([op isEqualToString:@"request"]) {
                         NSString *capability = field(message, "capability");
                         NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                        if (session && equalCapability(capability, session[@"capability"])) {
+                            stopInvalidatedProvider(session, binding);
+                        }
                         NSString *request = field(message, "request");
                         if (!session || !equalCapability(capability, session[@"capability"]) ||
                             ![binding[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
@@ -197,7 +212,10 @@ int sail_context_service_main(void) {
                                     NSDictionary *latest = sessions[key] == session
                                         ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
                                     if (![latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
-                                        if (sessions[key] == session) closeSession(sessions, key);
+                                        if (sessions[key] == session) {
+                                            stopInvalidatedProvider(session, latest);
+                                            closeSession(sessions, key);
+                                        }
                                         xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                                     } else if (success) {
                                         xpc_dictionary_set_string(reply, "response", output);
@@ -458,28 +476,28 @@ bool sail_context_probe_replay(const char *directory, char *error, size_t errorL
     if (!handle) return false;
     @autoreleasepool {
         SailContextSession *session = (__bridge SailContextSession *)handle;
-        xpc_connection_t other = xpc_connection_create_mach_service(serviceLabel().UTF8String, NULL, 0);
-        NSString *hash = selfCodeHash();
-        NSString *requirement = [NSString stringWithFormat:@"cdhash H\"%@\"", hash];
-        if (!hash || xpc_connection_set_peer_code_signing_requirement(other, requirement.UTF8String) != 0) {
-            writeError(error, errorLength, @"Replay probe cannot verify service signature.");
-            xpc_connection_set_event_handler(other, ^(xpc_object_t ignored) { (void)ignored; });
-            xpc_connection_resume(other);
-            xpc_connection_cancel(other);
-            sail_context_session_close(handle);
-            return false;
+        bool rejected = true;
+        for (NSString *operation in @[@"check", @"request"]) {
+            void *otherHandle = sail_context_session_open(directory, error, errorLength);
+            if (!otherHandle) {
+                sail_context_session_close(handle);
+                return false;
+            }
+            SailContextSession *other = (__bridge SailContextSession *)otherHandle;
+            xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_string(request, "op", operation.UTF8String);
+            xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
+            if ([operation isEqualToString:@"request"]) {
+                xpc_dictionary_set_string(request, "request", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+            }
+            xpc_object_t reply = xpc_connection_send_message_with_reply_sync(other.connection, request);
+            rejected = rejected && xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+                [senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)] &&
+                !xpc_dictionary_get_bool(reply, "authorized") &&
+                xpc_dictionary_get_string(reply, "response") == NULL &&
+                xpc_dictionary_get_string(reply, "error") != NULL;
+            sail_context_session_close(otherHandle);
         }
-        xpc_connection_set_event_handler(other, ^(xpc_object_t ignored) { (void)ignored; });
-        xpc_connection_resume(other);
-        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
-        xpc_dictionary_set_string(request, "op", "check");
-        xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
-        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(other, request);
-        bool rejected = xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
-            [senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)] &&
-            !xpc_dictionary_get_bool(reply, "authorized") &&
-            xpc_dictionary_get_string(reply, "error") != NULL;
-        xpc_connection_cancel(other);
         bool originalAuthorized = sail_context_session_check(handle, error, errorLength);
         sail_context_session_close(handle);
         if (!rejected) writeError(error, errorLength, @"Cross-connection capability replay was not rejected.");
