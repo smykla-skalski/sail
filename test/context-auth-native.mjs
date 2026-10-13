@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
@@ -49,6 +49,8 @@ const project = join(scratch, 'project');
 const other = join(scratch, 'other-project');
 const provider = join(scratch, 'fixture-provider');
 let appPid;
+let appLaunched = false;
+let primaryFailure = false;
 const probes = [];
 
 function makeProject(path) {
@@ -161,7 +163,7 @@ try {
   makeProject(project);
   makeProject(other);
 
-  run('open', [
+  const openArgs = [
     '-n',
     '-g',
     '--env',
@@ -183,7 +185,39 @@ try {
     '--env',
     `XDG_STATE_HOME=${join(scratch, 'xdg-state')}`,
     app,
-  ]);
+  ];
+  try {
+    run('open', openArgs);
+    appLaunched = true;
+  } catch (error) {
+    console.error('Private app launch failed:', String(error.stderr ?? error));
+    for (const args of [
+      ['-dv', '--verbose=4', app],
+      ['-d', '--entitlements', ':-', app],
+    ]) {
+      const diagnostic = spawnSync('codesign', args, {
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      console.error('codesign diagnostic:', diagnostic.stdout, diagnostic.stderr);
+      if (diagnostic.error) console.error(diagnostic.error);
+    }
+    try {
+      const logs = run('log', [
+        'show',
+        '--last',
+        '2m',
+        '--style',
+        'compact',
+        '--predicate',
+        'process == "amfid" OR process == "taskgated" OR process == "runningboardd"',
+      ], { timeout: 20_000, maxBuffer: 2 * 1024 * 1024 });
+      console.error(logs.split('\n').slice(-120).join('\n'));
+    } catch (diagnosticError) {
+      console.error('launch log diagnostic failed:', String(diagnosticError.stderr ?? diagnosticError));
+    }
+    throw error;
+  }
   assert.ok(
     await waitForReady(60),
     'Private Sail app did not expose its WebDriver status endpoint',
@@ -262,12 +296,19 @@ try {
     /Context service (signature or path rejected|unavailable or stale after upgrade)/,
   );
   console.log('PASS: upgraded app rejects the stale signed service');
+} catch (error) {
+  primaryFailure = true;
+  throw error;
 } finally {
   for (const probe of probes) if (!probe.killed) probe.kill('SIGTERM');
-  try {
-    run(binary, ['--context-auth-unregister-probe']);
-  } catch (error) {
-    console.error('Fixture service unregister failed:', String(error.stderr ?? error));
+  let cleanupError;
+  if (appLaunched) {
+    try {
+      run(binary, ['--context-auth-unregister-probe']);
+    } catch (error) {
+      console.error('Fixture service unregister failed:', String(error.stderr ?? error));
+      cleanupError = error;
+    }
   }
   if (appPid) {
     for (const pid of appPid.split(/\s+/))
@@ -280,4 +321,5 @@ try {
       }
   }
   rmSync(scratch, { recursive: true, force: true });
+  if (cleanupError && !primaryFailure) throw cleanupError;
 }

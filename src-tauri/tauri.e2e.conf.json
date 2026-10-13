@@ -4,6 +4,11 @@
   "build": {
     "beforeBuildCommand": "npm run build -- --mode e2e"
   },
+  "bundle": {
+    "macOS": {
+      "entitlements": "./Entitlements.e2e.plist"
+    }
+  },
   "app": {
     "withGlobalTauri": true,
     "security": {

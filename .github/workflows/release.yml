@@ -291,6 +291,7 @@ jobs:
           apps=("$CARGO_TARGET_DIR"/debug/bundle/macos/*.app)
           test "${#apps[@]}" -eq 1
           codesign --verify --deep --strict "${apps[0]}"
+          codesign --verify -v -R '=anchor apple generic' "${apps[0]}"
           test "$(codesign -dv --verbose=4 "${apps[0]}" 2>&1 | sed -n 's/^Signature=//p')" != 'adhoc'
           echo "SAIL_E2E_APP=${apps[0]}" >> "$GITHUB_ENV"
 
