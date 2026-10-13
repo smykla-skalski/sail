@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   renameSync,
+  realpathSync,
   statSync,
   writeFileSync,
   rmSync,
@@ -31,6 +32,7 @@ if (
 }
 const binary = join(app, 'Contents', 'MacOS', 'sail');
 const env = { ...process.env, SAIL_E2E_CONFIG_DIR: config };
+for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) delete env[key];
 const run = (command, args, options = {}) =>
   execFileSync(command, args, {
     encoding: 'utf8',
@@ -132,6 +134,7 @@ function makeProject(path) {
     }),
   );
   run('git', ['init', '-q', path]);
+  assert.equal(run('git', ['-C', path, 'rev-parse', '--show-toplevel']), realpathSync(path));
   run('git', ['-C', path, 'add', '.sail']);
   run('git', [
     '-C',

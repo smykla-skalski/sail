@@ -278,6 +278,33 @@ void sail_context_session_close(void *handle) {
 }
 
 #ifdef SAIL_CONTEXT_E2E
+bool sail_context_probe_service_status(char *output, size_t length) {
+    @autoreleasepool {
+        if (@available(macOS 13.0, *)) {
+            NSString *bundle = canonicalPath(NSBundle.mainBundle.bundlePath);
+            NSString *plist = servicePlist();
+            NSString *plistPath = [bundle stringByAppendingPathComponent:
+                [@"Contents/Library/LaunchAgents" stringByAppendingPathComponent:plist]];
+            SMAppService *service = [SMAppService agentServiceWithPlistName:plist];
+            NSDictionary *details = @{
+                @"status": @(service.status),
+                @"bundleIdentifier": NSBundle.mainBundle.bundleIdentifier ?: @"",
+                @"label": serviceLabel(),
+                @"plist": plist,
+                @"plistPresent": @([NSFileManager.defaultManager fileExistsAtPath:plistPath]),
+                @"helperPresent": @([NSFileManager.defaultManager fileExistsAtPath:
+                    [bundle stringByAppendingPathComponent:@"Contents/MacOS/sail"]]),
+            };
+            NSData *json = [NSJSONSerialization dataWithJSONObject:details options:0 error:nil];
+            if (!output || !json || json.length >= length) return false;
+            memcpy(output, json.bytes, json.length);
+            output[json.length] = '\0';
+            return true;
+        }
+        return false;
+    }
+}
+
 bool sail_context_probe_replay(const char *directory, char *error, size_t errorLength) {
     void *handle = sail_context_session_open(directory, error, errorLength);
     if (!handle) return false;
