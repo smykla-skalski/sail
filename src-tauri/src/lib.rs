@@ -2247,42 +2247,156 @@ fn ensure_expected_worktree_generation(
 }
 
 fn tracked_worktree_matches_head(root: &Path) -> Result<bool, String> {
-    // A fresh index has no cached file stats, so refresh must read tracked content.
-    let temporary =
-        std::env::temp_dir().join(format!("sail-worktree-check-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&temporary)
-        .map_err(|error| format!("Cannot prepare worktree content check: {error}"))?;
-    let index = temporary.join("index");
-    let result = (|| {
-        let tree = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["-c", "core.fsmonitor=false", "read-tree", "HEAD"])
-            .env("GIT_INDEX_FILE", &index)
-            .output()
-            .map_err(|error| format!("Cannot inspect tracked worktree files: {error}"))?;
-        if !tree.status.success() {
-            return Err("Cannot inspect tracked worktree files before deletion.".into());
+    use sha2::{Digest, Sha256};
+
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--stage", "-v", "-z"])
+        .output()
+        .map_err(|error| format!("Cannot inspect tracked worktree files: {error}"))?;
+    if !listed.status.success() {
+        return Err("Cannot inspect tracked worktree files before deletion.".into());
+    }
+    let mut entries = Vec::new();
+    for record in listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+    {
+        let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err("Cannot parse tracked worktree files before deletion.".into());
+        };
+        let (header, remainder) = record.split_at(separator);
+        let path = &remainder[1..];
+        let Some(path) = std::str::from_utf8(path).ok() else {
+            return Ok(false);
+        };
+        let Some(header) = std::str::from_utf8(header).ok() else {
+            return Ok(false);
+        };
+        let mut fields = header.split_ascii_whitespace();
+        let (Some(tag), Some(mode), Some(object), Some("0"), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return Ok(false);
+        };
+        if !matches!(tag, "H" | "h" | "S" | "s")
+            || !matches!(mode, "100644" | "100755" | "120000")
+            || Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Ok(false);
         }
-        let refresh = Command::new("git")
+        entries.push((
+            path.to_string(),
+            object.to_string(),
+            mode == "120000",
+            tag.eq_ignore_ascii_case("s"),
+        ));
+    }
+
+    // Custom filters can discard user bytes and can depend on external state.
+    // Their working-tree output is not a trustworthy deletion baseline.
+    for chunk in entries.chunks(256) {
+        let attributes = Command::new("git")
             .arg("-C")
             .arg(root)
-            .args([
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.ignoreStat=false",
-                "update-index",
-                "--really-refresh",
-            ])
-            .env("GIT_INDEX_FILE", &index)
+            .args(["check-attr", "-z", "filter", "--"])
+            .args(chunk.iter().map(|entry| entry.0.as_str()))
             .output()
-            .map_err(|error| format!("Cannot inspect tracked worktree files: {error}"))?;
-        Ok(refresh.status.success())
-    })();
-    std::fs::remove_dir_all(&temporary)
-        .map_err(|error| format!("Cannot finish worktree content check: {error}"))?;
-    result
+            .map_err(|error| format!("Cannot inspect tracked worktree filters: {error}"))?;
+        if !attributes.status.success() {
+            return Err("Cannot inspect tracked worktree filters before deletion.".into());
+        }
+        let parts: Vec<_> = attributes.stdout.split(|byte| *byte == 0).collect();
+        if parts.len() != chunk.len() * 3 + 1 || parts.last() != Some(&b"".as_slice()) {
+            return Err("Cannot parse tracked worktree filters before deletion.".into());
+        }
+        for part in parts.as_chunks::<3>().0.iter().take(chunk.len()) {
+            if part[1] != b"filter" || (part[2] != b"unspecified" && part[2] != b"unset") {
+                return Ok(false);
+            }
+        }
+    }
+
+    fn digest(mut input: impl Read) -> Result<Vec<u8>, String> {
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = input
+                .read(&mut buffer)
+                .map_err(|error| format!("Cannot read tracked worktree content: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        Ok(hash.finalize().to_vec())
+    }
+
+    for (path, object, symlink, sparse) in entries {
+        let file = root.join(&path);
+        let metadata = match std::fs::symlink_metadata(&file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && sparse => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("Cannot inspect tracked worktree content: {error}")),
+        };
+        if symlink != metadata.file_type().is_symlink() && !metadata.is_file() {
+            return Ok(false);
+        }
+        if !metadata.is_file() && !metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let actual = if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&file)
+                .map_err(|error| format!("Cannot read tracked worktree link: {error}"))?;
+            let Some(target) = target.to_str() else {
+                return Ok(false);
+            };
+            digest(target.as_bytes())?
+        } else {
+            let file = std::fs::File::open(&file)
+                .map_err(|error| format!("Cannot read tracked worktree file: {error}"))?;
+            digest(file)?
+        };
+        let mut expected = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("cat-file")
+            .arg("--filters")
+            .arg(format!("--path={path}"))
+            .arg(&object)
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("Cannot inspect committed worktree content: {error}"))?;
+        let expected_digest = match digest(expected.stdout.take().expect("piped Git output")) {
+            Ok(digest) => digest,
+            Err(error) => {
+                let _ = expected.kill();
+                let _ = expected.wait();
+                return Err(error);
+            }
+        };
+        if !expected
+            .wait()
+            .map_err(|error| format!("Cannot finish committed content check: {error}"))?
+            .success()
+        {
+            return Err("Cannot inspect committed worktree content before deletion.".into());
+        }
+        if actual != expected_digest {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn worktree_preview_state_with_hook<F>(
@@ -6331,7 +6445,9 @@ mod tests {
         fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
         fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
         let tracked = Path::new(&worktree).join("tracked.txt");
-        fs::File::open(&tracked)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&tracked)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
             .unwrap();
@@ -6340,7 +6456,9 @@ mod tests {
         git(&worktree, &["config", "core.checkStat", "minimal"]);
         let modified = fs::metadata(&tracked).unwrap().modified().unwrap();
         fs::write(&tracked, "change\n").unwrap();
-        fs::File::open(&tracked)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&tracked)
             .unwrap()
             .set_modified(modified)
             .unwrap();
@@ -6372,13 +6490,174 @@ mod tests {
     }
 
     #[test]
+    fn guarded_removal_preserves_bytes_hidden_by_lossy_clean_filter() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-lossy-filter");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        git(
+            &repository,
+            &[
+                "config",
+                "filter.generated.clean",
+                "git cat-file blob HEAD:tracked.txt",
+            ],
+        );
+        fs::write(
+            Path::new(&repository).join(".git/info/attributes"),
+            "tracked.txt filter=generated\n",
+        )
+        .unwrap();
+        let tracked = Path::new(&worktree).join("tracked.txt");
+        fs::write(&tracked, "private edits\n").unwrap();
+        git(
+            &worktree,
+            &["update-index", "--assume-unchanged", "tracked.txt"],
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty());
+
+        let (_, dirty) = worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
+        assert!(dirty);
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+        let error = remove_worktree_guarded(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+        )
+        .unwrap_err();
+        assert!(error.contains("modified or untracked files"), "{error}");
+        assert_eq!(fs::read_to_string(&tracked).unwrap(), "private edits\n");
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_removal_preserves_filtered_bytes_written_after_staging() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-staged-lossy-filter");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+            (
+                || Ok(()),
+                || Ok(()),
+                || Ok(()),
+                |staged| {
+                    git(
+                        &repository,
+                        &[
+                            "config",
+                            "filter.generated.clean",
+                            "git cat-file blob HEAD:tracked.txt",
+                        ],
+                    );
+                    fs::write(
+                        Path::new(&repository).join(".git/info/attributes"),
+                        "tracked.txt filter=generated\n",
+                    )
+                    .unwrap();
+                    fs::write(staged.join("tracked.txt"), "late private edits\n").unwrap();
+                    git(
+                        &staged.to_string_lossy(),
+                        &["update-index", "--assume-unchanged", "tracked.txt"],
+                    );
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("modified, untracked or ignored files"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            "late private edits\n"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tracked_content_check_accepts_clean_crlf_checkout() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-removal-clean-crlf");
+        fs::write(
+            Path::new(&repository).join(".git/info/attributes"),
+            "tracked.txt text eol=crlf\n",
+        )
+        .unwrap();
+        fs::write(Path::new(&worktree).join("tracked.txt"), b"before\r\n").unwrap();
+        assert_eq!(
+            fs::read(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            b"before\r\n"
+        );
+        assert!(super::tracked_worktree_matches_head(Path::new(&worktree)).unwrap());
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_sparse_worktree_content_is_verified() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-removal-sparse-clean");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        let outside = Path::new(&worktree).join("outside/tracked.txt");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, "outside\n").unwrap();
+        git(&worktree, &["add", "outside/tracked.txt"]);
+        git(
+            &worktree,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "outside file",
+            ],
+        );
+        git(&worktree, &["sparse-checkout", "init", "--cone"]);
+        git(&worktree, &["sparse-checkout", "set", "another-directory"]);
+        assert!(!outside.exists());
+        assert!(super::tracked_worktree_matches_head(Path::new(&worktree)).unwrap());
+        let (_, dirty) = worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
+        assert!(!dirty);
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn guarded_removal_preserves_hidden_tracked_edit_after_staging() {
         let (root, repository, worktree, revision) =
             ignored_archive_fixture("sail-removal-staged-hidden-edit");
         fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
         fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
         let tracked = Path::new(&worktree).join("tracked.txt");
-        fs::File::open(&tracked)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&tracked)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
             .unwrap();
@@ -6402,7 +6681,9 @@ mod tests {
                     let tracked = staged.join("tracked.txt");
                     let modified = fs::metadata(&tracked).unwrap().modified().unwrap();
                     fs::write(&tracked, "change\n").unwrap();
-                    fs::File::open(&tracked)
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&tracked)
                         .unwrap()
                         .set_modified(modified)
                         .unwrap();
