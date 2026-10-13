@@ -67,7 +67,7 @@ struct TerminalSession {
     process_group_stop: Arc<Mutex<()>>,
     write_busy: AtomicBool,
     #[cfg(windows)]
-    job: crate::acp_terminal::WindowsTerminalJob,
+    job: Arc<Mutex<crate::acp_terminal::WindowsTerminalJob>>,
     output: Arc<Mutex<TerminalOutput>>,
     changed: Arc<Condvar>,
 }
@@ -106,7 +106,7 @@ impl TerminalSession {
         }
         #[cfg(windows)]
         {
-            self.job.stop()?;
+            self.job.lock().map_err(|error| error.to_string())?.stop()?;
         }
         ownership_stop?;
         if let Some(lease) = &self._storage_lease {
@@ -451,7 +451,7 @@ mod tests {
             process_group_stop: Arc::new(Mutex::new(())),
             writer: Mutex::new(writer),
             write_busy: AtomicBool::new(false),
-            job,
+            job: Arc::new(Mutex::new(job)),
             output: Arc::new(Mutex::new(super::TerminalOutput {
                 history: VecDeque::new(),
                 start: 0,
@@ -467,12 +467,14 @@ mod tests {
         if result.is_err() {
             session
                 .job
+                .lock()
+                .expect("lock test job")
                 .stop()
                 .expect("stop test job after failed worktree removal");
         }
         assert!(result.is_ok(), "first removal failed: {result:?}");
         assert!(!managed.exists(), "managed data was retained");
-        assert_eq!(session.job.active_processes().unwrap(), 0);
+        assert_eq!(session.job.lock().unwrap().active_processes().unwrap(), 0);
         child.wait().expect("reap exited terminal shell");
         close_conpty_bounded(move || drop(session), output_drain);
     }
@@ -1215,13 +1217,13 @@ fn spawn(
     #[cfg(windows)]
     command.env("PROMPT", "$E]9;9;$P$E\\$P$G");
     #[cfg(windows)]
-    let job = crate::acp_terminal::WindowsTerminalJob::new()?;
+    let job = Arc::new(Mutex::new(crate::acp_terminal::WindowsTerminalJob::new()?));
     if let Some(lease) = &storage_lease {
         lease.prepare_process_start()?;
     }
     #[cfg(windows)]
     let job = {
-        command.set_job_handle(job.raw_handle());
+        command.set_job_handle(job.lock().map_err(|error| error.to_string())?.raw_handle());
         job
     };
     let mut child = match pair.slave.spawn_command(command) {
@@ -1300,6 +1302,9 @@ fn spawn(
     let background_output = Arc::clone(&output);
     let background_changed = Arc::clone(&changed);
     let background_child = Arc::clone(&child);
+    let background_storage_lease = storage_lease.clone();
+    #[cfg(windows)]
+    let background_job = Arc::clone(&job);
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -1350,6 +1355,15 @@ fn spawn(
         let _process_group_stop = background_process_group_stop
             .lock()
             .expect("terminal process group stop lock");
+        #[cfg(windows)]
+        let job_stopped = if background_storage_lease.is_some() {
+            background_job
+                .lock()
+                .map_err(|error| error.to_string())
+                .and_then(|job| job.stop())
+        } else {
+            Ok(())
+        };
         let code = background_child
             .lock()
             .ok()
@@ -1364,7 +1378,34 @@ fn spawn(
                 let _ = channel.send(TerminalEvent::Exit { code });
             }
         }
-        let _ = app.emit("terminal:exit", TerminalExitNotice { id, code });
+        let _ = app.emit(
+            "terminal:exit",
+            TerminalExitNotice {
+                id: id.clone(),
+                code,
+            },
+        );
+        #[cfg(unix)]
+        let storage_safe_to_release = true;
+        #[cfg(windows)]
+        let storage_safe_to_release = job_stopped.is_ok();
+        if storage_safe_to_release {
+            if let Some(lease) = &background_storage_lease {
+                if let Err(error) = lease.release_clean() {
+                    crate::diagnostics::record(
+                        "terminal_cache_release_failed",
+                        serde_json::json!({"id":&id,"error":error}),
+                    );
+                }
+            }
+        }
+        #[cfg(windows)]
+        if let Err(error) = job_stopped {
+            crate::diagnostics::record(
+                "terminal_process_job_stop_failed",
+                serde_json::json!({"id":&id,"error":error}),
+            );
+        }
     });
     Ok(TerminalSession {
         inspect_id: Uuid::new_v4().to_string(),

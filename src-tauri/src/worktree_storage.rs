@@ -2,6 +2,7 @@ use crate::acp_terminal::stable_worktree_identity;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -31,6 +32,10 @@ const TEMP_PROCESS_EXPOSED: &str = "sail-temp-process-state-v1\nexposed\n";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
+const CACHE_LIMIT_FILE: &str = "sail-cache-limit-v1";
+const CACHE_TRIM_ERROR_FILE: &str = "sail-cache-trim-error-v1";
+pub(crate) const DEFAULT_CACHE_LIMIT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const MAX_CACHE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 fn write_temp_pending(directory: &Path, reason: &str) -> std::io::Result<()> {
     let staging = directory.join(format!(".{TEMP_PENDING_FILE}-{}.tmp", uuid::Uuid::new_v4()));
@@ -133,6 +138,18 @@ pub(crate) struct CleanupPending {
     pub(crate) owner_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CacheUsage {
+    pub(crate) worktree: String,
+    pub(crate) worktree_token: String,
+    pub(crate) cache_key: String,
+    pub(crate) usage_bytes: Option<u64>,
+    pub(crate) limit_bytes: u64,
+    pub(crate) remaining_bytes: Option<u64>,
+    pub(crate) reason: Option<String>,
+}
+
 fn pending_size(path: &Path) -> Option<u64> {
     let mut total = 0u64;
     let mut remaining = vec![path.to_path_buf()];
@@ -165,10 +182,12 @@ fn pending_item(key: String, reason: &str, path: Option<&Path>, can_clean: bool)
 }
 
 pub(crate) struct WorktreeDataLease {
+    cache_directory: PathBuf,
     directory: PathBuf,
     active_marker: PathBuf,
     started: AtomicBool,
     released: AtomicBool,
+    trim_on_release: AtomicBool,
     _lease_lock: FileLock,
     temp: TempLease,
 }
@@ -434,6 +453,15 @@ impl WorktreeDataLease {
     }
 
     pub(crate) fn release_clean(&self) -> Result<(), String> {
+        self.release_clean_inner()
+    }
+
+    fn release_without_cache_trim(&self) -> Result<(), String> {
+        self.trim_on_release.store(false, Ordering::Release);
+        self.release_clean_inner()
+    }
+
+    fn release_clean_inner(&self) -> Result<(), String> {
         if self.released.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -454,6 +482,10 @@ impl WorktreeDataLease {
         }
         if temp_result.is_err() {
             self.released.store(false, Ordering::Release);
+        } else if self.trim_on_release.load(Ordering::Acquire) {
+            if let Err(error) = trim_cache(&self.cache_directory, &self.directory) {
+                report_pending(&self.directory, &format!("cache-trim-failed: {error}"));
+            }
         }
         temp_result
     }
@@ -519,10 +551,12 @@ pub(crate) fn register(
     drop(marker);
 
     let lease = Arc::new(WorktreeDataLease {
+        cache_directory: cache_directory.to_path_buf(),
         directory: data_directory,
         active_marker,
         started: AtomicBool::new(false),
         released: AtomicBool::new(false),
+        trim_on_release: AtomicBool::new(true),
         _lease_lock: lease_lock,
         temp,
     });
@@ -556,10 +590,12 @@ fn register_plain_folder(
         .and_then(|_| marker.sync_all())
         .map_err(|error| error.to_string())?;
     let lease = Arc::new(WorktreeDataLease {
+        cache_directory: cache_directory.to_path_buf(),
         directory: data_directory,
         active_marker,
         started: AtomicBool::new(false),
         released: AtomicBool::new(false),
+        trim_on_release: AtomicBool::new(true),
         _lease_lock: lease_lock,
         temp,
     });
@@ -588,8 +624,11 @@ fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<Te
     let mut state_created = false;
     let result = (|| {
         let pid = std::process::id();
-        let started_at = sysinfo::System::new_all()
-            .process(sysinfo::Pid::from_u32(pid))
+        let process_id = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[process_id]), true);
+        let started_at = system
+            .process(process_id)
             .ok_or("Cannot verify the private temporary owner process.")?
             .start_time();
         let contents = format!(
@@ -967,6 +1006,7 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         drop(repo_lock);
         let _ = remove_quarantine(&quarantine, &quarantine_key);
     }
+    trim_all_idle_caches(cache_directory);
 }
 
 pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
@@ -1141,6 +1181,554 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
 pub(crate) fn retry_cleanup(cache_directory: &Path) -> Vec<CleanupPending> {
     reconcile(cache_directory);
     cleanup_status(cache_directory)
+}
+
+fn trim_all_idle_caches(cache_directory: &Path) {
+    let Ok(entries) = fs::read_dir(cache_directory.join("terminal-worktrees")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(valid_cache_key) {
+            continue;
+        }
+        if let Err(error) = trim_cache(cache_directory, &entry.path()) {
+            report_pending(&entry.path(), &format!("cache-trim-failed: {error}"));
+        }
+    }
+}
+
+fn cache_children(data_directory: &Path) -> Result<Vec<(PathBuf, bool)>, String> {
+    let mut children = Vec::new();
+    for (root_name, is_build) in [("build", true), ("cache", false)] {
+        let root = data_directory.join(root_name);
+        let metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !metadata.is_dir() {
+            return Err(format!("{root_name} cache root is not a directory"));
+        }
+        for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if is_build && entry.file_name() == "go-tmp" {
+                continue;
+            }
+            children.push((entry.path(), is_build));
+        }
+    }
+    Ok(children)
+}
+
+fn reusable_cache_size(data_directory: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for (path, _) in cache_children(data_directory)? {
+        total = total.saturating_add(
+            pending_size(&path).ok_or_else(|| format!("Cannot measure {}", path.display()))?,
+        );
+    }
+    Ok(total)
+}
+
+fn eligible_cache_entry(path: &Path, is_build: bool) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() && !metadata.is_file() {
+        return false;
+    }
+    if is_build {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "go-build"
+                    | "go-cache"
+                    | "cargo"
+                    | "rustc"
+                    | "npm"
+                    | "pip"
+                    | "uv"
+                    | "poetry"
+                    | "yarn"
+                    | "corepack"
+            )
+        })
+}
+
+fn cache_candidates(
+    data_directory: &Path,
+) -> Result<Vec<(PathBuf, u64, std::time::SystemTime)>, String> {
+    let mut candidates = Vec::new();
+    for (path, is_build) in cache_children(data_directory)? {
+        if !eligible_cache_entry(&path, is_build) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        let size =
+            pending_size(&path).ok_or_else(|| format!("Cannot measure {}", path.display()))?;
+        candidates.push((
+            path,
+            size,
+            metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        ));
+    }
+    candidates.sort_by_key(|(_, _, modified)| *modified);
+    Ok(candidates)
+}
+
+#[cfg(unix)]
+fn remove_cache_entry_at(parent: &nix::dir::Dir, name: &std::ffi::OsStr) -> Result<(), String> {
+    use nix::dir::Dir;
+    use nix::errno::Errno;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use std::os::unix::ffi::OsStrExt;
+
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut child = match Dir::openat(parent, name, flags, Mode::empty()) {
+        Ok(child) => child,
+        Err(Errno::ENOTDIR | Errno::ELOOP) => {
+            return unlinkat(parent, name, UnlinkatFlags::NoRemoveDir)
+                .map_err(|error| error.to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut names = Vec::new();
+    for entry in child.iter() {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsStr::from_bytes(name).to_os_string());
+        }
+    }
+    for name in names {
+        remove_cache_entry_at(&child, &name)?;
+    }
+    drop(child);
+    unlinkat(parent, name, UnlinkatFlags::RemoveDir).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn remove_cache_candidate(
+    cache_directory: &Path,
+    data_directory: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    use nix::dir::Dir;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+
+    let data_root = cache_directory.join("terminal-worktrees");
+    if data_directory.parent() != Some(data_root.as_path()) {
+        return Err("Cache owner is outside its storage root.".into());
+    }
+    let data_name = data_directory
+        .file_name()
+        .ok_or("Cache owner has no name.")?;
+    let root = path.parent().ok_or("Cache entry has no parent.")?;
+    if root.parent() != Some(data_directory) {
+        return Err("Cache entry is outside its owner directory.".into());
+    }
+    let root_name = root.file_name().ok_or("Cache root has no name.")?;
+    if root_name != "build" && root_name != "cache" {
+        return Err("Cache entry has an unknown root.".into());
+    }
+    let name = path.file_name().ok_or("Cache entry has no name.")?;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let cache = Dir::open(cache_directory, flags, Mode::empty())
+        .map_err(|error| format!("Cache storage root changed during cleanup: {error}"))?;
+    let owners = Dir::openat(&cache, "terminal-worktrees", flags, Mode::empty())
+        .map_err(|error| format!("Cache owner root changed during cleanup: {error}"))?;
+    let data = Dir::openat(&owners, data_name, flags, Mode::empty())
+        .map_err(|error| format!("Cache owner changed during cleanup: {error}"))?;
+    let root = Dir::openat(&data, root_name, flags, Mode::empty())
+        .map_err(|error| format!("Cache root changed during cleanup: {error}"))?;
+    remove_cache_entry_at(&root, name)
+}
+
+#[cfg(not(unix))]
+fn remove_cache_candidate(
+    _cache_directory: &Path,
+    data_directory: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let root = path.parent().ok_or("Cache entry has no parent.")?;
+    if root.parent() != Some(data_directory)
+        || !fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_dir())
+    {
+        return Err("Cache root changed during cleanup.".into());
+    }
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        fs::remove_dir_all(path).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(path).map_err(|error| error.to_string())
+    }
+}
+
+fn read_cache_limit(data_directory: &Path) -> Result<u64, String> {
+    let path = data_directory.join(CACHE_LIMIT_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_CACHE_LIMIT_BYTES);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_file() {
+        return Err("Cache size limit is not a regular file.".into());
+    }
+    let value = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let limit = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "Cache size limit is invalid.".to_string())?;
+    if limit > MAX_CACHE_LIMIT_BYTES {
+        return Err("Cache size limit exceeds 1 TiB.".into());
+    }
+    Ok(limit)
+}
+
+fn write_cache_file(data_directory: &Path, name: &str, contents: &str) -> Result<(), String> {
+    let path = data_directory.join(name);
+    let staging = data_directory.join(format!(".{name}-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        match fs::rename(&staging, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&path)?;
+                fs::rename(&staging, &path)
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(staging);
+    }
+    result.map_err(|error: std::io::Error| error.to_string())
+}
+
+fn clear_cache_trim_error(data_directory: &Path) {
+    let _ = fs::remove_file(data_directory.join(CACHE_TRIM_ERROR_FILE));
+}
+
+fn cache_owner_current(cache_directory: &Path, data_directory: &Path) -> bool {
+    if !fs::symlink_metadata(data_directory).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return false;
+    }
+    if let Ok(identity) = read_owner(data_directory) {
+        return identity_data_directory(cache_directory, &identity)
+            .ok()
+            .as_deref()
+            == Some(data_directory)
+            && current_identity_matches(&identity) == Ok(true);
+    }
+    read_plain_owner(cache_directory, data_directory).is_ok_and(|root| root.is_dir())
+}
+
+fn trim_cache(cache_directory: &Path, data_directory: &Path) -> Result<(), String> {
+    let result = trim_cache_inner(cache_directory, data_directory);
+    if let Err(error) = &result {
+        let _ = write_cache_file(data_directory, CACHE_TRIM_ERROR_FILE, error);
+    }
+    result
+}
+
+fn trim_cache_inner(cache_directory: &Path, data_directory: &Path) -> Result<(), String> {
+    if !cache_owner_current(cache_directory, data_directory) {
+        return Ok(());
+    }
+    let repository_lock = match read_owner(data_directory) {
+        Ok(identity) => Some(lock_path(cache_directory, "repo", &identity.common_dir)?),
+        Err(_) => None,
+    };
+    let _repository = if let Some(path) = repository_lock {
+        Some(FileLock::acquire(&path, true)?)
+    } else {
+        None
+    };
+    let mutation_path = lock_path(cache_directory, "mutation", data_directory)?;
+    let Ok(_mutation) = FileLock::try_acquire(&mutation_path, true) else {
+        return Ok(());
+    };
+    let lease_path = lock_path(cache_directory, "lease", data_directory)?;
+    let Ok(_lease) = FileLock::try_acquire(&lease_path, true) else {
+        return Ok(());
+    };
+    if !cache_owner_current(cache_directory, data_directory) || has_active_markers(data_directory) {
+        return Ok(());
+    }
+    let limit = read_cache_limit(data_directory)?;
+    let mut usage = reusable_cache_size(data_directory)?;
+    if usage <= limit {
+        clear_cache_trim_error(data_directory);
+        return Ok(());
+    }
+    for (path, size, _) in cache_candidates(data_directory)? {
+        if usage <= limit {
+            break;
+        }
+        if !fs::symlink_metadata(data_directory).is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return Err("Cache owner changed during cleanup.".into());
+        }
+        if !eligible_cache_entry(
+            &path,
+            path.parent() == Some(data_directory.join("build").as_path()),
+        ) {
+            continue;
+        }
+        let result = remove_cache_candidate(cache_directory, data_directory, &path);
+        if let Err(error) = result {
+            let reason = format!("cache-removal-failed: {error}");
+            return Err(reason);
+        }
+        usage = usage.saturating_sub(size);
+    }
+    clear_cache_trim_error(data_directory);
+    Ok(())
+}
+
+fn set_cache_limit(
+    cache_directory: &Path,
+    requested_worktree: &Path,
+    limit_bytes: u64,
+    expected_token: Option<&str>,
+) -> Result<(), String> {
+    if limit_bytes > MAX_CACHE_LIMIT_BYTES {
+        return Err("Cache size limit must be at most 1 TiB.".into());
+    }
+    let worktree = crate::terminal::git_worktree_root(requested_worktree);
+    if !worktree.is_dir() {
+        return Err("Cannot set a cache limit for a missing worktree.".into());
+    }
+    let (data_directory, lease) = register(cache_directory, &worktree)?;
+    if let Some(expected_token) = expected_token {
+        let registered_token = registered_cache_limit_token(cache_directory, &data_directory);
+        if registered_token.as_deref() != Ok(expected_token) {
+            lease.release_without_cache_trim()?;
+            return Err("Worktree identity changed; refresh cache usage.".into());
+        }
+    }
+    let result = write_cache_file(
+        &data_directory,
+        CACHE_LIMIT_FILE,
+        &format!("{limit_bytes}\n"),
+    );
+    let release = lease.release_clean();
+    result.and(release)
+}
+
+pub(crate) fn set_cache_limit_token(
+    cache_directory: &Path,
+    worktree_token: &str,
+    limit_bytes: u64,
+) -> Result<(), String> {
+    let (kind, encoded_path) = worktree_token
+        .split_once(':')
+        .ok_or("Invalid worktree cache token.")?;
+    if kind != "git" && kind != "plain" {
+        return Err("Invalid worktree cache token.".into());
+    }
+    let encoded_path = encoded_path.split(':').next().unwrap_or_default();
+    let worktree = decode_path(encoded_path)?;
+    if cache_limit_token(&worktree)? != worktree_token {
+        return Err("Worktree identity changed; refresh cache usage.".into());
+    }
+    set_cache_limit(
+        cache_directory,
+        &worktree,
+        limit_bytes,
+        Some(worktree_token),
+    )
+}
+
+fn registered_cache_limit_token(
+    cache_directory: &Path,
+    data_directory: &Path,
+) -> Result<String, String> {
+    if let Ok(identity) = read_owner(data_directory) {
+        if identity_data_directory(cache_directory, &identity)?.as_path() != data_directory {
+            return Err("Worktree storage identity changed.".into());
+        }
+        return Ok(git_cache_limit_token(&identity));
+    }
+    let root = read_plain_owner(cache_directory, data_directory)?;
+    Ok(format!("plain:{}", encode_path(&root)))
+}
+
+fn git_cache_limit_token(identity: &WorktreeIdentity) -> String {
+    format!(
+        "git:{}:{}:{}",
+        encode_path(&identity.root),
+        identity.repository_generation,
+        identity.generation
+    )
+}
+
+fn cache_limit_token(worktree: &Path) -> Result<String, String> {
+    let root = stable_worktree_identity(worktree);
+    if !root.is_dir() {
+        return Err("Worktree folder no longer exists.".into());
+    }
+    match resolve_identity(&root) {
+        Ok(identity) => {
+            if identity.root != root
+                || !git_worktrees(&identity.common_dir)?
+                    .iter()
+                    .any(|known| stable_worktree_identity(known) == root)
+            {
+                return Err("Git worktree identity cannot be verified.".into());
+            }
+            Ok(git_cache_limit_token(&identity))
+        }
+        Err(error) if has_git_metadata(&root) => Err(error),
+        Err(_) => Ok(format!("plain:{}", encode_path(&root))),
+    }
+}
+
+pub(crate) fn cache_status(
+    cache_directory: &Path,
+    current_worktree: &Path,
+    known_worktrees: &[PathBuf],
+) -> Vec<CacheUsage> {
+    let mut worktrees = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+    let current = crate::terminal::git_worktree_root(current_worktree);
+    worktrees.entry(current.clone()).or_default();
+    for requested in std::iter::once(&current).chain(known_worktrees.iter()) {
+        let root = stable_worktree_identity(requested);
+        if !root.is_dir() || cache_limit_token(&root).is_err() {
+            continue;
+        }
+        worktrees.entry(root.clone()).or_default();
+        if let Ok(common_dir) = git_path(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ) {
+            if let Ok(known) = git_worktrees(&common_dir) {
+                for worktree in known {
+                    worktrees
+                        .entry(stable_worktree_identity(&worktree))
+                        .or_default();
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(cache_directory.join("terminal-worktrees")) {
+        for entry in entries.flatten() {
+            let directory = entry.path();
+            if !entry.file_name().to_str().is_some_and(valid_cache_key) {
+                continue;
+            }
+            if !cache_owner_current(cache_directory, &directory) {
+                continue;
+            }
+            let root = read_owner(&directory)
+                .ok()
+                .and_then(|identity| {
+                    (identity_data_directory(cache_directory, &identity)
+                        .ok()
+                        .as_deref()
+                        == Some(directory.as_path()))
+                    .then_some(identity.root)
+                })
+                .or_else(|| read_plain_owner(cache_directory, &directory).ok());
+            if let Some(root) = root {
+                worktrees.entry(root).or_default().push(directory);
+            }
+        }
+    }
+    worktrees
+        .into_iter()
+        .map(|(worktree, mut directories)| {
+            directories.sort();
+            let worktree_token = cache_limit_token(&worktree).unwrap_or_default();
+            let current_directory = directories.iter().find(|directory| {
+                registered_cache_limit_token(cache_directory, directory).as_deref()
+                    == Ok(worktree_token.as_str())
+            });
+            let key = current_directory
+                .or_else(|| directories.first())
+                .map(PathBuf::as_path)
+                .unwrap_or(&worktree);
+            let mut reason = None;
+            let limit = current_directory
+                .map(PathBuf::as_path)
+                .map(read_cache_limit)
+                .transpose()
+                .unwrap_or_else(|error| {
+                    reason = Some(format!("cache-limit-invalid: {error}"));
+                    Some(DEFAULT_CACHE_LIMIT_BYTES)
+                })
+                .unwrap_or(DEFAULT_CACHE_LIMIT_BYTES);
+            let measured =
+                directories
+                    .iter()
+                    .try_fold((0u64, 0u64), |(total, previous), directory| {
+                        let size = reusable_cache_size(directory)?;
+                        Ok::<_, String>((
+                            total.saturating_add(size),
+                            previous.saturating_add(if current_directory == Some(directory) {
+                                0
+                            } else {
+                                size
+                            }),
+                        ))
+                    });
+            let (usage, previous_usage) = match measured {
+                Ok((size, previous)) => (Some(size), previous),
+                Err(error) => {
+                    reason = Some(format!("cache-size-unavailable: {error}"));
+                    (None, 0)
+                }
+            };
+            let remaining = usage.map(|size| size.saturating_sub(limit));
+            if reason.is_none() && remaining.is_some_and(|size| size > 0) {
+                reason = if directories.iter().any(|directory| {
+                    has_active_markers(directory)
+                        || lock_path(cache_directory, "lease", directory)
+                            .and_then(|path| FileLock::try_acquire(&path, true))
+                            .is_err()
+                }) {
+                    Some("active-use".into())
+                } else if let Some(error) = current_directory.and_then(|directory| {
+                    fs::read_to_string(directory.join(CACHE_TRIM_ERROR_FILE)).ok()
+                }) {
+                    Some(error)
+                } else if current_directory.is_some_and(|directory| {
+                    !cache_candidates(directory).is_ok_and(|items| items.is_empty())
+                }) {
+                    Some("cleanup-pending".into())
+                } else if previous_usage > 0 {
+                    Some("previous-folder-cache-data".into())
+                } else {
+                    Some("protected-cache-data".into())
+                };
+            }
+            CacheUsage {
+                worktree: worktree.to_string_lossy().into_owned(),
+                worktree_token,
+                cache_key: cache_key(key).unwrap_or_else(|_| "unknown".into()),
+                usage_bytes: usage,
+                limit_bytes: limit,
+                remaining_bytes: remaining,
+                reason,
+            }
+        })
+        .collect()
 }
 
 fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path) {
@@ -3593,7 +4181,14 @@ mod tests {
         drop(lease);
         fixture.remove(&fixture.first);
 
-        let pending = retry_cleanup(&fixture.cache);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let pending = loop {
+            let pending = retry_cleanup(&fixture.cache);
+            if !directory.exists() || std::time::Instant::now() >= deadline {
+                break pending;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
 
         assert!(!directory.exists());
         assert!(pending.is_empty(), "remaining: {pending:?}");
@@ -4366,10 +4961,14 @@ mod tests {
         }
         let artifact = quarantine.join(TEMP_ROOT).join("late/artifact");
         let artifact_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while worker_ready && !artifact.exists() && std::time::Instant::now() < artifact_deadline {
+        let mut retained = fs::read_to_string(&artifact).ok();
+        while worker_ready
+            && retained.as_deref() != Some("late-write")
+            && std::time::Instant::now() < artifact_deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
+            retained = fs::read_to_string(&artifact).ok();
         }
-        let retained = fs::read_to_string(&artifact);
         retry_cleanup(&fixture.cache);
         worker.kill().unwrap();
         worker.wait().unwrap();
@@ -5193,7 +5792,13 @@ mod tests {
         drop(removed_lease);
         fixture.remove(&fixture.first);
 
-        reconcile(&fixture.cache);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while removed_directory.exists() && std::time::Instant::now() < deadline {
+            reconcile(&fixture.cache);
+            if removed_directory.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
 
         assert!(
             !removed_directory.exists(),
@@ -5265,5 +5870,339 @@ mod tests {
             legacy_data_directory(&fixture.cache, &stable_worktree_identity(&plain)).unwrap()
         );
         plain_lease.release_clean().unwrap();
+    }
+
+    #[test]
+    fn empty_worktrees_report_zero_reusable_cache_usage() {
+        let fixture = GitFixture::new();
+        let status = cache_status(&fixture.cache, &fixture.first, &[]);
+        let first_root = stable_worktree_identity(&fixture.first)
+            .to_string_lossy()
+            .into_owned();
+        let second_root = stable_worktree_identity(&fixture.second)
+            .to_string_lossy()
+            .into_owned();
+        let first = status
+            .iter()
+            .find(|item| item.worktree == first_root)
+            .unwrap();
+        let second = status
+            .iter()
+            .find(|item| item.worktree == second_root)
+            .unwrap();
+        for item in [first, second] {
+            assert_eq!(item.usage_bytes, Some(0));
+            assert_eq!(item.remaining_bytes, Some(0));
+            assert_eq!(item.limit_bytes, DEFAULT_CACHE_LIMIT_BYTES);
+            assert_eq!(item.reason, None);
+        }
+        set_cache_limit_token(&fixture.cache, &first.worktree_token, 1).unwrap();
+        assert_eq!(
+            cache_status(&fixture.cache, &fixture.first, &[])
+                .into_iter()
+                .find(|item| item.worktree_token == first.worktree_token)
+                .unwrap()
+                .limit_bytes,
+            1
+        );
+    }
+
+    #[test]
+    fn saved_worktree_in_another_repository_reports_zero_without_cache_owner() {
+        let fixture = GitFixture::new();
+        let other = GitFixture::new();
+        let other_root = stable_worktree_identity(&other.first)
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(!cache_status(&fixture.cache, &fixture.first, &[])
+            .iter()
+            .any(|item| item.worktree == other_root));
+        let status = cache_status(
+            &fixture.cache,
+            &fixture.first,
+            std::slice::from_ref(&other.first),
+        );
+        let unused = status
+            .iter()
+            .find(|item| item.worktree == other_root)
+            .unwrap();
+        assert_eq!(unused.usage_bytes, Some(0));
+        assert_eq!(unused.remaining_bytes, Some(0));
+        assert_eq!(unused.limit_bytes, DEFAULT_CACHE_LIMIT_BYTES);
+        assert!(!unused.worktree_token.is_empty());
+    }
+
+    #[test]
+    fn plain_folder_becoming_git_reports_both_caches_and_limits_current_owner() {
+        let fixture = GitFixture::new();
+        let folder = fixture.root.join("plain-then-git");
+        fs::create_dir_all(&folder).unwrap();
+        let (plain_directory, plain_lease) = register(&fixture.cache, &folder).unwrap();
+        let plain_artifact = plain_directory.join("cache/go-build/plain-artifact");
+        fs::create_dir_all(plain_artifact.parent().unwrap()).unwrap();
+        fs::write(&plain_artifact, b"plain").unwrap();
+        plain_lease.release_clean().unwrap();
+        set_cache_limit(&fixture.cache, &folder, 6, None).unwrap();
+
+        GitFixture::git(&folder, &["init", "--quiet"]);
+        let (git_directory, git_lease) = register(&fixture.cache, &folder).unwrap();
+        let git_artifact = git_directory.join("cache/go-build/git-artifact");
+        fs::create_dir_all(git_artifact.parent().unwrap()).unwrap();
+        fs::write(&git_artifact, b"git-data").unwrap();
+        git_lease.release_clean().unwrap();
+
+        let root = stable_worktree_identity(&folder)
+            .to_string_lossy()
+            .into_owned();
+        let status = cache_status(&fixture.cache, &folder, &[]);
+        let matching = status
+            .iter()
+            .filter(|item| item.worktree == root)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        let usage = matching[0];
+        assert_eq!(usage.usage_bytes, Some(13));
+        assert_eq!(usage.limit_bytes, DEFAULT_CACHE_LIMIT_BYTES);
+        assert_eq!(usage.cache_key, cache_key(&git_directory).unwrap());
+        assert!(usage.worktree_token.starts_with("git:"));
+
+        set_cache_limit_token(&fixture.cache, &usage.worktree_token, 0).unwrap();
+        assert!(plain_artifact.exists());
+        assert!(!git_artifact.exists());
+        let after = cache_status(&fixture.cache, &folder, &[])
+            .into_iter()
+            .find(|item| item.worktree == root)
+            .unwrap();
+        assert_eq!(after.usage_bytes, Some(5));
+        assert_eq!(after.remaining_bytes, Some(5));
+        assert_eq!(after.limit_bytes, 0);
+        assert_eq!(after.reason.as_deref(), Some("previous-folder-cache-data"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_token_round_trips_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"/worktree-\xff".to_vec()));
+        let other = PathBuf::from(OsString::from_vec(b"/worktree-\xfe".to_vec()));
+        assert_ne!(PathBuf::from(path.to_string_lossy().into_owned()), path);
+        assert_eq!(path.to_string_lossy(), other.to_string_lossy());
+        assert_ne!(encode_path(&path), encode_path(&other));
+        assert_eq!(decode_path(&encode_path(&path)).unwrap(), path);
+    }
+
+    #[test]
+    fn stale_or_forged_cache_tokens_cannot_trim_recreated_worktree() {
+        let fixture = GitFixture::new();
+        let old_token = cache_limit_token(&fixture.first).unwrap();
+        fixture.remove(&fixture.first);
+        GitFixture::git(
+            &fixture.repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                fixture.first.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let artifact = directory.join("build/cargo-target/artifact");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"keep this").unwrap();
+        lease.release_clean().unwrap();
+
+        assert_ne!(cache_limit_token(&fixture.first).unwrap(), old_token);
+        assert!(set_cache_limit_token(&fixture.cache, &old_token, 0).is_err());
+        let forged = format!("{}x", cache_limit_token(&fixture.first).unwrap());
+        assert!(set_cache_limit_token(&fixture.cache, &forged, 0).is_err());
+        assert!(artifact.exists());
+        assert!(!directory.join(CACHE_LIMIT_FILE).exists());
+    }
+
+    #[test]
+    fn cache_limit_trims_only_after_last_active_lease_ends() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.mark_started();
+        let build = directory.join("build/cargo-target");
+        let known = directory.join("cache/go-build");
+        let protected = directory.join("cache/opencode");
+        let shared = fixture.cache.join("terminal-package-downloads/npm");
+        for path in [&build, &known, &protected, &shared] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(build.join("artifact"), b"12345678").unwrap();
+        fs::write(known.join("artifact"), b"123456").unwrap();
+        fs::write(protected.join("sign-in"), b"1234").unwrap();
+        fs::write(shared.join("package"), b"12345678").unwrap();
+
+        set_cache_limit(&fixture.cache, &fixture.first, 8, None).unwrap();
+        let active = cache_status(&fixture.cache, &fixture.first, &[]);
+        let first_root = stable_worktree_identity(&fixture.first)
+            .to_string_lossy()
+            .into_owned();
+        let active = active
+            .iter()
+            .find(|item| item.worktree == first_root)
+            .unwrap();
+        assert_eq!(active.usage_bytes, Some(18));
+        assert_eq!(active.reason.as_deref(), Some("active-use"));
+        assert!(build.exists());
+        assert!(known.exists());
+
+        lease.release_clean().unwrap();
+        assert!(!build.exists());
+        assert!(!known.exists());
+        assert!(protected.join("sign-in").exists());
+        assert!(shared.join("package").exists());
+        let idle = cache_status(&fixture.cache, &fixture.first, &[]);
+        let idle = idle
+            .iter()
+            .find(|item| item.worktree == first_root)
+            .unwrap();
+        assert_eq!(idle.usage_bytes, Some(4));
+        assert_eq!(idle.limit_bytes, 8);
+        assert_eq!(idle.remaining_bytes, Some(0));
+        assert_eq!(idle.reason, None);
+    }
+
+    #[test]
+    fn cache_trim_waits_for_repository_registration_and_reclaims_after_release() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let artifact = directory.join("cache/go-build/artifact");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"reusable").unwrap();
+        set_cache_limit(&fixture.cache, &fixture.first, 0, None).unwrap();
+        let common_dir = read_owner(&directory).unwrap().common_dir;
+        let repository = FileLock::acquire(
+            &lock_path(&fixture.cache, "repo", &common_dir).unwrap(),
+            true,
+        )
+        .unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            finished.send(lease.release_clean()).unwrap();
+        });
+        ready.recv().unwrap();
+        let lease_path = lock_path(&fixture.cache, "lease", &directory).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(released) = FileLock::try_acquire(&lease_path, true) {
+                drop(released);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(done
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        assert!(artifact.exists());
+        drop(repository);
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn protected_cache_reports_residual_usage_and_reason() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let protected = directory.join("cache/opencode");
+        fs::create_dir_all(&protected).unwrap();
+        fs::write(protected.join("sign-in"), b"protected").unwrap();
+        lease.release_clean().unwrap();
+
+        set_cache_limit(&fixture.cache, &fixture.first, 1, None).unwrap();
+        let status = cache_status(&fixture.cache, &fixture.first, &[]);
+        let first_root = stable_worktree_identity(&fixture.first)
+            .to_string_lossy()
+            .into_owned();
+        let item = status
+            .iter()
+            .find(|item| item.worktree == first_root)
+            .unwrap();
+        assert_eq!(item.usage_bytes, Some(9));
+        assert_eq!(item.remaining_bytes, Some(8));
+        assert_eq!(item.reason.as_deref(), Some("protected-cache-data"));
+        assert!(protected.join("sign-in").exists());
+    }
+
+    #[test]
+    fn missing_worktree_cannot_create_cache_limit_storage() {
+        let fixture = GitFixture::new();
+        fixture.remove(&fixture.first);
+        assert!(set_cache_limit(&fixture.cache, &fixture.first, 1, None).is_err());
+        assert!(!fixture.cache.join("terminal-worktrees").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_cache_owner_is_not_trimmed() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = GitFixture::new();
+        set_cache_limit(&fixture.cache, &fixture.first, 1, None).unwrap();
+        let directory = data_directory_for_root(&fixture.cache, &fixture.first).unwrap();
+        let artifact = directory.join("build/cargo-target/artifact");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"keep this").unwrap();
+        let parked = fixture.root.join("parked-cache");
+        fs::rename(&directory, &parked).unwrap();
+        symlink(&parked, &directory).unwrap();
+
+        trim_cache(&fixture.cache, &directory).unwrap();
+        assert_eq!(
+            fs::read(parked.join("build/cargo-target/artifact")).unwrap(),
+            b"keep this"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_cache_root_cannot_delete_external_data() {
+        use nix::dir::Dir;
+        use nix::fcntl::OFlag;
+        use nix::sys::stat::Mode;
+        use std::os::unix::fs::symlink;
+
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let build = directory.join("build");
+        let candidate = build.join("cargo-target");
+        fs::create_dir_all(&candidate).unwrap();
+        fs::write(candidate.join("artifact"), b"cache").unwrap();
+        let outside = fixture.root.join("outside");
+        let outside_candidate = outside.join("cargo-target");
+        fs::create_dir_all(&outside_candidate).unwrap();
+        fs::write(outside_candidate.join("artifact"), b"keep this").unwrap();
+        symlink(&outside_candidate, candidate.join("outside-link")).unwrap();
+
+        let held_build = Dir::open(
+            &build,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        fs::rename(&build, directory.join("build-original")).unwrap();
+        symlink(&outside, &build).unwrap();
+        remove_cache_entry_at(&held_build, std::ffi::OsStr::new("cargo-target")).unwrap();
+        assert!(!directory.join("build-original/cargo-target").exists());
+        assert!(remove_cache_candidate(&fixture.cache, &directory, &candidate).is_err());
+        assert_eq!(
+            fs::read(outside_candidate.join("artifact")).unwrap(),
+            b"keep this"
+        );
     }
 }

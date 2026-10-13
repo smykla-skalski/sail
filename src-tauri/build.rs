@@ -36,6 +36,8 @@ fn main() {
             "retry_worktree_storage_cleanup",
             "retry_selected_removed_worktree_storage",
             "selected_removed_worktree_storage",
+            "worktree_cache_status",
+            "set_worktree_cache_limit",
             "clean_pending_worktree_temp",
             "list_interrupted_agent_turns",
             "finish_interrupted_agent_turn",

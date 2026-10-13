@@ -314,16 +314,34 @@ void test(
         /timed out after 1000 ms/,
       );
       const runDirectories = await readdir(join(outputPath, 'runs'));
-      const childFiles = await Promise.all(
-        runDirectories.map(async (directory) =>
-          readFile(join(outputPath, 'runs', directory, 'observation.json.child-pid'), 'utf8'),
-        ),
+      const spawned = (
+        await Promise.all(
+          runDirectories.map(async (directory) => {
+            try {
+              const pid = Number(
+                await readFile(
+                  join(outputPath, 'runs', directory, 'observation.json.child-pid'),
+                  'utf8',
+                ),
+              );
+              return { directory, pid };
+            } catch (error) {
+              if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+                return null;
+              throw error;
+            }
+          }),
+        )
+      ).filter((child) => child !== null);
+      assert.ok(spawned.length > 0, 'at least one timed-out runner spawned a descendant');
+      childPids.push(...spawned.map((child) => child.pid));
+      const heartbeats = spawned.map((child) =>
+        join(outputPath, 'runs', child.directory, 'observation.json.heartbeat'),
       );
-      childPids.push(...childFiles.map(Number));
-      const heartbeat = join(outputPath, 'runs', runDirectories[0], 'observation.json.heartbeat');
-      const before = await readFile(heartbeat, 'utf8');
+      const before = await Promise.all(heartbeats.map((heartbeat) => readFile(heartbeat, 'utf8')));
       await new Promise((settled) => setTimeout(settled, 200));
-      assert.equal(await readFile(heartbeat, 'utf8'), before);
+      const after = await Promise.all(heartbeats.map((heartbeat) => readFile(heartbeat, 'utf8')));
+      assert.deepEqual(after, before);
     } finally {
       childPids.forEach(stopFixtureChild);
       await rm(temporary, { recursive: true, force: true });
