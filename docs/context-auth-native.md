@@ -1,0 +1,13 @@
+# Signed native context fixture
+
+The private fixture requires an Apple-issued signing identity, a unique bundle identifier, and a runtime app outside macOS system temporary directories. LaunchServices excludes temporary apps from public bundle-ID lookup; the bundled LaunchAgent can register as enabled while `BundleProgram` fails to resolve its containing app with `EX_CONFIG` (78). This is a placement failure, not an approval request.
+
+Create one task-owned root with `mktemp -d "$HOME/Applications/sail-557-native.XXXXXX"` after creating `$HOME/Applications`. Put the installed app at `<root>/run/Sail Native Fixture.app`, set `TMPDIR=<root>/tmp`, and set `SAIL_E2E_CONFIG_DIR=<root>/tmp/config`. Keep test state, caches, and build targets under that root. The hosted workflow uses the same layout under the runner's Applications directory.
+
+For a private artifact export, dispatch `release.yml` with `context_auth_514=true`, `context_auth_export=true`, and absolute `context_auth_export_config` and `context_auth_export_tmpdir` inputs matching those paths. Download only the signed original and upgrade ZIPs. Extract artifact copies beneath `<root>/tmp`, copy the original unchanged to the runtime path, and verify the Apple signing chain before launch. Do not edit a signed plist locally; export again when the config paths change. Keep signing keys in CI.
+
+Run `test/context-auth-native.mjs` from the checkout with `SAIL_E2E_APP` pointing to the runtime app, `SAIL_TEST_SCRATCH=<root>/test`, and `SAIL_CONTEXT_AUTH_UPGRADE_APP` pointing to the extracted signed upgrade. Pass the matching config and temporary paths. The runner launches a separate app with private HOME, XDG, worktree, and agent paths, rejects system temporary placement, and checks public LaunchServices lookup before ordinary ServiceManagement registration.
+
+Use the signed app's `--context-auth-service-status-probe` to distinguish `NotFound` (3), `NotRegistered` (0), `RequiresApproval` (2), and `Enabled` (1). Approval is required only when macOS reports `RequiresApproval`; preserve existing background items and use normal OS controls for the exact private service. Do not bootstrap a helper manually or change privacy grants.
+
+Unregister only the task-created service through the app's `--context-auth-unregister-probe`, stop only its owned processes, and remove only the root created for this run. The coordinator that creates a shared acceptance root owns its final removal. Published installers retain mandatory notarization; this private signing fixture does not distribute an installer.

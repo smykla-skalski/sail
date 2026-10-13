@@ -261,11 +261,14 @@ jobs:
       - name: Configure private fixture paths
         shell: bash
         run: |
-          test -n "${TMPDIR:-}"
-          private="$(mktemp -d "${TMPDIR%/}/sail-514-context.XXXXXX")"
+          test -n "${HOME:-}"
+          mkdir -p "$HOME/Applications"
+          private="$(mktemp -d "$HOME/Applications/sail-514-context.XXXXXX")"
+          mkdir -p "$private/tmp"
           {
             echo "SAIL_CONTEXT_AUTH_ROOT=$private"
-            echo "SAIL_E2E_CONFIG_DIR=$private/config"
+            echo "TMPDIR=$private/tmp"
+            echo "SAIL_E2E_CONFIG_DIR=$private/tmp/config"
             echo "SAIL_TEST_SCRATCH=$private/test"
             echo "CARGO_TARGET_DIR=$private/target"
             echo "npm_config_cache=$private/npm-cache"
@@ -342,7 +345,7 @@ jobs:
         shell: bash
         run: |
           private="${SAIL_CONTEXT_AUTH_ROOT:-}"
-          if [[ -n "$private" && -n "${TMPDIR:-}" && "$(dirname "$private")" == "${TMPDIR%/}" && "$(basename "$private")" == sail-514-context.* ]]; then
+          if [[ -n "$private" && -n "${HOME:-}" && "$(dirname "$private")" == "$HOME/Applications" && "$(basename "$private")" == sail-514-context.* ]]; then
             security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
             rm -rf "$private"
           fi

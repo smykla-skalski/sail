@@ -11,7 +11,7 @@ import {
   rmSync,
 } from 'node:fs';
 import { createServer } from 'node:net';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import process from 'node:process';
 
@@ -58,6 +58,13 @@ const expectFailure = (executable, args, pattern) => {
     (error) => pattern.test(String(error.stderr)),
   );
 };
+for (const root of [run('getconf', ['DARWIN_USER_TEMP_DIR']), '/tmp']) {
+  const path = relative(realpathSync(root), realpathSync(app));
+  assert.ok(
+    path === '..' || path.startsWith('../') || isAbsolute(path),
+    'Install SAIL_E2E_APP outside macOS temporary directories, under a task-owned ~/Applications root; see docs/context-auth-native.md',
+  );
+}
 const signing = (bundle) => {
   const result = spawnSync('codesign', ['-dv', '--verbose=4', bundle], { encoding: 'utf8' });
   assert.equal(result.status, 0);
@@ -229,6 +236,7 @@ async function waitForReady(attempts) {
 
 try {
   mkdirSync(scratch, { recursive: true });
+  mkdirSync(join(scratch, 'home'), { recursive: true });
   mkdirSync(config, { recursive: true });
   writeFileSync(provider, '#!/bin/sh\nexit 0\n');
   chmodSync(provider, 0o700);
@@ -238,6 +246,8 @@ try {
   const openArgs = [
     '-n',
     '-g',
+    '--env',
+    `HOME=${join(scratch, 'home')}`,
     '--env',
     `SAIL_E2E_CONFIG_DIR=${config}`,
     '--env',
@@ -306,6 +316,16 @@ try {
     'Private Sail app did not expose its WebDriver status endpoint',
   );
   appPid = run('lsof', ['-nP', '-tiTCP:' + port, '-sTCP:LISTEN']);
+  assert.ok(
+    run('osascript', [
+      '-l',
+      'JavaScript',
+      '-e',
+      'ObjC.import("AppKit"); function run(args) { const url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(args[0]); return ObjC.unwrap(url.path) || ""; }',
+      bundleId,
+    ]),
+    'LaunchServices cannot resolve the private bundle identifier; install the app outside macOS temporary directories before registering its service',
+  );
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
