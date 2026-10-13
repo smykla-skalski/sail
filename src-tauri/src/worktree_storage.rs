@@ -3252,25 +3252,52 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn removed_worktree_retains_temp_used_by_detached_worker() {
+        struct Worker(std::process::Child);
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
+        let ready = fixture.root.join("worker-ready");
         fs::write(&artifact, "live").unwrap();
-        let mut worker = std::process::Command::new("python3")
+        let mut worker = Worker(std::process::Command::new("python3")
             .arg("-c")
-            .arg("import sys,time; time.sleep(30); open(sys.argv[1]).read()")
+            .arg("import sys; file=open(sys.argv[1]); open(sys.argv[2], 'w').write('ready'); sys.stdin.buffer.read()")
             .arg(&artifact)
+            .arg(&ready)
             .env("TMPDIR", &temp)
+            .stdin(std::process::Stdio::piped())
             .spawn()
-            .unwrap();
-        for _ in 0..100 {
-            if temp_directory_in_use(&temp) {
+            .unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut detected = false;
+        while std::time::Instant::now() < deadline {
+            if ready.exists() && temp_directory_in_use(&temp) {
+                detected = true;
+                break;
+            }
+            if worker.0.try_wait().unwrap().is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(temp_directory_in_use(&temp));
+        let worker_status = worker.0.try_wait().unwrap();
+        let worker_ready = ready.exists();
+        if !detected {
+            let _ = worker.0.kill();
+            let _ = worker.0.wait();
+        }
+        assert!(
+            detected,
+            "Detached worker {}: ready={worker_ready}, exit={worker_status:?}",
+            worker.0.id()
+        );
 
         lease.mark_started();
         assert!(lease.release_clean().is_err());
@@ -3283,8 +3310,8 @@ mod tests {
         reconcile(&fixture.cache);
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "live");
 
-        worker.kill().unwrap();
-        worker.wait().unwrap();
+        drop(worker.0.stdin.take());
+        assert!(worker.0.wait().unwrap().success());
         lease.release_clean().unwrap();
         drop(lease);
         retry_cleanup(&fixture.cache);

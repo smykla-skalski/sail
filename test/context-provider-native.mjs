@@ -89,12 +89,13 @@ const root = mkdtempSync(join(scratch, 'sail-553-native-'));
 const project = join(root, 'project');
 const broken = join(root, 'broken');
 const revoked = join(root, 'revoked');
+const blocked = join(root, 'blocked-input');
 const empty = join(root, 'empty');
 const provider = join(root, 'provider');
 const clients = [];
 let appPid;
 
-function makeProject(directory, command) {
+function makeProject(directory, command, blockInput = false) {
   mkdirSync(join(directory, '.sail'), { recursive: true });
   writeFileSync(
     join(directory, '.sail', 'worktree.json'),
@@ -114,6 +115,8 @@ function makeProject(directory, command) {
       ],
     }),
   );
+  if (blockInput)
+    writeFileSync(join(directory, '.sail/block-provider-stdin'), 'block after initialize');
   run('git', ['init', '-q', directory]);
   assert.equal(
     run('git', ['-C', directory, 'rev-parse', '--show-toplevel']),
@@ -174,17 +177,22 @@ function startClient(directory) {
           clientInfo: { name: 'sail-native-fixture', version: '1.0' },
         };
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-      const line = await Promise.race([
-        new Promise((resolve, reject) => {
-          if (lines.length) resolve(lines.shift());
-          else if (exited) reject(new Error(stderr.trim()));
-          else waiters.push({ resolve, reject });
-        }),
-        delay(30_000).then(() => {
-          throw new Error('Provider response timed out');
-        }),
-      ]);
-      return JSON.parse(line);
+      for (;;) {
+        const line = await Promise.race([
+          new Promise((resolve, reject) => {
+            if (lines.length) resolve(lines.shift());
+            else if (exited) reject(new Error(stderr.trim()));
+            else waiters.push({ resolve, reject });
+          }),
+          delay(30_000).then(() => {
+            throw new Error('Provider response timed out');
+          }),
+        ]);
+        const response = JSON.parse(line);
+        if (response.method && response.id === undefined) continue;
+        assert.equal(response.id, id);
+        return response;
+      }
     },
     waitForExit: () =>
       Promise.race([
@@ -228,6 +236,7 @@ try {
   makeProject(project, 'fixture-provider');
   makeProject(broken, 'broken-provider');
   makeProject(revoked, 'fixture-provider');
+  makeProject(blocked, 'fixture-provider', true);
   mkdirSync(empty);
   run('git', ['init', '-q', empty]);
   run('cc', [
@@ -310,6 +319,60 @@ try {
   const called = await first.request(16, 'tools/call', { name: 'fixture_ping', arguments: {} });
   assert.equal(called.result.content[0].text, 'fixture reply');
   assert.equal(called.result.pid, a.result.pid);
+  const pinged = await first.request(17, 'tools/call', {
+    name: 'fixture_server_ping',
+    arguments: {},
+  });
+  assert.equal(pinged.result.pid, a.result.pid);
+  assert.equal(pinged.result.content[0].text, 'fixture reply');
+  const cancellationStart = Date.now();
+  const waiting = first.request(18, 'tools/call', {
+    name: 'fixture_wait_cancel',
+    arguments: {},
+  });
+  first.child.stdin.write(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId: 18, reason: 'owner' },
+    }) + '\n',
+  );
+  const [cancelled, adjacent] = await Promise.all([waiting, second.request(19)]);
+  assert.equal(cancelled.result.cancelled, true);
+  assert.equal(cancelled.result.cancelledBy, 'owner');
+  assert.equal(cancelled.result.content[0].text, 'fixture cancelled');
+  assert.equal(cancelled.result.pid, a.result.pid);
+  assert.equal(adjacent.result.pid, a.result.pid);
+  assert.ok(Date.now() - cancellationStart < 10_000, 'cancellation bypasses the stalled call');
+  assert.equal(
+    run(binary, ['--context-auth-approve-probe', blocked, 'fixture-provider', provider]),
+    'approved',
+  );
+  const blockedClient = startClient(blocked);
+  const blockedPeer = startClient(blocked);
+  const blockedPid = (await blockedClient.request(20, 'initialize')).result.pid;
+  assert.equal((await blockedPeer.request(21, 'initialize')).result.pid, blockedPid);
+  const blockedStart = Date.now();
+  const blockedRequest = blockedClient.request(22, 'tools/call', {
+    name: 'fixture_ping',
+    arguments: { payload: 'x'.repeat(900_000) },
+  });
+  blockedClient.child.stdin.write(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId: 22 },
+    }) + '\n',
+  );
+  await assert.rejects(blockedRequest, /cancelled while writing stdin/);
+  await blockedClient.waitForExit();
+  assert.ok(Date.now() - blockedStart < 10_000, 'cancellation interrupts a blocked stdin write');
+  await waitForProcessExit(blockedPid);
+  rmSync(join(blocked, '.sail/block-provider-stdin'));
+  const recovered = startClient(blocked);
+  const recoveredPid = (await recovered.request(23, 'initialize')).result.pid;
+  assert.notEqual(recoveredPid, blockedPid);
+  assert.equal((await blockedPeer.request(24)).result.pid, recoveredPid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),
