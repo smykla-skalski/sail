@@ -9789,9 +9789,18 @@
       error = 'Pending worktrees with files or active sessions were kept. Inspect them and retry.';
       return;
     }
+    let archiveCommand: string;
+    try {
+      archiveCommand =
+        (await invoke<WorktreeConfig | null>('worktree_config', { worktree: target.path }))
+          ?.archive ?? '';
+    } catch (cause) {
+      error = `Could not check the worktree archive command: ${describe(cause)}`;
+      return;
+    }
     const confirmed = await confirmInApp(
       'Confirm unused worktrees',
-      `Confirm this pending worktree and its private storage are unused, and no other process will write to, move, or replace either until cleanup finishes? Sail rechecks Git identity, private storage, and files immediately before removal. Changes Sail detects stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
+      `Confirm this pending worktree and its private storage are unused, and no other process will write to, move, or replace either until cleanup finishes? Sail rechecks Git identity, private storage, and files immediately before removal. Changes Sail detects stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.${archiveCommand ? ' The configured archive command will not run during selected cleanup; run it before confirming if needed.' : ''}\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
       'Remove this worktree',
       { destructive: true },
     );
@@ -9992,25 +10001,17 @@
     const wasSelected = directory === path;
     worktreeDeletions = {
       ...worktreeDeletions,
-      [path]: config?.archive ? 'Archiving' : 'Preparing deletion',
+      [path]: config?.archive && !preconfirmed ? 'Archiving' : 'Preparing deletion',
     };
     try {
-      if (config?.archive && (!stopAgents || preconfirmed)) {
+      if (config?.archive && !stopAgents && !preconfirmed) {
         if (!wasSelected) await loadProject(path);
         const paneId = splitFocusedPane('row', 'terminal', config.archive);
-        if (!paneId) {
-          if (preconfirmed)
-            error = `Could not start the archive command for “${branch}”. Remaining worktrees were kept; retry when ready.`;
-          return false;
-        }
+        if (!paneId) return false;
         const code = await new Promise<number>((resolve) =>
           terminalExitWaiters.set(paneId, resolve),
         );
-        if (code < 0) {
-          if (preconfirmed)
-            error = `The archive command for “${branch}” did not finish. Remaining worktrees were kept; retry when ready.`;
-          return false;
-        }
+        if (code < 0) return false;
         if (code !== 0) {
           const deleteAnyway = await confirmInApp(
             'Archive failed',
@@ -10018,11 +10019,7 @@
             'Delete anyway',
             { destructive: true },
           );
-          if (!deleteAnyway) {
-            if (preconfirmed)
-              error = `The archive command for “${branch}” exited with code ${code}. Remaining worktrees were kept; retry when ready.`;
-            return false;
-          }
+          if (!deleteAnyway) return false;
         }
       }
       if (directory === path) await loadProject(repository);

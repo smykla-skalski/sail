@@ -251,6 +251,7 @@ describe('close worktree shortcut', () => {
     path: string,
     expectedSize?: number,
     expectSuccess = false,
+    expectedArchiveWarning = false,
   ): Promise<boolean> {
     await openPendingConfirmation(path, 'Clean up this worktree…');
     await diagnose(`Pending cleanup dialog ${path}`, async () => {
@@ -261,6 +262,12 @@ describe('close worktree shortcut', () => {
           'no other process will write to, move, or replace either until cleanup finishes',
         ),
       );
+      if (expectedArchiveWarning)
+        await expect(dialog).toHaveText(
+          expect.stringContaining(
+            'The configured archive command will not run during selected cleanup',
+          ),
+        );
       if (expectedSize !== undefined)
         await expect(dialog).toHaveText(
           expect.stringContaining(`Retained size: ${expectedSize} bytes`),
@@ -552,6 +559,14 @@ describe('close worktree shortcut', () => {
 
     const eligible = join(worktrees, 'eligible-selected');
     git('worktree', 'add', '-q', '-b', 'eligible-selected', eligible);
+    const archiveMarker = join(worktrees, 'eligible-archive-command-ran');
+    mkdirSync(join(eligible, '.sail'));
+    writeFileSync(
+      join(eligible, '.sail', 'worktree.json'),
+      JSON.stringify({ archive: 'touch ../eligible-archive-command-ran' }),
+    );
+    execFileSync('git', ['-C', eligible, 'add', '--', '.sail/worktree.json']);
+    execFileSync('git', ['-C', eligible, 'commit', '-S', '-q', '-m', 'add archive fixture']);
     await carryTaskRegisteredWorktrees();
     await browser.refresh();
     await expect($(`.project-worktree-select[title="${eligible}"]`)).toBeDisplayed();
@@ -568,10 +583,11 @@ describe('close worktree shortcut', () => {
         (worktree) => worktree.path === unrelatedAfterMark,
       ),
     ).toBe(false);
-    expect(await cleanPending(eligible)).toBe(false);
+    expect(await cleanPending(eligible, undefined, false, true)).toBe(false);
     expect(existsSync(eligible)).toBe(true);
     await cleanUnusedSelectedTemp(eligible);
-    expect(await cleanPending(eligible, undefined, true)).toBe(true);
+    expect(await cleanPending(eligible, undefined, true, true)).toBe(true);
+    expect(existsSync(archiveMarker)).toBe(false);
     expect(existsSync(eligible)).toBe(false);
     expect(git('worktree', 'list')).not.toContain(eligible);
     expect(existsSync(unrelatedAfterMark)).toBe(true);
