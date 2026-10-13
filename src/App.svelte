@@ -1138,11 +1138,11 @@
   let focusByThread = $derived.by(() => {
     void tasksTick;
     const result: Record<string, AgentFocusDisplay> = {};
-    for (const thread of Object.values(sidebarThreads).flat()) {
+    for (const thread of [...agentStatusThreads, ...Object.values(sidebarThreads).flat()]) {
       const key = threadKey(thread);
       const focus = agentFocusDisplay(
         sessionTasks().snapshot(thread),
-        taskOverviewStatuses[key] ?? null,
+        agentStatusStatuses[key] ?? taskOverviewStatuses[key] ?? null,
         focusActiveTurns[key] ?? null,
       );
       if (focus) result[key] = focus;

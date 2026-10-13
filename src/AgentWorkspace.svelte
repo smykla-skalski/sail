@@ -749,7 +749,7 @@
     agentHeaderStatus({
       connecting,
       ready,
-      waiting: permissions.length > 0,
+      waiting: permissions.length > 0 || elicitations.length > 0,
       sending: busy && !turnEnded,
       hasSession: !!activeSessionId,
       running,

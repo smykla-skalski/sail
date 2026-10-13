@@ -51,9 +51,29 @@ describe('reported agent focus', () => {
       expect.stringContaining('Test live tasks'),
     );
     await expect($('.task-card-focus time')).toExist();
+    await $('.task-card-focus').click();
+    await $('.project-agent-menu').click();
+    await $('[role="menuitem"]*=Remove from sidebar').click();
+    await $('.agent-status-summary').click();
+    await expect($('.agent-status-popover [data-focus-source="Agent report"]')).toHaveText(
+      expect.stringContaining('Test live tasks'),
+    );
+    await browser.keys('Escape');
     await browser.waitUntil(
       async () => (await $$('[data-focus-source="Agent report"]')).length === 0,
       { timeout: 25_000 },
     );
+  });
+  it('suppresses current focus while an elicitation form waits for input', async () => {
+    await $('.agent-composer [data-pane-prompt]').setValue('Report focus then ask');
+    await $('.agent-actions button:last-child').click();
+    const panel = $('#session-details [aria-label="Session tasks"]');
+    await expect(panel.$('[data-focus-source="Agent report"]')).toExist();
+    await expect($('[aria-label="Agent question"]')).toBeDisplayed();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Needs input'));
+    await expect(panel).toHaveText(expect.stringContaining('Waiting for input'));
+    await expect(panel).not.toHaveText(expect.stringContaining('Current focus'));
+    await expect(panel.$('[data-focus-source="Agent report"]')).not.toExist();
+    await $('[aria-label="Agent question"] button*=Decline').click();
   });
 });

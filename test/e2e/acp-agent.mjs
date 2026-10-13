@@ -145,7 +145,7 @@ function callWorktreeList(server, callback) {
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
-function reportSessionTasks(server, callback, focusDuration = 1500) {
+function reportSessionTasks(server, callback, focusDuration = 1500, onFocus = () => {}) {
   const child = spawn(server.command, server.args ?? [], {
     env: {
       ...process.env,
@@ -185,6 +185,7 @@ function reportSessionTasks(server, callback, focusDuration = 1500) {
           focus: 'smoke',
         });
       } else if (response.id === 3) {
+        onFocus();
         snapshot = JSON.parse(response.result.content[0].text);
         setTimeout(
           () =>
@@ -542,7 +543,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
-    if (text === 'Report session tasks' || text === 'Report session focus') {
+    if (
+      text === 'Report session tasks' ||
+      text === 'Report session focus' ||
+      text === 'Report focus then ask'
+    ) {
       const server = sessions
         .get(sessionId)
         .mcpServers.find((item) => item.name === 'sail-browser');
@@ -555,7 +560,32 @@ for await (const line of createInterface({ input: process.stdin })) {
           });
           send({ id: message.id, result: { stopReason: 'end_turn' } });
         },
-        text === 'Report session focus' ? 12_000 : 1500,
+        text === 'Report session tasks' ? 1500 : 12_000,
+        () => {
+          if (text !== 'Report focus then ask') return;
+          const id = ++nextPermission;
+          elicitations.set(id, { sessionId, promptId: message.id });
+          setTimeout(
+            () =>
+              send({
+                id,
+                method: 'elicitation/create',
+                params: {
+                  sessionId,
+                  mode: 'form',
+                  message: 'Choose the delivery approach',
+                  requestedSchema: {
+                    type: 'object',
+                    properties: {
+                      approach: { type: 'string', enum: ['safe', 'fast'], default: 'safe' },
+                    },
+                    required: ['approach'],
+                  },
+                },
+              }),
+            1000,
+          );
+        },
       );
       continue;
     }
