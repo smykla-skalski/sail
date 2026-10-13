@@ -395,6 +395,7 @@
     listSidebarAcpThreads,
     recordSidebarOpenCodeOutcome,
     sidebarThreadStatus,
+    waitForSidebarInventory,
   } from './lib/sidebar-agents';
   import {
     loadAttention,
@@ -9819,6 +9820,19 @@
         error = `A new descendant appeared under “${target.branch}”. Remaining worktrees were kept.`;
         return;
       }
+      // An inventory request started before this worktree became pending can still
+      // launch an agent runtime. Refuse cleanup if it does not finish promptly.
+      if (!(await waitForSidebarInventory(sidebarInventoryRequests))) {
+        error =
+          'Cleanup stopped: an agent inventory request is still running. This worktree and its private data remain pending; retry when inventory finishes.';
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, target.path, {
+            ...recovery,
+            reason: error,
+          }),
+        );
+        return;
+      }
       const previousCatalog = projectCatalog;
       const confirmedRecovery = { ...recovery, selectedWorktreeCleanupConfirmed: true };
       try {
@@ -9831,9 +9845,6 @@
           cause,
         });
       }
-      // An inventory request started before this worktree became pending can still
-      // launch an agent runtime. Let it finish before native cleanup stops that runtime.
-      await Promise.allSettled(sidebarInventoryRequests);
       const removed = await deleteProjectWorktreeOnce(
         repository,
         target.path,

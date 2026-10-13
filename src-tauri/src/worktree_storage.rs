@@ -2399,27 +2399,6 @@ pub(crate) fn retry_selected_removed_worktree_storage(
         );
     }
     if *selected == data_directory {
-        let mut cleared_tokens = std::collections::HashSet::new();
-        while let Some(item) = temp_directory_status(cache_directory, &data_directory)
-            .into_iter()
-            .next()
-        {
-            let token = item.cleanup_token.ok_or_else(|| {
-                format!(
-                    "Selected private storage retains unverifiable temporary data ({}); its bytes were retained.",
-                    item.reason
-                )
-            })?;
-            if !cleared_tokens.insert(token.clone()) {
-                return Err("Selected private storage temporary cleanup did not make progress; its bytes were retained.".into());
-            }
-            clean_pending_temp_inner(
-                cache_directory,
-                &token,
-                Some((&data_directory, &durable)),
-                None,
-            )?;
-        }
         return remove_after_worktree_removal_with_policy(
             cache_directory,
             &[data_directory],
@@ -4637,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_storage_retry_cleans_only_its_unused_exposed_temp() {
+    fn selected_storage_retry_keeps_exposed_temp_pending() {
         let fixture = GitFixture::new();
         let expected_generation = generation(&fixture.first).unwrap();
         let (storage, initial_lease) = register(&fixture.cache, &fixture.first).unwrap();
@@ -4667,26 +4646,30 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&selected_artifact).unwrap(), "selected");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match retry_selected_removed_worktree_storage(
-                &fixture.cache,
-                &fixture.repository,
-                &fixture.first,
-                &expected_generation,
-                storage.file_name().unwrap().to_str().unwrap(),
-            ) {
-                Ok(()) => break,
-                Err(error)
-                    if error == "Temporary data still has an active owner."
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("selected storage retry failed: {error}"),
-            }
-        }
-        assert!(!storage.exists());
+        let error = retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+            storage.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("temporary data"), "{error}");
+        assert!(storage.exists());
+        assert_eq!(fs::read_to_string(&selected_artifact).unwrap(), "selected");
+        let pending = cleanup_status(&fixture.cache);
+        let expected_owner = stable_worktree_identity(&fixture.first);
+        assert!(
+            pending.iter().any(|item| {
+                item.path.as_deref().is_some_and(|path| {
+                    fs::read_to_string(Path::new(path).join("selected-artifact"))
+                        .ok()
+                        .as_deref()
+                        == Some("selected")
+                }) && item.owner_path.as_deref() == expected_owner.to_str()
+            }),
+            "{pending:?}"
+        );
         assert_eq!(fs::read_to_string(sibling_artifact).unwrap(), "keep");
     }
 

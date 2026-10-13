@@ -285,9 +285,12 @@ describe('close worktree shortcut', () => {
       ),
     );
     if ((await pendingCleanup(path))?.reason.includes('Cleanup stopped')) {
+      const reason = (await pendingCleanup(path))!.reason;
       await expect($('.app-shell [role="alert"]')).toHaveText(
         expect.stringContaining(
-          'Private agent data is retained while temporary data is still in use or cannot be verified',
+          reason.includes('agent inventory request')
+            ? 'an agent inventory request is still running'
+            : 'Private agent data is retained while temporary data is still in use or cannot be verified',
         ),
       );
       await expect($(`[data-pending-worktree="${path}"]`)).toHaveText(
@@ -531,8 +534,8 @@ describe('close worktree shortcut', () => {
     expect(existsSync(second)).toBe(true);
     expect((await pendingCleanup(second))?.recoveryPath).toBe(second);
     expect(await cleanPending(second, current.sizeBytes)).toBe(false);
-    expect((await pendingCleanup(second))?.reason).toContain(
-      'temporary data is still in use or cannot be verified',
+    expect((await pendingCleanup(second))?.reason).toMatch(
+      /temporary data is still in use or cannot be verified|agent inventory request is still running/,
     );
     expect(await catalogPaths()).toEqual([first, second]);
     expect(existsSync(first)).toBe(true);

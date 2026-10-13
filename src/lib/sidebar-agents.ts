@@ -38,6 +38,23 @@ const maxListedPages = 50;
 
 const trimmedPath = (path: string) => path.replace(/\/+$/, '');
 
+export async function waitForSidebarInventory(
+  requests: Iterable<Promise<unknown>>,
+  timeoutMs = 10_000,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.allSettled(requests).then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Pages through an agent's own session history for one directory, including sessions Sail never saw. */
 export async function listSidebarAcpThreads(
   agent: string,
