@@ -2274,6 +2274,13 @@ struct FileLock {
     file: File,
 }
 
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Forked children can retain the descriptor before exec closes it.
+        let _ = self.unlock();
+    }
+}
+
 impl FileLock {
     fn acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
         Self::acquire_mode(path, exclusive, false)
@@ -2400,6 +2407,36 @@ fn lock_file(_file: &File, _exclusive: bool, _nonblocking: bool) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_lease_releases_lock_with_inherited_descriptor() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.mark_started();
+        let inherited = lease._lease_lock.file.try_clone().unwrap();
+        let path = lock_path(&fixture.cache, "lease", &directory).unwrap();
+
+        drop(lease);
+
+        assert!(FileLock::try_acquire(&path, true).is_ok());
+        assert!(inherited.metadata().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_lock_preserves_independently_held_lease() {
+        let fixture = GitFixture::new();
+        let path = fixture.cache.join("independent.lock");
+        let released = FileLock::acquire(&path, false).unwrap();
+        let independent = FileLock::acquire(&path, false).unwrap();
+
+        drop(released);
+
+        assert!(FileLock::try_acquire(&path, true).is_err());
+        drop(independent);
+        assert!(FileLock::try_acquire(&path, true).is_ok());
+    }
 
     struct GitFixture {
         root: PathBuf,

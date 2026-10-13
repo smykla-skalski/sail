@@ -7202,9 +7202,17 @@ mod session_config_tests {
     #[cfg(unix)]
     #[test]
     fn temporary_cleanup_preserves_orphaned_worker() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         let scratch =
             std::env::temp_dir().join(format!("sail-orphan-temp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch).unwrap();
+        let _scratch = Scratch(scratch.clone());
         let worktree = scratch.join("plain-folder");
         std::fs::create_dir(&worktree).unwrap();
         let (_, lease) =
@@ -7213,17 +7221,19 @@ mod session_config_tests {
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
         let ready = scratch.join("ready");
-        let code = r#"import os,sys,time
+        let code = r#"import os,sys
 p=os.fork()
 if p==0:
     p2=os.fork()
     if p2>0: os._exit(0)
-    open(sys.argv[1], 'w').write('live')
+    artifact=open(sys.argv[1], 'w')
+    artifact.write('live')
+    artifact.flush()
     open(sys.argv[2], 'w').write(str(os.getpid()))
-    time.sleep(10)
+    sys.stdin.buffer.read()
     os._exit(0)
 os.waitpid(p, 0)
-time.sleep(10)
+sys.stdin.buffer.read()
 "#;
         let mut command = Command::new("python3");
         command
@@ -7263,7 +7273,6 @@ time.sleep(10)
         assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
         runtime.stop_child().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(unix)]
