@@ -168,3 +168,38 @@ await test('history and retained sessions remain bounded', async () => {
   );
   assert.equal(createTaskStore(storage).scopes().length, 100);
 });
+
+await test('local starting turns survive backend registration gaps', async () => {
+  const { store } = fixture();
+  const started = await store.start(scope, 'turn');
+  await store.reconcile(scope, null, started.revision);
+  assert.equal(store.snapshot(scope).turnId, 'turn');
+  await store.report(scope, report('turn', started.revision));
+  assert.equal(store.snapshot(scope).focus, task.id);
+});
+await test('retrying a finished prompt attempt reuses its starting task identity', async () => {
+  const { store, storage } = fixture();
+  await store.start(scope, 'turn');
+  await store.finish(scope, 'turn');
+  const retried = await store.start(scope, 'turn');
+  assert.deepEqual(
+    retried.tasks.map((item) => item.id),
+    ['sail:turn'],
+  );
+  assert.deepEqual(
+    createTaskStore(storage)
+      .snapshot(scope)
+      .tasks.map((item) => item.id),
+    ['sail:turn'],
+  );
+});
+
+await test('resuming a saved task turn takes local ownership before backend registration', async () => {
+  const { store, storage } = fixture();
+  await store.start(scope, 'turn');
+  const restored = createTaskStore(storage);
+  const started = await restored.start(scope, 'turn');
+  await restored.reconcile(scope, null, started.revision);
+  assert.equal(restored.snapshot(scope).turnId, 'turn');
+  assert.equal(restored.snapshot(scope).tasks.length, 1);
+});

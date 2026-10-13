@@ -56,6 +56,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
   }
   let writes = Promise.resolve();
   const listeners = new Set<(scope: TaskScope) => void>();
+  const localTurns = new Map<string, string>();
   const snapshot = (scope: TaskScope): TaskSnapshot =>
     structuredClone(sessions.get(taskScopeKey(scope))?.snapshot ?? empty());
 
@@ -100,6 +101,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
         const before = snapshot(scope);
         if (
           !observed.turnId ||
+          localTurns.get(taskScopeKey(scope)) === before.turnId ||
           before.revision !== expectedRevision ||
           before.turnId === activeTurnId
         )
@@ -115,7 +117,10 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
     start(scope: TaskScope, turnId: string) {
       return serialize(async () => {
         const before = snapshot(scope);
-        if (before.turnId === turnId) return before;
+        if (before.turnId === turnId) {
+          localTurns.set(taskScopeKey(scope), turnId);
+          return before;
+        }
         if (before.turnId) throw new Error('This session already has an active task turn.');
         const task: SessionTask = {
           id: `sail:${turnId}`,
@@ -124,12 +129,14 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           origin: 'sail',
           turnId,
         };
-        return commit(scope, {
+        const started = await commit(scope, {
           turnId,
           revision: before.revision + 1,
-          tasks: [...before.tasks.slice(-199), task],
+          tasks: [...before.tasks.filter((item) => item.id !== task.id).slice(-199), task],
           focus: task.id,
         });
+        localTurns.set(taskScopeKey(scope), turnId);
+        return started;
       });
     },
     report(scope: TaskScope, input: unknown) {
@@ -183,6 +190,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
       return serialize(async () => {
         const before = snapshot(scope);
         if (before.turnId !== turnId) return before;
+        localTurns.delete(taskScopeKey(scope));
         return commit(scope, {
           ...before,
           turnId: null,
@@ -192,7 +200,10 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
       });
     },
     forget(scope: TaskScope) {
-      return serialize(() => commit(scope, null));
+      return serialize(() => {
+        localTurns.delete(taskScopeKey(scope));
+        return commit(scope, null);
+      });
     },
     subscribe(listener: (scope: TaskScope) => void) {
       listeners.add(listener);
