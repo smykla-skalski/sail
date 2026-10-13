@@ -326,7 +326,8 @@ void test(
               );
               return { directory, pid };
             } catch (error) {
-              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+              if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+                return null;
               throw error;
             }
           }),
