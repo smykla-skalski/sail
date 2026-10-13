@@ -188,14 +188,18 @@ void *sail_context_session_open(const char *directory, char *error, size_t error
                 return NULL;
             }
             SMAppService *service = [SMAppService agentServiceWithPlistName:servicePlist()];
+            SMAppServiceStatus status = service.status;
             NSError *registrationError = nil;
-            if (service.status == SMAppServiceStatusNotRegistered &&
+            if ((status == SMAppServiceStatusNotRegistered || status == SMAppServiceStatusNotFound) &&
                 ![service registerAndReturnError:&registrationError]) {
                 writeError(error, errorLength, registrationError.localizedDescription ?: @"Context service registration failed.");
                 return NULL;
             }
-            if (service.status != SMAppServiceStatusEnabled) {
-                writeError(error, errorLength, @"Context service needs approval in System Settings.");
+            status = service.status;
+            if (status != SMAppServiceStatusEnabled) {
+                writeError(error, errorLength, status == SMAppServiceStatusRequiresApproval
+                    ? @"Context service needs approval in System Settings."
+                    : @"Context service could not be found after registration.");
                 return NULL;
             }
             NSString *hash = selfCodeHash();
