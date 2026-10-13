@@ -6,6 +6,7 @@ import {
   canonicalizeRepositoryAliases,
   currentCatalogWorktrees,
   externalGitWorktrees,
+  visibleRailWorktrees,
   loadProjectCatalog,
   markNewWorktreeCleanupPending,
   markWorktreeCleanupPending,
@@ -1008,6 +1009,7 @@ await test('keeps a pending original visible beside a replacement generation', (
       recoveryPath: '/worktrees/child',
       sizeBytes: 42,
       reason: 'Awaiting recovery',
+      storagePaths: ['/private/cache/retained'],
     },
   );
   const registered = [
@@ -1016,6 +1018,16 @@ await test('keeps a pending original visible beside a replacement generation', (
 
   assert.equal(currentCatalogWorktrees(catalog, '/repo', registered)[0].branch, 'old');
   assert.deepEqual(externalGitWorktrees(catalog, '/repo', registered), [registered[0]]);
+  assert.deepEqual(visibleRailWorktrees(catalog, '/repo', registered), [registered[0]]);
+  assert.throws(
+    () => addWorktree(catalog, '/repo', registered[0]),
+    /older generation still has pending cleanup/,
+  );
+  const restored = loadProjectCatalog(JSON.stringify(catalog), '');
+  assert.deepEqual(
+    restored.worktrees['/repo'][0].pendingCleanup,
+    catalog.worktrees['/repo'][0].pendingCleanup,
+  );
 });
 
 await test('does not transfer a Sail entry to a replacement generation during cleanup marking', () => {

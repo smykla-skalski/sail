@@ -27,8 +27,8 @@
   } from './lib/agent-results';
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
   import {
-    currentCatalogWorktrees,
     externalGitWorktrees,
+    visibleRailWorktrees,
     ungroupedRepositories,
     worktreeAncestry,
   } from './lib/projects';
@@ -459,10 +459,7 @@
   function railWorktrees(path: string): ProjectWorktree[] {
     return repositoryCollapsed(path)
       ? []
-      : [
-          ...currentCatalogWorktrees(catalog, path, registeredWorktrees[path] ?? []),
-          ...externalWorktrees(path),
-        ];
+      : visibleRailWorktrees(catalog, path, registeredWorktrees[path] ?? []);
   }
 
   function externalWorktrees(repository: string): ProjectWorktree[] {
@@ -1013,7 +1010,13 @@
         ><span aria-hidden="true">⑂</span><span>{worktree.branch}</span></button
       >
     </div>
-    <p class="project-worktree-origin">External worktree · Open to add to Sail</p>
+    <p class="project-worktree-origin">
+      {catalog.worktrees[repository]?.some(
+        (saved) => saved.path === worktree.path && saved.pendingCleanup,
+      )
+        ? 'External replacement · older checkout cleanup remains pending; resolve it before adding this worktree'
+        : 'External worktree · Open to add to Sail'}
+    </p>
   {/each}
 {/snippet}
 

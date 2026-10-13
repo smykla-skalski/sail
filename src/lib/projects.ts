@@ -334,6 +334,17 @@ export function addWorktree(
   const existing = entries.find((entry) => entry.path === worktree.path);
   const incoming = { ...worktree, setupStatus: worktree.setup ? 'pending' : 'ready' } as const;
   if (existing && !worktree.generation) return catalog;
+  if (
+    entries.some(
+      (entry) =>
+        entry.path === worktree.path &&
+        entry.pendingCleanup &&
+        entry.generation !== worktree.generation,
+    )
+  )
+    throw new Error(
+      `Cannot add worktree at ${worktree.path}: an older generation still has pending cleanup. Recheck and resolve its retained data first.`,
+    );
   if (existing && existing.generation === worktree.generation) {
     const merged = mergeSavedWorktrees(existing, incoming);
     if (sameSavedValue(existing, merged)) return catalog;
@@ -392,6 +403,21 @@ export function externalGitWorktrees(
       branch: worktree.branch ?? 'detached',
       generation: worktree.generation,
     }));
+}
+
+export function visibleRailWorktrees(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; branch: string | null; generation: string | null }[],
+): ProjectWorktree[] {
+  const byPath = new Map<string, ProjectWorktree>();
+  for (const worktree of currentCatalogWorktrees(catalog, repository, registered))
+    byPath.set(worktree.path, worktree);
+  // A replacement can share the path of a retained pending generation. The
+  // compact rail opens the current Git checkout; the full list retains both rows.
+  for (const worktree of externalGitWorktrees(catalog, repository, registered))
+    byPath.set(worktree.path, worktree);
+  return [...byPath.values()];
 }
 
 export type WorktreeAncestryRow = {

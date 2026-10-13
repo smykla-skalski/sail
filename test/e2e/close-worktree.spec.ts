@@ -726,6 +726,16 @@ describe('close worktree shortcut', () => {
     expect(await catalogPaths()).toContain(completed);
     expect(existsSync(completed)).toBe(true);
     expect(git('worktree', 'list')).toContain(completed);
+    await browser.refresh();
+    const replacement = $(`button[aria-label="Open external worktree completed-replacement"]`);
+    await expect(replacement).toBeDisplayed();
+    await replacement.click();
+    await expect($('.app-shell [role="alert"]')).toHaveText(
+      expect.stringContaining('older generation still has pending cleanup'),
+    );
+    expect((await pendingCleanup(completed))?.reason).toBeTruthy();
+    expect(await catalogPaths()).toContain(completed);
+    expect(existsSync(completed)).toBe(true);
     git('worktree', 'remove', completed);
   });
 
