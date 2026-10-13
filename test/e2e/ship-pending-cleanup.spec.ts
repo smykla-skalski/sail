@@ -321,4 +321,96 @@ describe('merged Ship pending cleanup', () => {
     const persisted = loadProjectCatalog(settings['sai-project-catalog'] ?? null, repository);
     expect(persisted.worktrees[repository]?.map((item) => item.path)).toEqual([external]);
   });
+
+  it('keeps a selected parent when an unavailable alias owns its live child', async () => {
+    const parent = join(worktrees, 'alias-parent');
+    const child = join(worktrees, 'alias-child');
+    const unavailableAlias = join(worktrees, 'unavailable-repository-alias');
+    git('worktree', 'add', '-q', '-b', 'alias-parent', parent);
+    git('worktree', 'add', '-q', '-b', 'alias-child', child);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const parentGeneration = registered.find((item) => item.path === parent)?.generation;
+    const childGeneration = registered.find((item) => item.path === child)?.generation;
+    if (!parentGeneration || !childGeneration) throw new Error('Missing alias fixture generation');
+    await browser.tauri.execute(
+      async ({ core }, input) => {
+        await core.invoke('save_setting', { key: 'sai-directory', value: input.repo });
+        await core.invoke('save_setting', {
+          key: 'sai-project-catalog',
+          value: JSON.stringify({
+            repositories: [input.repo, input.alias],
+            groups: [],
+            worktrees: {
+              [input.repo]: [
+                {
+                  path: input.parent,
+                  branch: 'alias-parent',
+                  generation: input.parentGeneration,
+                  pendingCleanup: {
+                    originalPath: input.parent,
+                    recoveryPath: input.parent,
+                    sizeBytes: 0,
+                    reason: 'Merged Ship cleanup is pending.',
+                    registeredWorktreesAtMark: input.registered,
+                  },
+                },
+                { path: input.child, branch: 'alias-child', generation: input.childGeneration },
+              ],
+              [input.alias]: [
+                {
+                  path: input.child,
+                  branch: 'alias-child',
+                  generation: input.childGeneration,
+                  origin: {
+                    sourcePath: input.parent,
+                    sourceGeneration: input.parentGeneration,
+                    agent: 'test',
+                    sessionId: 'alias-child-session',
+                    sessionTitle: 'Alias child',
+                  },
+                },
+              ],
+            },
+          }),
+        });
+      },
+      {
+        repo: repository,
+        alias: unavailableAlias,
+        parent,
+        child,
+        parentGeneration,
+        childGeneration,
+        registered,
+      },
+    );
+    await browser.execute(() => {
+      localStorage.clear();
+      localStorage.setItem('sail-settings-migrated-v1', '1');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    });
+    await browser.refresh();
+    const row = $(`[data-pending-worktree="${parent}"]`);
+    await browser.waitUntil(() => row.isDisplayed());
+    await row.$('button=Clean up this worktree…').click();
+    await browser.waitUntil(async () => {
+      const alert = $('.app-shell [role="alert"]');
+      return (
+        (await alert.isExisting()) &&
+        (await alert.getText()).includes('A live descendant is saved under another repository path')
+      );
+    });
+    await expect($('dialog.confirmation-dialog[open]')).not.toExist();
+    await expect(row).toHaveText(
+      expect.stringContaining('A live descendant is saved under another repository path'),
+    );
+    expect(git('worktree', 'list')).toContain(parent);
+    expect(git('worktree', 'list')).toContain(child);
+  });
 });

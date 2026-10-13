@@ -9569,17 +9569,42 @@
     );
   }
 
+  function selectedCleanupDescendantReason(
+    repository: string,
+    path: string,
+    registered: RegisteredWorktree[],
+  ): string | null {
+    if (unmergedCatalogDescendants(projectCatalog, repository, registered, path).length)
+      return 'A live descendant is saved under another repository path. Restore that alias before retrying selected cleanup.';
+    if (worktreeDescendants(projectCatalog, repository, registered, path).length)
+      return 'A live descendant remains registered. Clean up that child before retrying its parent.';
+    return null;
+  }
+
   async function removeSelectedPendingWorktreeCleanup(repository: string, selectedPath: string) {
     if (deletingWorktreeRepositories.has(repository) || worktreeRegistrationPending(repository)) {
       error = 'A worktree operation is in progress. Retry cleanup when it finishes.';
       return;
     }
+    const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+    if (canonicalCatalog !== projectCatalog) await saveProjectCatalogDurably(canonicalCatalog);
     const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
     const pending = (projectCatalog.worktrees[repository] ?? []).filter(
       (worktree) => worktree.pendingCleanup && worktree.path === selectedPath,
     );
     if (!pending.length) return;
     const recovery = pending[0].pendingCleanup!;
+    const descendantReason = selectedCleanupDescendantReason(repository, selectedPath, registered);
+    if (descendantReason) {
+      error = descendantReason;
+      saveProjectCatalog(
+        markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+          ...recovery,
+          reason: error,
+        }),
+      );
+      return;
+    }
     if (
       !recovery.storagePaths?.length &&
       !registered.some(
@@ -9593,6 +9618,11 @@
             originalWorktree: recovery.originalPath,
           });
           if (!overlayAbsent) {
+            const current = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+              repository,
+            });
+            const reason = selectedCleanupDescendantReason(repository, selectedPath, current);
+            if (reason) throw new Error(reason);
             await invoke('retry_removed_worktree_overlay_cleanup', {
               repository,
               originalWorktree: recovery.originalPath,
@@ -9693,6 +9723,11 @@
         await verifiedRecovery.storagePaths.reduce(
           (previous, storagePath, index) =>
             previous.then(async () => {
+              const current = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+                repository,
+              });
+              const reason = selectedCleanupDescendantReason(repository, selectedPath, current);
+              if (reason) throw new Error(reason);
               const cacheKey =
                 verifiedRecovery.storageKeys?.[index] ?? storagePath.split(/[/\\]/).at(-1);
               if (!cacheKey) throw new Error('The selected private storage key is missing.');
@@ -9724,6 +9759,11 @@
           originalWorktree: verifiedRecovery.originalPath,
         });
         if (!overlayAbsent) {
+          const current = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+            repository,
+          });
+          const reason = selectedCleanupDescendantReason(repository, selectedPath, current);
+          if (reason) throw new Error(reason);
           await invoke('retry_removed_worktree_overlay_cleanup', {
             repository,
             originalWorktree: verifiedRecovery.originalPath,
@@ -9871,8 +9911,9 @@
           'A registered worktree is not in this catalog. Refresh or adopt it before selected cleanup.';
         return;
       }
-      if (worktreeDescendants(projectCatalog, repository, current, target.path).length) {
-        error = `A new descendant appeared under “${target.branch}”. Remaining worktrees were kept.`;
+      const reason = selectedCleanupDescendantReason(repository, target.path, current);
+      if (reason) {
+        error = `${reason} Remaining worktrees were kept.`;
         return;
       }
       // An inventory request started before this worktree became pending can still

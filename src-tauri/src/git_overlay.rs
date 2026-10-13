@@ -395,6 +395,14 @@ fn forget_removed_worktree_in_cache_checked(
             return Err("Overlay manifest backup belongs to another worktree.".into());
         }
     }
+    // A prior removal may have deleted only part of this directory. Its
+    // remaining contents cannot be distinguished from a replacement on retry.
+    if manifest.removing && present(&private) {
+        return Err(format!(
+            "Interrupted private Git cleanup retained unverifiable data at {}. Leave it pending for separate recovery.",
+            private.display()
+        ));
+    }
     if !manifest.removing && present(&private) {
         validate_overlay(&private, &manifest.common_dir)?;
         let head = output(
@@ -2155,6 +2163,30 @@ mod tests {
         forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap();
         forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap();
         assert_eq!(known_worktree_in_cache(&fixture.cache, &fixture.task), None);
+    }
+
+    #[test]
+    fn interrupted_private_cleanup_keeps_a_replacement_overlay_directory() {
+        let fixture = OverlayFixture::new();
+        let mut overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.task.to_str().unwrap()],
+        );
+        overlay.manifest.removing = true;
+        write_manifest(&overlay.manifest_path, &overlay.manifest).unwrap();
+        fs::remove_dir_all(&overlay.git_dir).unwrap();
+        fs::create_dir_all(&overlay.git_dir).unwrap();
+        let replacement = overlay.git_dir.join("private-replacement.txt");
+        fs::write(&replacement, "unrelated data").unwrap();
+
+        let error = forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap_err();
+        assert!(error.contains("retained unverifiable data"), "{error}");
+        assert!(error.contains(&overlay.git_dir.to_string_lossy().to_string()));
+        assert_eq!(fs::read_to_string(&replacement).unwrap(), "unrelated data");
+        assert!(overlay.manifest_path.exists());
     }
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
