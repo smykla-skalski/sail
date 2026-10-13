@@ -28,9 +28,16 @@
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import TasksPanel from './TasksPanel.svelte';
+  import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
   import { sessionTasks, TASK_TOOLS } from './lib/session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
-  import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import {
+    acpPlanBackend,
+    acpPlans,
+    planKey,
+    type PlanChange,
+    type PlanScope,
+  } from './lib/acp-plans';
   import { updateReplayingAgentSessions } from './lib/agent-replay';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
@@ -1579,9 +1586,9 @@
     if (tab === 'changes' && acpAgent) void refreshAgentDiff();
   }
 
-  function revealMainPlan(scope: PlanScope, reason: string) {
+  function revealMainPlan(scope: PlanScope, reason: PlanChange['reason']) {
     if (!acpPlanScope || planKey(scope) !== planKey(acpPlanScope)) return;
-    if (!['proposed', 'questions', 'amended', 'checkpoint', 'done'].includes(reason)) return;
+    if (!revealsPlanReview(reason)) return;
     sideTab = 'plan';
     agentChangesOpen = true;
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
@@ -12739,8 +12746,8 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
-                onnativeplan={(plan) => {
-                  if (plan && !nativePlan) {
+                onnativeplan={(plan, live) => {
+                  if (revealsNativePlanReview(plan, nativePlan, live ?? false)) {
                     sideTab = 'plan';
                     agentChangesOpen = true;
                     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';

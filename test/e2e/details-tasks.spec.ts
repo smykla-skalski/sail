@@ -39,9 +39,45 @@ describe('Tasks default details tab', () => {
   before(() => execFileSync('git', ['init', '-q', repository]));
   after(() => rmSync(repository, { recursive: true, force: true }));
 
+  it('preserves manual tab selection during ordinary native provider plan updates', async () => {
+    await browser.execute((directory) => {
+      localStorage.clear();
+      localStorage.setItem('sai-directory', directory);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      );
+    }, realpathSync(repository));
+    await browser.refresh();
+    await chooseTopbarAction('New agent', 'Codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await toggleDetails();
+    await $('#session-details button[role="tab"]*=Activity').click();
+    await $('.agent-composer [data-pane-prompt]').setValue('Plan revision fixture');
+    await $('.agent-actions button:last-child').click();
+    await expect($('.agent-conversation [aria-label="Native plan"]')).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    await expect($('#session-details button[role="tab"]*=Activity')).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await $('#session-details button[role="tab"]*=Plan').click();
+    await expect($('#session-details [aria-label="Native plan"]')).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    await toggleDetails();
+    await toggleDetails();
+    await expect($('#session-details button[role="tab"]*=Tasks')).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+  });
+
   it('resets main and split details to Tasks on each open and preserves tab selection', async () => {
     await browser.setWindowSize(1920, 1200);
     await browser.execute((directory) => {
+      localStorage.clear();
       localStorage.setItem('sai-directory', directory);
       localStorage.setItem(
         'sai-project-catalog',

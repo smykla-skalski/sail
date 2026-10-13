@@ -9,6 +9,7 @@
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import TasksPanel from './TasksPanel.svelte';
   import { sessionTasks } from './lib/session-tasks';
+  import { revealsPlanReview } from './lib/details-plan';
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import type { ShipActionId } from './lib/ship-actions';
@@ -433,11 +434,10 @@
     const scope = acpScope;
     if (!scope || !('id' in pane)) return;
     const paneId = pane.id;
-    const revealing = new Set(['proposed', 'questions', 'amended', 'checkpoint', 'done']);
     return acpPlans().subscribe((change) => {
       if (planKey(change.scope) !== planKey(scope)) return;
       acpPlanTick += 1;
-      if (!revealing.has(change.reason)) return;
+      if (!revealsPlanReview(change.reason)) return;
       planRevealed = true;
       acpTab = 'plan';
       onrevealplan(paneId);
