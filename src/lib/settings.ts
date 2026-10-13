@@ -3,6 +3,8 @@ import { writable } from 'svelte/store';
 
 export const settingsError = writable('');
 const migrationKey = 'sail-settings-migrated-v1';
+const transcriptKey = 'sai-agent-transcript-cache';
+const transcriptPendingKey = 'sail-transcript-cache-pending-v1';
 
 export function isSetting(key: string): boolean {
   return (
@@ -65,15 +67,22 @@ export async function initializeSettings(): Promise<void> {
     pendingLoads.add(loading);
     const saved = await loading.finally(() => pendingLoads.delete(loading));
     if (e2eQuiesced) return;
+    const pendingToken = localStorage.getItem(transcriptPendingKey);
+    const pendingTranscript = pendingToken === null ? null : localStorage.getItem(transcriptKey);
     values = Object.fromEntries(
       Object.entries(saved).filter(
         (entry): entry is [string, string] => isSetting(entry[0]) && typeof entry[1] === 'string',
       ),
     );
+    if (pendingTranscript !== null) values[transcriptKey] = pendingTranscript;
     for (const key of Object.keys(localStorage).filter(isSetting)) localStorage.removeItem(key);
     for (const [key, value] of Object.entries(values)) localStorage.setItem(key, value);
     localStorage.setItem(migrationKey, '1');
     ready = true;
+    if (pendingTranscript !== null && pendingToken !== null) {
+      persist(transcriptKey, pendingTranscript);
+      clearTranscriptPendingAfterWrite(pendingToken);
+    }
   } catch (cause) {
     settingsError.set(`Could not load Sail settings: ${String(cause)}`);
   }
@@ -85,6 +94,17 @@ function persist(key: string, value: string | null): void {
   void writes.catch((cause: unknown) =>
     settingsError.set(`Could not save Sail settings: ${String(cause)}`),
   );
+}
+
+function clearTranscriptPendingAfterWrite(token: string): void {
+  const write = writes;
+  void write
+    .then(() => {
+      if (localStorage.getItem(transcriptPendingKey) === token)
+        localStorage.removeItem(transcriptPendingKey);
+      return undefined;
+    })
+    .catch(() => undefined);
 }
 
 export function settingKeys(): string[] {
@@ -101,6 +121,14 @@ export function setSetting(key: string, value: string): void {
   if (ready && values[key] === value) return;
   if (ready) values[key] = value;
   persist(key, value);
+}
+
+export function setTranscriptSetting(value: string): void {
+  if (e2eQuiesced) return;
+  setSetting(transcriptKey, value);
+  const token = crypto.randomUUID();
+  localStorage.setItem(transcriptPendingKey, token);
+  if (ready) clearTranscriptPendingAfterWrite(token);
 }
 
 export async function setSettingDurable(key: string, value: string): Promise<void> {

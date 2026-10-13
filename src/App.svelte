@@ -518,6 +518,7 @@
     settingsError,
     trackSettingsMutation,
   } from './lib/settings';
+  import { parseReefCanaryPercent, reefCanarySettingKey } from './lib/reef-canary';
   import {
     defaultResourceLimits,
     isCheckingMachinePressure,
@@ -1241,6 +1242,7 @@
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
   let backgroundPriorityEnabled = $state(getSetting('sai-background-priority-enabled') !== 'false');
+  let reefCanaryPercent = $state(parseReefCanaryPercent(getSetting(reefCanarySettingKey)));
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
@@ -1643,7 +1645,7 @@
     try {
       const revision = await invoke<string>('working_tree_revision', { path });
       if (generation !== diffRefresh || path !== directory) return;
-      if (quiet && diffRevisionPath === path && diffRevision === revision) return;
+      if (quiet && !diffError && diffRevisionPath === path && diffRevision === revision) return;
       diffLoading = true;
       const next = await invoke<WorkingDiffInfo[]>('working_tree_diff', { path });
       if (generation !== diffRefresh || path !== directory) return;
@@ -2179,6 +2181,7 @@
       agentWorktreesEnabled,
       agentTerminalsEnabled,
       backgroundPriorityEnabled,
+      reefCanaryPercent,
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
@@ -2381,6 +2384,14 @@
         } else if (action.type === 'background-priority') {
           backgroundPriorityEnabled = action.value;
           setSetting('sai-background-priority-enabled', String(action.value));
+        } else if (action.type === 'reef-canary-percent') {
+          if (
+            action.value === null ||
+            (Number.isInteger(action.value) && action.value >= 0 && action.value <= 100)
+          ) {
+            reefCanaryPercent = action.value;
+            setSetting(reefCanarySettingKey, action.value === null ? 'off' : String(action.value));
+          }
         } else if (action.type === 'agent-status') {
           agentStatusEnabled = action.value;
           setSetting('sai-agent-status-enabled', String(action.value));
@@ -11013,15 +11024,6 @@
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
     if (thread.directory === directory) {
-      const available = await invoke<boolean>('repository_path_available', {
-        path: directory,
-      }).catch(() => false);
-      if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
-        return false;
-      if (!available) {
-        jumpFailure = 'This session is no longer available.';
-        return false;
-      }
       showSidebarThread(thread);
       focusMainPane();
       openAgent(thread.agent, thread, true);
@@ -13333,7 +13335,7 @@
   function focusWorkspace() {
     if (detectShippingClockResume()) void tickShippingRuns();
     for (const pane of leaves(paneLayout)) if (pane.thread) markThreadRead(pane.thread);
-    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
+    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff(true);
   }
 
   function describe(cause: unknown): string {

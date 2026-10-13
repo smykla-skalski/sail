@@ -101,7 +101,7 @@ fn check_id(directory: &str, thread: &str, turn: &str, source: &str, command: &s
 }
 
 fn settings(app: &AppHandle, key: &str) -> Result<String, String> {
-    Ok(crate::settings::load_settings(app.clone())?
+    Ok(crate::settings::load_settings_sync(app.clone())?
         .remove(key)
         .unwrap_or_default())
 }
@@ -115,7 +115,7 @@ fn history(app: &AppHandle) -> Result<Vec<CheckResult>, String> {
 }
 
 fn save_history(app: &AppHandle, checks: &[CheckResult]) -> Result<(), String> {
-    crate::settings::save_setting(
+    crate::settings::save_setting_sync(
         app.clone(),
         HISTORY_KEY.into(),
         Some(serde_json::to_string(checks).map_err(|error| error.to_string())?),
@@ -165,7 +165,7 @@ pub fn approve_post_turn_check(
     let mut approvals: HashSet<String> =
         serde_json::from_str(&settings(&app, APPROVALS_KEY)?).unwrap_or_default();
     approvals.insert(serde_json::to_string(&(&directory, &command)).map_err(|e| e.to_string())?);
-    crate::settings::save_setting(
+    crate::settings::save_setting_sync(
         app,
         APPROVALS_KEY.into(),
         Some(serde_json::to_string(&approvals).map_err(|e| e.to_string())?),

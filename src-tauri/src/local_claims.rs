@@ -243,7 +243,7 @@ pub async fn acquire_shipping_claim(
     claim: ShippingClaim,
 ) -> Result<ShippingClaim, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = PathBuf::from(crate::validate_repository(repository)?);
+        let repository = PathBuf::from(crate::validate_repository_path(repository)?);
         let target = github::require_target_repository(&repository, &expected_repository)?;
         if let Some(conflict) = github::equivalent_shipping_work(&repository, &target, number)? {
             return Err(conflict);
@@ -268,7 +268,7 @@ pub async fn heartbeat_shipping_claim(
 ) -> Result<ShippingClaim, String> {
     tauri::async_runtime::spawn_blocking(move || {
         github::validated_claim_input(&claim)?;
-        let repository = PathBuf::from(crate::validate_repository(repository)?);
+        let repository = PathBuf::from(crate::validate_repository_path(repository)?);
         let target = github::require_target_repository(&repository, &expected_repository)?;
         let key = claim_key(&target, number)?;
         with_store(&store_path(&app)?, |store| {
@@ -298,7 +298,7 @@ pub async fn release_shipping_claim(
 ) -> Result<ShippingClaim, String> {
     tauri::async_runtime::spawn_blocking(move || {
         github::validated_claim_input(&claim)?;
-        let repository = PathBuf::from(crate::validate_repository(repository)?);
+        let repository = PathBuf::from(crate::validate_repository_path(repository)?);
         let target = github::require_target_repository(&repository, &expected_repository)?;
         let key = claim_key(&target, number)?;
         with_store(&store_path(&app)?, |store| {
@@ -322,7 +322,7 @@ pub async fn observe_shipping_claim(
         if recovery_id.trim().is_empty() {
             return Err("Invalid shipping claim recovery identity.".to_string());
         }
-        let repository = PathBuf::from(crate::validate_repository(repository)?);
+        let repository = PathBuf::from(crate::validate_repository_path(repository)?);
         let target = github::target_repository_of(&repository)?;
         let key = claim_key(&target, number)?;
         with_store(&store_path(&app)?, |store| {
@@ -367,7 +367,7 @@ pub async fn complete_predecessor_shipping_claim_fence(
         if recovery_id.trim().is_empty() {
             return Err("Invalid shipping claim recovery identity.".to_string());
         }
-        let repository = PathBuf::from(crate::validate_repository(repository)?);
+        let repository = PathBuf::from(crate::validate_repository_path(repository)?);
         let target = github::target_repository_of(&repository)?;
         let key = claim_key(&target, number)?;
         with_store(&store_path(&app)?, |store| {

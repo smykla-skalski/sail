@@ -383,7 +383,7 @@ fn save_config(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|_| "Cannot encode memory provider settings.".to_string())?;
-    crate::settings::save_setting(app.clone(), config_key(project_key), value)
+    crate::settings::save_setting_sync(app.clone(), config_key(project_key), value)
 }
 
 fn credential(project_key: &str) -> Result<keyring::Entry, String> {

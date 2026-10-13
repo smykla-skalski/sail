@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -128,6 +129,57 @@ describe('disk-backed settings', () => {
     await forceAppearance(null);
     await browser.tauri.execute(async ({ core }) =>
       core.invoke('save_setting', { key: 'sai-theme', value: 'light' }),
+    );
+  });
+
+  it('recovers a transcript that closed before its native write completed', async () => {
+    const key = 'sai-agent-transcript-cache';
+    const pending = 'sail-transcript-cache-pending-v1';
+    const recent = JSON.stringify([{ id: 'recent', entries: [] }]);
+    await browser.tauri.execute(
+      async ({ core }, setting) =>
+        core.invoke('save_setting', { key: setting, value: 'older transcript' }),
+      key,
+    );
+    await browser.execute(
+      (setting, marker, value) => {
+        sessionStorage.setItem('sail-e2e-settings', 'enabled');
+        localStorage.setItem('sail-settings-migrated-v1', '1');
+        localStorage.setItem(setting, value);
+        localStorage.setItem(marker, '1');
+      },
+      key,
+      pending,
+      recent,
+    );
+
+    await browser.refresh();
+    const configDirectory = process.env.SAIL_E2E_CONFIG_DIR;
+    if (!configDirectory) throw new Error('The E2E settings directory is missing.');
+    await browser.waitUntil(
+      () => {
+        try {
+          const saved: unknown = JSON.parse(
+            readFileSync(join(configDirectory, 'settings.json'), 'utf8'),
+          );
+          return typeof saved === 'object' && saved !== null && Reflect.get(saved, key) === recent;
+        } catch {
+          return false;
+        }
+      },
+      {
+        timeoutMsg: 'The pending transcript was not restored to native settings',
+      },
+    );
+    expect(await browser.execute((setting) => localStorage.getItem(setting), key)).toBe(recent);
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute((marker) => localStorage.getItem(marker), pending)) === null,
+      { timeoutMsg: 'The transcript recovery marker was not cleared after the native write' },
+    );
+    await browser.tauri.execute(
+      async ({ core }, setting) => core.invoke('save_setting', { key: setting, value: null }),
+      key,
     );
   });
 

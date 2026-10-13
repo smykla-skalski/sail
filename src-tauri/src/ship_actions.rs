@@ -279,7 +279,8 @@ pub async fn ship_merge_pull_request(
     request: ShipMergeRequest,
 ) -> Result<ShipMergeOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = PathBuf::from(crate::validate_repository(request.repository.clone())?);
+        let repository =
+            PathBuf::from(crate::validate_repository_path(request.repository.clone())?);
         crate::github::require_target_repository(&repository, &request.expected_repository)?;
         // The project checkout, never the pull request's own worktree, so a branch cannot rewrite its merge policy.
         let policy = resolve_merge_policy(&repository)?;
@@ -387,7 +388,8 @@ pub async fn ship_reopen_pull_request(
     request: ShipReopenRequest,
 ) -> Result<ShipReopenOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = PathBuf::from(crate::validate_repository(request.repository.clone())?);
+        let repository =
+            PathBuf::from(crate::validate_repository_path(request.repository.clone())?);
         crate::github::require_target_repository(&repository, &request.expected_repository)?;
         reopen_pull_request(&request, &mut |arguments| {
             let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
@@ -401,7 +403,7 @@ pub async fn ship_reopen_pull_request(
 #[tauri::command]
 pub async fn ship_issue_title(repository: String, reference: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = PathBuf::from(crate::validate_repository(repository)?);
+        let repository = PathBuf::from(crate::validate_repository_path(repository)?);
         let (target, number) = match reference.split_once('#') {
             Some((target, number)) => (target.to_string(), number.to_string()),
             None => (crate::github::target_repository_of(&repository)?, reference),

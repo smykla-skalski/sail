@@ -4325,6 +4325,21 @@ fn connect_blocking_inner(
         Some(availability) => availability,
         None => agent_availability_for(&app, &agent)?,
     };
+    let canary_percent = crate::reef_canary::configured_percent(&app)?;
+    #[cfg(unix)]
+    let reef_canary = canary_percent
+        .map(|percent| {
+            let reef = crate::reef_canary::verify_executable(find_executable("reef"))?;
+            if percent > 0 {
+                crate::reef_canary::verify_scheduler(&reef)?;
+            }
+            Ok::<_, String>((reef, percent))
+        })
+        .transpose()?;
+    #[cfg(not(unix))]
+    if canary_percent.is_some() {
+        return Err("Reef canary is supported only on macOS and Linux.".into());
+    }
     #[cfg(unix)]
     let shared_build_directory = build_lease.and_then(|(build_owner, revision)| {
         let parent = agents.values().find(|runtime| {
@@ -4471,6 +4486,15 @@ fn connect_blocking_inner(
     }
     command.current_dir(worktree);
     let retry = crate::background_priority::normal_priority_copy(&command);
+    #[cfg(unix)]
+    let (command, retry) = if let Some((reef, percent)) = reef_canary {
+        (
+            crate::reef_canary::wrap_command(&command, &reef, &agent, percent)?,
+            crate::reef_canary::wrap_command(&retry, &reef, &agent, percent)?,
+        )
+    } else {
+        (command, retry)
+    };
     #[cfg(unix)]
     let mut wrapped = crate::scratch_cleanup::wrap_command(&command)
         .map_err(|error| format!("Could not prepare agent owner: {error}"))?;

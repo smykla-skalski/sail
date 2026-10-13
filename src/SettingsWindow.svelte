@@ -236,6 +236,7 @@
   }
 
   async function refreshWorktreeStorage(retry = false) {
+    if (worktreeStorageLoading) return;
     worktreeStorageLoading = true;
     worktreeStorageError = '';
     try {
@@ -979,7 +980,6 @@
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
           if (selectedSection === 'agents') {
-            void refreshWorktreeStorage();
             if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
@@ -1145,6 +1145,51 @@
             <strong>{agent.name}</strong>: {agent.binaryPath ?? agent.reason ?? 'Unavailable'}
           </p>{/each}
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
+      </section>
+      <section class="settings-card">
+        <h2>Reef canary</h2>
+        <label class="attention-setting">
+          <input
+            type="checkbox"
+            checked={snapshot?.reefCanaryPercent !== null &&
+              snapshot?.reefCanaryPercent !== undefined}
+            onchange={(event) =>
+              send({
+                type: 'reef-canary-percent',
+                value: event.currentTarget.checked ? 0 : null,
+              })}
+          />
+          Measure new agent processes with Reef
+        </label>
+        {#if snapshot?.reefCanaryPercent !== null && snapshot?.reefCanaryPercent !== undefined}
+          <label for="reef-canary-percent">Treatment percentage</label>
+          <input
+            id="reef-canary-percent"
+            type="number"
+            min="0"
+            max="100"
+            step="1"
+            value={snapshot.reefCanaryPercent}
+            onchange={(event) => {
+              const value = event.currentTarget.valueAsNumber;
+              if (Number.isInteger(value) && value >= 0 && value <= 100)
+                send({ type: 'reef-canary-percent', value });
+              else {
+                event.currentTarget.value = String(snapshot?.reefCanaryPercent ?? 0);
+                requestError = 'Enter a Reef canary percentage from 0 to 100.';
+              }
+            }}
+          />
+        {/if}
+        <p>
+          Off by default. Enabling starts at 0%, which measures a control baseline. Set a higher
+          percentage explicitly to admit that share of eligible build, test, and lint commands
+          through Reef's background scheduler. Under sustained machine pressure, treated commands
+          can wait and then fail at Reef's admission deadline. Changes affect only new agent
+          processes. This is host-only best effort, not hard containment. On macOS or Linux, new
+          agents fail clearly if Reef or its adapter support is unavailable. Nonzero treatment also
+          requires a running <code>reef serve</code> scheduler.
+        </p>
       </section>
       <section class="settings-card">
         <h2>Private agent storage</h2>

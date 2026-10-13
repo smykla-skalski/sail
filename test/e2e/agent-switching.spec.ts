@@ -172,6 +172,34 @@ async function openThread(title: string) {
   await expect($('.agent-header')).toHaveText(expect.stringContaining(title));
 }
 
+async function openLiveThreadWithin(title: string) {
+  await browser.execute((threadTitle) => {
+    Reflect.deleteProperty(window, '__liveSwitchVisible');
+    const started = performance.now();
+    const visible = () =>
+      document.querySelector('.agent-header')?.textContent?.includes(threadTitle) &&
+      document.querySelector('.agent-conversation')?.textContent?.includes('part-');
+    const observer = new MutationObserver(() => {
+      if (!visible()) return;
+      Reflect.set(window, '__liveSwitchVisible', performance.now() - started);
+      observer.disconnect();
+    });
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+    [...document.querySelectorAll<HTMLButtonElement>('.project-agent-row')]
+      .find((row) => row.getAttribute('aria-label')?.includes(threadTitle))
+      ?.click();
+    if (visible()) {
+      Reflect.set(window, '__liveSwitchVisible', performance.now() - started);
+      observer.disconnect();
+    }
+  }, title);
+  await browser.waitUntil(() => browser.execute(() => Reflect.has(window, '__liveSwitchVisible')));
+  const elapsed = await browser.execute(() => Number(Reflect.get(window, '__liveSwitchVisible')));
+  console.log('Live Codex sidebar switch', { elapsedMs: elapsed });
+  expect(elapsed).toBeLessThan(500);
+  await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+}
+
 async function switchAwayAndBack(title: string, away: string, times = 3): Promise<void> {
   if (times === 0) return;
   await openThread(away);
@@ -565,6 +593,8 @@ describe('agent sessions survive thread switches', () => {
     const before = restarts(codex);
     await sendPrompt('Long turn');
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-1 '));
+    await openThread('Codex sibling');
+    await openLiveThreadWithin('Continuity codex');
     await switchAwayAndBack('Continuity codex', 'Codex sibling');
     await switchAwayAndBack('Continuity codex', 'Continuity elsewhere', 1);
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-60 '), {

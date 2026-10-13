@@ -91,7 +91,7 @@ fn enabled(app: &tauri::AppHandle, directory: &str) -> Result<bool, String> {
         return Ok(false);
     }
     let project_key = crate::memory::memory_project_key(directory.to_string())?;
-    let settings = crate::settings::load_settings(app.clone())?;
+    let settings = crate::settings::load_settings_sync(app.clone())?;
     Ok(settings
         .get(&format!("sai-memory-auto-capture:{project_key}"))
         .is_some_and(|value| value == "true"))

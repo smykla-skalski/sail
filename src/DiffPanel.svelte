@@ -75,6 +75,16 @@
       : '',
   );
   let lines = $derived(parsePatch(displayPatch));
+  let patchRowHeight = $derived(area === 'all' ? 20 : 36);
+  const patchWindowSize = 160;
+  let patchScrollTop = $state(0);
+  let firstPatchLine = $derived(
+    Math.min(
+      Math.max(0, Math.floor(patchScrollTop / patchRowHeight) - 40),
+      Math.max(0, (lines?.length ?? 0) - patchWindowSize),
+    ),
+  );
+  let lastPatchLine = $derived(Math.min(lines?.length ?? 0, firstPatchLine + patchWindowSize));
   let unavailable = $derived(patchUnavailableReason(displayPatch));
   let actionError = $state('');
   let actionBusy = $state(false);
@@ -105,6 +115,18 @@
     void tick().then(() => commentInput?.focus());
   }
 
+  async function jumpPatchLine(event: KeyboardEvent) {
+    if (event.key !== 'Home' && event.key !== 'End') return;
+    if (!patchScroll || area !== 'all') return;
+    event.preventDefault();
+    patchScroll.scrollTop = event.key === 'End' ? patchScroll.scrollHeight : 0;
+    patchScrollTop = patchScroll.scrollTop;
+    await tick();
+    const buttons = patchScroll.querySelectorAll<HTMLButtonElement>('button.diff-line');
+    const target = event.key === 'End' ? buttons.item(buttons.length - 1) : buttons.item(0);
+    target?.focus();
+  }
+
   function selectArea(next: typeof area) {
     area = next;
     anchorIndex = null;
@@ -113,6 +135,7 @@
     commentText = '';
     confirmRevert = null;
     actionError = '';
+    patchScrollTop = 0;
     if (patchScroll) patchScroll.scrollTop = 0;
   }
 
@@ -248,7 +271,10 @@
 
   async function resetScroll(file: string | null) {
     await tick();
-    if (selected === file && patchScroll) patchScroll.scrollTop = 0;
+    if (selected === file && patchScroll) {
+      patchScrollTop = 0;
+      patchScroll.scrollTop = 0;
+    }
   }
 
   $effect(() => {
@@ -426,11 +452,15 @@
       {#if lines}
         <div
           class="patch-scroll"
+          class:action-area={area !== 'all'}
           bind:this={patchScroll}
           role="region"
           aria-label={`Diff for ${current.file}`}
+          onscroll={() => (patchScrollTop = patchScroll?.scrollTop ?? 0)}
         >
-          {#each lines as line, index (index)}
+          <div aria-hidden="true" style:height={`${firstPatchLine * patchRowHeight}px`}></div>
+          {#each lines.slice(firstPatchLine, lastPatchLine) as line, index (firstPatchLine + index)}
+            {@const lineIndex = firstPatchLine + index}
             {#if line.oldLine !== undefined || line.newLine !== undefined}
               <button
                 type="button"
@@ -439,11 +469,12 @@
                 class:deleted={line.kind === 'deleted'}
                 class:selected={anchorIndex !== null &&
                   selectedIndex !== null &&
-                  index >= Math.min(anchorIndex, selectedIndex) &&
-                  index <= Math.max(anchorIndex, selectedIndex)}
+                  lineIndex >= Math.min(anchorIndex, selectedIndex) &&
+                  lineIndex <= Math.max(anchorIndex, selectedIndex)}
                 aria-label={`Comment on ${line.kind === 'deleted' ? 'old' : 'new'} line ${line.kind === 'deleted' ? line.oldLine : line.newLine}`}
                 disabled={area !== 'all'}
-                onclick={(event) => selectLine(index, event.shiftKey)}
+                onclick={(event) => selectLine(lineIndex, event.shiftKey)}
+                onkeydown={(event) => void jumpPatchLine(event)}
                 ><span class="line-number">{line.oldLine ?? ''}</span><span class="line-number"
                   >{line.newLine ?? ''}</span
                 ><code>{line.text || ' '}</code></button
@@ -454,23 +485,27 @@
                     {#if area === 'unstaged'}
                       <Button
                         size="sm"
-                        onclick={() => void applyAction('stage', hunkOrdinal(index))}
+                        onclick={() => void applyAction('stage', hunkOrdinal(lineIndex))}
                         disabled={actionBusy}>Stage hunk</Button
                       >
                       <Button
                         size="sm"
                         variant="ghost"
-                        onclick={() => void applyAction('revert', hunkOrdinal(index))}
+                        onclick={() => void applyAction('revert', hunkOrdinal(lineIndex))}
                         disabled={actionBusy}>Revert hunk</Button
                       >
                     {:else}<Button
                         size="sm"
-                        onclick={() => void applyAction('unstage', hunkOrdinal(index))}
+                        onclick={() => void applyAction('unstage', hunkOrdinal(lineIndex))}
                         disabled={actionBusy}>Unstage hunk</Button
                       >{/if}
                   </span>{/if}
               </div>{/if}
           {/each}
+          <div
+            aria-hidden="true"
+            style:height={`${(lines.length - lastPatchLine) * patchRowHeight}px`}
+          ></div>
         </div>
       {:else}<p class="diff-fallback">
           {unavailable === 'large'
@@ -662,6 +697,12 @@
     text-align: left;
     font: inherit;
     cursor: pointer;
+    height: 20px;
+    box-sizing: border-box;
+    align-items: center;
+  }
+  .patch-scroll.action-area .diff-line {
+    height: 36px;
   }
   .diff-line .line-number {
     width: 32px;

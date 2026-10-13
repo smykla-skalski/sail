@@ -666,7 +666,7 @@ pub(crate) fn validated_claim_input(claim: &ShippingClaim) -> Result<(), String>
 #[tauri::command]
 pub async fn shipping_target_repository(repository: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = crate::validate_repository(repository)?;
+        let repository = crate::validate_repository_path(repository)?;
         target_repository(Path::new(&repository))
     })
     .await
@@ -681,7 +681,7 @@ pub async fn shipping_pull_request(
     base_branch: String,
 ) -> Result<Option<ShippingPullRequest>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = crate::validate_repository(repository)?;
+        let repository = crate::validate_repository_path(repository)?;
         if branch.is_empty() || branch.starts_with('-') || branch.contains(char::is_whitespace) {
             return Err("Invalid shipping branch.".to_string());
         }
@@ -819,7 +819,7 @@ pub async fn shipping_dependency_closed(
     reference: String,
 ) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = crate::validate_repository(repository)?;
+        let repository = crate::validate_repository_path(repository)?;
         let (target, number) = if let Some((target, number)) = reference.split_once('#') {
             if target.split('/').count() != 2
                 || target.split('/').any(str::is_empty)
@@ -2381,7 +2381,7 @@ fn expected_target_repository(
 }
 
 fn issue_repository(repository: String) -> Result<(PathBuf, String), String> {
-    let repository = PathBuf::from(crate::validate_repository(repository)?);
+    let repository = PathBuf::from(crate::validate_repository_path(repository)?);
     let remotes = output_or_error(run(&repository, "git", &["remote"])?, "Cannot list remotes")?;
     let has_github_remote = remotes.lines().any(|remote| {
         run(&repository, "git", &["remote", "get-url", remote])
@@ -2469,7 +2469,7 @@ fn checked_worktree(
     branch: &str,
     allow_repository: bool,
 ) -> Result<PathBuf, String> {
-    let repository = PathBuf::from(crate::validate_repository(repository)?);
+    let repository = PathBuf::from(crate::validate_repository_path(repository)?);
     let worktree = Path::new(&worktree)
         .git_canonical()
         .map_err(|_| "Worktree folder no longer exists.".to_string())?;
@@ -2504,7 +2504,7 @@ pub async fn pull_request_checks(
     worktrees: Vec<WorktreeBranch>,
 ) -> Result<RepositoryChecks, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = crate::validate_repository(repository)?;
+        let repository = crate::validate_repository_path(repository)?;
         let target = target_repository(Path::new(&repository))?;
         let response = gh_command(
             Path::new(&repository),

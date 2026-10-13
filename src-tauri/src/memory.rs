@@ -592,7 +592,7 @@ fn context(app: &tauri::AppHandle, directory: &str) -> Result<(PathBuf, String),
 }
 
 pub fn mode(app: &tauri::AppHandle, directory: &str) -> Result<String, String> {
-    let settings = crate::settings::load_settings(app.clone())?;
+    let settings = crate::settings::load_settings_sync(app.clone())?;
     let key = format!("sai-memory-mode:{}", project_key_for(Path::new(directory))?);
     Ok(match settings.get(&key).map(String::as_str) {
         Some("sail") => "sail",

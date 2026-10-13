@@ -889,14 +889,30 @@ pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
+pub async fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(move || load_settings_sync(app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn load_settings_sync(app: tauri::AppHandle) -> Result<Settings, String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
     read_settings(&path)
 }
 
 #[tauri::command]
-pub fn migrate_settings(
+pub async fn migrate_settings(
+    app: tauri::AppHandle,
+    legacy: Settings,
+    prefer_legacy: bool,
+) -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(move || migrate_settings_sync(app, legacy, prefer_legacy))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn migrate_settings_sync(
     app: tauri::AppHandle,
     legacy: Settings,
     prefer_legacy: bool,
@@ -957,7 +973,17 @@ pub fn migrate_settings(
 }
 
 #[tauri::command]
-pub fn save_setting(
+pub async fn save_setting(
+    app: tauri::AppHandle,
+    key: String,
+    value: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_setting_sync(app, key, value))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn save_setting_sync(
     app: tauri::AppHandle,
     key: String,
     value: Option<String>,

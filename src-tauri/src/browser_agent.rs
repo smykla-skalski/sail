@@ -484,7 +484,7 @@ impl BrowserManager {
             .copied();
         if policy == Some(false)
             || (policy.is_none()
-                && crate::settings::load_settings(app.clone())?
+                && crate::settings::load_settings_sync(app.clone())?
                     .get(&format!("sai-browser-disabled:{}", directory.display()))
                     .is_some_and(|value| value == "true"))
         {
@@ -571,7 +571,7 @@ impl BrowserManager {
             | "sail_plan_amend" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
-        let settings = crate::settings::load_settings(app.clone())?;
+        let settings = crate::settings::load_settings_sync(app.clone())?;
         if let Some(setting) = setting {
             let enabled = settings.get(setting).is_some_and(|value| value == "true");
             if (setting == "sai-agent-terminals-enabled" && !enabled)
