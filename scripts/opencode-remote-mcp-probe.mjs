@@ -202,10 +202,16 @@ async function probe(binary) {
     XDG_CONFIG_HOME: join(scratch, 'xdg-config'),
     XDG_DATA_HOME: join(scratch, 'xdg-data'),
     XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
+    XDG_STATE_HOME: join(scratch, 'xdg-state'),
+    OPENCODE_CONFIG_DIR: join(scratch, 'opencode-config'),
+    OPENCODE_CONFIG: undefined,
+    OPENCODE_CONFIG_CONTENT: undefined,
     APPDATA: join(scratch, 'appdata'),
     LOCALAPPDATA: join(scratch, 'appdata-local'),
   };
   try {
+    mkdirSync(environment.HOME, { recursive: true });
+    mkdirSync(environment.OPENCODE_CONFIG_DIR, { recursive: true });
     writeFileSync(join(project, 'opencode.json'), '{}\n');
     const fixture = await startMcpServer();
     server = fixture.server;

@@ -37,13 +37,14 @@ function openCodeBinary() {
   return located.status === 0 && located.stdout.trim() ? located.stdout.trim() : undefined;
 }
 
-function runProbe(binary: string) {
+function runProbe(binary: string, environment: Record<string, string> = {}) {
   const stdout = execFileSync(process.execPath, [probeScript, '--bin', binary, '--json'], {
     encoding: 'utf8',
     timeout: 600_000,
     maxBuffer: 16 * 1024 * 1024,
     env: {
       ...process.env,
+      ...environment,
       PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ''}`,
     },
   });
@@ -62,7 +63,10 @@ await test(
       writeFileSync(
         binary,
         `#!/usr/bin/env node
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+if (!existsSync(process.env.HOME)) process.exit(1);
+if (process.env.OPENCODE_CONFIG_DIR === ${JSON.stringify(join(scratch, 'inherited-config'))}) process.exit(1);
+if (process.env.OPENCODE_CONFIG || process.env.OPENCODE_CONFIG_CONTENT) process.exit(1);
 const args = process.argv.slice(2);
 if (args[0] === '--version') {
   console.log('2.0.24');
@@ -106,7 +110,11 @@ if (args[0] === '--version') {
 `,
         { mode: 0o700 },
       );
-      const result = runProbe(binary);
+      const result = runProbe(binary, {
+        OPENCODE_CONFIG_DIR: join(scratch, 'inherited-config'),
+        OPENCODE_CONFIG: join(scratch, 'inherited-config.json'),
+        OPENCODE_CONFIG_CONTENT: '{"mcp":{"servers":{"inherited":{}}}}',
+      });
       assert.equal(result.status, 'complete');
       assert.deepEqual(
         result.findings.filter((finding) => !finding.pass).map((finding) => finding.id),
