@@ -144,6 +144,11 @@ describe('close worktree shortcut', () => {
     await diagnose(`Selected storage dialog ${path}`, async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
+      await expect(dialog).toHaveText(
+        expect.stringContaining(
+          'no other process will write to, move, or replace it until cleanup finishes',
+        ),
+      );
       await dialog.$('button=Clean up selected storage').click();
     });
   }
@@ -153,6 +158,11 @@ describe('close worktree shortcut', () => {
     await diagnose(`Pending cleanup dialog ${path}`, async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
+      await expect(dialog).toHaveText(
+        expect.stringContaining(
+          'no other process will write to, move, or replace either until cleanup finishes',
+        ),
+      );
       if (expectedSize !== undefined)
         await expect(dialog).toHaveText(
           expect.stringContaining(`Retained size: ${expectedSize} bytes`),
@@ -269,6 +279,16 @@ describe('close worktree shortcut', () => {
     );
     if (current.sizeBytes === null || current.sizeBytes === 0)
       throw new Error('The stale-size fixture did not differ from the current checkout');
+    await $(`[data-pending-worktree="${second}"]`).$('button=Clean up this worktree…').click();
+    const declined = $('dialog.confirmation-dialog[open]');
+    await expect(declined).toHaveText(
+      expect.stringContaining(
+        'no other process will write to, move, or replace either until cleanup finishes',
+      ),
+    );
+    await declined.$('button=Cancel').click();
+    expect(existsSync(second)).toBe(true);
+    expect((await pendingCleanup(second))?.recoveryPath).toBe(second);
     await cleanPending(second, current.sizeBytes);
     await diagnose('Explicit cleanup', async () => {
       await browser.waitUntil(async () => !existsSync(second));

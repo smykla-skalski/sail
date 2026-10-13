@@ -9506,7 +9506,7 @@
         );
       const confirmed = await confirmInApp(
         'Retry selected private storage cleanup',
-        `The Git checkout was removed. Confirm no process uses this private storage or writes to it until cleanup finishes? Sail verifies its owner and Git generation before deleting it. Git can delete files written after the final check.\n\nOriginal worktree: ${verifiedRecovery.originalPath}\nRetained storage: ${verifiedRecovery.storagePaths.join(', ')}\nRetained size: ${verifiedRecovery.sizeBytes ?? 'unknown'} bytes\nPending reason: ${verifiedRecovery.reason}`,
+        `The Git checkout was removed. Confirm this private storage is unused and no other process will write to, move, or replace it until cleanup finishes? Sail verifies its owner and Git generation before deleting it. Changes Sail detects stop cleanup. Files written after the final check can be deleted.\n\nOriginal worktree: ${verifiedRecovery.originalPath}\nRetained storage: ${verifiedRecovery.storagePaths.join(', ')}\nRetained size: ${verifiedRecovery.sizeBytes ?? 'unknown'} bytes\nPending reason: ${verifiedRecovery.reason}`,
         'Clean up selected storage',
         { destructive: true },
       );
@@ -9647,7 +9647,7 @@
     }
     const confirmed = await confirmInApp(
       'Confirm unused worktrees',
-      `Confirm this pending worktree is unused, with no process writing to it until cleanup finishes? Sail rechecks its identity and files immediately before removal. Detected changes stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
+      `Confirm this pending worktree and its private storage are unused, and no other process will write to, move, or replace either until cleanup finishes? Sail rechecks Git identity, private storage, and files immediately before removal. Changes Sail detects stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
       'Remove this worktree',
       { destructive: true },
     );

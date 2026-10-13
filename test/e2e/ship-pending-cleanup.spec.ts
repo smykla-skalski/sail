@@ -72,6 +72,11 @@ describe('merged Ship pending cleanup', () => {
     await diagnose('Pending cleanup dialog', async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
+      await expect(dialog).toHaveText(
+        expect.stringContaining(
+          'no other process will write to, move, or replace either until cleanup finishes',
+        ),
+      );
       await dialog.$('button=Remove this worktree').click();
     });
     await diagnose('Pending checkout result', () =>
