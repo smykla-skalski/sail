@@ -10,6 +10,7 @@ import {
   owningRepository,
   removeRepository,
   removeWorktree,
+  reconcileSelectedRemovedWorktreeStorage,
   replaceRepositoryPath,
   setWorktreePullRequest,
   setWorktreeSetupStatus,
@@ -515,4 +516,81 @@ await test('resolves the owning repository of a project or catalogued worktree o
   assert.equal(owningRepository(catalog, '/repo'), '/repo');
   assert.equal(owningRepository(catalog, '/wt/one'), '/repo');
   assert.equal(owningRepository(catalog, '/wt/uncatalogued'), null);
+});
+
+await test('resumes confirmed two-directory cleanup after the first directory was deleted before catalog settlement', async () => {
+  // Arrange: a crash left both selected paths in the durable catalog, while A is gone.
+  const keyA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const keyB = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo'],
+      worktrees: {
+        '/repo': [
+          {
+            path: '/worktrees/child',
+            branch: 'child',
+            generation: testGeneration(99),
+            pendingCleanup: {
+              originalPath: '/worktrees/child',
+              recoveryPath: '/worktrees/child',
+              sizeBytes: 30,
+              reason: 'Selected private storage remains.',
+              storagePaths: ['/cache/a', '/cache/b'],
+              storageKeys: [keyA, keyB],
+              selectedStorageCleanupConfirmed: true,
+            },
+          },
+        ],
+      },
+    }),
+    '/repo',
+  );
+  const pending = catalog.worktrees['/repo'][0].pendingCleanup!;
+  const existingPaths = new Set(['/cache/b']);
+
+  // Act: native owner verification finds B, and native absence verification finds A gone.
+  const reconciled = await reconcileSelectedRemovedWorktreeStorage(
+    pending,
+    [{ cacheKey: keyB, path: '/cache/b', sizeBytes: 20 }],
+    async (paths) => paths.every((path) => !existingPaths.has(path)),
+  );
+  assert.ok(reconciled);
+  const settled = markWorktreeCleanupPending(catalog, '/repo', '/worktrees/child', reconciled);
+  const restarted = loadProjectCatalog(JSON.stringify(settled), '/repo');
+
+  // Assert: a restart retains confirmation and can retry the sole remaining directory.
+  assert.deepEqual(restarted.worktrees['/repo'][0].pendingCleanup?.storagePaths, ['/cache/b']);
+  assert.deepEqual(restarted.worktrees['/repo'][0].pendingCleanup?.storageKeys, [keyB]);
+  assert.equal(
+    restarted.worktrees['/repo'][0].pendingCleanup?.selectedStorageCleanupConfirmed,
+    true,
+  );
+  assert.equal(restarted.worktrees['/repo'][0].pendingCleanup?.sizeBytes, 20);
+});
+
+await test('keeps both selected paths pending when an omitted saved directory still exists', async () => {
+  // Arrange: owner verification omits A, but native absence verification sees its path.
+  const keyB = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const pending = {
+    originalPath: '/worktrees/child',
+    recoveryPath: '/worktrees/child',
+    sizeBytes: 30,
+    reason: 'Selected private storage remains.',
+    storagePaths: ['/cache/a', '/cache/b'],
+    storageKeys: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', keyB],
+    selectedStorageCleanupConfirmed: true,
+  };
+  const existingPaths = new Set(['/cache/a', '/cache/b']);
+
+  // Act.
+  const reconciled = await reconcileSelectedRemovedWorktreeStorage(
+    pending,
+    [{ cacheKey: keyB, path: '/cache/b', sizeBytes: 20 }],
+    async (paths) => paths.every((path) => !existingPaths.has(path)),
+  );
+
+  // Assert: no saved path is silently removed from the pending record.
+  assert.equal(reconciled, null);
+  assert.deepEqual(pending.storagePaths, ['/cache/a', '/cache/b']);
 });

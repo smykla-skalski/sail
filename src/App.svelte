@@ -587,6 +587,7 @@
     owningRepository,
     removeRepository,
     removeWorktree,
+    reconcileSelectedRemovedWorktreeStorage,
     worktreeDescendants,
     worktreeAt,
     replaceRepositoryPath,
@@ -9255,7 +9256,7 @@
           const pending = entry.pendingCleanup!;
           let reason: string;
           let sizeBytes = pending.sizeBytes;
-          if (pending.storagePaths?.length) {
+          if (pending.storagePaths?.length && !pending.selectedStorageCleanupConfirmed) {
             const statuses = await invoke<{ cacheKey: string; reason: string }[]>(
               'worktree_storage_cleanup_status',
             );
@@ -9305,17 +9306,21 @@
                 expectedGeneration: entry.generation,
               });
               if (storage.length) {
+                const reconciled = await reconcileSelectedRemovedWorktreeStorage(
+                  pending,
+                  storage,
+                  (paths) => invoke<boolean>('pending_cleanup_paths_absent', { paths }),
+                );
+                if (!reconciled) {
+                  reason =
+                    'A saved private storage path still exists, but its owner cannot be verified. Inspect it before retrying cleanup.';
+                  return { entry, pending, sizeBytes, reason, completed: false };
+                }
                 return {
                   entry,
-                  pending: {
-                    ...pending,
-                    storagePaths: storage.map((item) => item.path),
-                    storageKeys: storage.map((item) => item.cacheKey),
-                  },
-                  sizeBytes: storage.every((item) => item.sizeBytes !== null)
-                    ? storage.reduce((total, item) => total + item.sizeBytes!, 0)
-                    : null,
-                  reason: `The Git checkout was removed; selected private storage remains at ${storage.map((item) => item.path).join(', ')}. Confirm it is unused before retrying.`,
+                  pending: reconciled,
+                  sizeBytes: reconciled.sizeBytes,
+                  reason: reconciled.reason,
                   completed: false,
                 };
               }
@@ -9390,6 +9395,7 @@
       );
       let catalog = projectCatalog;
       const completedPaths: string[] = [];
+      let confirmedStorageRechecked = false;
       for (const { entry, pending, sizeBytes, reason, completed } of updates) {
         const currentEntry = catalog.worktrees[repository]?.find(
           (worktree) =>
@@ -9398,6 +9404,7 @@
             worktree.pendingCleanup,
         );
         if (!currentEntry) continue;
+        if (pending.selectedStorageCleanupConfirmed) confirmedStorageRechecked = true;
         if (completed) {
           completedPaths.push(entry.path);
           catalog = removeWorktree(catalog, repository, entry.path);
@@ -9414,6 +9421,8 @@
           (previous, path) => previous.then(() => settleMergedShipCleanup(repository, path)),
           Promise.resolve(),
         );
+      }
+      if (completedPaths.length || confirmedStorageRechecked) {
         const previousCatalog = projectCatalog;
         try {
           await saveProjectCatalogDurably(catalog);
@@ -9580,7 +9589,7 @@
               remainingStoragePaths = remainingStoragePaths.slice(1);
               remainingStorageKeys = remainingStorageKeys.slice(1);
               if (remainingStoragePaths.length) {
-                saveProjectCatalog(
+                await saveProjectCatalogDurably(
                   markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
                     ...verifiedRecovery,
                     storagePaths: remainingStoragePaths,

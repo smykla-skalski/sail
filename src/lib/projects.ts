@@ -29,6 +29,31 @@ export type PendingWorktreeCleanup = {
   storageKeys?: string[];
   selectedStorageCleanupConfirmed?: boolean;
 };
+export type SelectedRemovedWorktreeStorage = {
+  cacheKey: string;
+  path: string;
+  sizeBytes: number | null;
+};
+
+export async function reconcileSelectedRemovedWorktreeStorage(
+  pending: PendingWorktreeCleanup,
+  storage: SelectedRemovedWorktreeStorage[],
+  pathsAbsent: (paths: string[]) => Promise<boolean>,
+): Promise<PendingWorktreeCleanup | null> {
+  const verifiedPaths = new Set(storage.map((item) => item.path));
+  const omittedPaths = (pending.storagePaths ?? []).filter((path) => !verifiedPaths.has(path));
+  if (omittedPaths.length && !(await pathsAbsent(omittedPaths))) return null;
+  return {
+    ...pending,
+    storagePaths: storage.map((item) => item.path),
+    storageKeys: storage.map((item) => item.cacheKey),
+    sizeBytes: storage.every((item) => item.sizeBytes !== null)
+      ? storage.reduce((total, item) => total + item.sizeBytes!, 0)
+      : null,
+    reason: `The Git checkout was removed; selected private storage remains at ${storage.map((item) => item.path).join(', ')}. Confirm it is unused before retrying.`,
+  };
+}
+
 export type ProjectWorktree = {
   path: string;
   branch: string;
