@@ -1332,16 +1332,18 @@ fn cache_limit_token(worktree: &Path) -> Result<String, String> {
 }
 
 pub(crate) fn cache_status(cache_directory: &Path, current_worktree: &Path) -> Vec<CacheUsage> {
-    let mut worktrees = BTreeMap::<PathBuf, Option<PathBuf>>::new();
+    let mut worktrees = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
     let current = crate::terminal::git_worktree_root(current_worktree);
-    worktrees.insert(current.clone(), None);
+    worktrees.entry(current.clone()).or_default();
     if let Ok(common_dir) = git_path(
         &current,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ) {
         if let Ok(known) = git_worktrees(&common_dir) {
             for worktree in known {
-                worktrees.insert(stable_worktree_identity(&worktree), None);
+                worktrees
+                    .entry(stable_worktree_identity(&worktree))
+                    .or_default();
             }
         }
     }
@@ -1365,17 +1367,26 @@ pub(crate) fn cache_status(cache_directory: &Path, current_worktree: &Path) -> V
                 })
                 .or_else(|| read_plain_owner(cache_directory, &directory).ok());
             if let Some(root) = root {
-                worktrees.insert(root, Some(directory));
+                worktrees.entry(root).or_default().push(directory);
             }
         }
     }
     worktrees
         .into_iter()
-        .map(|(worktree, directory)| {
-            let key = directory.as_deref().unwrap_or(&worktree);
+        .map(|(worktree, mut directories)| {
+            directories.sort();
+            let worktree_token = cache_limit_token(&worktree).unwrap_or_default();
+            let current_directory = directories.iter().find(|directory| {
+                registered_cache_limit_token(cache_directory, directory).as_deref()
+                    == Ok(worktree_token.as_str())
+            });
+            let key = current_directory
+                .or_else(|| directories.first())
+                .map(PathBuf::as_path)
+                .unwrap_or(&worktree);
             let mut reason = None;
-            let limit = directory
-                .as_deref()
+            let limit = current_directory
+                .map(PathBuf::as_path)
                 .map(read_cache_limit)
                 .transpose()
                 .unwrap_or_else(|error| {
@@ -1383,41 +1394,53 @@ pub(crate) fn cache_status(cache_directory: &Path, current_worktree: &Path) -> V
                     Some(DEFAULT_CACHE_LIMIT_BYTES)
                 })
                 .unwrap_or(DEFAULT_CACHE_LIMIT_BYTES);
-            let usage = match directory.as_deref() {
-                None => Some(0),
-                Some(directory) => match reusable_cache_size(directory) {
-                    Ok(size) => Some(size),
-                    Err(error) => {
-                        reason = Some(format!("cache-size-unavailable: {error}"));
-                        None
-                    }
-                },
+            let measured =
+                directories
+                    .iter()
+                    .try_fold((0u64, 0u64), |(total, previous), directory| {
+                        let size = reusable_cache_size(directory)?;
+                        Ok::<_, String>((
+                            total.saturating_add(size),
+                            previous.saturating_add(if current_directory == Some(directory) {
+                                0
+                            } else {
+                                size
+                            }),
+                        ))
+                    });
+            let (usage, previous_usage) = match measured {
+                Ok((size, previous)) => (Some(size), previous),
+                Err(error) => {
+                    reason = Some(format!("cache-size-unavailable: {error}"));
+                    (None, 0)
+                }
             };
             let remaining = usage.map(|size| size.saturating_sub(limit));
             if reason.is_none() && remaining.is_some_and(|size| size > 0) {
-                if let Some(directory) = directory.as_deref() {
-                    reason = if !cache_owner_current(cache_directory, directory) {
-                        Some("worktree-identity-unverifiable".into())
-                    } else if has_active_markers(directory)
+                reason = if directories.iter().any(|directory| {
+                    has_active_markers(directory)
                         || lock_path(cache_directory, "lease", directory)
                             .and_then(|path| FileLock::try_acquire(&path, true))
                             .is_err()
-                    {
-                        Some("active-use".into())
-                    } else if let Ok(error) =
-                        fs::read_to_string(directory.join(CACHE_TRIM_ERROR_FILE))
-                    {
-                        Some(error)
-                    } else if cache_candidates(directory).is_ok_and(|items| items.is_empty()) {
-                        Some("protected-cache-data".into())
-                    } else {
-                        Some("cleanup-pending".into())
-                    };
-                }
+                }) {
+                    Some("active-use".into())
+                } else if let Some(error) = current_directory.and_then(|directory| {
+                    fs::read_to_string(directory.join(CACHE_TRIM_ERROR_FILE)).ok()
+                }) {
+                    Some(error)
+                } else if current_directory.is_some_and(|directory| {
+                    !cache_candidates(directory).is_ok_and(|items| items.is_empty())
+                }) {
+                    Some("cleanup-pending".into())
+                } else if previous_usage > 0 {
+                    Some("previous-folder-cache-data".into())
+                } else {
+                    Some("protected-cache-data".into())
+                };
             }
             CacheUsage {
                 worktree: worktree.to_string_lossy().into_owned(),
-                worktree_token: cache_limit_token(&worktree).unwrap_or_default(),
+                worktree_token,
                 cache_key: cache_key(key).unwrap_or_else(|_| "unknown".into()),
                 usage_bytes: usage,
                 limit_bytes: limit,
@@ -4323,6 +4346,53 @@ mod tests {
                 .limit_bytes,
             1
         );
+    }
+
+    #[test]
+    fn plain_folder_becoming_git_reports_both_caches_and_limits_current_owner() {
+        let fixture = GitFixture::new();
+        let folder = fixture.root.join("plain-then-git");
+        fs::create_dir_all(&folder).unwrap();
+        let (plain_directory, plain_lease) = register(&fixture.cache, &folder).unwrap();
+        let plain_artifact = plain_directory.join("cache/go-build/plain-artifact");
+        fs::create_dir_all(plain_artifact.parent().unwrap()).unwrap();
+        fs::write(&plain_artifact, b"plain").unwrap();
+        plain_lease.release_clean().unwrap();
+        set_cache_limit(&fixture.cache, &folder, 6, None).unwrap();
+
+        GitFixture::git(&folder, &["init", "--quiet"]);
+        let (git_directory, git_lease) = register(&fixture.cache, &folder).unwrap();
+        let git_artifact = git_directory.join("cache/go-build/git-artifact");
+        fs::create_dir_all(git_artifact.parent().unwrap()).unwrap();
+        fs::write(&git_artifact, b"git-data").unwrap();
+        git_lease.release_clean().unwrap();
+
+        let root = stable_worktree_identity(&folder)
+            .to_string_lossy()
+            .into_owned();
+        let status = cache_status(&fixture.cache, &folder);
+        let matching = status
+            .iter()
+            .filter(|item| item.worktree == root)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        let usage = matching[0];
+        assert_eq!(usage.usage_bytes, Some(13));
+        assert_eq!(usage.limit_bytes, DEFAULT_CACHE_LIMIT_BYTES);
+        assert_eq!(usage.cache_key, cache_key(&git_directory).unwrap());
+        assert!(usage.worktree_token.starts_with("git:"));
+
+        set_cache_limit_token(&fixture.cache, &usage.worktree_token, 0).unwrap();
+        assert!(plain_artifact.exists());
+        assert!(!git_artifact.exists());
+        let after = cache_status(&fixture.cache, &folder)
+            .into_iter()
+            .find(|item| item.worktree == root)
+            .unwrap();
+        assert_eq!(after.usage_bytes, Some(5));
+        assert_eq!(after.remaining_bytes, Some(5));
+        assert_eq!(after.limit_bytes, 0);
+        assert_eq!(after.reason.as_deref(), Some("previous-folder-cache-data"));
     }
 
     #[cfg(unix)]

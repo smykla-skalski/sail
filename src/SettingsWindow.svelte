@@ -299,6 +299,8 @@
     if (reason === 'active-use') return 'Active agent or terminal use';
     if (reason === 'protected-cache-data')
       return 'Only protected or unrecognized cache data remains';
+    if (reason === 'previous-folder-cache-data')
+      return 'Cache from before this folder became a Git repository remains';
     if (reason === 'cleanup-pending') return 'Cleanup is pending';
     if (reason === 'worktree-identity-unverifiable') return 'Worktree identity cannot be verified';
     return reason;
