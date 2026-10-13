@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   addWorktree,
   assignRepository,
+  canonicalizeRepositoryAliases,
   currentCatalogWorktrees,
   externalGitWorktrees,
   loadProjectCatalog,
@@ -17,6 +18,7 @@ import {
   setWorktreePullRequest,
   setWorktreeSetupStatus,
   setWorktreeStatus,
+  unmergedCatalogDescendants,
   ungroupedRepositories,
   worktreeAncestry,
   worktreeDescendants,
@@ -151,6 +153,98 @@ await test('canonicalizing a saved alias preserves pending and canonical worktre
   assert.equal(restored.worktrees['/canonical'][1].pendingCleanup?.recoveryPath, '/shared');
 });
 
+await test('canonicalizing an already selected repository includes saved alias descendants', async () => {
+  const parent = '/worktrees/parent';
+  const child = '/worktrees/child';
+  const parentGeneration = testGeneration(1);
+  const childGeneration = testGeneration(2);
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/canonical', '/alias', '/unavailable', '/other'],
+      worktrees: {
+        '/canonical': [{ path: parent, branch: 'parent', generation: parentGeneration }],
+        '/alias': [
+          {
+            path: child,
+            branch: 'child',
+            generation: childGeneration,
+            origin: {
+              sourcePath: parent,
+              sourceGeneration: parentGeneration,
+              agent: 'test',
+              sessionId: 'session',
+              sessionTitle: 'Child',
+            },
+            pendingCleanup: {
+              originalPath: child,
+              recoveryPath: child,
+              sizeBytes: 12,
+              reason: 'Selected checkout cleanup is pending.',
+            },
+          },
+        ],
+        '/unavailable': [{ path: '/retained', branch: 'retained' }],
+        '/other': [{ path: '/unrelated', branch: 'other' }],
+      },
+    }),
+    '',
+  );
+  const registered = [
+    { path: parent, generation: parentGeneration },
+    { path: child, generation: childGeneration },
+  ];
+  assert.deepEqual(worktreeDescendants(catalog, '/canonical', registered, parent), []);
+  assert.deepEqual(
+    unmergedCatalogDescendants(catalog, '/canonical', registered, parent).map((item) => item.path),
+    [child],
+  );
+  const resolved: string[] = [];
+  const migrated = await canonicalizeRepositoryAliases(catalog, '/canonical', async (path) => {
+    resolved.push(path);
+    if (path === '/unavailable') throw new Error('Repository path does not exist.');
+    return path === '/alias' ? '/canonical' : path;
+  });
+  assert.deepEqual(resolved, ['/alias', '/unavailable', '/other']);
+  assert.deepEqual(migrated.repositories, ['/canonical', '/unavailable', '/other']);
+  assert.deepEqual(
+    worktreeDescendants(migrated, '/canonical', registered, parent).map((item) => item.path),
+    [child],
+  );
+  assert.deepEqual(unmergedCatalogDescendants(migrated, '/canonical', registered, parent), []);
+  assert.equal(migrated.worktrees['/canonical'][1].pendingCleanup?.recoveryPath, child);
+  assert.equal(migrated.worktrees['/unavailable'][0].path, '/retained');
+  assert.equal(migrated.worktrees['/other'][0].path, '/unrelated');
+  const restored = loadProjectCatalog(JSON.stringify(migrated), '/canonical');
+  assert.equal(restored.worktrees['/canonical'][1].pendingCleanup?.recoveryPath, child);
+  assert.equal(catalog.worktrees['/alias'][0].path, child);
+});
+
+await test('canonicalizing a selected alias resolves every saved alias before merging', async () => {
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/first-alias', '/second-alias', '/canonical'],
+      worktrees: {
+        '/first-alias': [{ path: '/first-child', branch: 'first' }],
+        '/second-alias': [{ path: '/second-child', branch: 'second' }],
+        '/canonical': [{ path: '/canonical-child', branch: 'canonical' }],
+      },
+    }),
+    '',
+  );
+  const merged = await canonicalizeRepositoryAliases(
+    catalog,
+    '/canonical',
+    async () => '/canonical',
+  );
+  assert.deepEqual(merged.repositories, ['/canonical']);
+  assert.deepEqual(merged.worktrees['/canonical'].map((item) => item.path).toSorted(), [
+    '/canonical-child',
+    '/first-child',
+    '/second-child',
+  ]);
+  assert.equal(replaceRepositoryPath(merged, '/first-alias', '/canonical'), merged);
+});
+
 await test('canonicalization refuses conflicting generations without changing the saved catalog', () => {
   const catalog = loadProjectCatalog(
     JSON.stringify({
@@ -180,6 +274,26 @@ await test('canonicalization refuses conflicting generations without changing th
   );
   assert.equal(catalog.worktrees['/alias'][0].generation, testGeneration(1));
   assert.equal(catalog.worktrees['/alias'][0].pendingCleanup?.recoveryPath, '/shared');
+  assert.equal(catalog.worktrees['/canonical'][0].generation, testGeneration(2));
+});
+
+await test('canonical alias discovery propagates a saved generation conflict', async () => {
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/alias', '/canonical'],
+      worktrees: {
+        '/alias': [{ path: '/shared', branch: 'old', generation: testGeneration(1) }],
+        '/canonical': [{ path: '/shared', branch: 'new', generation: testGeneration(2) }],
+      },
+    }),
+    '',
+  );
+  await assert.rejects(
+    canonicalizeRepositoryAliases(catalog, '/canonical', async () => '/canonical'),
+    /Cannot merge conflicting saved worktrees at \/shared/,
+  );
+  assert.deepEqual(catalog.repositories, ['/alias', '/canonical']);
+  assert.equal(catalog.worktrees['/alias'][0].generation, testGeneration(1));
   assert.equal(catalog.worktrees['/canonical'][0].generation, testGeneration(2));
 });
 

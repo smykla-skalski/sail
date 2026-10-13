@@ -585,6 +585,7 @@
   import {
     addWorktree,
     assignRepository,
+    canonicalizeRepositoryAliases,
     loadProjectCatalog,
     markNewWorktreeCleanupPending,
     markWorktreeCleanupPending,
@@ -599,6 +600,7 @@
     setWorktreePullRequest,
     setWorktreeSetupStatus,
     setWorktreeStatus,
+    unmergedCatalogDescendants,
     type ProjectCatalog,
     type ProjectWorktree,
     type PendingWorktreeCleanup,
@@ -9140,14 +9142,6 @@
   }
 
   async function deleteProjectWorktree(repository: string, path: string, branch: string) {
-    if (
-      projectCatalog.worktrees[repository]?.some(
-        (item) => item.path === path && item.pendingCleanup,
-      )
-    ) {
-      error = 'This worktree is pending cleanup. Review its retained files before continuing.';
-      return;
-    }
     if (deletingWorktreeRequests.has(path)) return;
     if (deletingWorktreeRepositories.has(repository)) {
       error = 'Another worktree deletion is in progress. Retry when it finishes.';
@@ -9160,9 +9154,23 @@
     deletingWorktreeRepositories.add(repository);
     deletingWorktreeRequests.add(path);
     try {
+      const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+      if (canonicalCatalog !== projectCatalog) saveProjectCatalog(canonicalCatalog);
+      if (
+        projectCatalog.worktrees[repository]?.some(
+          (item) => item.path === path && item.pendingCleanup,
+        )
+      )
+        throw new Error(
+          'This worktree is pending cleanup. Review its retained files before continuing.',
+        );
       const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
       if (worktreeRegistrationPending(repository))
         throw new Error('A worktree is being created. Retry deletion when it finishes.');
+      if (unmergedCatalogDescendants(projectCatalog, repository, registered, path).length)
+        throw new Error(
+          'A live descendant is saved under another repository path. Restore that repository alias before retrying cleanup.',
+        );
       const descendants = worktreeDescendants(projectCatalog, repository, registered, path);
       if (descendants.length) {
         await deleteProjectWorktreeWithDescendants(
@@ -10511,17 +10519,33 @@
     }, 0);
   }
 
+  async function canonicalizedProjectCatalog(
+    repository: string,
+    attempt = 0,
+  ): Promise<ProjectCatalog> {
+    const snapshot = projectCatalog;
+    const canonicalCatalog = await canonicalizeRepositoryAliases(snapshot, repository, (path) =>
+      invoke<string>('validate_repository', { path }),
+    );
+    if (snapshot === projectCatalog) return canonicalCatalog;
+    if (attempt >= 2)
+      throw new Error('Saved projects changed while checking repository aliases. Retry.');
+    return canonicalizedProjectCatalog(repository, attempt + 1);
+  }
+
   /** Moves saved state to Git's canonical repository path, or falls back when the path is gone. */
   async function canonicalizeProject(path: string) {
     const current = selection;
     try {
       const repository = await invoke<string>('validate_repository', { path });
       if (current !== selection) return;
+      const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+      if (current !== selection) return;
       if (path === repository) {
+        if (canonicalCatalog !== projectCatalog) saveProjectCatalog(canonicalCatalog);
         setSetting('sai-directory', repository);
         return;
       }
-      const canonicalCatalog = replaceRepositoryPath(projectCatalog, path, repository);
       if (paneLayouts[path]) {
         paneLayouts = {
           ...paneLayouts,
@@ -10530,7 +10554,7 @@
         delete paneLayouts[path];
         persistPaneLayouts();
       }
-      saveProjectCatalog(canonicalCatalog);
+      saveProjectCatalog(replaceRepositoryPath(canonicalCatalog, path, repository));
       const knownThreads = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads];
       if (recentCycleKeys) {
         const selectedKey = recentCycleKeys[recentCycleIndex];

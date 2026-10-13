@@ -476,6 +476,29 @@ export function worktreeDescendants(
   return descendants;
 }
 
+export function unmergedCatalogDescendants(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null }[],
+  root: string,
+): ProjectWorktree[] {
+  const known = new Set(
+    worktreeDescendants(catalog, repository, registered, root).map(
+      (worktree) => `${worktree.path}\0${worktree.generation}`,
+    ),
+  );
+  const combined = {
+    ...catalog,
+    worktrees: {
+      ...catalog.worktrees,
+      [repository]: Object.values(catalog.worktrees).flat(),
+    },
+  };
+  return worktreeDescendants(combined, repository, registered, root).filter(
+    (worktree) => !known.has(`${worktree.path}\0${worktree.generation}`),
+  );
+}
+
 export function setWorktreeSetupStatus(
   catalog: ProjectCatalog,
   repository: string,
@@ -678,4 +701,20 @@ export function replaceRepositoryPath(
       collapsedRepositories?.map((path) => (path === oldPath ? canonicalPath : path)) ?? [],
     ),
   };
+}
+
+export async function canonicalizeRepositoryAliases(
+  catalog: ProjectCatalog,
+  repository: string,
+  resolveRepository: (path: string) => Promise<string>,
+): Promise<ProjectCatalog> {
+  let canonicalCatalog = catalog;
+  const aliases = catalog.repositories.filter((path) => path !== repository);
+  const resolutions = await Promise.allSettled(aliases.map(resolveRepository));
+  for (const [index, resolution] of resolutions.entries()) {
+    // Keep an unavailable saved repository and its worktrees intact.
+    if (resolution.status !== 'fulfilled' || resolution.value !== repository) continue;
+    canonicalCatalog = replaceRepositoryPath(canonicalCatalog, aliases[index], repository);
+  }
+  return canonicalCatalog;
 }

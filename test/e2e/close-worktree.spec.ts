@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1791,5 +1792,94 @@ describe('close worktree shortcut', () => {
     await diagnose('Interrupted confirmed cleanup settlement', () =>
       browser.waitUntil(async () => !(await catalogPaths()).includes(path)),
     );
+  });
+
+  it('previews a saved alias descendant when the selected repository is already canonical', async () => {
+    const alias = join(worktrees, 'repository-alias');
+    const parent = join(worktrees, 'alias-parent');
+    const child = join(worktrees, 'alias-child');
+    symlinkSync(repository, alias, 'dir');
+    git('worktree', 'add', '-q', '-b', 'alias-parent', parent);
+    git('worktree', 'add', '-q', '-b', 'alias-child', child);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const parentGeneration = registered.find((item) => item.path === parent)?.generation;
+    const childGeneration = registered.find((item) => item.path === child)?.generation;
+    if (!parentGeneration || !childGeneration) throw new Error('Missing alias fixture generations');
+    const taskRows = registered
+      .filter((item) => item.path !== repository)
+      .map((item) => {
+        const withinFixture = relative(worktrees, item.path);
+        if (
+          !withinFixture ||
+          withinFixture === '..' ||
+          withinFixture.startsWith(`..${sep}`) ||
+          isAbsolute(withinFixture) ||
+          !existsSync(item.path) ||
+          !item.generation
+        )
+          throw new Error(`Unexpected or unverifiable worktree registration: ${item.path}`);
+        return { path: item.path, branch: basename(item.path), generation: item.generation };
+      });
+    await browser.execute(
+      (repo, aliasPath, parentPath, childPath, parentIdentity, rows) => {
+        localStorage.setItem('sai-directory', repo);
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [repo, aliasPath],
+            groups: [],
+            worktrees: {
+              [repo]: rows.filter((item: { path: string }) => item.path !== childPath),
+              [aliasPath]: [
+                {
+                  ...rows.find((item: { path: string }) => item.path === childPath),
+                  origin: {
+                    sourcePath: parentPath,
+                    sourceGeneration: parentIdentity,
+                    agent: 'test',
+                    sessionId: 'alias-descendant',
+                    sessionTitle: 'Alias descendant',
+                  },
+                },
+              ],
+            },
+          }),
+        );
+      },
+      repository,
+      alias,
+      parent,
+      child,
+      parentGeneration,
+      taskRows,
+    );
+    await browser.refresh();
+    await diagnose('Saved alias merged before preview', () =>
+      browser.waitUntil(async () =>
+        browser.execute(
+          (repo, aliasPath, childPath) => {
+            const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+            return (
+              !catalog.repositories?.includes(aliasPath) &&
+              catalog.worktrees?.[repo]?.some((item: { path: string }) => item.path === childPath)
+            );
+          },
+          repository,
+          alias,
+          child,
+        ),
+      ),
+    );
+    await openRemovalConfirmation(parent, 'alias-parent');
+    await expect($('dialog.confirmation-dialog[open]')).toHaveText(expect.stringContaining(child));
+    await $('dialog.confirmation-dialog[open]').$('button=Cancel').click();
+    expect(existsSync(parent)).toBe(true);
+    expect(existsSync(child)).toBe(true);
   });
 });
