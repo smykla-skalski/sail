@@ -19,8 +19,14 @@ int main(void) {
     size_t capacity = 0;
     int initialization_count = 0;
     int initialized = 0;
+    int roots_supported = 0;
+    int client_capabilities_empty = 0;
     while (getline(&line, &capacity, stdin) != -1) {
-        if (strstr(line, "\"method\":\"initialize\"")) initialization_count++;
+        if (strstr(line, "\"method\":\"initialize\"")) {
+            initialization_count++;
+            roots_supported = strstr(line, "\"roots\":") != NULL;
+            client_capabilities_empty = strstr(line, "\"capabilities\":{}") != NULL;
+        }
         if (strstr(line, "\"method\":\"notifications/initialized\"")) {
             initialized = initialization_count == 1;
             continue;
@@ -44,6 +50,16 @@ int main(void) {
             continue;
         }
         int tool_call = strstr(line, "\"method\":\"tools/call\"") != NULL;
+        int tools_changed = tool_call && strstr(line, "\"name\":\"fixture_tools_changed\"");
+        if (tool_call && roots_supported) {
+            puts("{\"jsonrpc\":\"2.0\",\"id\":884,\"method\":\"roots/list\"}");
+            fflush(stdout);
+            if (getline(&line, &capacity, stdin) == -1 || !strstr(line, "\"result\"")) return 1;
+        }
+        if (tools_changed) {
+            puts("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}");
+            fflush(stdout);
+        }
         int idle_progress = strstr(line, "\"method\":\"idle-many-progress\"") != NULL ||
             (tool_call && strstr(line, "\"name\":\"fixture_idle_progress\""));
         int idle_ping = strstr(line, "\"method\":\"idle-ping\"") != NULL ||
@@ -97,12 +113,15 @@ int main(void) {
                      "{\"name\":\"fixture_idle_ping\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_idle_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_many_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_tools_changed\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_wait_cancel\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
         } else if (tool_call) {
             result = ",\"content\":[{\"type\":\"text\",\"text\":\"fixture reply\"}],\"isError\":false";
         }
-        printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d%s}}\n",
-               value, (long)getpid(), initialization_count, result);
+        printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d,"
+               "\"clientCapabilitiesEmpty\":%s%s}}\n",
+               value, (long)getpid(), initialization_count,
+               client_capabilities_empty ? "true" : "false", result);
         fflush(stdout);
         if (idle_progress) {
             for (int count = 0; count < 160; count++) {

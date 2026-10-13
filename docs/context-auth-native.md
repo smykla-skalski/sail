@@ -12,6 +12,8 @@ For provider relay acceptance, dispatch the provider branch with `context_provid
 
 The shared bridge forwards the provider's negotiated MCP wire version. Later clients receive that version as a fallback and decide whether they support it; the bridge does not advertise unverified upstream versions or translate protocols. A replacement provider repeats the surviving authenticated session's handshake with the previously negotiated version before receiving its next request. A changed replacement version fails explicitly.
 
+The supervisor advertises empty client capabilities upstream because it cannot route provider callbacks to an individual agent. Roots, sampling, elicitation, and experimental client callbacks are unavailable through this bridge. Provider pings remain supported. Tool, resource, and prompt list changes reach every authenticated session with the same project and approval fingerprint, while active-request progress remains with its requesting session.
+
 Use the signed app's `--context-auth-service-status-probe` to distinguish `NotFound` (3), `NotRegistered` (0), `RequiresApproval` (2), and `Enabled` (1). Approval is required only when macOS reports `RequiresApproval`; preserve existing background items and use normal OS controls for the exact private service. Do not bootstrap a helper manually or change privacy grants.
 
 Unregister only the task-created service through the app's `--context-auth-unregister-probe`, stop only its owned processes, and remove only the root created for this run. The coordinator that creates a shared acceptance root owns its final removal. Published installers retain mandatory notarization; this private signing fixture does not distribute an installer.

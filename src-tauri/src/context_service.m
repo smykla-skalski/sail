@@ -47,6 +47,34 @@ static void stopInvalidatedProvider(NSDictionary *session, NSDictionary *binding
     }
 }
 
+static bool sharedNotification(NSString *text) {
+    NSData *bytes = [text dataUsingEncoding:NSUTF8StringEncoding];
+    id value = [NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil];
+    if (![value isKindOfClass:NSDictionary.class]) return false;
+    NSString *method = value[@"method"];
+    if (![method isKindOfClass:NSString.class]) return false;
+    return [@[@"notifications/tools/list_changed", @"notifications/resources/list_changed",
+              @"notifications/prompts/list_changed"] containsObject:method];
+}
+
+static bool enqueueNotification(NSMutableDictionary<NSValue *, NSDictionary *> *sessions,
+                                NSValue *key, NSDictionary *session, NSString *text, bool shared) {
+    for (NSValue *otherKey in sessions.allKeys) {
+        NSDictionary *other = sessions[otherKey];
+        if ((!shared && ![otherKey isEqual:key]) ||
+            ![other[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
+            ![other[@"fingerprint"] isEqualToString:session[@"fingerprint"]]) continue;
+        NSMutableString *pending = other[@"notifications"];
+        if ([pending lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
+            [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 1024 * 1024) {
+            [pending appendString:text];
+        } else {
+            closeSession(sessions, otherKey);
+        }
+    }
+    return sessions[key] == session;
+}
+
 static NSString *serviceLabel(void) {
 #ifdef SAIL_CONTEXT_E2E
     NSString *identifier = NSBundle.mainBundle.bundleIdentifier;
@@ -227,18 +255,7 @@ int sail_context_service_main(void) {
                                 return;
                             }
                             if (text.length) {
-                                for (NSValue *otherKey in sessions.allKeys) {
-                                    NSDictionary *other = sessions[otherKey];
-                                    if (![other[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
-                                        ![other[@"fingerprint"] isEqualToString:session[@"fingerprint"]]) continue;
-                                    NSMutableString *pending = other[@"notifications"];
-                                    if ([pending lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
-                                        [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 1024 * 1024) {
-                                        [pending appendString:text];
-                                    } else {
-                                        closeSession(sessions, otherKey);
-                                    }
-                                }
+                                enqueueNotification(sessions, key, session, text, true);
                             }
                             if (sessions[key] != session) {
                                 xpc_dictionary_set_string(reply, "error", "Context MCP notification queue exceeded 1 MiB.");
@@ -269,12 +286,8 @@ int sail_context_service_main(void) {
                                         NSDictionary *latest = sessions[key] == session
                                             ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
                                         if ([latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
-                                            NSMutableString *pending = session[@"notifications"];
-                                            if ([pending lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
-                                                [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 1024 * 1024) {
-                                                [pending appendString:text];
-                                                accepted = true;
-                                            }
+                                            accepted = enqueueNotification(sessions, key, session,
+                                                                           text, sharedNotification(text));
                                         } else if (sessions[key] == session) {
                                             stopInvalidatedProvider(session, latest);
                                             closeSession(sessions, key);

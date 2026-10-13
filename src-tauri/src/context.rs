@@ -2034,6 +2034,13 @@ fn exchange_provider_request(
         .get("method")
         .and_then(serde_json::Value::as_str)
         .ok_or("MCP method missing.")?;
+    // A shared provider cannot call back into any individual agent client.
+    let initialize = (method == "initialize").then(|| {
+        let mut initialize = request.clone();
+        initialize["params"]["capabilities"] = serde_json::json!({});
+        initialize.to_string()
+    });
+    let message = initialize.as_deref().unwrap_or(message);
     write_shared_provider_request(&process.stdin, message, Duration::from_secs(30), || {
         if !session_active()? {
             return Err("Context session revoked during provider stdin write.".into());
@@ -2450,6 +2457,45 @@ mod tests {
         repository.commit();
         assert!(call().unwrap_err().contains("approval changed"));
         assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_negotiates_only_supported_client_capabilities() {
+        let repository = Repository::new("runtime-client-capabilities");
+        repository.configure();
+        let _stop = StopProvider(project_key(&repository.0).unwrap());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |request: serde_json::Value| {
+            let response = provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap();
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        let initialized = call(json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"test","version":"1"},
+            "capabilities":{"roots":{"listChanged":true},"sampling":{},"elicitation":{},
+            "experimental":{"custom":{}},"tasks":{}}}}));
+        assert_eq!(initialized["result"]["clientCapabilitiesEmpty"], true);
+        let called = call(json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"fixture_ping","arguments":{}}}));
+        assert_eq!(called["result"]["content"][0]["text"], "fixture reply");
+        assert_eq!(called["result"]["pid"], initialized["result"]["pid"]);
     }
 
     #[cfg(target_os = "macos")]

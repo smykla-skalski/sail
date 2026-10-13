@@ -176,7 +176,7 @@ function startClient(directory) {
       if (method === 'initialize')
         params = {
           protocolVersion: '2025-06-18',
-          capabilities: {},
+          capabilities: { roots: { listChanged: true }, sampling: {}, elicitation: {} },
           clientInfo: { name: 'sail-native-fixture', version: '1.0' },
         };
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
@@ -323,6 +323,7 @@ try {
   assert.ok(a.result.pid > 0);
   assert.equal(a.result.protocolVersion, '2025-06-18');
   assert.equal(a.result.serverInfo.name, 'sail-fixture');
+  assert.equal(a.result.clientCapabilitiesEmpty, true, 'relay advertises its supported callbacks');
   assert.equal(a.result.pid, b.result.pid, 'one provider process serves both agents');
   assert.equal(a.result.pid, c.result.pid, 'one provider process serves all three clients');
   assert.equal(a.result.initializeCount, 1);
@@ -342,6 +343,20 @@ try {
   const called = await first.request(16, 'tools/call', { name: 'fixture_ping', arguments: {} });
   assert.equal(called.result.content[0].text, 'fixture reply');
   assert.equal(called.result.pid, a.result.pid);
+  const changes = [0, 0, 0];
+  const countChange = (index) => (notification) => {
+    if (notification.method === 'notifications/tools/list_changed') changes[index]++;
+  };
+  const changed = await first.request(
+    34,
+    'tools/call',
+    { name: 'fixture_tools_changed', arguments: {} },
+    countChange(0),
+  );
+  assert.equal(changed.result.pid, a.result.pid);
+  await second.request(35, 'tools/list', undefined, countChange(1));
+  await peer.request(36, 'tools/list', undefined, countChange(2));
+  assert.deepEqual(changes, [1, 1, 1], 'active-request tool changes reach all project clients');
   const pinged = await first.request(17, 'tools/call', {
     name: 'fixture_server_ping',
     arguments: {},
@@ -378,6 +393,13 @@ try {
   );
   assert.equal(progressCount, 160);
   assert.equal(progressed.result.pid, a.result.pid);
+  let peerProgress = 0;
+  const countPeerProgress = (notification) => {
+    if (notification.method === 'notifications/progress') peerProgress++;
+  };
+  await second.request(37, 'tools/list', undefined, countPeerProgress);
+  await peer.request(38, 'tools/list', undefined, countPeerProgress);
+  assert.equal(peerProgress, 0, 'request progress stays with its requesting client');
   let idleCount = 0;
   const idleNotification = (notification) => {
     assert.equal(notification.method, 'notifications/message');
