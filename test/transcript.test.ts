@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { AgentDisplayEntry } from '../src/lib/acp.ts';
+import { groupAgentEntries, updateEntriesBatch, type AgentDisplayEntry } from '../src/lib/acp.ts';
 import type { ActivityHistoryEvent } from '../src/lib/activity-history.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 import {
@@ -9,6 +9,7 @@ import {
   currentToolGroup,
   hookItems,
   nativeItems,
+  presentToolIds,
   pendingCoordinationItems,
   queuedItems,
   shellItems,
@@ -18,6 +19,7 @@ import {
   latestRevision,
   decisionItems,
 } from '../src/lib/transcript.ts';
+import { toolAlert } from '../src/lib/tool-alerts.ts';
 import {
   acpPermissionChoices,
   acpPermissionDetails,
@@ -78,6 +80,117 @@ await test('native entries keep one entry per type with the right role and autho
       ['tools', 'tool-group:a'],
       ['message', 'assistant:Claude'],
     ],
+  );
+});
+
+const failed = (id: string): AgentDisplayEntry => ({
+  id: `tool-group:${id}`,
+  type: 'tool-group',
+  tools: [
+    {
+      id,
+      type: 'tool',
+      title: 'Run',
+      status: 'failed',
+      content: 'Command failed',
+      terminalIds: [],
+    },
+  ],
+});
+
+await test('historical and live failed tools keep separate announcement state', () => {
+  const replayed = failed('older');
+  const items = nativeItems([failed('older'), failed('current')], [], {
+    ...host,
+    historicalToolIds: presentToolIds(replayed.type === 'tool-group' ? replayed.tools : []),
+  });
+  const tools = items.flatMap((item) => (item.kind === 'tools' ? item.tools : []));
+  assert.deepEqual(
+    tools.map((tool) => [tool.id, tool.live, tool.error]),
+    [
+      ['older', false, 'Command failed'],
+      ['current', true, 'Command failed'],
+    ],
+  );
+  const seen = new Set<string>();
+  assert.equal(
+    toolAlert(
+      {
+        id: tools[0].id,
+        error: tools[0].error,
+        mountedError: tools[0].error,
+        mountedLive: tools[0].live ?? false,
+      },
+      seen,
+    ),
+    '',
+  );
+  assert.equal(
+    toolAlert(
+      {
+        id: tools[1].id,
+        error: tools[1].error,
+        mountedError: tools[1].error,
+        mountedLive: tools[1].live ?? false,
+      },
+      seen,
+    ),
+    'Command failed',
+  );
+  assert.equal(
+    toolAlert(
+      {
+        id: tools[1].id,
+        error: tools[1].error,
+        mountedError: tools[1].error,
+        mountedLive: tools[1].live ?? false,
+      },
+      seen,
+    ),
+    '',
+  );
+});
+
+await test('opening a working child keeps earlier failures silent while new failures announce', () => {
+  const existing = failed('older');
+  assert.equal(existing.type, 'tool-group');
+  const initial = existing.type === 'tool-group' ? existing.tools : [];
+  const historicalToolIds = presentToolIds(initial);
+  const updated = updateEntriesBatch(initial, [
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'new',
+      title: 'Run',
+      status: 'failed',
+      content: [{ content: { type: 'text', text: 'New failure' } }],
+    },
+  ]);
+  const items = nativeItems(groupAgentEntries(updated), [], {
+    ...host,
+    historicalToolIds,
+  });
+  const tools = items.flatMap((item) => (item.kind === 'tools' ? item.tools : []));
+  const seen = new Set<string>();
+  assert.deepEqual(
+    tools.map((tool) => [tool.id, tool.live]),
+    [
+      ['older', false],
+      ['new', true],
+    ],
+  );
+  assert.equal(
+    toolAlert(
+      { id: tools[0].id, error: tools[0].error, mountedError: tools[0].error, mountedLive: false },
+      seen,
+    ),
+    '',
+  );
+  assert.equal(
+    toolAlert(
+      { id: tools[1].id, error: tools[1].error, mountedError: tools[1].error, mountedLive: true },
+      seen,
+    ),
+    'New failure',
   );
 });
 

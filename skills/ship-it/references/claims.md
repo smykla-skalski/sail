@@ -1,6 +1,6 @@
 # Expiring GitHub work claims
 
-Use this contract only when checkpoint bookkeeping policy enables claims. Claims default off; then create no issue comment and keep `claim: null`. When enabled, use one visible issue comment as a portable lease for GitHub-backed work. Jira tickets and plain task descriptions do not create claims.
+Use this contract only when checkpoint bookkeeping policy enables claims outside Sail. In Sail mode, Sail owns a local claim and the portable checkpoint keeps `claim: null`; never write a GitHub claim comment. Claims default off; then create no issue comment and keep `claim: null`. When enabled outside Sail, use one visible issue comment as a portable lease for GitHub-backed work. Jira tickets and plain task descriptions do not create claims.
 
 ## Comment format
 

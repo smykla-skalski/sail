@@ -32,11 +32,27 @@ describe('agent memory import', () => {
       );
     }, canonicalRepository);
     await browser.refresh();
-    await browser.tauri.execute(async ({ core }) => {
+    await browser.waitUntil(async () =>
+      browser.execute(() => {
+        const tauri: unknown = Reflect.get(window, '__TAURI__');
+        const core: unknown =
+          tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
+        return (
+          !!document.querySelector('.app-shell') &&
+          !!core &&
+          typeof core === 'object' &&
+          typeof Reflect.get(core, 'invoke') === 'function'
+        );
+      }),
+    );
+    const projectKey = await browser.tauri.execute(async ({ core }) => {
       const directory = localStorage.getItem('sai-directory');
-      const projectKey = await core.invoke<string>('memory_project_key', { directory });
-      await core.invoke('save_setting', { key: `sai-memory-mode:${projectKey}`, value: 'sail' });
+      if (!directory) throw new Error('Memory import fixture lost its directory after refresh');
+      return core.invoke<string>('memory_project_key', { directory });
     });
+    await browser.tauri.execute(async ({ core }, key) => {
+      await core.invoke('save_setting', { key: `sai-memory-mode:${key}`, value: 'sail' });
+    }, projectKey);
   });
 
   after(async () => {

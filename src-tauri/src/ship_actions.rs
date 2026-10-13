@@ -193,18 +193,10 @@ pub struct ShipMergeOutcome {
     policy_source: String,
 }
 
-/// Arguments for the GitHub call that merges. A bot-comment repository never
-/// reaches the merge endpoint, and no argument bypasses branch protection.
+/// Arguments for the GitHub merge call. No argument bypasses branch protection.
 fn merge_call(policy: &MergePolicy, target: &str, number: u64, head: &str) -> Vec<String> {
     match &policy.method {
-        MergeMethod::BotComment(comment) => vec![
-            "api".to_string(),
-            "--method".to_string(),
-            "POST".to_string(),
-            format!("repos/{target}/issues/{number}/comments"),
-            "-f".to_string(),
-            format!("body={comment}"),
-        ],
+        MergeMethod::BotComment(_) => unreachable!("bot comment merges are rejected first"),
         MergeMethod::Github => vec![
             "api".to_string(),
             "--method".to_string(),
@@ -264,6 +256,9 @@ pub(crate) fn merge_pull_request(
             short(&request.expected_head)
         ));
     }
+    if matches!(policy.method, MergeMethod::BotComment(_)) {
+        return Err("This repository merges through a PR comment. Sail does not post GitHub comments; merge the pull request outside Sail.".to_string());
+    }
     github(merge_call(policy, &target, number, head))?;
     let (method, comment) = match &policy.method {
         MergeMethod::Github => ("github".to_string(), None),
@@ -284,7 +279,8 @@ pub async fn ship_merge_pull_request(
     request: ShipMergeRequest,
 ) -> Result<ShipMergeOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = PathBuf::from(crate::validate_repository(request.repository.clone())?);
+        let repository =
+            PathBuf::from(crate::validate_repository_path(request.repository.clone())?);
         crate::github::require_target_repository(&repository, &request.expected_repository)?;
         // The project checkout, never the pull request's own worktree, so a branch cannot rewrite its merge policy.
         let policy = resolve_merge_policy(&repository)?;
@@ -332,26 +328,54 @@ pub(crate) fn reopen_pull_request(
     if details["merged"] == true {
         return Err("The pull request is already merged.".to_string());
     }
-    let head = details["head"]["sha"]
-        .as_str()
-        .ok_or("GitHub returned a pull request without a head revision.")?
-        .to_string();
     let already_open = details["state"] == "open";
-    if !already_open {
+    let patch_error = if already_open {
+        None
+    } else {
         github(vec![
             "api".to_string(),
             "--method".to_string(),
             "PATCH".to_string(),
-            endpoint,
+            endpoint.clone(),
             "-f".to_string(),
             "state=open".to_string(),
         ])
-        .map_err(|error| {
-            format!(
+        .err()
+    };
+    let details = github(vec!["api".to_string(), endpoint]).map_err(|error| {
+        if patch_error.is_some() {
+            format!("Cannot verify the pull request after the reopen request failed. Refresh and retry. {error}")
+        } else {
+            error
+        }
+    })?;
+    let details: serde_json::Value = serde_json::from_str(&details).map_err(|_| {
+        if patch_error.is_some() {
+            "Cannot verify the pull request after the reopen request failed. Refresh and retry. GitHub returned invalid details.".to_string()
+        } else {
+            "GitHub returned invalid pull request details after reopening.".to_string()
+        }
+    })?;
+    if let Some(error) = patch_error {
+        if details["state"] == "closed" && details["merged"] == false && error.contains("HTTP 422")
+        {
+            return Err(format!(
                 "GitHub could not reopen the pull request. Its branch may have been deleted or force-pushed. {error}"
-            )
-        })?;
+            ));
+        }
+        if details["state"] != "open" || details["merged"] == true {
+            return Err(format!(
+                "Cannot confirm whether the pull request reopened. Refresh its GitHub state before retrying. {error}"
+            ));
+        }
     }
+    if details["state"] != "open" || details["merged"] == true {
+        return Err("The pull request did not remain open after reopening.".to_string());
+    }
+    let head = details["head"]["sha"]
+        .as_str()
+        .ok_or("GitHub returned a pull request without a head revision.")?
+        .to_string();
     Ok(ShipReopenOutcome {
         head,
         pull_request: request.pull_request.clone(),
@@ -364,7 +388,8 @@ pub async fn ship_reopen_pull_request(
     request: ShipReopenRequest,
 ) -> Result<ShipReopenOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = PathBuf::from(crate::validate_repository(request.repository.clone())?);
+        let repository =
+            PathBuf::from(crate::validate_repository_path(request.repository.clone())?);
         crate::github::require_target_repository(&repository, &request.expected_repository)?;
         reopen_pull_request(&request, &mut |arguments| {
             let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
@@ -378,7 +403,7 @@ pub async fn ship_reopen_pull_request(
 #[tauri::command]
 pub async fn ship_issue_title(repository: String, reference: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = PathBuf::from(crate::validate_repository(repository)?);
+        let repository = PathBuf::from(crate::validate_repository_path(repository)?);
         let (target, number) = match reference.split_once('#') {
             Some((target, number)) => (target.to_string(), number.to_string()),
             None => (crate::github::target_repository_of(&repository)?, reference),
@@ -467,8 +492,10 @@ mod tests {
                 calls.push(arguments.join(" "));
                 Ok(if calls.len() == 1 {
                     closed.clone()
-                } else {
+                } else if calls.len() == 2 {
                     "{}".to_string()
+                } else {
+                    open_pull_request(HEAD)
                 })
             },
         )
@@ -480,6 +507,7 @@ mod tests {
             [
                 "api repos/owner/repo/pulls/7",
                 "api --method PATCH repos/owner/repo/pulls/7 -f state=open",
+                "api repos/owner/repo/pulls/7",
             ]
         );
     }
@@ -523,6 +551,63 @@ mod tests {
     }
 
     #[test]
+    fn reopen_patch_timeout_uses_the_reread_state_instead_of_starting_a_replacement() {
+        let closed = format!(r#"{{"state":"closed","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let moved = "fedcba9876543210fedcba9876543210fedcba98";
+        let mut calls = 0;
+        let outcome = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                match calls {
+                    1 => Ok(closed.clone()),
+                    2 => Err("request timed out after GitHub applied PATCH".to_string()),
+                    _ => Ok(open_pull_request(moved)),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(outcome.head, moved);
+        assert!(!outcome.already_open);
+
+        let mut calls = 0;
+        let error = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                match calls {
+                    1 | 3 => Ok(closed.clone()),
+                    _ => Err("request timed out before GitHub responded".to_string()),
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert!(error.contains("Cannot confirm whether"));
+        assert!(!error.starts_with("GitHub could not reopen the pull request."));
+
+        let mut calls = 0;
+        let error = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(closed.clone())
+                } else {
+                    Err("request timed out".to_string())
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert!(error.contains("Cannot verify the pull request"));
+        assert!(!error.starts_with("GitHub could not reopen the pull request."));
+    }
+
+    #[test]
     fn reopen_leaves_an_open_pull_request_alone() {
         let open = format!(r#"{{"state":"open","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
         let mut calls = 0;
@@ -535,7 +620,28 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.already_open);
-        assert_eq!(calls, 1);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn reopen_returns_the_head_seen_after_github_accepts_the_patch() {
+        let closed = format!(r#"{{"state":"closed","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let moved = "fedcba9876543210fedcba9876543210fedcba98";
+        let mut calls = 0;
+        let outcome = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    closed.clone()
+                } else {
+                    open_pull_request(moved)
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(outcome.head, moved);
     }
 
     #[test]
@@ -636,31 +742,15 @@ mod tests {
     }
 
     #[test]
-    fn a_bot_comment_repository_posts_exactly_the_comment() {
+    fn a_bot_comment_repository_does_not_post_a_comment() {
         let mut calls: Vec<Vec<String>> = Vec::new();
-        let outcome = merge_pull_request(&request(HEAD, true), &bot("squash"), &mut |arguments| {
+        let error = merge_pull_request(&request(HEAD, true), &bot("squash"), &mut |arguments| {
             calls.push(arguments.clone());
             Ok(open_pull_request(HEAD))
         })
-        .unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[1],
-            [
-                "api",
-                "--method",
-                "POST",
-                "repos/owner/repo/issues/7/comments",
-                "-f",
-                "body=squash"
-            ]
-        );
-        assert_eq!(outcome.method, "bot-comment");
-        assert_eq!(outcome.comment.as_deref(), Some("squash"));
-        assert!(calls
-            .iter()
-            .flatten()
-            .all(|argument| !argument.contains("/merge") && argument != "pr"));
+        .unwrap_err();
+        assert!(error.contains("Sail does not post GitHub comments"));
+        assert_eq!(calls, vec![vec!["api", "repos/owner/repo/pulls/7"]]);
     }
 
     #[test]
@@ -754,17 +844,13 @@ mod tests {
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(!production.to_lowercase().contains("admin"));
         assert!(!production.contains("pr\", \"merge"));
-        for policy in [
-            bot("squash"),
-            MergePolicy {
-                method: MergeMethod::Github,
-                strategy: "squash".to_string(),
-                source: "default".to_string(),
-            },
-        ] {
-            for argument in merge_call(&policy, "owner/repo", 7, HEAD) {
-                assert!(!argument.to_lowercase().contains("admin"), "{argument}");
-            }
+        let policy = MergePolicy {
+            method: MergeMethod::Github,
+            strategy: "squash".to_string(),
+            source: "default".to_string(),
+        };
+        for argument in merge_call(&policy, "owner/repo", 7, HEAD) {
+            assert!(!argument.to_lowercase().contains("admin"), "{argument}");
         }
     }
 }

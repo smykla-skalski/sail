@@ -28,12 +28,16 @@ describe('shared transcript view', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer [data-pane-prompt]').setValue('Do a small thing');
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     const card = $('.permission-card');
     await expect(card).toBeDisplayed();
     await expect(card).not.toHaveText(expect.stringContaining('Always'));
     await expect($('.agent-tool-group, .agent-tool-current')).toBeDisplayed();
+    await browser.execute(() => {
+      document.querySelector<HTMLDetailsElement>('.tool-activity')!.open = false;
+    });
     await $('.permission-card .permission-link').click();
+    await expect($('.tool-activity')).toHaveAttribute('open');
     await $('.permission-card .permission-actions button').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),

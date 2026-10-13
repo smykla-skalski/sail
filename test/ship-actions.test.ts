@@ -3,12 +3,17 @@ import test from 'node:test';
 import {
   shipArchiveAction,
   shipArchiveConfirmation,
+  shipCheckpointCommit,
   shipMergeAction,
   shipMergeConfirmation,
+  shipMergeRetryDelay,
+  shipMergeRetryReason,
   shipPoolLabel,
   shipPoolUsage,
   shipReopenAction,
   shipReopenConfirmation,
+  shipReplacementConfirmation,
+  shipReopenHeadWarning,
   shipRetryAction,
   shipStopAction,
   shipStopConfirmation,
@@ -55,14 +60,43 @@ void test('merge is available only for a ready pull request at the checkpoint re
   assert.match(shipMergeAction(closed).reason!, /not open/);
 });
 
-void test('merge stays disabled after the bot comment until the pull request closes', () => {
+void test('a recent merge request blocks a duplicate comment', () => {
   const requested = mergeable();
-  requested.mergeRequested = { at: 1, head: 'revision-one', comment: 'squash' };
-  const state = shipMergeAction(requested);
+  const now = Date.now();
+  requested.mergeRequested = { at: now, head: 'revision-one', comment: 'squash' };
+  const state = shipMergeAction(requested, now);
   assert.equal(state.enabled, false);
   assert.match(state.reason!, /Merge already requested with “squash”/);
   requested.pullRequestState = 'MERGED';
   assert.match(shipMergeAction(requested).reason!, /not open/);
+});
+
+void test('a stale merge request can be confirmed again at the threshold', () => {
+  const requested = mergeable();
+  const now = Date.now();
+  requested.mergeRequested = {
+    at: now - shipMergeRetryDelay + 1,
+    head: 'revision-one',
+    comment: 'squash',
+  };
+  assert.equal(shipMergeAction(requested, now).enabled, false);
+  requested.mergeRequested.at -= 1;
+  assert.deepEqual(shipMergeAction(requested, now), { enabled: true, reason: null });
+  const confirmation = shipMergeConfirmation(requested, 'a/b');
+  assert.match(confirmation.title, /Request merge again/);
+  assert.match(confirmation.message, /Sail does not post GitHub comments/);
+  assert.equal(confirmation.confirmLabel, 'Request again');
+  requested.checks = [{ name: 'test', state: 'FAILURE', url: 'https://example.test' }];
+  assert.equal(shipMergeAction(requested, now).enabled, false);
+});
+
+void test('a new reviewed head allows a fresh merge request', () => {
+  const requested = mergeable();
+  requested.mergeRequested = { at: Date.now(), head: 'previous-head', comment: 'squash' };
+  assert.match(shipMergeRetryReason(requested)!, /head changed/);
+  assert.equal(shipMergeAction(requested).enabled, true);
+  requested.pullRequestHead = 'unreviewed-head';
+  assert.equal(shipMergeAction(requested).enabled, false);
 });
 
 void test('retry applies to failed issues whose pull request is still usable', () => {
@@ -111,6 +145,38 @@ void test('the reopen confirmation names the pull request, issue and repository'
   assert.match(confirmation.title, /^Reopen pull request #9 for #\d+/);
   assert.match(confirmation.message, /pull request #9 in a\/b/);
   assert.equal(confirmation.confirmLabel, 'Reopen');
+});
+
+void test('a replacement confirmation names the closed and new pull requests', () => {
+  const issue = mergeable();
+  const confirmation = shipReplacementConfirmation(issue, 'a/b');
+  assert.match(confirmation.title, /replacement for pull request #9/);
+  assert.match(confirmation.message, /replacement pull request for #\d+/);
+  assert.match(confirmation.message, /saved checkpoint/);
+  assert.equal(confirmation.confirmLabel, 'Start replacement');
+});
+
+void test('reopen warns when the live head differs from the saved checkpoint', () => {
+  const checkpoint = '0123456789abcdef0123456789abcdef01234567';
+  const moved = 'fedcba9876543210fedcba9876543210fedcba98';
+  assert.equal(shipReopenHeadWarning(checkpoint, checkpoint), '');
+  assert.match(shipReopenHeadWarning(moved, checkpoint), /differs from checkpoint commit/);
+  assert.match(shipReopenHeadWarning(moved, checkpoint), /fedcba98/);
+  assert.match(shipReopenHeadWarning(moved, checkpoint), /01234567/);
+  assert.match(shipReopenHeadWarning(moved, null), /no Git commit to compare/);
+});
+
+void test('legacy checkpoints recover only a commit recorded for their exact digest', () => {
+  const issue = mergeable();
+  issue.checkpoint!.revision = '0123456789abcdef';
+  issue.checkpoint!.commit = null;
+  issue.evidenceRevision = '0123456789abcdef';
+  issue.evidenceCommit = 'a'.repeat(40);
+  assert.equal(shipCheckpointCommit(issue), issue.evidenceCommit);
+  issue.evidenceRevision = 'fedcba9876543210';
+  assert.equal(shipCheckpointCommit(issue), null);
+  issue.checkpoint!.commit = 'b'.repeat(40);
+  assert.equal(shipCheckpointCommit(issue), 'b'.repeat(40));
 });
 
 void test('stop needs live work and archive needs a stopped run', () => {

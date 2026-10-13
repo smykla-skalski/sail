@@ -34,6 +34,7 @@ function permission(key: string, receivedAt = 100): InboxItem {
     agent: 'Claude',
     agentId: 'claude',
     directory: '/projects/alpha',
+    repository: '/projects/alpha',
     project: 'alpha',
     worktree: null,
     sessionId: key,
@@ -153,7 +154,12 @@ void test('a worker thread that already shows a request is not counted twice', (
     now,
     requestThreads: threadRequestKeys(requests),
   });
-  assert.deepEqual(both, []);
+  assert.equal(both.length, 1);
+  assert.equal(both[0].suppressed, true);
+  assert.deepEqual(
+    applyAttentionLifecycle(emptyAttentionLedger, [...requests, ...both], now).items.length,
+    1,
+  );
   assert.deepEqual(kinds(shipAttentionCandidates([run], { mergeOwner: 'you', now })), [
     'ship-needs-input:ship-issue',
   ]);
@@ -193,6 +199,23 @@ void test('waiting subagents become items unless their thread shows a request', 
     sessionRequestCandidates([{ ...permission('child'), sessionId: 'child' }]),
   );
   assert.deepEqual(subagentAttentionCandidates([receipt()], requests), []);
+});
+
+void test('waiting subagents in worktrees group under their repository', () => {
+  const [item] = subagentAttentionCandidates(
+    [receipt({ project: '/worktrees/alpha-feature', targetDirectory: '/worktrees/alpha-feature' })],
+    new Set(),
+    new Set(),
+    {
+      repositories: ['/projects/alpha'],
+      groups: [],
+      worktrees: {
+        '/projects/alpha': [{ path: '/worktrees/alpha-feature', branch: 'feature' }],
+      },
+    },
+  );
+  assert.equal(item.repository, '/projects/alpha');
+  assert.equal(item.repo, 'alpha');
 });
 
 void test('Ship workers and validation gates are not counted as subagents', () => {
@@ -236,6 +259,16 @@ void test('a dismissed item returns on its next state change', () => {
   view = applyAttentionLifecycle(view.ledger, [ready], now + 99_999_999);
   assert.deepEqual(view.items, [], 'a dismissal does not expire with time');
 
+  const changedReason = { ...ready, detail: 'A different blocker reason' };
+  view = applyAttentionLifecycle(view.ledger, [changedReason], now + 99_999_999);
+  assert.equal(view.items[0].detail, 'A different blocker reason');
+  view = applyAttentionLifecycle(
+    dismissAttention(view.ledger, view.items[0]),
+    [changedReason],
+    now,
+  );
+  assert.deepEqual(view.items, []);
+
   const other: AttentionCandidate = {
     ...ready,
     id: 'ship-needs-input:x',
@@ -254,7 +287,70 @@ void test('a dismissed item returns on its next state change', () => {
   assert.equal(view.items[0].since, back);
 });
 
-void test('an item that is missing for a moment keeps its dismissal and start time', () => {
+void test('a changed Ship blocker reason restores a dismissed item', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, { state: 'working', workerState: 'working', reportedStatus: 'blocked' });
+  issue.blockedReason = 'First reason';
+  const [first] = shipAttentionCandidates([run], { mergeOwner: 'you', now });
+  let view = applyAttentionLifecycle(emptyAttentionLedger, [first], now);
+  const stored = loadAttentionLedger(JSON.stringify(dismissAttention(view.ledger, view.items[0])));
+
+  issue.blockedReason = 'Second reason';
+  const [second] = shipAttentionCandidates([run], { mergeOwner: 'you', now: now + 1 });
+  assert.equal(second.id, first.id);
+  view = applyAttentionLifecycle(stored, [second], now + 1);
+  assert.equal(view.items[0].detail, 'Second reason');
+});
+
+void test('a pending worker request preserves the Ship dismissal it replaces', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'working',
+    workerState: 'waiting',
+    path: '/projects/alpha',
+    threadId: 'acp:claude:s1',
+  });
+  const options = { mergeOwner: 'you' as const, now };
+  const [blocked] = shipAttentionCandidates([run], options);
+  let view = applyAttentionLifecycle(emptyAttentionLedger, [blocked], now);
+  view = applyAttentionLifecycle(dismissAttention(view.ledger, view.items[0]), [blocked], now);
+
+  const requests = sessionRequestCandidates([{ ...permission('s1'), sessionId: 's1' }]);
+  const [suppressed] = shipAttentionCandidates([run], {
+    ...options,
+    requestThreads: threadRequestKeys(requests),
+  });
+  view = applyAttentionLifecycle(view.ledger, [...requests, suppressed], now + 1);
+  assert.deepEqual(
+    view.items.map((item) => item.kind),
+    ['permission'],
+  );
+  assert.ok(view.ledger.hidden[blocked.id]);
+
+  view = applyAttentionLifecycle(view.ledger, [blocked], now + 2);
+  assert.deepEqual(view.items, []);
+});
+
+void test('a saved dismissal without a state snapshot stays hidden until a change', () => {
+  const [ready] = shipAttentionCandidates([readyRun()], { mergeOwner: 'you', now });
+  const legacy = loadAttentionLedger(
+    JSON.stringify({
+      seen: { [ready.id]: now },
+      hidden: { [ready.id]: { mode: 'dismissed', since: now } },
+    }),
+  );
+  const view = applyAttentionLifecycle(legacy, [ready], now + 1);
+  assert.deepEqual(view.items, []);
+  assert.equal(typeof view.ledger.hidden[ready.id].state, 'string');
+  assert.equal(
+    applyAttentionLifecycle(view.ledger, [{ ...ready, detail: 'Changed' }], now + 2).items.length,
+    1,
+  );
+});
+
+void test('a dismissed item returns after resolving within the grace period', () => {
   const [ready] = shipAttentionCandidates([readyRun()], { mergeOwner: 'you', now });
   let view = applyAttentionLifecycle(emptyAttentionLedger, [ready], now);
   const since = view.items[0].since;
@@ -262,7 +358,7 @@ void test('an item that is missing for a moment keeps its dismissal and start ti
   view = applyAttentionLifecycle(view.ledger, [], now + 1_000);
   assert.deepEqual(view.items, []);
   view = applyAttentionLifecycle(view.ledger, [ready], now + 30_000);
-  assert.deepEqual(view.items, [], 'a source that loads late does not undo a dismissal');
+  assert.equal(view.items.length, 1, 'resolving and re-blocking is a state change');
   assert.deepEqual(view.ledger.gone ?? {}, {});
   assert.equal(view.ledger.seen[ready.id], since);
 });

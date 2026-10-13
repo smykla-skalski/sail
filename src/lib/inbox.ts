@@ -3,6 +3,7 @@ import { permissionDecisionTitle, type PermissionPolicyDecision } from './capabi
 
 export type InboxLocation = {
   directory: string;
+  repository: string;
   project: string;
   worktree: string | null;
 };
@@ -150,15 +151,37 @@ export function repositoryName(path: string): string {
   return path.split(/[\\/]/).findLast((part) => !!part) ?? path;
 }
 
+export function inboxRepositoryLabel(repository: string, repositories: string[]): string {
+  const name = repositoryName(repository);
+  const duplicates = repositories.filter(
+    (other) => other !== repository && repositoryName(other) === name,
+  );
+  if (!duplicates.length) return name;
+  const parents = repository.split(/[\\/]/).filter(Boolean).slice(0, -1);
+  for (let depth = 1; depth <= parents.length; depth++) {
+    const suffix = parents.slice(-depth).join('/');
+    if (
+      duplicates.every(
+        (other) =>
+          other.split(/[\\/]/).filter(Boolean).slice(0, -1).slice(-depth).join('/') !== suffix,
+      )
+    )
+      return `${name} · ${suffix}`;
+  }
+  return repository;
+}
+
 export function inboxLocations(catalog: ProjectCatalog): InboxLocation[] {
   return catalog.repositories.flatMap((repository) => [
     {
       directory: repository,
+      repository,
       project: repositoryName(repository),
       worktree: null,
     },
     ...(catalog.worktrees[repository] ?? []).map((worktree) => ({
       directory: worktree.path,
+      repository,
       project: repositoryName(repository),
       worktree: worktree.branch,
     })),

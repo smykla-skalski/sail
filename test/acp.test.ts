@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acp,
   acpDisconnectAffectsSession,
+  acpSessionOwner,
+  acpRestoreMode,
   acpCancelMatchesSession,
   acpEventMatchesSession,
   applyLiveTranscriptUpdate,
@@ -10,11 +13,16 @@ import {
   groupAgentEntries,
   invalidateLiveTranscript,
   liveSessionView,
+  markLiveMessageBoundary,
+  restoredLiveTurnIsCurrent,
   liveTranscriptLimit,
   loadRecentTranscript,
   rememberSessionState,
+  recoverMissingCodexSession,
   restoreEntryTimes,
+  restoreOwnedEntries,
   saveRecentTranscript,
+  saveRecentTranscriptAfterPaint,
   sessionState,
   takeLiveTranscript,
   trackLiveTranscript,
@@ -31,6 +39,104 @@ import { toolCommand } from '../src/lib/tool-display.ts';
 const normalizeEntries = (entries: AgentEntry[]) =>
   entries.map((entry) => (entry.type === 'tool' ? entry : { ...entry, id: entry.type }));
 
+void test('owned thread restore chooses the advertised provider mode', () => {
+  assert.equal(acpRestoreMode({ sessionCapabilities: { resume: {} } }), 'resume');
+  assert.equal(acpRestoreMode({ loadSession: true }), 'load');
+  assert.equal(
+    acpRestoreMode({ loadSession: true, sessionCapabilities: { resume: {}, subagents: {} } }),
+    'load',
+  );
+  assert.equal(acpRestoreMode({ loadSession: false, sessionCapabilities: {} }), null);
+});
+
+void test('a stale Codex session resumes before retrying its prompt', async () => {
+  const calls: string[] = [];
+  const response = await recoverMissingCodexSession(
+    'codex',
+    async () => {
+      calls.push('prompt');
+      if (calls.length === 1) throw new Error('Session not found: codex-test');
+      return 'recovered';
+    },
+    async () => {
+      calls.push('resume');
+    },
+  );
+  assert.equal(response, 'recovered');
+  assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
+});
+
+void test('a failed history load can restore Codex backend registration on send', async () => {
+  const calls: string[] = [];
+  let registered = false;
+  const response = await recoverMissingCodexSession(
+    'codex',
+    async () => {
+      calls.push('prompt');
+      if (!registered) throw new Error('Agent session is not connected in this worktree.');
+      return 'sent';
+    },
+    async () => {
+      calls.push('resume');
+      registered = true;
+    },
+  );
+  assert.equal(response, 'sent');
+  assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
+});
+
+void test('prompt recovery leaves other errors and agents untouched', async () => {
+  await Promise.all(
+    [
+      ['codex', 'Permission denied'],
+      ['codex', 'Agent session is not connected in another worktree.'],
+      ['claude', 'Session not found: claude-test'],
+      ['claude', 'Agent session is not connected in this worktree.'],
+    ].map(async ([agent, message]) => {
+      let resumes = 0;
+      await assert.rejects(
+        recoverMissingCodexSession(
+          agent,
+          async () => {
+            throw new Error(message);
+          },
+          async () => {
+            resumes += 1;
+          },
+        ),
+        { message },
+      );
+      assert.equal(resumes, 0);
+    }),
+  );
+});
+
+void test('a missing Codex session is retried only once', async () => {
+  await Promise.all(
+    ['Session not found: codex-test', 'Agent session is not connected in this worktree.'].map(
+      async (message) => {
+        let prompts = 0;
+        let resumes = 0;
+        await assert.rejects(
+          recoverMissingCodexSession(
+            'codex',
+            async () => {
+              prompts += 1;
+              throw new Error(message);
+            },
+            async () => {
+              resumes += 1;
+            },
+          ),
+          { message },
+        );
+        assert.equal(prompts, 2);
+        assert.equal(resumes, 1);
+      },
+    ),
+  );
+});
+
 void test('scoped ACP disconnect only affects sessions from the exited connection', () => {
   const message: AgentEvent['message'] = {
     method: 'sail/disconnected',
@@ -42,6 +148,13 @@ void test('scoped ACP disconnect only affects sessions from the exited connectio
   assert.equal(acpDisconnectAffectsSession(message, 'build-session', 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'review'), true);
+});
+
+void test('a reopened owned thread reconnects to its run', () => {
+  const owner = '0d66d3a1-5c47-45d1-8c3d-4a789f129001';
+  assert.equal(acpSessionOwner(`sail-owned:${owner}:wire-session`), owner);
+  assert.equal(acpSessionOwner('wire-session'), null);
+  assert.equal(acpSessionOwner('sail-owned:invalid:wire-session'), null);
 });
 
 void test('ACP replay ignores updates from a sibling worktree with the same session ID', () => {
@@ -113,6 +226,145 @@ void test('ACP chunks stream into one assistant message and tool updates keep th
     content: 'Done',
     terminalIds: [],
   });
+});
+
+void test('a resumed live chunk starts after an incomplete cached assistant message', () => {
+  const cached = updateEntries([], {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Historical answer' },
+  });
+  const resumed = updateEntries(cached, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Live answer' },
+    sailStartNewMessage: true,
+  });
+  assert.equal(resumed.length, 2);
+  assert.equal(resumed[0]?.type === 'assistant' && resumed[0].text, 'Historical answer');
+  assert.equal(resumed[1]?.type === 'assistant' && resumed[1].text, 'Live answer');
+});
+
+void test('a live chunk arriving before restore reservation keeps the cached message separate', async () => {
+  const cached = updateEntries([], {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Historical answer' },
+  });
+  const view = liveSessionView(cached, null, undefined);
+  const boundary = view.messageBoundary;
+  let finishConnect!: () => void;
+  const connecting = new Promise<void>((resolve) => {
+    finishConnect = resolve;
+  });
+  const activate = async () => {
+    await connecting;
+    return { liveTurn: 'turn-1' };
+  };
+  const reservation = activate();
+  const first = markLiveMessageBoundary(
+    {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Live ' },
+    },
+    boundary,
+  );
+  let entries = updateEntries(view.entries, first);
+  finishConnect();
+  assert.deepEqual(await reservation, { liveTurn: 'turn-1' });
+  entries = updateEntries(
+    entries,
+    markLiveMessageBoundary(
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answer' } },
+      boundary,
+    ),
+  );
+  assert.deepEqual(
+    entries.map((entry) => entry.type === 'assistant' && entry.text),
+    ['Historical answer', 'Live answer'],
+  );
+});
+
+void test('a workspace load does not join a concurrent background resume', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const calls: string[] = [];
+  let held = false;
+  let nextToken = 0;
+  const waiting: Array<() => void> = [];
+  let resumeStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resumeStarted = resolve;
+  });
+  let finishResume!: (value: Record<string, unknown>) => void;
+  const resumeResponse = new Promise<Record<string, unknown>>((resolve) => {
+    finishResume = resolve;
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          calls.push(command);
+          if (command === 'acp_begin_session_restore') {
+            if (held) await new Promise<void>((resolve) => waiting.push(resolve));
+            held = true;
+            return { restoreToken: `token-${++nextToken}` };
+          }
+          if (command === 'acp_end_session_restore') {
+            held = false;
+            waiting.shift()?.();
+            return undefined;
+          }
+          if (command === 'acp_resume_session') {
+            resumeStarted();
+            return resumeResponse;
+          }
+          if (command === 'acp_load_session') return { configOptions: [], history: 'replayed' };
+          throw new Error(`Unexpected command: ${command}`);
+        },
+      },
+    },
+  });
+  try {
+    const resume = acp.resume('claude', '/repo', 'shared-session', 'build');
+    await started;
+    const reservation = acp.beginRestore('claude', '/repo', 'shared-session', 'build');
+    finishResume({ configOptions: [], history: 'resume-only' });
+    assert.equal((await resume).history, 'resume-only');
+    const token = (await reservation).restoreToken;
+    assert.equal(token, 'token-2');
+    assert.equal(
+      (await acp.load('claude', '/repo', 'shared-session', 'build', token)).history,
+      'replayed',
+    );
+    await acp.endRestore('claude', '/repo', 'shared-session', token);
+    assert.deepEqual(calls, [
+      'acp_begin_session_restore',
+      'acp_resume_session',
+      'acp_begin_session_restore',
+      'acp_end_session_restore',
+      'acp_load_session',
+      'acp_end_session_restore',
+    ]);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
+
+void test('a finished event overtakes a live restore snapshot without reviving its turn', async () => {
+  const finished: string[] = [];
+  let returnActivity!: (turnId: string) => void;
+  const activity = new Promise<string>((resolve) => {
+    returnActivity = resolve;
+  });
+  const reconcile = async () => restoredLiveTurnIsCurrent('turn-1', await activity, finished);
+  const pending = reconcile();
+  // The backend sampled turn-1 while it was active; its finish event reaches the webview
+  // before the activity result does.
+  finished.push('turn-1');
+  returnActivity('turn-1');
+  assert.equal(await pending, false);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', 'turn-1', []), true);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', undefined, []), false);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', 'turn-1', ['turn-2']), true);
 });
 
 void test('ACP tool calls keep terminal references across updates', () => {
@@ -227,6 +479,18 @@ void test('history replay keeps recent message times for subagent order', () => 
   );
 });
 
+void test('owned restore retains a complete local transcript when provider replay is empty or partial', () => {
+  const saved: AgentEntry[] = Array.from({ length: 80 }, (_, index) => ({
+    id: `saved-${index}`,
+    type: 'assistant',
+    text: `Owned history ${index}`,
+    created: index,
+  }));
+  assert.deepEqual(restoreOwnedEntries([], saved), saved);
+  assert.deepEqual(restoreOwnedEntries(saved.slice(-50), saved), saved);
+  assert.equal(restoreOwnedEntries(saved, saved).length, 80);
+});
+
 void test('recent transcript cache keeps the latest entries within a size budget', () => {
   const values = new Map<string, string>();
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
@@ -321,6 +585,78 @@ void test('recent transcript cache keeps the latest entries within a size budget
     forgetRecentTranscript(thread);
     assert.deepEqual(loadRecentTranscript(thread), []);
   } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
+void test('recent transcript reads stay safe when browser storage is blocked', () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    get: () => {
+      throw new DOMException('Storage blocked', 'SecurityError');
+    },
+  });
+  const thread: AgentThread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'blocked',
+    title: 'Blocked',
+    updated: 0,
+  };
+  try {
+    assert.deepEqual(loadRecentTranscript(thread), []);
+    assert.deepEqual(loadRecentTranscript(thread), []);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
+void test('switching threads shows recent entries immediately and persists them after the switch', async () => {
+  const values = new Map<string, string>();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => void values.set(key, value),
+    },
+  });
+  const thread: AgentThread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'deferred',
+    title: 'Deferred',
+    updated: 0,
+  };
+  try {
+    saveRecentTranscriptAfterPaint(thread, [{ id: 'first', type: 'assistant', text: 'First' }]);
+
+    assert.deepEqual(
+      loadRecentTranscript(thread).map((entry) => entry.id),
+      ['first'],
+    );
+    assert.equal(values.get('sai-agent-transcript-cache')?.includes('first') ?? false, false);
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(values.get('sai-agent-transcript-cache')?.includes('first'), true);
+
+    saveRecentTranscriptAfterPaint(thread, [{ id: 'stale', type: 'assistant', text: 'Stale' }]);
+    saveRecentTranscript(thread, [{ id: 'latest', type: 'assistant', text: 'Latest' }]);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(
+      loadRecentTranscript(thread).map((entry) => entry.id),
+      ['latest'],
+    );
+
+    saveRecentTranscriptAfterPaint(thread, [{ id: 'deleted', type: 'assistant', text: 'Deleted' }]);
+    forgetRecentTranscript(thread);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(loadRecentTranscript(thread), []);
+  } finally {
+    forgetRecentTranscript(thread);
     if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
     else Reflect.deleteProperty(globalThis, 'localStorage');
   }
@@ -481,7 +817,12 @@ void test('without a complete kept transcript the capped cache is shown as incom
   assert.equal(takeLiveTranscript('claude', '/repo', 'replayed'), null);
   trackLiveTranscript('claude', '/repo', 'unknown-state', [], true);
   const reloaded = liveSessionView(cached, null, sessionState('claude', '/repo', 'unknown-state'));
-  assert.deepEqual(reloaded, { complete: false, entries: cached, configOptions: [] });
+  assert.deepEqual(reloaded, {
+    complete: false,
+    messageBoundary: { pending: true },
+    entries: cached,
+    configOptions: [],
+  });
   takeLiveTranscript('claude', '/repo', 'unknown-state');
 });
 

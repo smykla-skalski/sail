@@ -8,8 +8,10 @@ import {
   shortcutForEvent,
   shortcutLabel,
   shortcuts,
+  terminalDivertsKey,
   terminalOwnsKey,
   type ShortcutId,
+  type ShortcutPlatform,
 } from '../src/lib/shortcuts.ts';
 
 const key = (
@@ -17,13 +19,43 @@ const key = (
   modifiers: Partial<Record<'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey', boolean>> = {},
 ) => ({ key: value, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...modifiers });
 
-void test('Command J goes to the next attention item and Command Shift J stays side chat', () => {
-  assert.equal(shortcutForEvent(key('j', { metaKey: true }))?.id, 'attention.next');
-  assert.equal(shortcutForEvent(key('J', { metaKey: true, shiftKey: true }))?.id, 'chat.side');
-  assert.equal(shortcutForEvent(key('j', { ctrlKey: true }))?.id, 'attention.next');
-  assert.equal(shortcutForEvent(key('j', { ctrlKey: true, shiftKey: true })), undefined);
-  assert.equal(shortcutForEvent(key('j')), undefined);
-  assert.equal(shortcutForEvent(key('j', { metaKey: true, altKey: true })), undefined);
+void test('primary shortcuts use Command on macOS and Control elsewhere', () => {
+  for (const shortcut of shortcuts.filter((entry) => entry.modifier === 'primary')) {
+    for (const platform of ['mac', 'other'] as const) {
+      const primary = platform === 'mac' ? { metaKey: true } : { ctrlKey: true };
+      const secondary = platform === 'mac' ? { ctrlKey: true } : { metaKey: true };
+      const event = { shiftKey: shortcut.shift ?? false };
+      assert.equal(
+        matches(key(shortcut.keys[0], { ...primary, ...event }), shortcut.id, platform),
+        true,
+        shortcut.id,
+      );
+      assert.equal(
+        matches(key(shortcut.keys[0], { ...secondary, ...event }), shortcut.id, platform),
+        false,
+        shortcut.id,
+      );
+      assert.equal(
+        matches(
+          key(shortcut.keys[0], { metaKey: true, ctrlKey: true, ...event }),
+          shortcut.id,
+          platform,
+        ),
+        false,
+        shortcut.id,
+      );
+    }
+  }
+  assert.equal(shortcutForEvent(key('j', { metaKey: true }), 'mac')?.id, 'attention.next');
+  assert.equal(shortcutForEvent(key('j', { ctrlKey: true }), 'mac'), undefined);
+  assert.equal(shortcutForEvent(key('j', { ctrlKey: true }), 'other')?.id, 'attention.next');
+  assert.equal(
+    shortcutForEvent(key('J', { metaKey: true, shiftKey: true }), 'mac')?.id,
+    'chat.side',
+  );
+  assert.equal(shortcutForEvent(key('j', { ctrlKey: true, shiftKey: true }), 'mac'), undefined);
+  assert.equal(shortcutForEvent(key('j'), 'mac'), undefined);
+  assert.equal(shortcutForEvent(key('j', { metaKey: true, altKey: true }), 'mac'), undefined);
 });
 
 void test('no two shortcuts match the same key press', () => {
@@ -37,29 +69,34 @@ void test('no two shortcuts match the same key press', () => {
       ),
     ),
   );
-  for (const event of combos) {
-    const owners = shortcuts.filter((shortcut) => matches(event, shortcut.id));
-    assert.ok(owners.length <= 1, `${event.key} ${JSON.stringify(event)} matches ${owners.length}`);
+  for (const platform of ['mac', 'other'] as const) {
+    for (const event of combos) {
+      const owners = shortcuts.filter((shortcut) => matches(event, shortcut.id, platform));
+      assert.ok(
+        owners.length <= 1,
+        `${platform} ${event.key} ${JSON.stringify(event)} matches ${owners.length}`,
+      );
+    }
   }
 });
 
 void test('existing workspace shortcuts keep their modifiers', () => {
-  const cases: [ShortcutId, ReturnType<typeof key>, boolean][] = [
-    ['sidebar.toggle', key('b', { metaKey: true }), true],
-    ['sidebar.toggle', key('b', { ctrlKey: true, shiftKey: true }), false],
-    ['threads.cycle', key('Tab', { ctrlKey: true, shiftKey: true }), true],
-    ['threads.cycle', key('Tab', { metaKey: true }), false],
-    ['threads.jump', key('3', { metaKey: true }), true],
-    ['threads.jump', key('3', { ctrlKey: true }), false],
-    ['threads.jump', key('0', { metaKey: true }), false],
-    ['worktree.close', key('W', { metaKey: true, shiftKey: true }), true],
-    ['pane.close', key('w', { ctrlKey: true }), true],
-    ['pane.split', key('d', { metaKey: true, shiftKey: true }), true],
-    ['settings.open', key(',', { metaKey: true }), true],
-    ['details.toggle', key('l', { metaKey: true }), true],
+  const cases: [ShortcutId, ReturnType<typeof key>, ShortcutPlatform, boolean][] = [
+    ['sidebar.toggle', key('b', { metaKey: true }), 'mac', true],
+    ['sidebar.toggle', key('b', { ctrlKey: true, shiftKey: true }), 'mac', false],
+    ['threads.cycle', key('Tab', { ctrlKey: true, shiftKey: true }), 'mac', true],
+    ['threads.cycle', key('Tab', { metaKey: true }), 'mac', false],
+    ['threads.jump', key('3', { metaKey: true }), 'mac', true],
+    ['threads.jump', key('3', { ctrlKey: true }), 'mac', false],
+    ['threads.jump', key('0', { metaKey: true }), 'mac', false],
+    ['worktree.close', key('W', { metaKey: true, shiftKey: true }), 'mac', true],
+    ['pane.close', key('w', { ctrlKey: true }), 'mac', false],
+    ['pane.split', key('d', { metaKey: true, shiftKey: true }), 'mac', true],
+    ['settings.open', key(',', { metaKey: true }), 'mac', true],
+    ['details.toggle', key('l', { metaKey: true }), 'mac', true],
   ];
-  for (const [id, event, expected] of cases)
-    assert.equal(matches(event, id), expected, `${id} ${event.key}`);
+  for (const [id, event, platform, expected] of cases)
+    assert.equal(matches(event, id, platform), expected, `${id} ${event.key}`);
 });
 
 void test('labels and aria-keyshortcuts come from the registry', () => {
@@ -67,19 +104,35 @@ void test('labels and aria-keyshortcuts come from the registry', () => {
   assert.equal(shortcutLabel(shortcutFor('attention.next'), 'other'), 'Ctrl+J');
   assert.equal(shortcutLabel(shortcutFor('chat.side'), 'mac'), '⌘⇧J');
   assert.equal(shortcutLabel(shortcutFor('threads.cycle'), 'mac'), '⌃Tab');
-  assert.equal(ariaKeyShortcutsFor('attention.next'), 'Meta+J Control+J');
-  assert.equal(ariaKeyShortcutsFor('chat.side'), 'Meta+Shift+J');
+  assert.equal(ariaKeyShortcutsFor('attention.next', 'mac'), 'Meta+J');
+  assert.equal(ariaKeyShortcutsFor('attention.next', 'other'), 'Control+J');
+  assert.equal(ariaKeyShortcutsFor('chat.side', 'mac'), 'Meta+Shift+J');
   assert.equal(shortcutFor('attention.next').label, 'Go to next item needing attention');
   assert.equal(new Set(shortcuts.map((shortcut) => shortcut.id)).size, shortcuts.length);
 });
 
-void test('Command slash opens the shortcut sheet with either modifier and any Shift state', () => {
-  assert.equal(shortcutForEvent(key('/', { metaKey: true }))?.id, 'shortcuts.help');
-  assert.equal(shortcutForEvent(key('/', { ctrlKey: true }))?.id, 'shortcuts.help');
-  assert.equal(shortcutForEvent(key('/', { metaKey: true, shiftKey: true }))?.id, 'shortcuts.help');
-  assert.equal(shortcutForEvent(key('/')), undefined);
+void test('shortcut sheet uses the platform primary modifier with any Shift state', () => {
+  assert.equal(shortcutForEvent(key('/', { metaKey: true }), 'mac')?.id, 'shortcuts.help');
+  assert.equal(shortcutForEvent(key('/', { ctrlKey: true }), 'mac'), undefined);
+  assert.equal(shortcutForEvent(key('/', { ctrlKey: true }), 'other')?.id, 'shortcuts.help');
+  assert.equal(
+    shortcutForEvent(key('/', { metaKey: true, shiftKey: true }), 'mac')?.id,
+    'shortcuts.help',
+  );
+  assert.equal(shortcutForEvent(key('/'), 'mac'), undefined);
   assert.equal(shortcutLabel(shortcutFor('shortcuts.help'), 'mac'), '⌘/');
   assert.equal(shortcutLabel(shortcutFor('shortcuts.help'), 'other'), 'Ctrl+/');
+});
+
+void test('terminal keeps macOS Control input while diverting workspace shortcuts', () => {
+  for (const value of ['w', 'd', 't', 'k', 'n']) {
+    assert.equal(terminalDivertsKey(key(value, { ctrlKey: true }), 'mac'), false, value);
+    assert.equal(terminalDivertsKey(key(value, { metaKey: true }), 'mac'), true, value);
+    assert.equal(terminalDivertsKey(key(value, { ctrlKey: true }), 'other'), true, value);
+    assert.equal(terminalDivertsKey(key(value, { metaKey: true }), 'other'), false, value);
+  }
+  assert.equal(terminalDivertsKey(key('ArrowLeft', { ctrlKey: true, altKey: true }), 'mac'), true);
+  assert.equal(terminalDivertsKey(key('F6'), 'mac'), true);
 });
 
 void test('every registry entry has a label and a sheet label on each platform', () => {

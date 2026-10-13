@@ -4,7 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { Button } from '@smykla-skalski/sui';
   import { invoke } from '@tauri-apps/api/core';
-  import { open as openDialog } from '@tauri-apps/plugin-dialog';
+  import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
   import OptionPicker from './OptionPicker.svelte';
   import { getSetting } from './lib/settings';
   import {
@@ -49,6 +49,7 @@
     exportMemories,
     memoryKinds,
     parseMemoryTags,
+    resolveHandoffExpiry,
     type MemoryAgentInstallPreview,
     type MemoryAgentStatus,
     type MemoryImportCandidate,
@@ -59,10 +60,17 @@
     type MemoryRecord,
     type MemorySearchResult,
     type MemoryStatus,
+    type KnowledgePreview,
+    type KnowledgeChange,
   } from './lib/shared-memory';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
-  type WorktreeStoragePending = { cacheKey: string; reason: string };
+  type WorktreeStoragePending = {
+    cacheKey: string;
+    reason: string;
+    sizeBytes: number | null;
+    cleanupToken: string | null;
+  };
   let worktreeStoragePending = $state<WorktreeStoragePending[]>([]);
   let worktreeStorageLoading = $state(false);
   let worktreeStorageError = $state('');
@@ -125,13 +133,47 @@
   let memoryContent = $state('');
   let memoryKind = $state<MemoryKind>('other');
   let memoryTags = $state('');
+  let memoryExpiry = $state('');
+  let memoryCorrectionOriginalValue = '';
+  let memoryCorrectionOriginalTimestamp: number | null = null;
+  let memorySupersedesId = $state('');
+  let memoryResolveConflicts = $state(false);
+  let pendingConflict = $state('');
+  let conflictOtherId = $state('');
   let memoryLoading = $state(false);
   let memoryStorageError = $state('');
+  let knowledgeMemoryId = $state('');
+  let knowledgeDestination = $state('');
+  let knowledgeText = $state('');
+  let knowledgePreview = $state<{
+    result: KnowledgePreview;
+    memoryId: string;
+    destination: string;
+    text: string;
+    directory: string;
+  } | null>(null);
+  let knowledgeChange = $state<KnowledgeChange | null>(null);
+  let knowledgeError = $state('');
+  let knowledgeLoading = $state(false);
+  const knowledgeReviewCurrent = $derived(
+    knowledgePreview !== null &&
+      knowledgePreview.memoryId === knowledgeMemoryId &&
+      knowledgePreview.destination === knowledgeDestination &&
+      knowledgePreview.text === knowledgeText &&
+      knowledgePreview.directory === snapshot?.directory,
+  );
+  const selectedKnowledgeMemory = $derived(
+    memoryRecords.find((record) => record.id === knowledgeMemoryId),
+  );
   let memoryAgentError = $state('');
   let memoryConfigError = $state('');
   let memoryRequest = 0;
   let memoryDirectory = '';
   let pendingForget = $state('');
+  let pendingExpiry = $state('');
+  let expiryEditValue = $state('');
+  let expiryEditOriginalValue = '';
+  let expiryEditOriginalTimestamp: number | null = null;
   let agentPreview = $state<{
     action: 'install' | 'uninstall';
     result: MemoryAgentInstallPreview;
@@ -194,6 +236,7 @@
   }
 
   async function refreshWorktreeStorage(retry = false) {
+    if (worktreeStorageLoading) return;
     worktreeStorageLoading = true;
     worktreeStorageError = '';
     try {
@@ -202,6 +245,49 @@
       );
     } catch (cause) {
       worktreeStorageError = `Private agent storage status: ${String(cause)}`;
+    } finally {
+      worktreeStorageLoading = false;
+    }
+  }
+
+  function formatStorageSize(bytes: number | null): string {
+    if (bytes === null) return 'Size unavailable';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = -1;
+    do {
+      value /= 1024;
+      unit += 1;
+    } while (value >= 1024 && unit < units.length - 1);
+    return `${value.toFixed(1)} ${units[unit]}`;
+  }
+
+  async function cleanPendingTemp(item: WorktreeStoragePending) {
+    if (!item.cleanupToken || worktreeStorageLoading) return;
+    let confirmed: boolean;
+    try {
+      confirmed = await ask(
+        `I checked that no process is using this ${formatStorageSize(item.sizeBytes)} of temporary data (${item.reason}). Remove it?`,
+        { title: 'Clean pending temporary data' },
+      );
+    } catch (cause) {
+      worktreeStorageError = `Private agent storage confirmation: ${String(cause)}`;
+      return;
+    }
+    if (!confirmed) return;
+    worktreeStorageLoading = true;
+    worktreeStorageError = '';
+    try {
+      worktreeStoragePending = await invoke<WorktreeStoragePending[]>(
+        'clean_pending_worktree_temp',
+        {
+          token: item.cleanupToken,
+          confirmedUnused: true,
+        },
+      );
+    } catch (cause) {
+      worktreeStorageError = `Private agent storage cleanup: ${String(cause)}`;
     } finally {
       worktreeStorageLoading = false;
     }
@@ -252,7 +338,8 @@
       await invoke('context_approve_provider', { directory, expectedFingerprint });
       if (snapshot?.directory === directory) {
         await refreshContext(directory);
-        contextMessage = 'Provider approved for this project. Connection is not available yet.';
+        contextMessage =
+          'Provider approved for this project. Approval does not show connection health.';
       }
     } catch (cause) {
       if (snapshot?.directory === directory) {
@@ -286,6 +373,12 @@
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
     if (memoryDirectory !== directory) {
+      knowledgeMemoryId = '';
+      knowledgeDestination = '';
+      knowledgeText = '';
+      knowledgePreview = null;
+      knowledgeChange = null;
+      knowledgeError = '';
       memoryStatus = null;
       memoryRecords = [];
       memoryImportCandidates = [];
@@ -293,6 +386,17 @@
       memoryImportMessage = '';
       memoryQuery = '';
       pendingForget = '';
+      pendingExpiry = '';
+      expiryEditValue = '';
+      expiryEditOriginalValue = '';
+      expiryEditOriginalTimestamp = null;
+      memoryExpiry = '';
+      memoryCorrectionOriginalValue = '';
+      memoryCorrectionOriginalTimestamp = null;
+      memorySupersedesId = '';
+      memoryResolveConflicts = false;
+      pendingConflict = '';
+      conflictOtherId = '';
       agentPreview = null;
       previewRequest += 1;
       memoryProviderStatus = null;
@@ -449,18 +553,115 @@
     }
   }
 
+  async function previewKnowledge() {
+    const directory = snapshot?.directory;
+    if (!directory || !knowledgeMemoryId || !knowledgeDestination.trim() || !knowledgeText.trim())
+      return;
+    knowledgeLoading = true;
+    knowledgeError = '';
+    knowledgeChange = null;
+    knowledgePreview = null;
+    const memoryId = knowledgeMemoryId;
+    const destination = knowledgeDestination;
+    const text = knowledgeText;
+    try {
+      const result = await invoke<KnowledgePreview>('preview_project_knowledge', {
+        directory,
+        memoryId,
+        destination,
+        proposedText: text,
+      });
+      if (snapshot?.directory === directory) {
+        knowledgePreview = { result, memoryId, destination, text, directory };
+      }
+    } catch (cause) {
+      knowledgeError = String(cause);
+    } finally {
+      knowledgeLoading = false;
+    }
+  }
+
+  async function rejectKnowledge() {
+    const preview = knowledgePreview;
+    knowledgePreview = null;
+    if (!preview) return;
+    try {
+      await invoke('reject_project_knowledge', { token: preview.result.token });
+    } catch (cause) {
+      knowledgeError = String(cause);
+    }
+  }
+
+  async function acceptKnowledge() {
+    const preview = knowledgePreview;
+    if (!preview || !knowledgeReviewCurrent) return;
+    knowledgeLoading = true;
+    knowledgeError = '';
+    try {
+      knowledgeChange = await invoke<KnowledgeChange>('accept_project_knowledge', {
+        token: preview.result.token,
+      });
+      knowledgePreview = null;
+    } catch (cause) {
+      knowledgePreview = null;
+      knowledgeError = String(cause);
+    } finally {
+      knowledgeLoading = false;
+    }
+  }
+
   async function rememberMemory() {
     const directory = snapshot?.directory;
     const content = memoryContent.trim();
     if (!directory || !content) return;
     memoryStorageError = '';
+    const resolvedExpiry = resolveHandoffExpiry(
+      memoryExpiry,
+      memoryCorrectionOriginalValue,
+      memoryCorrectionOriginalTimestamp,
+    );
+    const expiresAt = memoryKind === 'handoff' ? (resolvedExpiry ?? undefined) : undefined;
+    if (expiresAt !== undefined && !Number.isFinite(expiresAt)) {
+      memoryStorageError = 'Storage: Enter a valid handoff expiry.';
+      return;
+    }
     try {
-      await invoke<MemoryRecord>('memory_remember', {
-        directory,
-        input: { content, kind: memoryKind, tags: parseMemoryTags(memoryTags) },
-      });
+      const input = { content, kind: memoryKind, tags: parseMemoryTags(memoryTags), expiresAt };
+      if (memorySupersedesId) {
+        await invoke<MemoryRecord>('memory_supersede', {
+          directory,
+          id: memorySupersedesId,
+          input,
+          resolveConflicts: memoryResolveConflicts,
+        });
+      } else {
+        await invoke<MemoryRecord>('memory_remember', { directory, input });
+      }
       memoryContent = '';
       memoryTags = '';
+      memoryExpiry = '';
+      memoryCorrectionOriginalValue = '';
+      memoryCorrectionOriginalTimestamp = null;
+      memorySupersedesId = '';
+      memoryResolveConflicts = false;
+      await refreshMemory(directory);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function markMemoryConflict(id: string) {
+    const directory = snapshot?.directory;
+    if (!directory || !conflictOtherId) return;
+    memoryStorageError = '';
+    try {
+      await invoke('memory_mark_conflict', {
+        directory,
+        firstId: id,
+        secondId: conflictOtherId,
+      });
+      pendingConflict = '';
+      conflictOtherId = '';
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -497,6 +698,29 @@
     try {
       await invoke('memory_forget', { directory, id });
       pendingForget = '';
+      await refreshMemory(directory);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function saveMemoryExpiry(id: string) {
+    const directory = snapshot?.directory;
+    if (!directory) return;
+    const expiresAt = resolveHandoffExpiry(
+      expiryEditValue,
+      expiryEditOriginalValue,
+      expiryEditOriginalTimestamp,
+    );
+    if (expiresAt !== null && !Number.isFinite(expiresAt)) {
+      memoryStorageError = 'Storage: Enter a valid handoff expiry.';
+      return;
+    }
+    memoryStorageError = '';
+    try {
+      await invoke<MemoryRecord>('memory_set_expiry', { directory, id, expiresAt });
+      pendingExpiry = '';
+      expiryEditValue = '';
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -756,7 +980,6 @@
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
           if (selectedSection === 'agents') {
-            void refreshWorktreeStorage();
             if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
@@ -869,6 +1092,21 @@
           </label>
           <p>Selecting text outside inputs copies it and announces "Copied".</p>
         </section>
+        <section class="settings-card">
+          <h2>Performance</h2>
+          <label class="attention-setting">
+            <input
+              type="checkbox"
+              checked={snapshot.backgroundPriorityEnabled}
+              onchange={(event) =>
+                send({ type: 'background-priority', value: event.currentTarget.checked })}
+            />
+            Run agent commands and browser tools at background priority
+          </label>
+          <p>
+            Turn this off to troubleshoot slow agent commands. New jobs use the changed setting.
+          </p>
+        </section>
       {:else}<p role="status">Loading settings…</p>{/if}
     {:else if selectedSection === 'opencode'}
       <h1>OpenCode</h1>
@@ -909,6 +1147,51 @@
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
       </section>
       <section class="settings-card">
+        <h2>Reef canary</h2>
+        <label class="attention-setting">
+          <input
+            type="checkbox"
+            checked={snapshot?.reefCanaryPercent !== null &&
+              snapshot?.reefCanaryPercent !== undefined}
+            onchange={(event) =>
+              send({
+                type: 'reef-canary-percent',
+                value: event.currentTarget.checked ? 0 : null,
+              })}
+          />
+          Measure new agent processes with Reef
+        </label>
+        {#if snapshot?.reefCanaryPercent !== null && snapshot?.reefCanaryPercent !== undefined}
+          <label for="reef-canary-percent">Treatment percentage</label>
+          <input
+            id="reef-canary-percent"
+            type="number"
+            min="0"
+            max="100"
+            step="1"
+            value={snapshot.reefCanaryPercent}
+            onchange={(event) => {
+              const value = event.currentTarget.valueAsNumber;
+              if (Number.isInteger(value) && value >= 0 && value <= 100)
+                send({ type: 'reef-canary-percent', value });
+              else {
+                event.currentTarget.value = String(snapshot?.reefCanaryPercent ?? 0);
+                requestError = 'Enter a Reef canary percentage from 0 to 100.';
+              }
+            }}
+          />
+        {/if}
+        <p>
+          Off by default. Enabling starts at 0%, which measures a control baseline. Set a higher
+          percentage explicitly to admit that share of eligible build, test, and lint commands
+          through Reef's background scheduler. Under sustained machine pressure, treated commands
+          can wait and then fail at Reef's admission deadline. Changes affect only new agent
+          processes. This is host-only best effort, not hard containment. On macOS or Linux, new
+          agents fail clearly if Reef or its adapter support is unavailable. Nonzero treatment also
+          requires a running <code>reef serve</code> scheduler.
+        </p>
+      </section>
+      <section class="settings-card">
         <h2>Private agent storage</h2>
         {#if worktreeStorageError}<p class="runtime-diagnostic" role="alert">
             {worktreeStorageError}
@@ -919,8 +1202,17 @@
             Sail could not verify that no process still owns it or that its Git worktree identity is unchanged.
           </p>
           <ul>
-            {#each worktreeStoragePending as item (item.cacheKey)}
-              <li>{item.reason} <code>{item.cacheKey}</code></li>
+            {#each worktreeStoragePending as item (`${item.cacheKey}:${item.reason}:${item.cleanupToken ?? ''}`)}
+              <li>
+                {item.reason} · {formatStorageSize(item.sizeBytes)} <code>{item.cacheKey}</code>
+                {#if item.cleanupToken}
+                  <Button
+                    size="sm"
+                    disabled={worktreeStorageLoading}
+                    onclick={() => void cleanPendingTemp(item)}>Clean after checking unused</Button
+                  >
+                {/if}
+              </li>
             {/each}
           </ul>
         {:else}
@@ -1364,10 +1656,15 @@
           <p role="status">Checking committed context configuration…</p>
         {:else if contextStatus?.state === 'not-configured'}
           <p role="status">This project has no committed context provider selection.</p>
+          <p>
+            To set up a provider, add its selection to this project's Sail context configuration,
+            commit the configuration, then refresh this view. Sail uses the committed selection.
+          </p>
         {:else if contextStatus?.state === 'invalid'}
           <p class="runtime-diagnostic" role="alert">
             {contextStatus.reason || 'The committed context configuration is invalid.'}
           </p>
+          <p>Fix and commit the project context configuration, then refresh this view.</p>
         {:else if contextStatus}
           <dl class="integration-preview context-provider-details">
             <dt>Provider</dt>
@@ -1383,14 +1680,29 @@
             <dt>Committed revision</dt>
             <dd><code>{contextStatus.revision}</code></dd>
             <dt>Approval</dt>
-            <dd>{contextStatus.state === 'approved' ? 'Approved' : 'Approval required'}</dd>
+            <dd>
+              {contextStatus.state === 'approved'
+                ? 'Approved'
+                : contextStatus.state === 'unavailable'
+                  ? 'Unavailable'
+                  : 'Approval required'}
+            </dd>
           </dl>
           {#if contextStatus.reason}<p class="runtime-diagnostic" role="status">
               {contextStatus.reason}
             </p>{/if}
-          <p>
-            Approval records your choice. Sail does not start the provider or add it to agents yet.
-          </p>
+          {#if contextStatus.state === 'unavailable'}
+            <p>
+              Select an available executable for this registry command, then review its identity.
+            </p>
+          {:else if contextStatus.state === 'approval-required'}
+            <p>Review the executable and capabilities before approving this project.</p>
+          {:else}
+            <p>
+              Approval records your choice for this project. It does not show live connection
+              health.
+            </p>
+          {/if}
           <label for="context-executable">Provider executable</label>
           <input
             id="context-executable"
@@ -1783,7 +2095,133 @@
                   >
                 </div>
                 <p>{record.content}</p>
+                {#if record.supersededBy}
+                  <p class="memory-tags">Superseded by {record.supersededBy}</p>
+                {:else if record.conflictsWith?.length}
+                  <p class="memory-tags">
+                    Unresolved conflict with {record.conflictsWith.join(', ')}
+                  </p>
+                {/if}
                 {#if record.tags.length}<p class="memory-tags">{record.tags.join(' · ')}</p>{/if}
+                {#if record.provenance.sessionId}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onclick={() => {
+                      knowledgeMemoryId = record.id;
+                      knowledgePreview = null;
+                      knowledgeChange = null;
+                      knowledgeError = '';
+                    }}>Propose for project docs</Button
+                  >
+                {/if}
+                {#if record.kind === 'handoff' && record.expiresAt != null}
+                  <p class="memory-tags">
+                    {record.expiresAt <= Date.now() ? 'Expired' : 'Expires'}
+                    <span aria-hidden="true"> · </span>
+                    <time datetime={new Date(record.expiresAt).toISOString()}>
+                      {new Date(record.expiresAt).toLocaleString()}
+                    </time>
+                  </p>
+                {/if}
+                {#if record.kind === 'handoff'}
+                  {#if !record.supersededBy && record.forgottenAt == null}
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={() => {
+                        memoryKind = 'handoff';
+                        memorySupersedesId = record.id;
+                        memoryResolveConflicts = false;
+                        memoryTags = record.tags.join(', ');
+                        memoryExpiry =
+                          record.expiresAt != null
+                            ? new Date(
+                                record.expiresAt -
+                                  new Date(record.expiresAt).getTimezoneOffset() * 60_000,
+                              )
+                                .toISOString()
+                                .slice(0, 16)
+                            : '';
+                        memoryCorrectionOriginalValue = memoryExpiry;
+                        memoryCorrectionOriginalTimestamp = record.expiresAt ?? null;
+                        document.getElementById('memory-content')?.focus();
+                      }}>Correct</Button
+                    >
+                    {#if record.expiresAt == null || record.expiresAt > Date.now()}
+                      {#if pendingConflict === record.id}
+                        <div
+                          class="memory-forget-confirm"
+                          role="group"
+                          aria-label="Mark handoff conflict"
+                        >
+                          <label for="conflict-{record.id}">Conflicts with</label>
+                          <select id="conflict-{record.id}" bind:value={conflictOtherId}>
+                            <option value="">Select another handoff</option>
+                            {#each memoryRecords.filter((candidate) => candidate.kind === 'handoff' && candidate.id !== record.id && !candidate.supersededBy && candidate.forgottenAt == null && (candidate.expiresAt == null || candidate.expiresAt > Date.now())) as candidate (candidate.id)}
+                              <option value={candidate.id}>{candidate.content.slice(0, 80)}</option>
+                            {/each}
+                          </select>
+                          <Button
+                            size="sm"
+                            disabled={!conflictOtherId}
+                            onclick={() => void markMemoryConflict(record.id)}>Mark conflict</Button
+                          >
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onclick={() => (pendingConflict = '')}>Cancel</Button
+                          >
+                        </div>
+                      {:else}
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onclick={() => {
+                            pendingConflict = record.id;
+                            conflictOtherId = '';
+                          }}>Mark conflict</Button
+                        >
+                      {/if}
+                    {/if}
+                  {/if}
+                  {#if pendingExpiry === record.id}
+                    <div
+                      class="memory-forget-confirm"
+                      role="group"
+                      aria-label="Edit handoff expiry"
+                    >
+                      <label for="expiry-{record.id}">Expires (leave empty to remove)</label>
+                      <input
+                        id="expiry-{record.id}"
+                        type="datetime-local"
+                        bind:value={expiryEditValue}
+                      />
+                      <Button size="sm" onclick={() => void saveMemoryExpiry(record.id)}
+                        >Save expiry</Button
+                      >
+                      <Button size="sm" variant="secondary" onclick={() => (pendingExpiry = '')}
+                        >Cancel</Button
+                      >
+                    </div>
+                  {:else}
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={() => {
+                        pendingExpiry = record.id;
+                        const expiry = record.expiresAt;
+                        expiryEditValue = expiry
+                          ? new Date(expiry - new Date(expiry).getTimezoneOffset() * 60_000)
+                              .toISOString()
+                              .slice(0, 16)
+                          : '';
+                        expiryEditOriginalValue = expiryEditValue;
+                        expiryEditOriginalTimestamp = expiry ?? null;
+                      }}>Edit expiry</Button
+                    >
+                  {/if}
+                {/if}
                 {#if pendingForget === record.id}
                   <div class="memory-forget-confirm" role="group" aria-label="Confirm forget">
                     <span>Forget this memory?</span>
@@ -1810,13 +2248,101 @@
       </section>
 
       <section class="settings-card">
+        <h2>Propose project knowledge</h2>
+        <p>
+          Select a memory with a source session above, then choose a tracked Markdown file in this
+          repository. Sail prepares an uncommitted change in a separate worktree for your review.
+        </p>
+        {#if selectedKnowledgeMemory}
+          <p><strong>Private memory</strong></p>
+          <p>{selectedKnowledgeMemory.content}</p>
+          <p class="runtime-binary">
+            Source session: {selectedKnowledgeMemory.provenance.sessionId}
+          </p>
+        {:else}
+          <p class="memory-empty">Select a memory with a source session to start.</p>
+        {/if}
+        <label for="knowledge-destination">Tracked Markdown destination</label>
+        <input
+          id="knowledge-destination"
+          bind:value={knowledgeDestination}
+          placeholder="docs/project-context.md"
+          autocomplete="off"
+        />
+        <label for="knowledge-text">Text to add to the document</label>
+        <textarea
+          id="knowledge-text"
+          rows="5"
+          bind:value={knowledgeText}
+          placeholder="Write only the knowledge you want to share."></textarea>
+        <Button
+          size="sm"
+          disabled={!selectedKnowledgeMemory ||
+            !knowledgeDestination.trim() ||
+            !knowledgeText.trim() ||
+            knowledgeLoading}
+          onclick={() => void previewKnowledge()}>Preview exact diff</Button
+        >
+        {#if knowledgeError}<p role="alert" class="runtime-diagnostic">{knowledgeError}</p>{/if}
+        {#if knowledgePreview && knowledgeReviewCurrent}
+          <div class="memory-install-preview">
+            <h3>Review proposed document change</h3>
+            <p><strong>Original memory:</strong> {knowledgePreview.result.memory}</p>
+            <p><strong>Source session:</strong> {knowledgePreview.result.sourceSession}</p>
+            <p><strong>Destination:</strong> <code>{knowledgePreview.result.destination}</code></p>
+            <p><strong>Base revision:</strong> <code>{knowledgePreview.result.revision}</code></p>
+            <pre class="knowledge-diff">{knowledgePreview.result.diff}</pre>
+            <Button size="sm" disabled={knowledgeLoading} onclick={() => void acceptKnowledge()}
+              >Accept and prepare worktree</Button
+            >
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={knowledgeLoading}
+              onclick={() => void rejectKnowledge()}>Reject</Button
+            >
+          </div>
+        {:else if knowledgePreview}
+          <p role="status">The proposal inputs changed. Preview the diff again before accepting.</p>
+        {/if}
+        {#if knowledgeChange}
+          <p role="status">
+            Review the uncommitted change in <code>{knowledgeChange.worktree}</code>, then commit
+            and share it through your normal repository review process.
+          </p>
+        {/if}
+      </section>
+
+      <section class="settings-card">
         <h2>Add memory</h2>
         <label for="memory-content">What should agents remember?</label>
         <textarea id="memory-content" rows="4" bind:value={memoryContent}></textarea>
         <label for="memory-kind">Kind</label>
-        <select id="memory-kind" bind:value={memoryKind}>
+        <select id="memory-kind" bind:value={memoryKind} disabled={!!memorySupersedesId}>
           {#each memoryKinds as kind (kind)}<option value={kind}>{kind}</option>{/each}
         </select>
+        {#if memoryKind === 'handoff'}
+          {#if memorySupersedesId}
+            <p>Correction for handoff {memorySupersedesId}</p>
+            <label class="attention-setting">
+              <input type="checkbox" bind:checked={memoryResolveConflicts} />
+              This correction resolves the handoff's conflicts
+            </label>
+            <Button
+              size="sm"
+              variant="secondary"
+              onclick={() => {
+                memorySupersedesId = '';
+                memoryResolveConflicts = false;
+                memoryExpiry = '';
+                memoryCorrectionOriginalValue = '';
+                memoryCorrectionOriginalTimestamp = null;
+              }}>Cancel correction</Button
+            >
+          {/if}
+          <label for="memory-expiry">Expires (optional)</label>
+          <input id="memory-expiry" type="datetime-local" bind:value={memoryExpiry} />
+        {/if}
         <label for="memory-tags">Tags, separated by commas</label>
         <input id="memory-tags" bind:value={memoryTags} />
         <Button

@@ -52,6 +52,7 @@ export type SpawnReceipt = {
   name?: string;
   /** Tool calls the child made, when its transcript reports them. */
   toolCount?: number;
+  nativeCapabilities?: Record<string, unknown>;
   model?: string;
   routing?: SpawnRouting;
   validation?: GateMetadata;
@@ -240,9 +241,19 @@ export function replayResultForReceipt(
   return (
     turn
       .flatMap((entry) => (entry.type === 'assistant' ? [entry.text] : []))
-      .join('\n')
+      // Live receipts concatenate ACP chunks without inserting tool or message separators.
+      .join('')
       .slice(-16_000) || null
   );
+}
+
+/** A completed replay may repair a listener gap only when it retains the text seen live. */
+export function completeReceiptFromReplay(
+  replayed: string | null,
+  liveTail: string,
+): string | null {
+  if (!replayed || (liveTail && !replayed.endsWith(liveTail))) return null;
+  return replayed;
 }
 
 export function receiptIsSettled(state: SpawnState): boolean {

@@ -178,6 +178,29 @@ describe('live subagent activity', () => {
     expect(toggled.expanded.height).toBeGreaterThan(toggled.clamped);
     expect(toggled.label).toBe('Expand');
     expect(toggled.collapsedHeight).toBe(toggled.clamped);
+    await browser.execute(() => {
+      document
+        .querySelector<HTMLButtonElement>(
+          '.spawn-response[data-spawn-id="finished"] .spawn-expand',
+        )!
+        .click();
+      document
+        .querySelector<HTMLButtonElement>('button[aria-label="Shrink finished result"]')!
+        .click();
+    });
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const card = document.querySelector<HTMLElement>(
+            '.spawn-response[data-spawn-id="finished"]',
+          )!;
+          return (
+            !card.querySelector('.spawn-expand') &&
+            card.querySelector('.spawn-result')?.classList.contains('clamped')
+          );
+        }),
+      { timeout: 5_000, timeoutMsg: 'shrunk expanded result stayed expanded' },
+    );
     await browser.execute(() =>
       document
         .querySelector<HTMLButtonElement>(

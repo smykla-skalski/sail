@@ -29,6 +29,7 @@
   import PlanPanel from './PlanPanel.svelte';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import { updateReplayingAgentSessions } from './lib/agent-replay';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
   import {
@@ -79,6 +80,7 @@
     shipOwner,
     shipCheckpointOwner,
     shipTaskReceiptIdsToProtect,
+    shipWorkerProgressChanges,
     authorizeShipCheckpointThread,
     commitRevisionBoundValidation,
     rollbackValidationIssue,
@@ -99,10 +101,13 @@
   import {
     shipArchiveAction,
     shipArchiveConfirmation,
+    shipCheckpointCommit,
     shipMergeAction,
     shipMergeConfirmation,
     shipReopenAction,
     shipReopenConfirmation,
+    shipReplacementConfirmation,
+    shipReopenHeadWarning,
     shipRetryAction,
     shipRetryConfirmation,
     shipStopAction,
@@ -147,6 +152,7 @@
     shippingClockWasSuspended,
     shippingClaimOwnedByInstance,
     shippingWorkerSettled,
+    shipOwnerReleaseReady,
     shipWorkerPrompt,
     parseMergeOwner,
     type MergeOwner,
@@ -259,10 +265,14 @@
   import { resolveTaskLocation, type TaskLocation as TaskLocationValue } from './lib/task-location';
   import {
     checkKey,
+    hasDurableCheckOutcome,
     personalChecks,
+    retryInterruptedCheck,
+    uniquePostTurnCheckCommands,
     upsertCheck,
     type PostTurnCheck,
   } from './lib/post-turn-checks';
+  import { createTurnVerificationQueue } from './lib/turn-verification-queue';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import { promptSkill, type SkillChoice } from './lib/skills';
@@ -419,6 +429,8 @@
     acpEventMatchesSession,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
+    acpSessionOwner,
+    archiveOwnedTranscriptUpdate,
     applyLiveTranscriptUpdate,
     forgetRecentTranscript,
     invalidateLiveTranscript,
@@ -471,6 +483,7 @@
     receiptForSource,
     receiptIsLatestFinishedTurn,
     replayResultForReceipt,
+    completeReceiptFromReplay,
     receiptMatchesTurn,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -491,6 +504,7 @@
     nativeSubagentAcceptsPrompts,
     nativeSubagentId,
     nativeSubagentReceipts,
+    nativeSubagentSupports,
     nativeSubagentThreads as threadsForNativeSubagents,
     reconcileNativeSubagents,
     setNativeSubagentWaiting,
@@ -503,7 +517,9 @@
     setSetting,
     setSettingDurable,
     settingsError,
+    trackSettingsMutation,
   } from './lib/settings';
+  import { parseReefCanaryPercent, reefCanarySettingKey } from './lib/reef-canary';
   import {
     defaultResourceLimits,
     isCheckingMachinePressure,
@@ -579,6 +595,7 @@
     type ProjectCatalog,
     type ProjectWorktree,
     type WorktreeCreation,
+    type WorktreeOrigin,
   } from './lib/projects';
 
   let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
@@ -628,7 +645,7 @@
   const initialShipArchiveDelay = parseShipArchiveDelay(getSetting('sai-ship-archive-delay'));
   const storedShipRuns = loadShipRunStore(getSetting('sai-ship-runs'));
   // Entries this build cannot parse are written back with every save instead of being lost.
-  const unparsedShipRuns = storedShipRuns.unparsed;
+  let unparsedShipRuns = $state<unknown[]>(storedShipRuns.unparsed);
   const shipArchiveMigration =
     getSetting(shipArchiveMigrationKey) === 'done'
       ? null
@@ -639,7 +656,7 @@
     : Number(getSetting('sai-ship-archive-notice')) || 0;
   if (shipArchiveMigration) {
     if (shipArchiveMigration.archived > 0) {
-      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, unparsedShipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, storedShipRuns.unparsed));
       setSetting('sai-ship-archive-notice', String(initialShipArchiveNotice));
     }
     setSetting(shipArchiveMigrationKey, 'done');
@@ -762,6 +779,7 @@
   type CreatedWorktree = {
     path: string;
     branch: string;
+    generation: string | null;
     base: string;
     setup: string;
     shippingTarget?: ShippingTarget;
@@ -860,9 +878,14 @@
   const initialSpawnReceipts = loadSpawnReceipts(getSetting('sai-agent-spawn-receipts'));
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
+  const receiptReplayNeeded = new SvelteSet<string>();
+  const postReloadReceiptTail = new SvelteMap<string, string>();
+  const recoveringSpawnResults = new SvelteMap<string, Promise<void>>();
   const activeSpawnTargets = new SvelteMap<string, string>();
   const spawnTargetKey = (path: string, targetId: string) => JSON.stringify([path, targetId]);
   for (const receipt of initialSpawnReceipts) {
+    if (receipt.targetId?.startsWith('acp:') && receipt.turnId && !receiptIsSettled(receipt.state))
+      receiptReplayNeeded.add(receipt.receiptId);
     if (
       receipt.targetId &&
       receipt.turnId &&
@@ -886,6 +909,8 @@
   };
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
+  const queueTurnVerification = createTurnVerificationQueue();
+  const pendingCompletionErrors = new SvelteMap<string, string>();
   let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
   let selectedWorktreeConfig = $state<WorktreeConfig | null>(null);
@@ -1184,12 +1209,15 @@
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  let copiedStatusGeneration = 0;
   let copyStatusRegion: HTMLDivElement;
   let copyStatusHome: { parent: Node; next: Node | null } | undefined;
   let shortcutsDialog: HTMLDialogElement;
   const shortcutPlatform = detectShortcutPlatform();
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
+  let backgroundPriorityEnabled = $state(getSetting('sai-background-priority-enabled') !== 'false');
+  let reefCanaryPercent = $state(parseReefCanaryPercent(getSetting(reefCanarySettingKey)));
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
@@ -1225,6 +1253,7 @@
           visibleSpawnReceipts,
           threadRequestKeys(sessionAttention),
           shipReceiptIds(shipRuns),
+          projectCatalog,
         ),
       ],
       attentionClock,
@@ -1273,6 +1302,7 @@
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
   let inboxRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingStatusRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let inboxGeneration = 0;
   // Requests resolved since a refresh started; that refresh's stale list must not bring them back.
   const resolvedDuringRefresh = new SvelteMap<string, number>();
@@ -1590,7 +1620,7 @@
     try {
       const revision = await invoke<string>('working_tree_revision', { path });
       if (generation !== diffRefresh || path !== directory) return;
-      if (quiet && diffRevisionPath === path && diffRevision === revision) return;
+      if (quiet && !diffError && diffRevisionPath === path && diffRevision === revision) return;
       diffLoading = true;
       const next = await invoke<WorkingDiffInfo[]>('working_tree_diff', { path });
       if (generation !== diffRefresh || path !== directory) return;
@@ -1619,7 +1649,10 @@
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
   let sidebarInventoryGeneration = 0;
+  let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
+  let sidebarInventoryReadyKey = '';
+  let agentDetectionSettled = false;
   let projectLoadGeneration = 0;
 
   let actionAgentThread = $derived(
@@ -1664,6 +1697,11 @@
     goToSubagentTarget(direction < 0 ? subagentNav?.previous : subagentNav?.next);
   }
   let answeredPermissions = $state<AnsweredPermission[]>([]);
+  const permissionStatusRevisions = new SvelteMap<string, number>();
+  const pendingStatusRetries = new SvelteMap<
+    string,
+    { agent: AgentId; directory: string; sessionId: string }
+  >();
   // Inbox items can go before their resolution event arrives, so their titles are kept here.
   const permissionTitles = new SvelteMap<string, string>();
   $effect(() => {
@@ -1704,6 +1742,57 @@
         outcome: permissionResolution(params),
       },
     ].slice(-50);
+  }
+  function reconcilePendingSessionStatus(
+    agent: AgentId,
+    worktreeDirectory: string,
+    sessionId: string,
+    pendingSnapshot?: Awaited<ReturnType<typeof acp.pendingInbox>>,
+  ) {
+    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
+    const revision = permissionStatusRevisions.get(key);
+    void (pendingSnapshot ? Promise.resolve(pendingSnapshot) : acp.pendingInbox())
+      .then((pending) => {
+        if (permissionStatusRevisions.get(key) === revision) pendingStatusRetries.delete(key);
+        if (
+          pending.some(
+            (item) =>
+              item.agent === agent &&
+              item.directory === worktreeDirectory &&
+              item.message.params?.sessionId === sessionId,
+          ) ||
+          permissionStatusRevisions.get(key) !== revision
+        )
+          return undefined;
+        nativeSubagents = setNativeSubagentWaiting(
+          nativeSubagents,
+          agent,
+          worktreeDirectory,
+          sessionId,
+          false,
+        );
+        for (const thread of agentThreads.filter(
+          (item) =>
+            item.agent === agent &&
+            item.sessionId === sessionId &&
+            item.directory === worktreeDirectory &&
+            threadAttention[threadKey(item)]?.status === 'waiting',
+        ))
+          updateAgentThreadStatus(thread, 'working');
+        for (const receipt of spawnReceipts.filter(
+          (item) =>
+            item.targetId === `acp:${agent}:${sessionId}` &&
+            item.targetDirectory === worktreeDirectory &&
+            item.state === 'waiting',
+        ))
+          updateSpawnReceipt(receipt.receiptId, { state: 'working' });
+        return undefined;
+      })
+      .catch(() => {
+        if (permissionStatusRevisions.get(key) !== revision) return;
+        pendingStatusRetries.set(key, { agent, directory: worktreeDirectory, sessionId });
+        scheduleInboxRefresh();
+      });
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
@@ -2066,6 +2155,8 @@
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
+      backgroundPriorityEnabled,
+      reefCanaryPercent,
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
@@ -2092,6 +2183,7 @@
     } catch (cause) {
       agentDetectionError = `Could not detect agents: ${describe(cause)}`;
     }
+    agentDetectionSettled = true;
     await sendSettingsState();
   }
 
@@ -2139,6 +2231,7 @@
   onMount(() => {
     window.addEventListener(OPEN_IN_SPLIT_EVENT, openLinkInSplit);
     let unlistenAgentEvents: (() => void) | undefined;
+    let unlistenPostTurnCheckEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
     const unsubscribePlans = acpPlans().subscribe((change) => {
@@ -2263,6 +2356,17 @@
         } else if (action.type === 'agent-terminals') {
           agentTerminalsEnabled = action.value;
           setSetting('sai-agent-terminals-enabled', String(action.value));
+        } else if (action.type === 'background-priority') {
+          backgroundPriorityEnabled = action.value;
+          setSetting('sai-background-priority-enabled', String(action.value));
+        } else if (action.type === 'reef-canary-percent') {
+          if (
+            action.value === null ||
+            (Number.isInteger(action.value) && action.value >= 0 && action.value <= 100)
+          ) {
+            reefCanaryPercent = action.value;
+            setSetting(reefCanarySettingKey, action.value === null ? 'off' : String(action.value));
+          }
         } else if (action.type === 'agent-status') {
           agentStatusEnabled = action.value;
           setSetting('sai-agent-status-enabled', String(action.value));
@@ -2340,22 +2444,40 @@
       void listen<(typeof agentTerminals)[number]>('acp-terminal-created', ({ payload }) => {
         agentTerminals = [...agentTerminals, payload];
       }).then((unlisten) => (unlistenAgentTerminals = unlisten));
-      void listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)).then(
-        (unlisten) => {
-          if (disposed) unlisten();
-          else {
-            unlistenAgentEvents = unlisten;
-            void recoverInterruptedAgentTurns()
-              .then(() => restoreAgentActivity())
-              .finally(() => {
-                acpRecoveryReady = true;
-                void tickShippingRuns();
-              });
-            scheduleInboxRefresh();
-          }
-          return undefined;
-        },
-      );
+      void Promise.all([
+        listen<PostTurnCheck>('post-turn-check-completed', ({ payload }) => {
+          postTurnResults = upsertCheck(postTurnResults, payload);
+          if (!hasDurableCheckOutcome(payload)) return;
+          const match = /^acp:([^:]+):(.+)$/.exec(payload.thread);
+          if (match)
+            void runVerifiedCompletedChecks(match[1], payload.directory, match[2], payload.turn);
+        }),
+        listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)),
+      ]).then(([unlistenChecks, unlistenAgent]) => {
+        if (disposed) {
+          unlistenChecks();
+          unlistenAgent();
+        } else {
+          unlistenPostTurnCheckEvents = unlistenChecks;
+          unlistenAgentEvents = unlistenAgent;
+          if (import.meta.env.MODE === 'e2e')
+            Reflect.set(window, 'sailE2eStopAgentEvents', () => {
+              unlistenAgentEvents?.();
+              unlistenAgentEvents = undefined;
+            });
+          void recoverInterruptedAgentTurns()
+            .then(() => restoreAgentActivity())
+            .then(() => reconcilePendingPostTurnChecks())
+            .finally(() => {
+              acpRecoveryReady = true;
+              if (import.meta.env.MODE === 'e2e')
+                Reflect.set(window, 'sailE2eAcpRecoveryReady', true);
+              void tickShippingRuns();
+            });
+          scheduleInboxRefresh();
+        }
+        return undefined;
+      });
       if (import.meta.env.MODE === 'e2e') {
         const emulateClick = (event: Event) =>
           void openNotificationTarget((event as CustomEvent<unknown>).detail);
@@ -2403,12 +2525,16 @@
       for (const timer of shipClaimLeaseFenceTimers.values()) clearTimeout(timer);
       shipClaimLeaseFenceTimers.clear();
       clearTimeout(inboxRefreshTimer);
+      clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
       clearInterval(sidebarRefreshTimer);
       clearTimeout(sidebarInventoryTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
+      unlistenPostTurnCheckEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eAcpRecoveryReady');
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
       unsubscribePlans();
@@ -2511,9 +2637,42 @@
     scheduleInboxRefresh();
   }
 
+  async function agentWorktreeOrigin(
+    project: string,
+    sourcePath: string,
+    agent: string,
+    sessionId: string,
+    sessionTitle: string,
+  ): Promise<WorktreeOrigin> {
+    const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+      repository: project,
+      paths: [sourcePath],
+    });
+    const source = registered.find((item) => item.path === sourcePath);
+    if (!source?.generation) throw new Error('Source Git worktree identity is unavailable.');
+    return {
+      sourcePath,
+      sourceGeneration: source.generation,
+      agent,
+      sessionId,
+      sessionTitle,
+    };
+  }
+
   async function saveShipRuns(): Promise<void> {
     const value = serializeShipRuns(shipRuns, unparsedShipRuns);
     await setSettingDurable('sai-ship-runs', value);
+  }
+
+  async function discardUnparsedShipRun(index: number): Promise<void> {
+    const previous = unparsedShipRuns;
+    unparsedShipRuns = unparsedShipRuns.filter((_, itemIndex) => itemIndex !== index);
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      unparsedShipRuns = previous;
+      throw cause;
+    }
   }
 
   async function archiveDueShipRuns(): Promise<void> {
@@ -2558,9 +2717,7 @@
     const ready = shipMergeAction(issue);
     if (!ready.enabled) throw new Error(ready.reason ?? 'This pull request cannot merge.');
     const outcome = await invoke<{
-      method: 'github' | 'bot-comment';
       strategy: string;
-      comment: string | null;
     }>('ship_merge_pull_request', {
       request: {
         repository: run.repository,
@@ -2570,31 +2727,8 @@
         evidenceReady: shipEvidenceReadiness(issue).ready,
       },
     });
-    if (outcome.method !== 'bot-comment') {
-      void tickShippingRuns(true);
-      return `Merged the pull request (${outcome.strategy}).`;
-    }
-    const posted = `Posted “${outcome.comment}” on the pull request. The repository's bot merges it.`;
-    // Kept in memory even if saving fails, so this session cannot post the comment again.
-    await updateShipIssue(
-      run,
-      issue,
-      {
-        mergeRequested: {
-          at: Date.now(),
-          head: issue.pullRequestHead ?? null,
-          comment: outcome.comment ?? '',
-        },
-      },
-      false,
-    );
     void tickShippingRuns(true);
-    try {
-      await saveShipRuns();
-    } catch (cause) {
-      return `${posted} Sail could not save that the merge was requested: ${describe(cause)}`;
-    }
-    return posted;
+    return `Merged the pull request (${outcome.strategy}).`;
   }
 
   function requireShipClaimOwnership(issue: ShipIssue, action: string): void {
@@ -2605,6 +2739,14 @@
       throw new Error(
         `Another Sail instance holds the shipping claim for this issue. ${action} after it releases or expires.`,
       );
+  }
+
+  async function cleanCheckpointCommit(path: string, revision: string): Promise<string | null> {
+    const commit = await invoke<string | null>('working_tree_commit', { path });
+    const after = await invoke<string>('working_tree_revision', { path });
+    if (after !== revision)
+      throw new Error('The worktree changed while recording the checkpoint commit. Retry.');
+    return commit;
   }
 
   /** Stops leftovers and queues a fresh worker that resumes from the saved checkpoint. */
@@ -2638,6 +2780,7 @@
       cancelledAt: undefined,
       stage: undefined,
       reportedStatus: undefined,
+      workerRequest: null,
       claimFencePending: false,
       claimRevalidationPending: false,
       claimHandoffPending: false,
@@ -2672,16 +2815,76 @@
     const ready = shipReopenAction(issue);
     if (!ready.enabled)
       throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
-    const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
-      'ship_reopen_pull_request',
-      {
+    let outcome: { head: string; pullRequest: string; alreadyOpen: boolean };
+    try {
+      outcome = await invoke('ship_reopen_pull_request', {
         request: {
           repository: run.repository,
           expectedRepository: run.remote,
           pullRequest: issue.pullRequest,
         },
-      },
-    );
+      });
+    } catch (cause) {
+      if (!describe(cause).startsWith('GitHub could not reopen the pull request.')) throw cause;
+      const revision = issue.checkpoint?.revision;
+      if (!revision)
+        throw new Error('The saved checkpoint has no revision for a replacement.', { cause });
+      let commit = shipCheckpointCommit(issue);
+      if (!commit && issue.path) {
+        const current = await invoke<string>('working_tree_revision', { path: issue.path });
+        if (current !== revision)
+          throw new Error(
+            'The source worktree differs from the saved checkpoint. Reconcile it before replacement.',
+            { cause },
+          );
+        commit = await cleanCheckpointCommit(issue.path, revision);
+      }
+      if (!commit)
+        throw new Error(
+          'The saved checkpoint has no clean Git commit for a replacement. Restore and bind a clean source worktree first.',
+          { cause },
+        );
+      if (!(await confirmShipAction(shipReplacementConfirmation(issue, run.remote)))) return '';
+      const stillReady = shipReopenAction(issue);
+      if (!stillReady.enabled)
+        throw new Error(stillReady.reason ?? 'This issue changed and cannot start a replacement.', {
+          cause,
+        });
+      if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+        await stopShippingWorker(issue);
+      const created = await invoke<CreatedWorktree>('create_shipping_replacement_worktree', {
+        repository: run.repository,
+        expectedRepository: run.remote,
+        issueNumber: issue.number,
+        pullRequest: issue.pullRequest,
+        checkpointRevision: commit,
+      });
+      saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
+      const key = `${run.id}:${issue.id}`;
+      beginLatestRefresh(shippingPullRequestGenerations, key);
+      shippingPullRequests.delete(key);
+      await restartShipIssue(
+        run,
+        issue,
+        `The closed pull request ${issue.pullRequest} could not reopen. Continue from checkpoint commit ${commit.slice(0, 8)} on replacement branch ${created.branch} and publish a new pull request.`,
+        {
+          branch: created.branch,
+          path: created.path,
+          worktreeUnavailable: false,
+          setupStarted: false,
+          setupCompleted: false,
+          shippingTarget: created.shippingTarget ?? issue.shippingTarget,
+          pullRequest: null,
+          pullRequestState: undefined,
+          pullRequestHead: undefined,
+          pullRequestMergeable: undefined,
+          mergeRequested: undefined,
+          checks: undefined,
+          ciTriages: undefined,
+        },
+      );
+      return `Replacement pull request queued on ${created.branch} from checkpoint commit ${commit.slice(0, 8)}. The original pull request stays closed.`;
+    }
     if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
       await stopShippingWorker(issue);
     const key = `${run.id}:${issue.id}`;
@@ -2689,15 +2892,16 @@
     beginLatestRefresh(shippingPullRequestGenerations, key);
     const cached = shippingPullRequests.get(key);
     if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
+    const warning = shipReopenHeadWarning(outcome.head, shipCheckpointCommit(issue));
     await restartShipIssue(
       run,
       issue,
-      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.`,
+      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.${warning}`,
       { pullRequestState: 'OPEN', pullRequestHead: outcome.head },
     );
     return outcome.alreadyOpen
-      ? 'The pull request was already open. A fresh worker resumes from the saved checkpoint.'
-      : 'Pull request reopened. A fresh worker resumes from the saved checkpoint.';
+      ? `The pull request was already open. A fresh worker resumes from the saved checkpoint.${warning}`
+      : `Pull request reopened. A fresh worker resumes from the saved checkpoint.${warning}`;
   }
 
   async function stopShipRun(run: ShipRun): Promise<string> {
@@ -2718,6 +2922,8 @@
         state: 'failed',
         error: stoppedMessage,
         blockedReason: null,
+        reportedStatus: undefined,
+        workerRequest: null,
         workerSettled: true,
         cancelledAt: Date.now(),
         ...(checkpoint && checkpoint.status !== 'completed'
@@ -2833,6 +3039,23 @@
       setSetting('sai-ship-runs', serializeShipRuns(shipRuns, unparsedShipRuns));
       throw cause;
     }
+    await maybeReleaseShipOwner(current);
+  }
+
+  async function maybeReleaseShipOwner(issue: ShipIssue): Promise<void> {
+    if (!shipOwnerReleaseReady(issue, spawnReceipts)) return;
+    await acp.releaseOwner(issue.path, issue.receiptId).catch((cause) => {
+      if (describe(cause).includes('active validation gate')) return;
+      throw cause;
+    });
+  }
+
+  async function releaseTerminalShipOwners(path: string): Promise<void> {
+    await Promise.all(
+      shipRuns.flatMap((run) =>
+        run.issues.filter((issue) => issue.path === path).map(maybeReleaseShipOwner),
+      ),
+    );
   }
 
   function contextProvider(threadId: string): ContextProvider {
@@ -4064,7 +4287,7 @@
       const available = (await acp.agents()).find((agent) => agent.id === run.provider);
       if (!available?.available)
         throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
-      await acp.connect(run.provider, created.path);
+      await acp.connect(run.provider, created.path, 'build', { owner: receiptId });
       ensureClaimHeld();
       const gateExecution =
         'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
@@ -4329,6 +4552,20 @@
     return waitForAcpWorkerTermination(agent, worktreeDirectory, sessionId, turnId, deadline);
   }
 
+  async function waitForOwnedPromptSettlement(
+    agent: string,
+    worktreeDirectory: string,
+    sessionId: string,
+    deadline: number,
+  ): Promise<void> {
+    const activity = (await acp.activity(worktreeDirectory))[agent];
+    if (!activity?.active.includes(sessionId) && !activity?.waiting.includes(sessionId)) return;
+    if (monotonicDeadlineExpired(performance.now(), deadline))
+      throw new Error('Owned agent prompt did not settle after cancellation.');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return waitForOwnedPromptSettlement(agent, worktreeDirectory, sessionId, deadline);
+  }
+
   async function stopShippingThread(issue: ShipIssue, threadId: string): Promise<void> {
     const match = /^acp:([^:]+):(.+)$/.exec(threadId);
     if (!match) throw new Error('Worker thread cannot be interrupted automatically.');
@@ -4353,6 +4590,7 @@
     } catch (cause) {
       if (!shippingWorkerGone(cause)) throw cause;
     }
+    if (receipt && issue.path) await acp.releaseOwner(issue.path, receipt.receiptId);
     if (receipt) updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
   }
 
@@ -5281,6 +5519,7 @@
     await settleShipRefresh(
       run.issues.map((issue) =>
         (async () => {
+          await maybeReleaseShipOwner(issue);
           const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
           const claim = issue.claim;
           const claimOwned = shippingClaimOwnedByInstance(claim, shippingInstanceId);
@@ -5483,6 +5722,8 @@
       if (pendingReceipt.dispatchPending) protectedIds.add(pendingReceipt.receiptId);
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    if (receipt.state === 'completed' && receiptReplayNeeded.has(receipt.receiptId))
+      void recoverAcpSpawnResult(receipt).catch(() => undefined);
     for (const run of shipRuns) {
       const issue = run.issues.find((item) => item.receiptId === receipt.receiptId);
       if (issue) {
@@ -5725,7 +5966,7 @@
             ? (outcome.error ?? receipt.error)
             : receipt.error,
       });
-      if (state === 'completed' && !spawnOutput.has(receipt.receiptId))
+      if (state === 'completed' && !spawnOutput.has(receipt.receiptId) && !receipt.result)
         void recoverAcpSpawnResult(receipt).catch(() => undefined);
       if (
         receipt.targetId &&
@@ -5736,7 +5977,18 @@
     }
   }
 
-  async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
+  function recoverAcpSpawnResult(receipt: SpawnReceipt): Promise<void> {
+    const existing = recoveringSpawnResults.get(receipt.receiptId);
+    if (existing) return existing;
+    const pending = recoverAcpSpawnResultInner(receipt);
+    recoveringSpawnResults.set(receipt.receiptId, pending);
+    void pending
+      .finally(() => recoveringSpawnResults.delete(receipt.receiptId))
+      .catch(() => undefined);
+    return pending;
+  }
+
+  async function recoverAcpSpawnResultInner(receipt: SpawnReceipt) {
     const targetDirectory = receipt.targetDirectory;
     if (
       !receipt.targetId ||
@@ -5751,35 +6003,69 @@
       const activity = await acp.activity(worktreeDirectory).catch(() => null);
       return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
     }
+    await acp.connect(receipt.provider, worktreeDirectory);
+    const profile = capabilityProfileForAcpSession(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      receipt.validation ? 'review' : undefined,
+    );
+    const reservation = await acp.beginRestore(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      profile,
+    );
+    if (reservation.liveTurn) return;
+    if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
     const replay: AgentEntry[] = [];
-    const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
-      if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId)) return;
-      const update = payload.message.params?.update;
-      if (update && typeof update === 'object')
-        updateEntriesInPlace(replay, update as Record<string, unknown>);
-    });
-    setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+    let unlisten: (() => void) | undefined;
+    let replaying = false;
     try {
-      await acp.connect(receipt.provider, worktreeDirectory);
+      unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
+        if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId))
+          return;
+        const update = payload.message.params?.update;
+        if (update && typeof update === 'object')
+          updateEntriesInPlace(replay, update as Record<string, unknown>);
+      });
+      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+      replaying = true;
       await acp.load(
         receipt.provider,
         worktreeDirectory,
         sessionId,
-        capabilityProfileForAcpSession(
-          receipt.provider,
-          worktreeDirectory,
-          sessionId,
-          receipt.validation ? 'review' : undefined,
-        ),
+        profile,
+        reservation.restoreToken,
       );
       const latestFinished = await isLatestFinishedTurn();
-      const result = replayResultForReceipt(replay, receipt.prompt, latestFinished);
-      if (result) updateSpawnReceipt(receipt.receiptId, { result }, true);
+      const result = completeReceiptFromReplay(
+        replayResultForReceipt(replay, receipt.prompt, latestFinished),
+        postReloadReceiptTail.get(receipt.receiptId) ?? '',
+      );
+      if (result) {
+        receiptReplayNeeded.delete(receipt.receiptId);
+        postReloadReceiptTail.delete(receipt.receiptId);
+        spawnOutput.set(receipt.receiptId, result);
+        updateSpawnReceipt(receipt.receiptId, { result }, true);
+      }
     } catch {
       return;
     } finally {
-      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
-      unlisten();
+      try {
+        if (replaying) setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
+      } finally {
+        try {
+          unlisten?.();
+        } finally {
+          await acp.endRestore(
+            receipt.provider,
+            worktreeDirectory,
+            sessionId,
+            reservation.restoreToken,
+          );
+        }
+      }
     }
   }
 
@@ -5820,7 +6106,9 @@
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
       return threads;
     const known = new Set(threads.map((thread) => thread.id));
-    const listed = await Promise.all(directories.map((path) => listOpenCodeRootThreads(path)));
+    const listed = await Promise.all(
+      directories.map((path) => listOpenCodeRootThreads(path).catch(() => [])),
+    );
     return [
       ...threads,
       ...listed
@@ -5858,6 +6146,47 @@
     setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
   }
 
+  async function resolveCoordinationThread(
+    target: CoordinationThread,
+  ): Promise<AgentThread | null> {
+    const existing = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find(
+      (item) =>
+        item.directory === target.directory && target.id === `acp:${item.agent}:${item.sessionId}`,
+    );
+    if (existing) return existing;
+
+    const match = /^acp:([^:]+):(.+)$/.exec(target.id);
+    if (!match) return null;
+    const [, agent, sessionId] = match;
+    const receipt = spawnReceipts.find(
+      (item) => item.targetId === target.id && item.targetDirectory === target.directory,
+    );
+    const listed =
+      agent === 'opencode'
+        ? await listSidebarAcpThreads(
+            agent,
+            (cursor) => acp.listSessions(agent, target.directory, cursor, 'explore'),
+            target.directory,
+          ).catch(() => [])
+        : [];
+    return (
+      listed.find((item) => item.sessionId === sessionId) ?? {
+        agent,
+        directory: target.directory,
+        sessionId,
+        title: target.title || receipt?.name || 'Recovered session',
+        updated: receipt?.updated ?? Date.now(),
+        model: receipt?.model,
+        capabilityProfile: capabilityProfileForAcpSession(agent, target.directory, sessionId),
+      }
+    );
+  }
+
   function queueCoordinationDelivery(target: CoordinationThread, message: CoordinationMessage) {
     const previous = coordinationDeliveries.get(message.target) ?? Promise.resolve();
     const delivery = previous
@@ -5866,11 +6195,7 @@
         if (disposed || coordinationMessages.find((item) => item.id === message.id)?.delivered)
           return;
         const text = coordinationPrompt(message);
-        const thread = [...agentThreads, ...sidebarOpenCodeThreads].find(
-          (item) =>
-            item.directory === target.directory &&
-            target.id === `acp:${item.agent}:${item.sessionId}`,
-        );
+        const thread = await resolveCoordinationThread(target);
         if (!thread) throw new Error('The receiving thread is unavailable.');
         const info = await acp.connect(thread.agent, thread.directory);
         const agentActivity = (await acp.activity(thread.directory))[thread.agent];
@@ -5891,6 +6216,15 @@
             await acp.resume(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
           else await acp.load(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
         }
+        if (
+          !agentThreads.some(
+            (item) =>
+              item.agent === thread.agent &&
+              item.directory === thread.directory &&
+              item.sessionId === thread.sessionId,
+          )
+        )
+          saveAgentThread(thread);
         await waitForCoordinationThread(thread);
         if (disposed) return;
         await invoke('record_turn_snapshot', {
@@ -6365,7 +6699,11 @@
         return awaitReceipt(await boundedReceipt(current));
       }
       let current = await awaitReceipt(await boundedReceipt(receipt));
-      if (request.name === 'agent_result' && current.state === 'completed' && !current.result) {
+      if (
+        request.name === 'agent_result' &&
+        current.state === 'completed' &&
+        (!current.result || receiptReplayNeeded.has(current.receiptId))
+      ) {
         await recoverAcpSpawnResult(current);
         current = spawnReceipts.find((item) => item.receiptId === current.receiptId) ?? current;
       }
@@ -6538,6 +6876,7 @@
           request.arguments.expectedRevision,
           request.arguments.rebindRevision,
           Date.now(),
+          await cleanCheckpointCommit(request.directory, execution.revision),
         );
         await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
       } else if (!owner.issue.checkpoint) {
@@ -6655,6 +6994,7 @@
         checkpointBeforePolicy.revision,
         true,
         Date.now(),
+        await cleanCheckpointCommit(request.directory, revision),
       );
       const evidenceManifests = syncEvidenceManifest(
         owner.issue.evidenceManifests ?? [],
@@ -6746,11 +7086,20 @@
     if (!(await approval)) throw new Error('User declined the worktree request.');
     if (Date.now() >= request.expiresAt)
       throw new Error('The worktree request expired before approval.');
-    const created = await invoke<{ path: string; branch: string; base: string; setup: string }>(
-      'create_worktree',
-      { repository: request.directory, name, destinationParent: null, baseRef: null },
+    const origin = await agentWorktreeOrigin(
+      project,
+      request.directory,
+      source.agent,
+      request.sessionId,
+      source.title,
     );
-    saveProjectCatalog(addWorktree(projectCatalog, project, created));
+    const created = await invoke<CreatedWorktree>('create_worktree', {
+      repository: request.directory,
+      name,
+      destinationParent: null,
+      baseRef: null,
+    });
+    saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
     if (created.setup) {
       await loadProject(created.path);
       if (directory !== created.path) throw new Error('Worktree changed before setup started.');
@@ -7043,8 +7392,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
-        reportedStatus: report.status,
-        blockedReason: report.status === 'blocked' ? report.reason : null,
+        ...shipWorkerProgressChanges(report.status, report.reason),
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
     }
@@ -7213,14 +7561,6 @@
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       await saveShipRuns();
       try {
-        try {
-          await acp.connect(choice.agent, request.directory);
-        } catch (cause) {
-          throw new ValidationCandidateUnavailable(
-            `Provider ${choice.agent} is unavailable`,
-            cause,
-          );
-        }
         await ensureSelected();
         const [revision, mutationGeneration, baseRevision] = await Promise.all([
           invoke<string>('working_tree_revision', { path: request.directory }),
@@ -7245,6 +7585,19 @@
           },
         });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        try {
+          await acp.connect(choice.agent, request.directory, 'review', {
+            owner: receiptId,
+            ...(gateOwner?.issue.receiptId
+              ? { buildOwner: gateOwner.issue.receiptId, buildRevision: revision }
+              : {}),
+          });
+        } catch (cause) {
+          throw new ValidationCandidateUnavailable(
+            `Provider ${choice.agent} is unavailable`,
+            cause,
+          );
+        }
         const ensureLaunchState = async () => {
           await ensureSelected();
           const currentRevision = await invoke<string>('working_tree_revision', {
@@ -7286,6 +7639,8 @@
         };
       } catch (cause) {
         updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        await acp.releaseOwner(request.directory, receiptId);
         if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
         return tryChoice(
           candidates.filter((item) => item !== choice),
@@ -7513,11 +7868,20 @@
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
       if (!destination) {
-        const created = await invoke<{ path: string; branch: string; setup: string }>(
-          'create_worktree',
-          { repository: project, name, destinationParent: null, baseRef: null },
+        const origin = await agentWorktreeOrigin(
+          project,
+          request.directory,
+          source.agent,
+          request.sessionId,
+          source.title,
         );
-        saveProjectCatalog(addWorktree(projectCatalog, project, created));
+        const created = await invoke<CreatedWorktree>('create_worktree', {
+          repository: project,
+          name,
+          destinationParent: null,
+          baseRef: null,
+        });
+        saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
         destination = created;
         updateSpawnReceipt(receiptId, {
           worktreeId: created.path,
@@ -7638,6 +8002,16 @@
     promptAuthorization?: DirectShipAuthorization,
     onPromptQueue?: (limit: number | null, reason: string | null) => void,
   ) {
+    const receipt = receiptId
+      ? spawnReceipts.find((item) => item.receiptId === receiptId)
+      : undefined;
+    const runOwner =
+      receiptId &&
+      (validation ||
+        receipt?.requestId.startsWith('ship:') ||
+        receipt?.requestId.startsWith('handoff:'))
+        ? receiptId
+        : undefined;
     const requestedModel =
       validation && source.model && hasUnresolvedModelAlias(source.model)
         ? undefined
@@ -7659,11 +8033,12 @@
         ? routedProfile
         : 'build';
     const session = await acp
-      .create(source.agent, created.path, capabilityProfile, nativeGeneration)
+      .create(source.agent, created.path, capabilityProfile, nativeGeneration, runOwner)
       .catch((cause) => {
         if (!validation) throw cause;
         throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
       });
+    let dispatchedTurnId: string | null = null;
     try {
       let configOptions = session.configOptions ?? [];
       const reportedModel = configOptions.find(
@@ -7728,16 +8103,16 @@
       };
       saveAgentThread(thread);
       if (receiptId) {
-        const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+        const existingReceipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         updateSpawnReceipt(receiptId, {
           targetId: `acp:${source.agent}:${session.sessionId}`,
           model: requestedModel ?? reportedModel,
           targetDirectory: created.path,
           worktreeId: created.path,
-          ...(receipt?.routing
+          ...(existingReceipt?.routing
             ? {
                 routing: {
-                  ...receipt.routing,
+                  ...existingReceipt.routing,
                   actual: {
                     provider: source.agent as 'claude' | 'codex' | 'opencode',
                     model: requestedModel ?? reportedModel ?? null,
@@ -7784,7 +8159,7 @@
           activeSpawnTargets.set(spawnTargetKey(created.path, targetId), receiptId);
         }
         try {
-          return acp.prompt(
+          const pending = acp.prompt(
             source.agent,
             created.path,
             session.sessionId,
@@ -7797,6 +8172,8 @@
             },
             false,
           );
+          dispatchedTurnId = turnId;
+          return pending;
         } catch (cause) {
           if (
             receiptId &&
@@ -7833,6 +8210,10 @@
                 spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
               );
           }
+          if (runOwner && validation) {
+            await acp.releaseOwner(created.path, runOwner);
+            await releaseTerminalShipOwners(created.path);
+          }
           return undefined;
         },
         async (cause) => {
@@ -7865,6 +8246,13 @@
               );
           }
           if (!interrupted) error = describe(cause);
+          if (runOwner && validation)
+            await acp
+              .releaseOwner(created.path, runOwner)
+              .then(() => releaseTerminalShipOwners(created.path))
+              .catch((releaseCause) => {
+                error = `Validation agent cleanup failed: ${describe(releaseCause)}`;
+              });
           throw cause;
         },
       );
@@ -7890,6 +8278,23 @@
       };
     } catch (cause) {
       await acp.cancel(source.agent, created.path, session.sessionId, null).catch(() => undefined);
+      if (runOwner) {
+        let cleanupError: unknown;
+        if (dispatchedTurnId)
+          await waitForOwnedPromptSettlement(
+            source.agent,
+            created.path,
+            session.sessionId,
+            performance.now() + 5_000,
+          ).catch((failure) => {
+            cleanupError = failure;
+          });
+        await acp.releaseOwner(created.path, runOwner).catch((failure) => {
+          cleanupError = failure;
+        });
+        if (cleanupError)
+          throw new Error(`Agent run cleanup failed: ${describe(cleanupError)}`, { cause });
+      }
       if (nativeGeneration !== undefined)
         await acp.releaseSessionFence(source.agent, created.path, session.sessionId);
       throw cause;
@@ -8041,7 +8446,17 @@
           )
         : new Map();
     if (generation !== inboxGeneration || disposed) return;
+    clearTimeout(pendingStatusRetryTimer);
+    if (acpResult.status === 'rejected' && pendingStatusRetries.size)
+      pendingStatusRetryTimer = setTimeout(() => scheduleInboxRefresh(), 1000);
     if (acpResult.status === 'fulfilled') {
+      for (const retry of pendingStatusRetries.values())
+        reconcilePendingSessionStatus(
+          retry.agent,
+          retry.directory,
+          retry.sessionId,
+          acpResult.value,
+        );
       for (const pending of acpResult.value) {
         const sessionId = pending.message.params?.sessionId;
         const requestId = pending.message.id;
@@ -8321,6 +8736,29 @@
     return runWorktreeCreation(id, request);
   }
 
+  async function adoptExternalWorktree(repository: string, worktree: ProjectWorktree) {
+    try {
+      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository,
+        paths: [worktree.path],
+      });
+      const current = registered.find((entry) => entry.path === worktree.path);
+      if (!current || current.generation !== worktree.generation)
+        throw new Error('The external Git worktree changed. Refresh the list and try again.');
+      saveProjectCatalog(
+        addWorktree(projectCatalog, repository, {
+          path: worktree.path,
+          branch: current.branch ?? 'detached',
+          generation: current.generation,
+        }),
+      );
+      showWorkspace();
+      await loadProject(worktree.path);
+    } catch (cause) {
+      error = describe(cause);
+    }
+  }
+
   function retryWorktreeCreation(id: string) {
     const request = worktreeCreationRequests.get(id);
     if (!request || !worktreeCreations.some((creation) => creation.id === id && creation.error))
@@ -8467,8 +8905,9 @@
     forgetMissingRecentThreads();
     for (const thread of [...removedThreads, ...removedNative]) {
       forgetThreadAttention(thread);
-      if (thread.agent !== 'opencode') {
+      if (thread.agent !== 'opencode' || acpSessionOwner(thread.sessionId))
         forgetRecentTranscript(thread);
+      if (thread.agent !== 'opencode') {
         void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
       }
     }
@@ -8490,7 +8929,10 @@
   }
 
   function hasActiveAgentSessions(message: string) {
-    return message.startsWith('Worktree has active agent sessions');
+    return (
+      message.startsWith('Worktree has active agent sessions') ||
+      message === 'An agent session is starting in this worktree.'
+    );
   }
 
   async function deleteProjectWorktreeOnce(
@@ -8583,8 +9025,9 @@
       forgetMissingRecentThreads();
       for (const thread of [...removedThreads, ...removedNative]) {
         forgetThreadAttention(thread);
-        if (thread.agent !== 'opencode') {
+        if (thread.agent !== 'opencode' || acpSessionOwner(thread.sessionId))
           forgetRecentTranscript(thread);
+        if (thread.agent !== 'opencode') {
           void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
         }
       }
@@ -8613,8 +9056,8 @@
     }
     if (retryStop) {
       const stopConfirmed = await confirmInApp(
-        'Agent is running',
-        `An agent is still running in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
+        'Agent is running or starting',
+        `An agent is running or starting in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
         'Stop agent and delete',
         { destructive: true },
       );
@@ -9063,12 +9506,31 @@
 
   function scheduleSidebarInventoryRefresh() {
     clearTimeout(sidebarInventoryTimer);
+    sidebarInventoryReadyKey = '';
+    const key = sidebarDirectoryKey;
+    const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
+      sidebarInventoryTimer = undefined;
       void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
-        reportSidebarInventoryFailure,
+        (failure) => {
+          reportSidebarInventoryFailure(failure);
+          if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
+            sidebarInventoryReadyKey = key;
+          return undefined;
+        },
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
     }, 250);
+  }
+
+  if (import.meta.env.MODE === 'e2e') {
+    Object.assign(window, {
+      __SAIL_E2E_SIDEBAR_INVENTORY_READY__: () =>
+        agentDetectionSettled &&
+        (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available) ||
+          (sidebarInventoryReadyKey === sidebarDirectoryKey &&
+            sidebarInventoryTimer === undefined)),
+    });
   }
 
   $effect(() => {
@@ -9301,10 +9763,19 @@
     shortcutsDialog.showModal();
   }
 
-  function placeCopyStatus() {
-    const node = window.getSelection()?.anchorNode;
-    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
-    const host = copyStatusHost(anchor, [...document.querySelectorAll('dialog:modal')]);
+  function currentCopyStatusHost(anchor: Element | null) {
+    const focused = document.activeElement;
+    const hit = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+    return copyStatusHost(
+      anchor?.closest<HTMLDialogElement>('dialog') ?? null,
+      [...document.querySelectorAll<HTMLDialogElement>('dialog:modal')],
+      focused instanceof Element ? focused.closest<HTMLDialogElement>('dialog') : null,
+      hit?.closest<HTMLDialogElement>('dialog') ?? null,
+    );
+  }
+
+  function placeCopyStatus(preferredHost: HTMLDialogElement | null) {
+    const host = currentCopyStatusHost(preferredHost);
     copyStatusHome ??= {
       parent: copyStatusRegion.parentNode as Node,
       next: copyStatusRegion.nextSibling,
@@ -9312,6 +9783,13 @@
     if (host) {
       if (copyStatusRegion.parentNode === host) return false;
       host.append(copyStatusRegion);
+      host.addEventListener(
+        'close',
+        () => {
+          if (copyStatusRegion.parentNode === host && copiedStatus) void announceCopied(null);
+        },
+        { once: true },
+      );
       return true;
     }
     const { parent, next } = copyStatusHome;
@@ -9320,20 +9798,39 @@
     return true;
   }
 
-  async function announceCopied() {
+  async function waitForCopyStatusPlacement(
+    preferredHost: HTMLDialogElement | null,
+    generation: number,
+  ): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (generation !== copiedStatusGeneration) return;
+    if (placeCopyStatus(preferredHost)) await waitForCopyStatusPlacement(preferredHost, generation);
+  }
+
+  async function announceCopied(preferredHost: HTMLDialogElement | null) {
+    const generation = ++copiedStatusGeneration;
     clearTimeout(copiedStatusTimer);
-    const moved = placeCopyStatus();
+    const moved = placeCopyStatus(preferredHost);
     copiedStatus = '';
     // A cleared region makes a repeated "Copied" a new live-region change.
     await tick();
     // Screen readers skip changes made as a live region is inserted.
-    if (moved) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (moved) await waitForCopyStatusPlacement(preferredHost, generation);
+    if (generation !== copiedStatusGeneration) return;
     copiedStatus = 'Copied';
-    copiedStatusTimer = setTimeout(() => (copiedStatus = ''), 2000);
+    copiedStatusTimer = setTimeout(() => {
+      if (generation === copiedStatusGeneration) copiedStatus = '';
+    }, 2000);
   }
 
   function copySelection() {
-    copyCompletedSelection({ enabled: autoCopyEnabled, oncopied: () => void announceCopied() });
+    const node = window.getSelection()?.anchorNode;
+    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
+    const host = currentCopyStatusHost(anchor);
+    copyCompletedSelection({
+      enabled: autoCopyEnabled,
+      oncopied: () => void announceCopied(host),
+    });
   }
 
   async function choosePaletteEntry(entry: PaletteEntry | null) {
@@ -9615,15 +10112,6 @@
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
     if (thread.directory === directory) {
-      const available = await invoke<boolean>('repository_path_available', {
-        path: directory,
-      }).catch(() => false);
-      if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
-        return false;
-      if (!available) {
-        jumpFailure = 'This session is no longer available.';
-        return false;
-      }
       showSidebarThread(thread);
       focusMainPane();
       openAgent(thread.agent, thread, true);
@@ -10592,12 +11080,18 @@
     const confirmed = await confirmInApp(
       'Delete thread',
       `Delete “${thread.title}” from Sail? Its transcript and status are removed from Sail.${
-        stillRunning ? ' The agent is still working, and deleting the thread does not stop it.' : ''
+        stillRunning ? ' The active turn will be stopped.' : ''
       }`,
       'Delete thread',
       { destructive: true },
     );
-    if (confirmed) removeAgentThread(thread);
+    if (!confirmed) return;
+    try {
+      await acp.forget(thread.agent, thread.directory, thread.sessionId);
+      removeAgentThread(thread);
+    } catch (cause) {
+      error = `Could not stop thread: ${describe(cause)}`;
+    }
   }
 
   function removeAgentThread(thread: AgentThread) {
@@ -10644,7 +11138,6 @@
       // session/list keeps returning a deleted OpenCode session.
       removeSidebarThread(thread);
     }
-    void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
@@ -11058,15 +11551,22 @@
       }).catch(() => undefined),
   });
 
-  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
+  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false): Promise<boolean> {
     const key = checkKey(check);
-    if (
-      pendingPostTurnChecks.has(key) ||
-      (!retry && postTurnResults.some((item) => checkKey(item) === key))
-    )
-      return;
+    if (pendingPostTurnChecks.has(key)) return false;
     pendingPostTurnChecks.add(key);
+    let retryRecovered = false;
     try {
+      if (!retry) {
+        const stored = (await invoke<PostTurnCheck[]>('list_post_turn_checks')).find(
+          (item) => checkKey(item) === key,
+        );
+        if (stored) {
+          postTurnResults = upsertCheck(postTurnResults, stored);
+          retryRecovered = retryInterruptedCheck(stored);
+          if (!retryRecovered) return hasDurableCheckOutcome(stored);
+        }
+      }
       if (check.source === 'repository') {
         const approved = await invoke<boolean>('is_post_turn_check_approved', {
           directory: check.directory,
@@ -11079,21 +11579,26 @@
             'Approve command',
           );
           if (!allow) {
-            const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
+            const canceled = await trackSettingsMutation(() =>
+              invoke<PostTurnCheck>('cancel_post_turn_check', check),
+            );
             postTurnResults = upsertCheck(postTurnResults, canceled);
-            return;
+            return hasDurableCheckOutcome(canceled);
           }
-          await invoke('approve_post_turn_check', {
-            directory: check.directory,
-            command: check.command,
-          });
+          await trackSettingsMutation(() =>
+            invoke('approve_post_turn_check', {
+              directory: check.directory,
+              command: check.command,
+            }),
+          );
         }
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });
       const result = await invoke<PostTurnCheck>('run_post_turn_check', {
-        request: { ...check, retry },
+        request: { ...check, retry: retry || retryRecovered },
       });
       postTurnResults = upsertCheck(postTurnResults, result);
+      return hasDurableCheckOutcome(result);
     } catch (cause) {
       postTurnResults = upsertCheck(postTurnResults, {
         ...check,
@@ -11101,18 +11606,21 @@
         output: describe(cause),
         code: null,
       });
+      return false;
     } finally {
       pendingPostTurnChecks.delete(key);
       scheduleInboxRefresh();
     }
   }
 
-  async function runCompletedChecks(path: string, thread: string, turn: string) {
-    if (!path || !thread || !turn) return;
+  async function runCompletedChecks(path: string, thread: string, turn: string): Promise<boolean> {
+    if (!path || !thread || !turn) return false;
     const entries: { source: 'repository' | 'personal'; command: string }[] =
       personalPostTurnChecks.map((command) => ({ source: 'personal', command }));
+    let configLoaded = false;
     try {
       const config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
+      configLoaded = true;
       entries.push(
         ...(config?.postTurnChecks ?? []).map((command) => ({
           source: 'repository' as const,
@@ -11122,18 +11630,71 @@
     } catch (cause) {
       error = `Could not load repository post-turn checks: ${describe(cause)}`;
     }
-    for (const entry of entries) {
-      void runOnePostTurnCheck({
-        id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
-        updated: Date.now(),
-        directory: path,
-        thread,
-        turn,
-        ...entry,
-        status: 'running',
-        output: '',
-        code: null,
-      });
+    const durable = await Promise.all(
+      uniquePostTurnCheckCommands(entries).map((entry) =>
+        runOnePostTurnCheck({
+          id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
+          updated: Date.now(),
+          directory: path,
+          thread,
+          turn,
+          ...entry,
+          status: 'running',
+          output: '',
+          code: null,
+        }),
+      ),
+    );
+    return configLoaded && durable.every(Boolean);
+  }
+
+  async function runVerifiedCompletedChecks(
+    agent: AgentId,
+    path: string,
+    sessionId: string,
+    turnId: string,
+  ) {
+    const key = JSON.stringify([agent, path, sessionId, turnId]);
+    await queueTurnVerification(key, async () => {
+      try {
+        const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
+        if (
+          evidence?.status !== 'done' ||
+          !evidence.postTurnPending ||
+          evidence.agent !== agent ||
+          evidence.directory !== path ||
+          evidence.sessionId !== sessionId ||
+          evidence.turnId !== turnId
+        )
+          return;
+        const warning = pendingCompletionErrors.get(key);
+        pendingCompletionErrors.delete(key);
+        if (warning && error === warning) error = '';
+        if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
+        await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
+      } catch (cause) {
+        error = `Could not verify completed agent turn: ${describe(cause)}`;
+      }
+    });
+  }
+
+  async function retryPostTurnCheck(check: PostTurnCheck) {
+    if (!(await runOnePostTurnCheck(check, true))) return;
+    const match = /^acp:([^:]+):(.+)$/.exec(check.thread);
+    if (!match) return;
+    await runVerifiedCompletedChecks(match[1], check.directory, match[2], check.turn);
+  }
+
+  async function reconcilePendingPostTurnChecks() {
+    try {
+      const pending = await acp.pendingPostTurnChecks();
+      await Promise.all(
+        pending.map((turn) =>
+          runVerifiedCompletedChecks(turn.agent, turn.directory, turn.sessionId, turn.turnId),
+        ),
+      );
+    } catch (cause) {
+      error = `Could not restore completed agent checks: ${describe(cause)}`;
     }
   }
 
@@ -11158,6 +11719,22 @@
     const eventDirectory = event.directory ?? event.worktree;
     if (!eventDirectory) return;
     const eventSessionId = event.message.params?.sessionId;
+    const permissionStatusKey =
+      typeof eventSessionId === 'string'
+        ? JSON.stringify([event.agent, eventDirectory, eventSessionId])
+        : null;
+    if (
+      permissionStatusKey &&
+      (event.message.method === 'session/request_permission' ||
+        event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === 'elicitation/create' ||
+        event.message.method === '$/cancel_request')
+    )
+      permissionStatusRevisions.set(
+        permissionStatusKey,
+        (permissionStatusRevisions.get(permissionStatusKey) ?? 0) + 1,
+      );
     const eventThread =
       typeof eventSessionId === 'string'
         ? [...agentThreads, ...nativeChildThreads].find(
@@ -11205,14 +11782,13 @@
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
-      nativeSubagents = setNativeSubagentWaiting(
-        nativeSubagents,
-        event.agent,
-        eventDirectory,
-        eventSessionId,
-        false,
-      );
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === '$/cancel_request') &&
+      typeof eventSessionId === 'string'
+    )
+      reconcilePendingSessionStatus(event.agent, eventDirectory, eventSessionId);
     if (event.message.method === 'session/update') {
       const params = event.message.params;
       const sessionId = params?.sessionId;
@@ -11220,6 +11796,10 @@
         const update = params?.update;
         if (update && typeof update === 'object') {
           const data = update as Record<string, unknown>;
+          if (!replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])])
+            void archiveOwnedTranscriptUpdate(event.agent, eventDirectory, sessionId, data).catch(
+              (cause) => (error = `Could not save owned conversation: ${describe(cause)}`),
+            );
           const thread = [...agentThreads, ...nativeChildThreads].find(
             (item) =>
               item.agent === event.agent &&
@@ -11282,6 +11862,11 @@
             const result = `${receipt.result ?? ''}${text}`.slice(-16_000);
             updateSpawnReceipt(receipt.receiptId, { result, activity: 'Writing response…' });
             spawnOutput.set(receipt.receiptId, result);
+            if (receiptReplayNeeded.has(receipt.receiptId))
+              postReloadReceiptTail.set(
+                receipt.receiptId,
+                `${postReloadReceiptTail.get(receipt.receiptId) ?? ''}${text}`.slice(-16_000),
+              );
           }
         const toolTitle =
           update &&
@@ -11351,9 +11936,14 @@
         }
       }
     }
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved') &&
+      typeof eventSessionId === 'string'
+    ) {
       // The scheduled refresh lags; the thread header already shows the request answered.
-      const resolvedKey = `acp:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      const prefix = event.message.method === 'sail/permission_resolved' ? 'acp' : 'elicitation';
+      const resolvedKey = `${prefix}:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
       resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
       if (inboxItems.some((item) => item.key === resolvedKey))
         inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
@@ -11363,6 +11953,7 @@
       event.message.method === 'elicitation/create' ||
       event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
+      event.message.method === 'sail/elicitation_resolved' ||
       event.message.method === 'sail/disconnected'
     )
       scheduleInboxRefresh();
@@ -11375,29 +11966,37 @@
       )
         removeStructuredQuestion(event.agent, eventDirectory, sessionId, requestID);
     }
+    if (event.message.method === 'sail/post_turn_evidence_ready') {
+      const sessionId = event.message.params?.sessionId;
+      const turnId = event.message.params?.turnId;
+      if (typeof sessionId === 'string' && typeof turnId === 'string') {
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
+      }
+    }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
+      const promotionError = event.message.params?.gitPromotionError;
+      if (typeof promotionError === 'string')
+        error = `Private Git changes remain pending: ${promotionError}`;
+      else if (error.startsWith('Private Git changes remain pending: ')) error = '';
       if (
         typeof sessionId !== 'string' ||
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
       )
         return;
-      if (
-        status === 'done' &&
-        typeof turnId === 'string' &&
-        event.message.params?.notify !== false
-      ) {
-        const thread = agentThreads.find(
-          (item) =>
-            item.agent === event.agent &&
-            item.sessionId === sessionId &&
-            item.directory === eventDirectory,
+      const evidenceError = event.message.params?.evidenceError;
+      if (typeof evidenceError === 'string' && typeof turnId === 'string') {
+        const warning = `Completed turn is waiting for its post-turn check record: ${evidenceError}`;
+        pendingCompletionErrors.set(
+          JSON.stringify([event.agent, eventDirectory, sessionId, turnId]),
+          warning,
         );
-        if (thread)
-          void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
+        error = warning;
       }
+      if (status === 'done' && typeof turnId === 'string' && event.message.params?.notify !== false)
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
@@ -11455,6 +12054,7 @@
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
     } else if (event.message.method === 'sail/disconnected') {
+      const releasedOwner = event.message.params?.releasedOwner === true;
       const disconnectedSessionIds =
         acpDisconnectedSessionIds(event.message) ??
         Object.values(nativeSubagents)
@@ -11477,6 +12077,7 @@
             item.sessionId,
             item.capabilityProfile ?? 'build',
           ) &&
+          !releasedOwner &&
           ['working', 'waiting'].includes(threadAttention[threadKey(item)]?.status ?? ''),
       ))
         updateAgentThreadStatus(thread, 'failed');
@@ -11489,6 +12090,7 @@
           item.provider === event.agent &&
           item.targetDirectory === eventDirectory &&
           acpDisconnectAffectsSession(event.message, sessionId) &&
+          !releasedOwner &&
           !receiptIsSettled(item.state)
         );
       }))
@@ -11503,12 +12105,13 @@
     replaying: boolean,
   ) {
     if (!sessionId) return;
-    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
-    const next = { ...replayingAgentSessions };
-    const count = (next[key] ?? 0) + (replaying ? 1 : -1);
-    if (count > 0) next[key] = count;
-    else delete next[key];
-    replayingAgentSessions = next;
+    replayingAgentSessions = updateReplayingAgentSessions(
+      replayingAgentSessions,
+      agent,
+      worktreeDirectory,
+      sessionId,
+      replaying,
+    );
     if (!replaying && sessionId)
       nativeSubagents = finalizeNativeSubagentRestore(
         nativeSubagents,
@@ -11820,7 +12423,7 @@
   function focusWorkspace() {
     if (detectShippingClockResume()) void tickShippingRuns();
     for (const pane of leaves(paneLayout)) if (pane.thread) markThreadRead(pane.thread);
-    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
+    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff(true);
   }
 
   function describe(cause: unknown): string {
@@ -11883,9 +12486,11 @@
           showWorkspace();
           if (path !== directory) void loadProject(path);
         }}
+        onadoptworktree={(repository, worktree) => void adoptExternalWorktree(repository, worktree)}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
         onselectthread={(key) => void selectSidebarThread(key)}
         onremovethread={removeSidebarThread}
+        oncopied={() => void announceCopied(null)}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}
@@ -12058,6 +12663,14 @@
                       ],
                     )
                   : false}
+                childStops={acpThread
+                  ? nativeSubagentSupports(
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ]?.capabilities,
+                      'cancel',
+                    )
+                  : false}
                 nativeEntries={acpThread
                   ? nativeSubagents[
                       nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
@@ -12131,7 +12744,7 @@
                     check.directory === directory &&
                     check.thread === `acp:${acpAgent}:${acpThread.sessionId}`,
                 )}
-                onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+                onretrycheck={(check) => void retryPostTurnCheck(check)}
               />
             {/key}
           {:else}
@@ -12224,7 +12837,7 @@
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRunWithAuthorization}
         postTurnChecks={postTurnResults}
-        onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+        onretrycheck={(check) => void retryPostTurnCheck(check)}
         {agentUsage}
         {agentRates}
         onentries={(id, entries, sessionId, ready) =>
@@ -12300,6 +12913,8 @@
       <ShipPanel
         repository={coordinationProject(directory) ?? directory}
         runs={shipRuns}
+        unparsedRuns={unparsedShipRuns}
+        ondiscardunparsed={discardUnparsedShipRun}
         busy={shippingBusy}
         {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
@@ -12478,6 +13093,8 @@
             repository={coordinationProject(directory) ?? directory}
             active={activeSideTab === 'ship' && detailsOpen && (acpAgent ? agentChangesOpen : true)}
             runs={shipRuns}
+            unparsedRuns={unparsedShipRuns}
+            ondiscardunparsed={discardUnparsedShipRun}
             busy={shippingBusy}
             {mergeOwner}
             nativeSubagents={Object.values(nativeSubagents)}
