@@ -583,6 +583,7 @@
     addWorktree,
     assignRepository,
     loadProjectCatalog,
+    markNewWorktreeCleanupPending,
     markWorktreeCleanupPending,
     movePendingWorktreeCleanup,
     pendingExpectedRegisteredWorktrees,
@@ -1193,7 +1194,7 @@
       ...new Set([
         ...projectCatalog.repositories,
         ...Object.values(projectCatalog.worktrees).flatMap((worktrees) =>
-          worktrees.map((worktree) => worktree.path),
+          worktrees.filter((worktree) => !worktree.pendingCleanup).map((worktree) => worktree.path),
         ),
       ]),
     ]),
@@ -1677,6 +1678,7 @@
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
   let sidebarInventoryGeneration = 0;
+  const sidebarInventoryRequests = new SvelteSet<Promise<unknown>>();
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
@@ -5399,7 +5401,7 @@
             if (!worktree.generation)
               throw new Error('Ship worktree identity changed before pending cleanup.');
             const state = preview[index];
-            pendingCatalog = markWorktreeCleanupPending(
+            pendingCatalog = markNewWorktreeCleanupPending(
               pendingCatalog,
               run.repository,
               worktree.path,
@@ -9830,6 +9832,9 @@
           cause,
         });
       }
+      // An inventory request started before this worktree became pending can still
+      // launch an agent runtime. Let it finish before native cleanup stops that runtime.
+      await Promise.allSettled(sidebarInventoryRequests);
       const removed = await deleteProjectWorktreeOnce(
         repository,
         target.path,
@@ -10571,7 +10576,9 @@
   async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;
     const generation = ++sidebarInventoryGeneration;
-    const results = await Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
+    const request = Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
+    sidebarInventoryRequests.add(request);
+    const results = await request.finally(() => sidebarInventoryRequests.delete(request));
     if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
     const listed = new Set(paths);

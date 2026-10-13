@@ -225,7 +225,14 @@ describe('merged Ship pending cleanup', () => {
     );
     expect(archived).toContain('Automatic ignored-file archival is unavailable');
     expect(existsSync(source)).toBe(true);
-    const removed = await cleanPending(source);
+    const cleanAfterStartingSession = async (retriesLeft: number): Promise<boolean> => {
+      const removed = await cleanPending(source);
+      if (removed || retriesLeft === 0) return removed;
+      if (!(await pendingCleanup(source))?.reason.includes('An agent session is starting'))
+        return false;
+      return cleanAfterStartingSession(retriesLeft - 1);
+    };
+    const removed = await cleanAfterStartingSession(2);
     console.log(`Merged Ship selected cleanup: ${removed ? 'removed' : 'retained pending'}`);
     expect(existsSync(source)).toBe(!removed);
     expect(existsSync(first)).toBe(true);

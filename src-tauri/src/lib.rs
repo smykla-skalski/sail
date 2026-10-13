@@ -4373,17 +4373,27 @@ fn selected_removed_worktree_storage(
 async fn clean_pending_worktree_temp(
     app: tauri::AppHandle,
     token: String,
+    expected_path: String,
+    expected_owner_path: String,
     confirmed_unused: bool,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
     if !confirmed_unused {
         return Err("Confirm that no process is using this temporary data.".into());
+    }
+    if !Path::new(&expected_path).is_absolute() || !Path::new(&expected_owner_path).is_absolute() {
+        return Err("The selected temporary data path or owner is invalid.".into());
     }
     let cache = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
-        worktree_storage::clean_pending_temp(&cache, &token)
+        worktree_storage::clean_pending_temp_checked(
+            &cache,
+            &token,
+            Path::new(&expected_path),
+            Path::new(&expected_owner_path),
+        )
     })
     .await
     .map_err(|error| error.to_string())?

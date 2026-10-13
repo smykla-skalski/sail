@@ -585,6 +585,18 @@ export function markWorktreeCleanupPending(
   };
 }
 
+export function markNewWorktreeCleanupPending(
+  catalog: ProjectCatalog,
+  repository: string,
+  path: string,
+  pendingCleanup: PendingWorktreeCleanup,
+  generation?: string,
+): ProjectCatalog {
+  if (catalog.worktrees[repository]?.some((item) => item.path === path && item.pendingCleanup))
+    return catalog;
+  return markWorktreeCleanupPending(catalog, repository, path, pendingCleanup, generation);
+}
+
 export function worktreeAt(
   catalog: ProjectCatalog,
   directory: string,

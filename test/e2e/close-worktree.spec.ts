@@ -1,4 +1,4 @@
-import { browser, $, expect } from '@wdio/globals';
+import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -11,8 +11,9 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { topbarMenuTrigger } from './topbar';
+import { openSettings, returnToWorkspace } from './settings-window';
 import { loadProjectCatalog } from '../../src/lib/projects.ts';
 
 async function captureDescendantPreviewTheme(theme: 'light' | 'dark') {
@@ -195,6 +196,43 @@ describe('close worktree shortcut', () => {
     )?.pendingCleanup;
   };
 
+  async function carryTaskRegisteredWorktrees() {
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const rows = registered
+      .filter((item) => item.path !== repository)
+      .map((item) => {
+        const withinFixture = relative(worktrees, item.path);
+        if (
+          !withinFixture ||
+          withinFixture === '..' ||
+          withinFixture.startsWith(`..${sep}`) ||
+          isAbsolute(withinFixture) ||
+          !existsSync(item.path) ||
+          !item.generation
+        )
+          throw new Error(`Unexpected or unverifiable worktree registration: ${item.path}`);
+        return { path: item.path, branch: basename(item.path), generation: item.generation };
+      });
+    await browser.execute(
+      (repo, taskRows) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        const entries = catalog.worktrees?.[repo];
+        if (!Array.isArray(entries)) throw new Error('Missing task worktree catalog');
+        const present = new Set(entries.map((item: { path: string }) => item.path));
+        for (const row of taskRows) if (!present.has(row.path)) entries.push(row);
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      rows,
+    );
+  }
+
   async function retryPendingStorage(path: string) {
     await openPendingConfirmation(path, 'Retry selected storage cleanup…');
     await diagnose(`Selected storage dialog ${path}`, async () => {
@@ -209,7 +247,11 @@ describe('close worktree shortcut', () => {
     });
   }
 
-  async function cleanPending(path: string, expectedSize?: number) {
+  async function cleanPending(
+    path: string,
+    expectedSize?: number,
+    expectSuccess = false,
+  ): Promise<boolean> {
     await openPendingConfirmation(path, 'Clean up this worktree…');
     await diagnose(`Pending cleanup dialog ${path}`, async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
@@ -225,19 +267,137 @@ describe('close worktree shortcut', () => {
         );
       await dialog.$('button=Remove this worktree').click();
     });
+    if (expectSuccess) {
+      await diagnose(`Pending cleanup success ${path}`, () =>
+        browser.waitUntil(async () => !(await catalogPaths()).includes(path), {
+          timeout: 20000,
+          timeoutMsg: `Selected worktree remained pending after temporary cleanup: ${path}`,
+        }),
+      );
+      return true;
+    }
     await diagnose(`Pending checkout result ${path}`, () =>
       browser.waitUntil(
         async () =>
           !(await catalogPaths()).includes(path) ||
-          !!(await pendingCleanup(path))?.storagePaths?.length,
+          !!(await pendingCleanup(path))?.storagePaths?.length ||
+          (await pendingCleanup(path))?.reason.includes('Cleanup stopped') === true,
       ),
     );
+    if ((await pendingCleanup(path))?.reason.includes('Cleanup stopped')) {
+      await expect($('.app-shell [role="alert"]')).toHaveText(
+        expect.stringContaining(
+          'Private agent data is retained while temporary data is still in use or cannot be verified',
+        ),
+      );
+      await expect($(`[data-pending-worktree="${path}"]`)).toHaveText(
+        expect.stringContaining('Retained size:'),
+      );
+      expect(existsSync(path)).toBe(true);
+      expect(git('worktree', 'list')).toContain(path);
+      return false;
+    }
     if ((await pendingCleanup(path))?.storagePaths?.length) {
       await retryPendingStorage(path);
     }
     await diagnose(`Pending cleanup result ${path}`, () =>
       browser.waitUntil(async () => !(await catalogPaths()).includes(path)),
     );
+    return true;
+  }
+
+  async function inspectSelectedTemp(path: string): Promise<void> {
+    await openSettings();
+    try {
+      await $('.settings-window').$('button=Agents').click();
+      const selector = `li[data-pending-temp-owner="${path}"]`;
+      await diagnose(`Settings selected private temp ${path}`, () =>
+        browser.waitUntil(async () => (await $$(selector)).length > 0, {
+          timeoutMsg: `Settings did not show the selected private temp owner ${path}`,
+        }),
+      );
+      const rows = await $$(selector);
+      await Promise.all(
+        Array.from({ length: rows.length }, async (_, index) => {
+          const row = rows[index];
+          const tempPath = await row.getAttribute('data-pending-temp-path');
+          if (!tempPath) throw new Error('Settings omitted the selected temporary path');
+          await expect(row).toHaveText(expect.stringContaining(`Owner worktree: ${path}`));
+          await expect(row).toHaveText(expect.stringContaining(`Temporary data: ${tempPath}`));
+          await expect(row).toHaveText(expect.stringContaining('Pending reason:'));
+          await expect(row).toHaveText(expect.stringContaining('Retained size:'));
+          const reason = await row.getText();
+          if (/turn-temp-process-active|turn-temp-owner-unverified-active/.test(reason)) {
+            await expect(row.$('button=Clean after checking unused')).not.toExist();
+          }
+        }),
+      );
+    } finally {
+      await returnToWorkspace();
+    }
+  }
+
+  async function cleanUnusedSelectedTemp(path: string): Promise<void> {
+    const withinFixture = relative(worktrees, path);
+    if (
+      !withinFixture ||
+      withinFixture === '..' ||
+      withinFixture.startsWith(`..${sep}`) ||
+      isAbsolute(withinFixture)
+    )
+      throw new Error('Refusing to clean temporary data outside the task-owned worktree fixture');
+    await openSettings();
+    try {
+      await $('.settings-window').$('button=Agents').click();
+      const selector = `li[data-pending-temp-owner="${path}"]`;
+      await browser.waitUntil(async () => (await $$(selector)).length > 0);
+      const rows = await $$(selector);
+      const pending = await Promise.all(
+        Array.from({ length: rows.length }, async (_, index) => ({
+          row: rows[index],
+          reason: await rows[index].getText(),
+          tempPath: await rows[index].getAttribute('data-pending-temp-path'),
+        })),
+      );
+      if (
+        pending.some(({ reason }) =>
+          /turn-temp-process-active|turn-temp-owner-unverified-active/.test(reason),
+        )
+      )
+        throw new Error(
+          `Selected temporary data still has an active owner: ${pending.map(({ reason }) => reason).join('; ')}`,
+        );
+      const canClean = await Promise.all(
+        pending.map((item) => item.row.$('button=Clean after checking unused').isExisting()),
+      );
+      const item = pending[canClean.findIndex(Boolean)];
+      if (!item?.tempPath)
+        throw new Error('Selected unused temporary data has no verified cleanup action');
+      await expect(item.row).toHaveText(expect.stringContaining(`Owner worktree: ${path}`));
+      await expect(item.row).toHaveText(
+        expect.stringContaining(`Temporary data: ${item.tempPath}`),
+      );
+      await expect(item.row).toHaveText(expect.stringContaining('Pending reason:'));
+      await expect(item.row).toHaveText(expect.stringContaining('Retained size:'));
+      await item.row.$('button=Clean after checking unused').click();
+      const confirmation = $('dialog.confirmation-dialog[open]');
+      await expect(confirmation).toHaveText(expect.stringContaining(`Owner worktree: ${path}`));
+      await expect(confirmation).toHaveText(
+        expect.stringContaining(`Temporary data: ${item.tempPath}`),
+      );
+      await expect(confirmation).toHaveText(
+        expect.stringContaining('no other process will write to, move, or replace it'),
+      );
+      await confirmation.$('button=Remove selected temporary data').click();
+      await browser.waitUntil(async () => {
+        const error = $('.settings-window .runtime-diagnostic[role="alert"]');
+        return (await $$(selector)).length === 0 || (await error.isExisting());
+      });
+      const error = $('.settings-window .runtime-diagnostic[role="alert"]');
+      if (await error.isExisting()) throw new Error(await error.getText());
+    } finally {
+      await returnToWorkspace();
+    }
   }
 
   async function diagnose<T>(label: string, step: () => Promise<T>): Promise<T> {
@@ -254,6 +414,16 @@ describe('close worktree shortcut', () => {
           ),
           dialogs: [...document.querySelectorAll('dialog[open]')].map(
             (dialog) => dialog.textContent,
+          ),
+          privateStorage: [
+            ...document.querySelectorAll('.settings-window li[data-pending-temp-path]'),
+          ].map((item) => ({
+            owner: item.getAttribute('data-pending-temp-owner'),
+            path: item.getAttribute('data-pending-temp-path'),
+            text: item.textContent,
+          })),
+          settingsAlerts: [...document.querySelectorAll('.settings-window [role="alert"]')].map(
+            (item) => item.textContent,
           ),
           focused: document.activeElement?.outerHTML.slice(0, 200),
           hasFocus: document.hasFocus(),
@@ -291,7 +461,7 @@ describe('close worktree shortcut', () => {
     expect(await catalogPaths()).toEqual([first, second]);
   });
 
-  it('marks only the selected worktree pending when pressed repeatedly, then cleans it explicitly', async () => {
+  it('marks only the selected worktree pending and retains its checkout when private temp is unverifiable', async () => {
     await select(second);
     await browser.execute(() => {
       sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes');
@@ -345,20 +515,38 @@ describe('close worktree shortcut', () => {
     await declined.$('button=Cancel').click();
     expect(existsSync(second)).toBe(true);
     expect((await pendingCleanup(second))?.recoveryPath).toBe(second);
-    await cleanPending(second, current.sizeBytes);
-    await diagnose('Explicit cleanup', async () => {
-      await browser.waitUntil(async () => !existsSync(second));
-      await browser.waitUntil(async () => (await catalogPaths()).length === 1);
-    });
-    expect(await catalogPaths()).toEqual([first]);
+    expect(await cleanPending(second, current.sizeBytes)).toBe(false);
+    expect((await pendingCleanup(second))?.reason).toContain(
+      'temporary data is still in use or cannot be verified',
+    );
+    expect(await catalogPaths()).toEqual([first, second]);
     expect(existsSync(first)).toBe(true);
-    expect(git('worktree', 'list')).not.toContain(second);
-    await expect($('.app-shell [role="alert"]')).not.toExist();
-    expect(await browser.execute(() => localStorage.getItem('sai-directory'))).toBe(repository);
-    expect(
-      await browser.execute((path) => localStorage.getItem(`sai-main-pane-empty:${path}`), second),
-    ).toBeNull();
+    expect(existsSync(second)).toBe(true);
     await expect($('dialog[open]')).not.toExist();
+    await $(`.project-default-worktree-select[title="${repository}"]`).click();
+    await browser.waitUntil(() =>
+      browser.execute((repo) => localStorage.getItem('sai-directory') === repo, repository),
+    );
+    await inspectSelectedTemp(second);
+    expect(existsSync(second)).toBe(true);
+    expect((await pendingCleanup(second))?.originalPath).toBe(second);
+    expect(await catalogPaths()).toEqual([first, second]);
+
+    const eligible = join(worktrees, 'eligible-selected');
+    git('worktree', 'add', '-q', '-b', 'eligible-selected', eligible);
+    await carryTaskRegisteredWorktrees();
+    await browser.refresh();
+    await expect($(`.project-worktree-select[title="${eligible}"]`)).toBeDisplayed();
+    await openRemovalConfirmation(eligible, 'eligible-selected');
+    await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
+    await browser.waitUntil(async () => !!(await pendingCleanup(eligible)));
+    expect(await cleanPending(eligible)).toBe(false);
+    expect(existsSync(eligible)).toBe(true);
+    await cleanUnusedSelectedTemp(eligible);
+    expect(await cleanPending(eligible, undefined, true)).toBe(true);
+    expect(existsSync(eligible)).toBe(false);
+    expect(git('worktree', 'list')).not.toContain(eligible);
+    expect(await catalogPaths()).toEqual([first, second]);
   });
 
   it('keeps an externally removed checkout pending across restart and path replacement', async () => {
@@ -576,7 +764,7 @@ describe('close worktree shortcut', () => {
     git('worktree', 'remove', '--force', detached);
   });
 
-  it('removes a clean detached descendant and preserves its commit', async () => {
+  it('retains a detached descendant and its commit when private temp is unverifiable', async () => {
     const detached = join(worktrees, 'clean-detached');
     git('worktree', 'add', '-q', '-b', 'clean-detached', detached);
     execFileSync('git', ['-C', detached, 'checkout', '--detach', '-q']);
@@ -612,7 +800,7 @@ describe('close worktree shortcut', () => {
       return value;
     };
     await browser.execute(
-      (repo, root, child, rootGeneration, childGeneration) => {
+      (repo, root, sibling, child, rootGeneration, siblingGeneration, childGeneration) => {
         localStorage.setItem(
           'sai-project-catalog',
           JSON.stringify({
@@ -621,6 +809,7 @@ describe('close worktree shortcut', () => {
             worktrees: {
               [repo]: [
                 { path: root, branch: 'first', generation: rootGeneration },
+                { path: sibling, branch: 'second', generation: siblingGeneration },
                 {
                   path: child,
                   branch: 'clean-detached',
@@ -640,8 +829,10 @@ describe('close worktree shortcut', () => {
       },
       repository,
       first,
+      second,
       detached,
       generation(first),
+      generation(second),
       generation(detached),
     );
     await browser.refresh();
@@ -666,20 +857,22 @@ describe('close worktree shortcut', () => {
     await browser.waitUntil(async () => !!(await pendingCleanup(detached)));
     expect(existsSync(first)).toBe(true);
     expect(existsSync(detached)).toBe(true);
-    await cleanPending(detached);
-    await browser.waitUntil(() => !existsSync(detached));
-    await cleanPending(first);
-    await browser.waitUntil(() => !existsSync(first) && !existsSync(detached));
-    await browser.waitUntil(async () => (await catalogPaths()).length === 0);
+    expect(await cleanPending(detached)).toBe(false);
+    expect(await catalogPaths()).toEqual([first, second, detached]);
+    expect(existsSync(first)).toBe(true);
+    expect(existsSync(detached)).toBe(true);
     expect(
-      git('for-each-ref', '--format=%(objectname)', 'refs/sail/preserved-detached').trim(),
+      execFileSync('git', ['-C', detached, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
     ).toBe(head);
-    git('worktree', 'add', '-q', first, 'first');
+    expect((await pendingCleanup(detached))?.reason).toContain(
+      'temporary data is still in use or cannot be verified',
+    );
   });
 
   it('keeps a pending parent when another instance registers an unseen child', async () => {
     const parent = join(worktrees, 'inventory-parent');
     const child = join(worktrees, 'inventory-new-child');
+    const retained = join(worktrees, 'clean-detached');
     git('worktree', 'add', '-q', '-b', 'inventory-parent', parent);
     const registered = await browser.tauri.execute(
       async ({ core }, repo) =>
@@ -689,17 +882,26 @@ describe('close worktree shortcut', () => {
       repository,
     );
     const generation = registered.find((item) => item.path === parent)?.generation;
+    const retainedGeneration = registered.find((item) => item.path === retained)?.generation;
     if (!generation) throw new Error('Missing pending parent generation');
+    if (!retainedGeneration) throw new Error('Missing retained descendant generation');
     await select(first, false);
     await browser.execute(
-      (repo, path, identity) => {
+      (repo, path, identity, retainedPath, retainedIdentity) => {
         const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push({
+          path: retainedPath,
+          branch: 'clean-detached',
+          generation: retainedIdentity,
+        });
         catalog.worktrees[repo].push({ path, branch: 'inventory-parent', generation: identity });
         localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
       },
       repository,
       parent,
       generation,
+      retained,
+      retainedGeneration,
     );
     await browser.refresh();
     await diagnose('Pending parent row', () =>
@@ -718,14 +920,19 @@ describe('close worktree shortcut', () => {
     expect(existsSync(child)).toBe(true);
     expect(await pendingCleanup(parent)).toBeDefined();
     git('worktree', 'remove', child);
-    await cleanPending(parent);
-    await browser.waitUntil(() => !existsSync(parent));
+    expect(await cleanPending(parent)).toBe(false);
+    expect((await pendingCleanup(parent))?.reason).toContain(
+      'temporary data is still in use or cannot be verified',
+    );
+    expect(existsSync(parent)).toBe(true);
   });
 
-  it('previews Sail descendants, preserves them pending, and cleans selected checkouts leaves first', async () => {
+  it('previews Sail descendants and retains selected cleanup while private temp is unverifiable', async () => {
     const child = join(worktrees, 'child');
     const grandchild = join(worktrees, 'grandchild');
     const external = join(worktrees, 'external');
+    const retained = join(worktrees, 'clean-detached');
+    const pendingParent = join(worktrees, 'inventory-parent');
     const uncommitted = join(grandchild, 'uncommitted.txt');
     git('worktree', 'add', '-q', '-b', 'child', child);
     git('worktree', 'add', '-q', '-b', 'grandchild', grandchild);
@@ -757,7 +964,7 @@ describe('close worktree shortcut', () => {
       return value;
     };
     await browser.execute(
-      (repo, root, descendant, leaf, unrelated, identities) => {
+      (repo, root, sibling, pendingSibling, descendant, leaf, unrelated, identities) => {
         localStorage.setItem(
           'sai-project-catalog',
           JSON.stringify({
@@ -766,6 +973,8 @@ describe('close worktree shortcut', () => {
             worktrees: {
               [repo]: [
                 { path: root, branch: 'first', generation: identities.root },
+                { path: sibling, branch: 'second', generation: identities.second },
+                { path: pendingSibling, branch: 'clean-detached', generation: identities.retained },
                 {
                   path: descendant,
                   branch: 'child',
@@ -798,16 +1007,21 @@ describe('close worktree shortcut', () => {
       },
       repository,
       first,
+      second,
+      retained,
       child,
       grandchild,
       external,
       {
         root: generation(first),
+        second: generation(second),
+        retained: generation(retained),
         child: generation(child),
         grandchild: generation(grandchild),
         external: generation(external),
       },
     );
+    await carryTaskRegisteredWorktrees();
     await browser.refresh();
     await browser.waitUntil(
       () =>
@@ -818,6 +1032,28 @@ describe('close worktree shortcut', () => {
       { timeout: 20000, timeoutMsg: 'Descendant catalog did not settle after reload' },
     );
     const openRemoval = async () => {
+      await browser.waitUntil(
+        async () => {
+          try {
+            await browser.tauri.execute(
+              async ({ core }, input) =>
+                core.invoke('worktree_removal_preview', {
+                  repository: input.repository,
+                  paths: input.paths,
+                }),
+              { repository, paths: [grandchild, child, first] },
+            );
+            return true;
+          } catch (cause) {
+            if (String(cause).includes('requires recovery; task Git command refused')) return false;
+            throw cause;
+          }
+        },
+        {
+          timeout: 20000,
+          timeoutMsg: 'Private Git overlay did not settle before descendant preview',
+        },
+      );
       await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
       await $('[aria-label="Delete worktree first"]').click();
     };
@@ -856,20 +1092,35 @@ describe('close worktree shortcut', () => {
     expect(existsSync(first)).toBe(true);
     expect(existsSync(child)).toBe(true);
     expect(existsSync(grandchild)).toBe(true);
-    expect(await catalogPaths()).toEqual([first, child, grandchild, external]);
+    expect(await catalogPaths()).toEqual([
+      first,
+      second,
+      retained,
+      child,
+      grandchild,
+      external,
+      pendingParent,
+    ]);
 
     rmSync(uncommitted);
-    await cleanPending(grandchild);
-    await browser.waitUntil(() => !existsSync(grandchild));
-    await cleanPending(child);
-    await browser.waitUntil(() => !existsSync(child));
-    await cleanPending(first);
-    await browser.waitUntil(
-      () => !existsSync(first) && !existsSync(child) && !existsSync(grandchild),
+    expect(await cleanPending(grandchild)).toBe(false);
+    expect((await pendingCleanup(grandchild))?.reason).toContain(
+      'temporary data is still in use or cannot be verified',
     );
-    await browser.waitUntil(async () => (await catalogPaths()).length === 1);
+    expect(existsSync(grandchild)).toBe(true);
+    expect(existsSync(child)).toBe(true);
+    expect(existsSync(first)).toBe(true);
+    expect(await pendingCleanup(first)).toBeDefined();
     expect(existsSync(external)).toBe(true);
-    expect(await catalogPaths()).toEqual([external]);
+    expect(await catalogPaths()).toEqual([
+      first,
+      second,
+      retained,
+      child,
+      grandchild,
+      external,
+      pendingParent,
+    ]);
   });
 
   it('keeps an occupied original path and restores its registered recovery before cleanup', async () => {
@@ -877,7 +1128,6 @@ describe('close worktree shortcut', () => {
     const recovery = join(worktrees, '.sail-pending-recovery');
     git('worktree', 'add', '-q', '-b', 'recovery-original', original);
     git('worktree', 'move', original, recovery);
-    git('worktree', 'add', '-q', '-b', 'recovery-replacement', original);
     const registered = await browser.tauri.execute(
       async ({ core }, repo) =>
         core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
@@ -918,6 +1168,8 @@ describe('close worktree shortcut', () => {
       recovery,
       generation,
     );
+    await carryTaskRegisteredWorktrees();
+    git('worktree', 'add', '-q', '-b', 'recovery-replacement', original);
     await browser.refresh();
     await browser.waitUntil(async () => $(`[data-pending-worktree="${recovery}"]`).isDisplayed());
     await expect($(`[data-pending-worktree="${recovery}"]`)).toHaveText(
@@ -967,7 +1219,7 @@ describe('close worktree shortcut', () => {
             return (
               (!existsSync(original) && !pending) ||
               !!pending?.storagePaths?.length ||
-              /(An agent session is starting|Private Git state|unverifiable owner)/i.test(
+              /(An agent session is starting|Private Git state|unverifiable owner|temporary data is still in use or cannot be verified)/i.test(
                 pending?.reason ?? '',
               )
             );
@@ -984,7 +1236,7 @@ describe('close worktree shortcut', () => {
       } else if (await pendingCleanup(original)) {
         await expect($(`[data-pending-worktree="${original}"]`)).toHaveText(
           expect.stringMatching(
-            /An agent session is starting|Private Git state|unverifiable owner/i,
+            /An agent session is starting|Private Git state|unverifiable owner|temporary data is still in use or cannot be verified/i,
           ),
         );
         expect(existsSync(original)).toBe(true);
@@ -1081,6 +1333,7 @@ describe('close worktree shortcut', () => {
       original,
       generation,
     );
+    await carryTaskRegisteredWorktrees();
     await browser.refresh();
     await diagnose('Movable worktree row', () =>
       expect($(`.project-worktree-select[title="${original}"]`)).toBeDisplayed(),
@@ -1165,6 +1418,7 @@ describe('close worktree shortcut', () => {
       parentGeneration,
       childGeneration,
     );
+    await carryTaskRegisteredWorktrees();
     await browser.refresh();
     await diagnose('Parent with staged child', () =>
       expect($(`.project-worktree-select[title="${parent}"]`)).toBeDisplayed(),
@@ -1223,6 +1477,7 @@ describe('close worktree shortcut', () => {
       original,
       generation,
     );
+    await carryTaskRegisteredWorktrees();
     git('worktree', 'move', original, moved);
     const admin = execFileSync('git', ['-C', moved, 'rev-parse', '--absolute-git-dir'], {
       encoding: 'utf8',
@@ -1230,23 +1485,29 @@ describe('close worktree shortcut', () => {
     const marker = join(admin, 'sail-worktree-generation-v1');
     const savedMarker = readFileSync(marker);
     writeFileSync(marker, 'malformed generation marker');
-    await browser.refresh();
-    const current = await browser.tauri.execute(
-      async ({ core }, repo) =>
-        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
-          repository: repo,
-        }),
-      repository,
-    );
-    expect(current.find((item) => item.path === moved)?.generation).toBeNull();
-    await $(`[data-pending-worktree="${original}"]`).$('button=Recheck worktree').click();
-    await diagnose('Unverifiable moved checkout retained', () =>
-      browser.waitUntil(async () =>
-        (await pendingCleanup(original))?.reason.includes('unverifiable Git generation'),
-      ),
-    );
-    expect(existsSync(moved)).toBe(true);
-    writeFileSync(marker, savedMarker);
+    try {
+      await browser.refresh();
+      await diagnose('Unverifiable checkout after reload', () =>
+        expect($(`[data-pending-worktree="${original}"]`)).toBeDisplayed(),
+      );
+      const current = await browser.tauri.execute(
+        async ({ core }, repo) =>
+          core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+            repository: repo,
+          }),
+        repository,
+      );
+      expect(current.find((item) => item.path === moved)?.generation).toBeNull();
+      await $(`[data-pending-worktree="${original}"]`).$('button=Recheck worktree').click();
+      await diagnose('Unverifiable moved checkout retained', () =>
+        browser.waitUntil(async () =>
+          (await pendingCleanup(original))?.reason.includes('unverifiable Git generation'),
+        ),
+      );
+      expect(existsSync(moved)).toBe(true);
+    } finally {
+      writeFileSync(marker, savedMarker);
+    }
     await $(`[data-pending-worktree="${original}"]`).$('button=Recheck worktree').click();
     await diagnose('Verified moved checkout recovered', () =>
       browser.waitUntil(async () => (await pendingCleanup(moved))?.originalPath === original),
@@ -1299,6 +1560,7 @@ describe('close worktree shortcut', () => {
       generation,
     );
     git('worktree', 'remove', path);
+    await carryTaskRegisteredWorktrees();
     const identity = join(realpathSync(dirname(path)), basename(path));
     const key = createHash('sha256')
       .update(Buffer.from(identity, process.platform === 'win32' ? 'utf16le' : 'utf8'))
@@ -1367,6 +1629,7 @@ describe('close worktree shortcut', () => {
       path,
       generation,
     );
+    await carryTaskRegisteredWorktrees();
     const [preview] = await browser.tauri.execute(
       async ({ core }, input) =>
         core.invoke<

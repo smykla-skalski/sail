@@ -6,6 +6,7 @@ import {
   currentCatalogWorktrees,
   externalGitWorktrees,
   loadProjectCatalog,
+  markNewWorktreeCleanupPending,
   markWorktreeCleanupPending,
   movePendingWorktreeCleanup,
   owningRepository,
@@ -176,6 +177,74 @@ await test('keeps a recovery worktree visible and distinct from a replacement at
   );
   assert.equal(worktreeAt(restored, '/worktrees/.sail-removing-recovery')?.repository, '/repo');
   assert.equal(worktreeAt(restored, '/worktrees/child'), null);
+});
+
+await test('marking Ship descendants keeps an existing recovery origin intact', () => {
+  const parentGeneration = testGeneration(47);
+  const childGeneration = testGeneration(48);
+  const parent = '/worktrees/ship-parent';
+  const original = '/worktrees/ship-child';
+  const recovery = '/worktrees/.sail-removing-child';
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo'],
+      worktrees: {
+        '/repo': [
+          { path: parent, branch: 'ship-parent', generation: parentGeneration },
+          {
+            path: recovery,
+            branch: 'ship-child',
+            generation: childGeneration,
+            origin: {
+              sourcePath: parent,
+              sourceGeneration: parentGeneration,
+              agent: 'codex',
+              sessionId: 'child-session',
+              sessionTitle: 'Ship child',
+            },
+            pendingCleanup: {
+              originalPath: original,
+              recoveryPath: recovery,
+              sizeBytes: 2048,
+              reason: 'Original path was replaced during cleanup.',
+            },
+          },
+        ],
+      },
+    }),
+    '/repo',
+  );
+  const registered = [
+    { path: parent, generation: parentGeneration },
+    { path: recovery, generation: childGeneration },
+  ];
+  const targets = [
+    catalog.worktrees['/repo'][0],
+    ...worktreeDescendants(catalog, '/repo', registered, parent),
+  ];
+  let marked = catalog;
+  for (const target of targets) {
+    marked = markNewWorktreeCleanupPending(
+      marked,
+      '/repo',
+      target.path,
+      {
+        originalPath: target.path,
+        recoveryPath: target.path,
+        sizeBytes: 0,
+        reason: 'The parent Ship worktree completed.',
+      },
+      target.generation ?? undefined,
+    );
+  }
+
+  assert.equal(marked.worktrees['/repo'][0].pendingCleanup?.originalPath, parent);
+  assert.deepEqual(marked.worktrees['/repo'][1].pendingCleanup, {
+    originalPath: original,
+    recoveryPath: recovery,
+    sizeBytes: 2048,
+    reason: 'Original path was replaced during cleanup.',
+  });
 });
 
 await test('keeps a removed checkout visible while its private storage remains pending', () => {
