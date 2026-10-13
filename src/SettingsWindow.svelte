@@ -166,6 +166,90 @@
   let contextExecutable = $state('');
   let contextError = $state('');
   let contextMessage = $state('');
+  type OutputStorageStatus = {
+    items: number;
+    bytes: number;
+    retentionDays: number;
+    maxTotalMib: number;
+    maxRetentionDays: number;
+    maxSizeMib: number;
+  };
+  let outputStatus = $state<OutputStorageStatus | null>(null);
+  let outputRetentionDays = $state('7');
+  let outputMaxTotalMib = $state('128');
+  let outputError = $state('');
+  let outputMessage = $state('');
+  let outputBusy = $state(false);
+  let outputPurgePending = $state(false);
+
+  function applyOutputStatus(status: OutputStorageStatus) {
+    outputStatus = status;
+    outputRetentionDays = String(status.retentionDays);
+    outputMaxTotalMib = String(status.maxTotalMib);
+  }
+
+  async function refreshOutputStorage() {
+    outputBusy = true;
+    outputError = '';
+    try {
+      applyOutputStatus(await invoke<OutputStorageStatus>('context_output_status'));
+    } catch (cause) {
+      outputError = `Stored output: ${String(cause)}`;
+    } finally {
+      outputBusy = false;
+    }
+  }
+
+  async function saveOutputLimits() {
+    const retentionDays = Number(outputRetentionDays);
+    const maxTotalMib = Number(outputMaxTotalMib);
+    if (
+      !Number.isInteger(retentionDays) ||
+      retentionDays < 1 ||
+      retentionDays > 365 ||
+      !Number.isInteger(maxTotalMib) ||
+      maxTotalMib < 1 ||
+      maxTotalMib > 256
+    ) {
+      outputError = 'Choose 1–365 retention days and a 1–256 MiB size limit.';
+      return;
+    }
+    outputBusy = true;
+    outputError = '';
+    outputMessage = '';
+    try {
+      applyOutputStatus(
+        await invoke<OutputStorageStatus>('context_output_save_limits', {
+          retentionDays,
+          maxTotalMib,
+        }),
+      );
+      outputMessage = 'Stored output limits saved. New output uses these limits.';
+    } catch (cause) {
+      outputError = `Stored output: ${String(cause)}`;
+    } finally {
+      outputBusy = false;
+    }
+  }
+
+  async function purgeOutputStorage() {
+    if (!outputPurgePending) {
+      outputPurgePending = true;
+      return;
+    }
+    outputBusy = true;
+    outputError = '';
+    outputMessage = '';
+    try {
+      applyOutputStatus(await invoke<OutputStorageStatus>('context_output_purge'));
+      outputMessage = 'Stored output cleared.';
+      outputPurgePending = false;
+    } catch (cause) {
+      outputError = `Stored output: ${String(cause)}`;
+    } finally {
+      outputBusy = false;
+    }
+  }
 
   async function refreshContext(directory: string) {
     const request = ++contextRequest;
@@ -831,6 +915,7 @@
         onclick={() => {
           selectedSection = 'context';
           if (snapshot?.directory) void refreshContext(snapshot.directory);
+          void refreshOutputStorage();
         }}>Context</button
       >
     </nav>
@@ -1431,6 +1516,71 @@
               >
             {/if}
           </div>
+        {/if}
+      </section>
+      <section class="settings-card">
+        <h2>Local stored output</h2>
+        <p>Large tool results saved by Sail stay on this Mac. Usage covers all local projects.</p>
+        {#if outputError}<p class="runtime-diagnostic" role="alert">{outputError}</p>{/if}
+        {#if outputMessage}<p role="status">{outputMessage}</p>{/if}
+        {#if outputStatus}
+          <p role="status">
+            {outputStatus.items === 0
+              ? 'No stored output: 0 items, 0 content bytes.'
+              : `${outputStatus.items} stored item(s), ${outputStatus.bytes.toLocaleString()} content bytes.`}
+          </p>
+          <label for="output-retention-days">Retention (days)</label>
+          <input
+            id="output-retention-days"
+            type="number"
+            min="1"
+            max={outputStatus.maxRetentionDays}
+            step="1"
+            bind:value={outputRetentionDays}
+            disabled={outputBusy}
+          />
+          <label for="output-max-total-mib">Maximum stored content (MiB)</label>
+          <input
+            id="output-max-total-mib"
+            type="number"
+            min="1"
+            max={outputStatus.maxSizeMib}
+            step="1"
+            bind:value={outputMaxTotalMib}
+            disabled={outputBusy}
+          />
+          <div class="context-provider-actions">
+            <Button size="sm" disabled={outputBusy} onclick={saveOutputLimits}>Save limits</Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={outputBusy}
+              onclick={refreshOutputStorage}>Refresh usage</Button
+            >
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={outputBusy || outputStatus.items === 0}
+              onclick={purgeOutputStorage}
+              >{outputPurgePending
+                ? 'Confirm clear all stored output'
+                : 'Clear stored output'}</Button
+            >
+          </div>
+          {#if outputPurgePending}
+            <p>
+              Clearing removes stored results for every local project and breaks their references.
+            </p>
+            <Button size="sm" variant="secondary" onclick={() => (outputPurgePending = false)}
+              >Cancel</Button
+            >
+          {/if}
+        {:else if outputBusy}
+          <p role="status">Checking stored output…</p>
+        {:else}
+          <Button size="sm" variant="secondary" onclick={refreshOutputStorage}
+            >Retry storage status</Button
+          >
         {/if}
       </section>
     {:else}
