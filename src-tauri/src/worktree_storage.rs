@@ -2596,10 +2596,9 @@ mod tests {
 
     fn write_expired_temp_owner_with_header(temp: &Path, data_directory: &Path, header: &str) {
         let pid = std::process::id();
-        let started_at = sysinfo::System::new_all()
-            .process(sysinfo::Pid::from_u32(pid))
-            .unwrap()
-            .start_time();
+        let owner = read_temp_owner(temp, data_directory).expect("registered temporary owner");
+        assert_eq!(owner.pid, pid);
+        let started_at = owner.started_at.expect("registered owner process start");
         fs::write(
             temp.join(TEMP_OWNER_FILE),
             format!(

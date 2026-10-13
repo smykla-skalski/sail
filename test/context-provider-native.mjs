@@ -357,8 +357,13 @@ try {
     readdirSync(config, { withFileTypes: true }).some(
       (entry) => entry.isDirectory() && existsSync(join(config, entry.name, marker)),
     );
-  const idleDeadline = Date.now() + 5_000;
-  while (!idleReply() && Date.now() < idleDeadline) await delay(10);
+  const waitForIdleReply = async (marker, deadline = Date.now() + 5_000) => {
+    if (idleReply(marker)) return;
+    assert.ok(Date.now() < deadline, `Provider idle marker ${marker} did not appear`);
+    await delay(10);
+    return waitForIdleReply(marker, deadline);
+  };
+  await waitForIdleReply('idle-ping-replied');
   assert.ok(idleReply(), 'provider ping receives a reply while all clients are idle');
   let progressCount = 0;
   const progressed = await first.request(
@@ -385,9 +390,7 @@ try {
     idleNotification,
   );
   assert.equal(idleProgressed.result.pid, a.result.pid);
-  const idleProgressDeadline = Date.now() + 5_000;
-  while (!idleReply('idle-progress-ping-replied') && Date.now() < idleProgressDeadline)
-    await delay(10);
+  await waitForIdleReply('idle-progress-ping-replied');
   assert.ok(
     idleReply('idle-progress-ping-replied'),
     'idle notification bursts drain before the following provider ping',
