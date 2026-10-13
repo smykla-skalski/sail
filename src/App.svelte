@@ -5393,6 +5393,8 @@
           }
           let pendingCatalog = projectCatalog;
           for (const [index, worktree] of targets.entries()) {
+            if (!worktree.generation)
+              throw new Error('Ship worktree identity changed before pending cleanup.');
             const state = preview[index];
             pendingCatalog = markWorktreeCleanupPending(
               pendingCatalog,
@@ -5414,7 +5416,7 @@
                           ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
                           : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
               },
-              state.generation,
+              worktree.generation,
             );
           }
           await saveProjectCatalogDurably(pendingCatalog);
@@ -9337,6 +9339,15 @@
               const absent = paths.length
                 ? await invoke<boolean>('pending_cleanup_paths_absent', { paths })
                 : true;
+              if (absent && pending.selectedStorageCleanupConfirmed) {
+                return {
+                  entry,
+                  pending,
+                  sizeBytes: null,
+                  reason: 'Confirmed selected storage cleanup completed after interruption.',
+                  completed: true,
+                };
+              }
               if (absent) {
                 reason =
                   'The Git checkout was removed outside Sail. Private storage without a durable cleanup marker cannot be ruled out; inspect its cache before clearing this pending entry.';
@@ -9378,6 +9389,7 @@
         }),
       );
       let catalog = projectCatalog;
+      const completedPaths: string[] = [];
       for (const { entry, pending, sizeBytes, reason, completed } of updates) {
         const currentEntry = catalog.worktrees[repository]?.find(
           (worktree) =>
@@ -9387,6 +9399,7 @@
         );
         if (!currentEntry) continue;
         if (completed) {
+          completedPaths.push(entry.path);
           catalog = removeWorktree(catalog, repository, entry.path);
           continue;
         }
@@ -9396,7 +9409,21 @@
           reason,
         });
       }
-      saveProjectCatalog(catalog);
+      if (completedPaths.length) {
+        await completedPaths.reduce(
+          (previous, path) => previous.then(() => settleMergedShipCleanup(repository, path)),
+          Promise.resolve(),
+        );
+        const previousCatalog = projectCatalog;
+        try {
+          await saveProjectCatalogDurably(catalog);
+        } catch (cause) {
+          saveProjectCatalog(previousCatalog);
+          throw cause;
+        }
+      } else {
+        saveProjectCatalog(catalog);
+      }
       error = '';
     } catch (cause) {
       error = `Could not recheck pending worktrees: ${describe(cause)}`;
@@ -9522,6 +9549,18 @@
         { destructive: true },
       );
       if (!confirmed) return;
+      verifiedRecovery.selectedStorageCleanupConfirmed = true;
+      const previousCatalog = projectCatalog;
+      try {
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, verifiedRecovery),
+        );
+      } catch (cause) {
+        saveProjectCatalog(previousCatalog);
+        throw new Error(`Could not record selected storage confirmation: ${describe(cause)}`, {
+          cause,
+        });
+      }
       let remainingStoragePaths = [...verifiedRecovery.storagePaths];
       let remainingStorageKeys = [...(verifiedRecovery.storageKeys ?? [])];
       try {

@@ -27,6 +27,7 @@ export type PendingWorktreeCleanup = {
   reason: string;
   storagePaths?: string[];
   storageKeys?: string[];
+  selectedStorageCleanupConfirmed?: boolean;
 };
 export type ProjectWorktree = {
   path: string;
@@ -105,8 +106,15 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
         if (typeof entry.statusComment === 'string')
           worktree.statusComment = entry.statusComment.slice(0, 140);
         if (isRecord(entry.pendingCleanup)) {
-          const { originalPath, recoveryPath, sizeBytes, reason, storagePaths, storageKeys } =
-            entry.pendingCleanup;
+          const {
+            originalPath,
+            recoveryPath,
+            sizeBytes,
+            reason,
+            storagePaths,
+            storageKeys,
+            selectedStorageCleanupConfirmed,
+          } = entry.pendingCleanup;
           if (
             typeof originalPath === 'string' &&
             !!originalPath &&
@@ -135,6 +143,9 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
                 (key): key is string => typeof key === 'string' && /^[0-9a-f]{64}$/.test(key),
               )
                 ? { storageKeys }
+                : {}),
+              ...(selectedStorageCleanupConfirmed === true
+                ? { selectedStorageCleanupConfirmed: true }
                 : {}),
             };
         }

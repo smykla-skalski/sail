@@ -226,4 +226,70 @@ describe('merged Ship pending cleanup', () => {
       expect(git('worktree', 'list')).toContain(source);
     }
   });
+  it('rechecks a completed selected-storage cleanup after restart', async () => {
+    const confirmed = join(worktrees, 'completed-storage');
+    const external = join(worktrees, 'external-removal');
+    git('worktree', 'add', '-q', '-b', 'completed-storage', confirmed);
+    git('worktree', 'add', '-q', '-b', 'external-removal', external);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = (path: string) => registered.find((item) => item.path === path)?.generation;
+    if (!generation(confirmed) || !generation(external))
+      throw new Error('Missing worktree generation for interrupted cleanup fixture');
+    git('worktree', 'remove', confirmed);
+    git('worktree', 'remove', external);
+    const pending = (path: string, authorized: boolean) => ({
+      path,
+      branch: path === confirmed ? 'completed-storage' : 'external-removal',
+      generation: generation(path),
+      pendingCleanup: {
+        originalPath: path,
+        recoveryPath: path,
+        sizeBytes: 0,
+        reason: 'Cleanup interrupted before catalog settlement.',
+        storagePaths: [join(worktrees, `${path === confirmed ? 'confirmed' : 'external'}-storage`)],
+        ...(authorized ? { selectedStorageCleanupConfirmed: true } : {}),
+      },
+    });
+    await browser.tauri.execute(
+      async ({ core }, input) => {
+        await core.invoke('save_setting', { key: 'sai-directory', value: input.repo });
+        await core.invoke('save_setting', {
+          key: 'sai-project-catalog',
+          value: JSON.stringify({
+            repositories: [input.repo],
+            groups: [],
+            worktrees: { [input.repo]: input.entries },
+          }),
+        });
+      },
+      { repo: repository, entries: [pending(confirmed, true), pending(external, false)] },
+    );
+    await browser.execute(() => {
+      localStorage.clear();
+      localStorage.setItem('sail-settings-migrated-v1', '1');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    });
+    await browser.refresh();
+    await browser.waitUntil(async () => $(`[data-pending-worktree="${confirmed}"]`).isDisplayed());
+    expect((await pendingCleanup(confirmed))?.selectedStorageCleanupConfirmed).toBe(true);
+    await $(`[data-pending-worktree="${confirmed}"]`).$('button=Recheck storage').click();
+    await browser.waitUntil(async () => !(await catalogPaths()).includes(confirmed));
+    expect(await catalogPaths()).toContain(external);
+    await $(`[data-pending-worktree="${external}"]`).$('button=Recheck storage').click();
+    await browser.waitUntil(async () =>
+      ((await pendingCleanup(external))?.reason ?? '').includes('removed outside Sail'),
+    );
+    expect(await catalogPaths()).toContain(external);
+    const settings = await browser.tauri.execute(async ({ core }) =>
+      core.invoke<Record<string, string>>('load_settings'),
+    );
+    const persisted = loadProjectCatalog(settings['sai-project-catalog'] ?? null, repository);
+    expect(persisted.worktrees[repository]?.map((item) => item.path)).toEqual([external]);
+  });
 });
