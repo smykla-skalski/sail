@@ -985,10 +985,8 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
                     .map_err(|_| "Context MCP output worker stopped.".to_string());
             }
         }
-        if active {
-            if let Some(notifications) = session.notifications()? {
-                emit(notifications)?;
-            }
+        if let Some(notifications) = session.notifications()? {
+            emit(notifications)?;
         }
         let event = match receive.recv_timeout(std::time::Duration::from_millis(25)) {
             Ok(event) => event,
@@ -1796,7 +1794,10 @@ enum ProviderEvent {
 }
 
 #[cfg(target_os = "macos")]
-struct ProviderOutput(std::sync::mpsc::Receiver<ProviderEvent>);
+struct ProviderOutput {
+    receive: std::sync::mpsc::Receiver<ProviderEvent>,
+    pending: Option<String>,
+}
 
 #[cfg(target_os = "macos")]
 fn write_shared_provider_request(
@@ -1825,6 +1826,130 @@ fn write_shared_provider_request(
 }
 
 #[cfg(target_os = "macos")]
+fn provider_notifications(
+    key: &str,
+    expected: &str,
+    capability: &str,
+) -> Result<Option<String>, String> {
+    let sessions = active_sessions()
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let initialization = sessions.get(capability).ok_or("Context session revoked.")?;
+    let Some(initialization) = initialization else {
+        return Ok(None);
+    };
+    if initialization.project != key || initialization.fingerprint != expected {
+        return Err("Context session belongs to another provider.".into());
+    }
+    drop(sessions);
+    let slot = PROVIDERS
+        .get()
+        .and_then(|registry| registry.lock().ok()?.get(key).and_then(Option::clone));
+    let Some(slot) = slot else {
+        return Ok(None);
+    };
+    let mut provider = match slot.try_lock() {
+        Ok(provider) => provider,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let Some(process) = provider.as_mut() else {
+        return Ok(None);
+    };
+    if process.fingerprint != expected {
+        return Err("Context approval changed or was revoked.".into());
+    }
+    let Some(output) = process.output.as_mut() else {
+        return Ok(None);
+    };
+    let drain = (|| -> Result<Option<String>, String> {
+        let mut buffered = String::new();
+        for _ in 0..32 {
+            let event = if let Some(pending) = output.pending.take() {
+                ProviderEvent::Notification(pending)
+            } else {
+                match output.receive.try_recv() {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Err("Provider response reader stopped.".into());
+                    }
+                }
+            };
+            match event {
+                ProviderEvent::Notification(message) => {
+                    if buffered.len() + message.len() > 1024 * 1024 {
+                        output.pending = Some(message);
+                        break;
+                    }
+                    buffered.push_str(&message);
+                }
+                ProviderEvent::Response(_) => {
+                    return Err("Provider sent a response without an active request.".into());
+                }
+                ProviderEvent::Failure(error) => return Err(error),
+            }
+        }
+        Ok((!buffered.is_empty()).then_some(buffered))
+    })();
+    match drain {
+        Ok(messages) => Ok(messages),
+        Err(error) => {
+            let detail = process.error(&error);
+            drop(provider);
+            let _ = stop_provider_if_fingerprint(key, expected);
+            Err(detail)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// Inputs must be NUL-terminated strings; output must hold the stated length.
+pub unsafe extern "C" fn sail_context_provider_notifications(
+    key: *const std::ffi::c_char,
+    expected: *const std::ffi::c_char,
+    capability: *const std::ffi::c_char,
+    output: *mut std::ffi::c_char,
+    output_length: usize,
+) -> bool {
+    if key.is_null()
+        || expected.is_null()
+        || capability.is_null()
+        || output.is_null()
+        || output_length == 0
+    {
+        return false;
+    }
+    let result = (|| {
+        let key = unsafe { std::ffi::CStr::from_ptr(key) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let expected = unsafe { std::ffi::CStr::from_ptr(expected) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let capability = unsafe { std::ffi::CStr::from_ptr(capability) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        provider_notifications(key, expected, capability)
+    })();
+    let (ok, text) = match result {
+        Ok(Some(message)) => (true, message),
+        Ok(None) => (true, String::new()),
+        Err(error) => (false, error),
+    };
+    if text.len() >= output_length {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), output.cast::<u8>(), text.len());
+        *output.add(text.len()) = 0;
+    }
+    ok
+}
+
+#[cfg(target_os = "macos")]
 fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
     if process.output.is_some() {
         return Ok(());
@@ -1835,7 +1960,10 @@ fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
         .ok_or("Provider output unavailable.")?;
     let stdin = process.stdin.clone();
     let (send, receive) = std::sync::mpsc::sync_channel(32);
-    process.output = Some(ProviderOutput(receive));
+    process.output = Some(ProviderOutput {
+        receive,
+        pending: None,
+    });
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {
             loop {
@@ -1927,7 +2055,7 @@ fn exchange_provider_request(
     start_provider_output(process)?;
     let output = process
         .output
-        .as_ref()
+        .as_mut()
         .ok_or("Provider output unavailable.")?;
     let request_id = request.get("id").ok_or("MCP request has no ID.")?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1954,10 +2082,15 @@ fn exchange_provider_request(
         if remaining.is_zero() {
             return Err("Provider response timed out.".into());
         }
-        match output
-            .0
-            .recv_timeout(remaining.min(Duration::from_millis(10)))
-        {
+        let event = output.pending.take().map_or_else(
+            || {
+                output
+                    .receive
+                    .recv_timeout(remaining.min(Duration::from_millis(10)))
+            },
+            |message| Ok(ProviderEvent::Notification(message)),
+        );
+        match event {
             Ok(ProviderEvent::Notification(message)) => {
                 if let Some(notify) = &mut notify {
                     notify(&message)?;
@@ -2638,6 +2771,72 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn idle_notification_burst_drains_before_the_following_provider_ping() {
+        let repository = Repository::new("runtime-idle-notification-ping");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let owner = ActiveSession::new();
+        let call = |message: &str| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                Some(&owner.0),
+                message,
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        );
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let response = call(r#"{"jsonrpc":"2.0","id":2,"method":"idle-many-progress"}"#);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["pid"], first["result"]["pid"]);
+
+        let marker = repository
+            .0
+            .join("data")
+            .join(&key)
+            .join("idle-progress-ping-replied");
+        let mut count = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (count < 160 || !marker.exists()) && std::time::Instant::now() < deadline {
+            if let Some(messages) = provider_notifications(&key, &fingerprint, &owner.0).unwrap() {
+                for message in messages.lines() {
+                    let notification: serde_json::Value = serde_json::from_str(message).unwrap();
+                    assert_eq!(notification["method"], "notifications/message");
+                    assert_eq!(notification["params"]["data"], count);
+                    count += 1;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(count, 160);
+        assert!(
+            marker.exists(),
+            "Idle ping was blocked by the notification queue"
+        );
+        let next = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+        let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(next["result"]["pid"], first["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn progress_stream_exceeding_32_messages_reaches_its_result() {
         let repository = Repository::new("runtime-many-progress");
         repository.configure();
@@ -2733,7 +2932,7 @@ mod tests {
             let old = scope.spawn(move || {
                 assert!(session_is_active(Some(&owner.0)).unwrap());
                 assert_eq!(
-                    locked_store(&store_path, |store| Ok((
+                    locked_store(store_path, |store| Ok((
                         status(&repository.0, store).fingerprint,
                         false
                     )))
@@ -2742,7 +2941,7 @@ mod tests {
                 );
                 authorized.send(()).unwrap();
                 suspended.recv().unwrap();
-                call(&original, Some(owner.0.as_str()))
+                call(original, Some(owner.0.as_str()))
             });
             ready.recv().unwrap();
             repository.write(".sail/context.json", r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["search"]}]}"#);

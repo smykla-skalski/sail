@@ -353,9 +353,9 @@ try {
     arguments: {},
   });
   assert.equal(idlePinged.result.pid, a.result.pid);
-  const idleReply = () =>
+  const idleReply = (marker = 'idle-ping-replied') =>
     readdirSync(config, { withFileTypes: true }).some(
-      (entry) => entry.isDirectory() && existsSync(join(config, entry.name, 'idle-ping-replied')),
+      (entry) => entry.isDirectory() && existsSync(join(config, entry.name, marker)),
     );
   const idleDeadline = Date.now() + 5_000;
   while (!idleReply() && Date.now() < idleDeadline) await delay(10);
@@ -373,6 +373,28 @@ try {
   );
   assert.equal(progressCount, 160);
   assert.equal(progressed.result.pid, a.result.pid);
+  let idleCount = 0;
+  const idleNotification = (notification) => {
+    assert.equal(notification.method, 'notifications/message');
+    assert.equal(notification.params.data, idleCount++);
+  };
+  const idleProgressed = await first.request(
+    33,
+    'tools/call',
+    { name: 'fixture_idle_progress', arguments: {} },
+    idleNotification,
+  );
+  assert.equal(idleProgressed.result.pid, a.result.pid);
+  const idleProgressDeadline = Date.now() + 5_000;
+  while (!idleReply('idle-progress-ping-replied') && Date.now() < idleProgressDeadline)
+    await delay(10);
+  assert.ok(
+    idleReply('idle-progress-ping-replied'),
+    'idle notification bursts drain before the following provider ping',
+  );
+  const afterIdle = await first.request(34, 'tools/list', undefined, idleNotification);
+  assert.equal(idleCount, 160);
+  assert.equal(afterIdle.result.pid, a.result.pid);
   const cancellationStart = Date.now();
   let notificationReceived;
   const notified = new Promise((resolve) => {

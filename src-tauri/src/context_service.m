@@ -9,6 +9,8 @@ extern bool sail_context_provider_request(const char *directory, const char *exp
                                           const char *capability, const char *request,
                                           bool (*notify)(void *, const char *), void *notifyContext,
                                           char *output, size_t length);
+extern bool sail_context_provider_notifications(const char *projectKey, const char *expected,
+                                                const char *capability, char *output, size_t length);
 extern void sail_context_provider_stop(const char *projectKey);
 extern void sail_context_provider_stop_if_fingerprint(const char *projectKey, const char *expected);
 extern bool sail_context_session_activate(const char *capability);
@@ -211,6 +213,38 @@ int sail_context_service_main(void) {
                             closeSession(sessions, key);
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         } else {
+                            char *output = calloc(1024 * 1024 + 1, 1);
+                            bool success = output && sail_context_provider_notifications(
+                                [session[@"projectKey"] UTF8String],
+                                [session[@"fingerprint"] UTF8String],
+                                capability.UTF8String, output, 1024 * 1024 + 1);
+                            NSString *text = output ? [NSString stringWithUTF8String:output] : nil;
+                            free(output);
+                            if (!success) {
+                                xpc_dictionary_set_string(reply, "error", text.UTF8String ?: "Provider notification read failed.");
+                                closeSession(sessions, key);
+                                xpc_connection_send_message(peer, reply);
+                                return;
+                            }
+                            if (text.length) {
+                                for (NSValue *otherKey in sessions.allKeys) {
+                                    NSDictionary *other = sessions[otherKey];
+                                    if (![other[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
+                                        ![other[@"fingerprint"] isEqualToString:session[@"fingerprint"]]) continue;
+                                    NSMutableString *pending = other[@"notifications"];
+                                    if ([pending lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
+                                        [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 1024 * 1024) {
+                                        [pending appendString:text];
+                                    } else {
+                                        closeSession(sessions, otherKey);
+                                    }
+                                }
+                            }
+                            if (sessions[key] != session) {
+                                xpc_dictionary_set_string(reply, "error", "Context MCP notification queue exceeded 1 MiB.");
+                                xpc_connection_send_message(peer, reply);
+                                return;
+                            }
                             NSMutableString *pending = session[@"notifications"];
                             xpc_dictionary_set_string(reply, "response", pending.UTF8String);
                             [pending setString:@""];

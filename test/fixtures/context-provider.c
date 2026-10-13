@@ -44,8 +44,10 @@ int main(void) {
             continue;
         }
         int tool_call = strstr(line, "\"method\":\"tools/call\"") != NULL;
+        int idle_progress = strstr(line, "\"method\":\"idle-many-progress\"") != NULL ||
+            (tool_call && strstr(line, "\"name\":\"fixture_idle_progress\""));
         int idle_ping = strstr(line, "\"method\":\"idle-ping\"") != NULL ||
-            (tool_call && strstr(line, "\"name\":\"fixture_idle_ping\""));
+            (tool_call && strstr(line, "\"name\":\"fixture_idle_ping\"")) || idle_progress;
         int progress = strstr(line, "\"method\":\"many-progress\"") != NULL ||
             (tool_call && strstr(line, "\"name\":\"fixture_many_progress\""));
         if (access(".sail/strict-provider-lifecycle", F_OK) == 0 &&
@@ -93,6 +95,7 @@ int main(void) {
                      "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_server_ping\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_idle_ping\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_idle_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_many_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_wait_cancel\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
         } else if (tool_call) {
@@ -101,13 +104,20 @@ int main(void) {
         printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d%s}}\n",
                value, (long)getpid(), initialization_count, result);
         fflush(stdout);
+        if (idle_progress) {
+            for (int count = 0; count < 160; count++) {
+                printf("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\","
+                       "\"params\":{\"level\":\"info\",\"data\":%d}}\n", count);
+                fflush(stdout);
+            }
+        }
         if (idle_ping) {
             puts("{\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"ping\"}");
             fflush(stdout);
             if (getline(&line, &capacity, stdin) == -1 ||
                 !strstr(line, "\"id\":999") || !strstr(line, "\"result\":{}") ||
                 strstr(line, "\"error\"")) return 1;
-            if (!write_marker("idle-ping-replied")) return 1;
+            if (!write_marker(idle_progress ? "idle-progress-ping-replied" : "idle-ping-replied")) return 1;
         }
         if (initialization_count && access(".sail/block-provider-stdin", F_OK) == 0) {
             if (!write_marker("blocked-input")) return 1;
