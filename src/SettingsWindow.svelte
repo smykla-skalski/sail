@@ -73,6 +73,7 @@
   };
   type WorktreeCacheUsage = {
     worktree: string;
+    worktreeToken: string;
     cacheKey: string;
     usageBytes: number | null;
     limitBytes: number;
@@ -282,7 +283,7 @@
     let failure = '';
     try {
       await invoke('set_worktree_cache_limit', {
-        worktree: item.worktree,
+        worktreeToken: item.worktreeToken,
         limitBytes: Math.round(gib * 1024 ** 3),
       });
     } catch (cause) {
@@ -1254,7 +1255,7 @@
         </p>
         {#if worktreeCacheUsage.length > 0}
           <ul>
-            {#each worktreeCacheUsage as item (item.worktree)}
+            {#each worktreeCacheUsage as item (item.worktreeToken || item.cacheKey)}
               <li>
                 <code>{item.worktree}</code> · {formatStorageSize(item.usageBytes)} used
                 <label for={`cache-limit-${item.cacheKey}`}>Limit (GiB)</label>
@@ -1265,7 +1266,7 @@
                   max="1024"
                   step="0.5"
                   value={item.limitBytes / 1024 ** 3}
-                  disabled={worktreeStorageLoading}
+                  disabled={worktreeStorageLoading || !item.worktreeToken}
                   onchange={(event) =>
                     void setWorktreeCacheLimit(item, event.currentTarget.valueAsNumber)}
                 />
@@ -1278,6 +1279,9 @@
                 {/if}
                 {#if item.usageBytes === null && item.reason}
                   <span role="status">{cacheReason(item.reason)}</span>
+                {/if}
+                {#if !item.worktreeToken}
+                  <span role="status">Worktree identity cannot be verified</span>
                 {/if}
               </li>
             {/each}

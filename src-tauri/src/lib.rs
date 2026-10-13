@@ -3851,7 +3851,7 @@ async fn worktree_cache_status(
 #[tauri::command]
 async fn set_worktree_cache_limit(
     app: tauri::AppHandle,
-    worktree: String,
+    worktree_token: String,
     limit_bytes: u64,
 ) -> Result<(), String> {
     let cache = app
@@ -3859,7 +3859,7 @@ async fn set_worktree_cache_limit(
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
-        worktree_storage::set_cache_limit(&cache, Path::new(&worktree), limit_bytes)
+        worktree_storage::set_cache_limit_token(&cache, &worktree_token, limit_bytes)
     })
     .await
     .map_err(|error| error.to_string())?
