@@ -1982,6 +1982,11 @@ pub(crate) fn ensure_ready_before_worktree_removal(
     data_directories: &[PathBuf],
 ) -> Result<(), String> {
     for data_directory in data_directories {
+        match fs::symlink_metadata(data_directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+            Ok(_) => {}
+        }
         let identity = read_owner(data_directory).map_err(|reason| {
             report_pending(data_directory, reason);
             format!("Private agent data is retained pending ownership verification ({reason}).")
@@ -2479,6 +2484,25 @@ pub(crate) fn generation(worktree: &Path) -> Result<String, String> {
         "{}:{}",
         identity.repository_generation, identity.generation
     ))
+}
+
+pub(crate) fn with_idle_worktree<T>(
+    cache_directory: &Path,
+    worktree: &Path,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let identity = resolve_identity(worktree)?;
+    let data_directory = identity_data_directory(cache_directory, &identity)?;
+    let _repo_lock = FileLock::acquire(
+        &lock_path(cache_directory, "repo", &identity.common_dir)?,
+        true,
+    )?;
+    let Ok(_lease) =
+        FileLock::try_acquire(&lock_path(cache_directory, "lease", &data_directory)?, true)
+    else {
+        return Ok(None);
+    };
+    operation().map(Some)
 }
 
 fn git_path(directory: &Path, arguments: &[&str]) -> Result<PathBuf, String> {

@@ -3477,39 +3477,44 @@ pub struct PromptOutcome {
 }
 
 #[tauri::command]
-pub fn acp_activity(
+pub async fn acp_activity(
     manager: State<'_, AgentManager>,
     directory: String,
 ) -> Result<HashMap<String, AgentActivity>, String> {
-    let worktree = worktree_identity(Path::new(&directory));
-    let agents = manager.0.lock().map_err(|error| error.to_string())?;
-    let mut activity = HashMap::<String, AgentActivity>::new();
-    for runtime in agents
-        .values()
-        .filter(|runtime| runtime.worktree == worktree)
-    {
-        let prompts = runtime
-            .prompt_state
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let directories = runtime
-            .session_directories
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let permission_state = runtime
-            .permission_state
-            .lock()
-            .map_err(|error| error.to_string())?;
-        append_connection_activity(
-            &mut activity,
-            &runtime.agent,
-            runtime.alive.load(Ordering::Acquire),
-            &prompts,
-            &directories,
-            &permission_state.pending,
-        );
-    }
-    Ok(activity)
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let worktree = worktree_identity(Path::new(&directory));
+        let agents = manager.0.lock().map_err(|error| error.to_string())?;
+        let mut activity = HashMap::<String, AgentActivity>::new();
+        for runtime in agents
+            .values()
+            .filter(|runtime| runtime.worktree == worktree)
+        {
+            let prompts = runtime
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let directories = runtime
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let permission_state = runtime
+                .permission_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            append_connection_activity(
+                &mut activity,
+                &runtime.agent,
+                runtime.alive.load(Ordering::Acquire),
+                &prompts,
+                &directories,
+                &permission_state.pending,
+            );
+        }
+        Ok(activity)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

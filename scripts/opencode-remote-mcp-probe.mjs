@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
+import { run } from './opencode-probe-runner.mjs';
 
 const PINNED_VERSION = '2.0.24';
 const PROBE_TOKEN = 's3cret-probe-token';
@@ -39,24 +40,8 @@ function findBinary() {
   return undefined;
 }
 
-function run(binary, cliArguments, options = {}) {
-  const result = spawnSync(binary, cliArguments, {
-    cwd: options.cwd,
-    encoding: 'utf8',
-    timeout: options.timeout ?? 30_000,
-    input: options.input ?? '',
-    env: { ...process.env, ...options.environment },
-  });
-  return {
-    status: result.status,
-    timedOut: result.signal === 'SIGTERM' || result.signal === 'SIGKILL',
-    stdout: (result.stdout ?? '').trim(),
-    stderr: (result.stderr ?? '').trim(),
-  };
-}
-
-function versionOf(binary) {
-  const result = run(binary, ['--version'], { timeout: 15_000 });
+async function versionOf(binary, environment) {
+  const result = await run(binary, ['--version'], { timeout: 15_000, environment });
   const match = /v?(\d+\.\d+\.\d+)/.exec(result.stdout);
   return match ? match[1] : undefined;
 }
@@ -169,7 +154,7 @@ function delay(milliseconds) {
 }
 
 async function settleList(binary, project, environment, expectedNames, attempts = 10) {
-  const result = run(binary, ['mcp', 'list'], { cwd: project, environment, timeout: 20_000 });
+  const result = await run(binary, ['mcp', 'list'], { cwd: project, environment, timeout: 20_000 });
   if (expectedNames.every((name) => result.stdout.includes(name))) return result;
   if (attempts <= 1) return undefined;
   await delay(1000);
@@ -177,6 +162,8 @@ async function settleList(binary, project, environment, expectedNames, attempts 
 }
 
 async function probe(binary) {
+  let server;
+  let serviceIsolated = false;
   const scratch = mkdtempSync(join(tmpdir(), 'sail-300-mcp-probe-'));
   const project = join(scratch, 'project');
   mkdirSync(project, { recursive: true });
@@ -186,21 +173,28 @@ async function probe(binary) {
     XDG_CONFIG_HOME: join(scratch, 'xdg-config'),
     XDG_DATA_HOME: join(scratch, 'xdg-data'),
     XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
+    XDG_STATE_HOME: join(scratch, 'xdg-state'),
+    OPENCODE_CONFIG_DIR: join(scratch, 'opencode-config'),
+    OPENCODE_CONFIG: undefined,
+    OPENCODE_CONFIG_CONTENT: undefined,
     APPDATA: join(scratch, 'appdata'),
     LOCALAPPDATA: join(scratch, 'appdata-local'),
   };
   try {
+    mkdirSync(environment.HOME, { recursive: true });
+    mkdirSync(environment.OPENCODE_CONFIG_DIR, { recursive: true });
     writeFileSync(join(project, 'opencode.json'), '{}\n');
-    const { server, port, requests } = await startMcpServer();
+    const fixture = await startMcpServer();
+    server = fixture.server;
+    const { port, requests } = fixture;
     const servicePort = await freePort();
-    const serviceIsolation = run(binary, ['service', 'set', 'port', String(servicePort)], {
+    const serviceIsolation = await run(binary, ['service', 'set', 'port', String(servicePort)], {
       cwd: project,
       environment,
     });
     if (serviceIsolation.status !== 0) {
-      server.close();
       return {
-        version: versionOf(binary),
+        version: await versionOf(binary, environment),
         pinnedVersion: PINNED_VERSION,
         url: `http://127.0.0.1:${port}/mcp`,
         findings: [
@@ -217,11 +211,12 @@ async function probe(binary) {
         ],
       };
     }
+    serviceIsolated = true;
     const url = `http://127.0.0.1:${port}/mcp`;
     const findings = [];
-    const version = versionOf(binary);
+    const version = await versionOf(binary, environment);
 
-    const addFirst = run(
+    const addFirst = await run(
       binary,
       ['mcp', 'add', 'probe', '--url', url, '--header', `Authorization=Bearer ${PROBE_TOKEN}`],
       { cwd: project, environment },
@@ -250,7 +245,7 @@ async function probe(binary) {
     );
 
     const replacementUrl = `http://127.0.0.1:${port}/replaced`;
-    const addReplace = run(binary, ['mcp', 'add', 'probe', '--url', replacementUrl], {
+    const addReplace = await run(binary, ['mcp', 'add', 'probe', '--url', replacementUrl], {
       cwd: project,
       environment,
     });
@@ -268,7 +263,10 @@ async function probe(binary) {
       ),
     );
 
-    const removeAttempt = run(binary, ['mcp', 'remove', 'probe'], { cwd: project, environment });
+    const removeAttempt = await run(binary, ['mcp', 'remove', 'probe'], {
+      cwd: project,
+      environment,
+    });
     findings.push(
       finding(
         'remove-has-no-command',
@@ -282,7 +280,7 @@ async function probe(binary) {
       ),
     );
 
-    run(
+    await run(
       binary,
       [
         'mcp',
@@ -298,13 +296,12 @@ async function probe(binary) {
         environment,
       },
     );
-    run(binary, ['mcp', 'add', 'anonymous', '--url', `${url}anonymous`], {
+    await run(binary, ['mcp', 'add', 'anonymous', '--url', `${url}anonymous`], {
       cwd: project,
       environment,
     });
     const afterAdds = readProjectConfig(project);
     if (!afterAdds?.mcp?.servers?.authed || !afterAdds?.mcp?.servers?.anonymous) {
-      server.close();
       return {
         version,
         pinnedVersion: PINNED_VERSION,
@@ -363,7 +360,7 @@ async function probe(binary) {
       ),
     );
 
-    const authHeadless = run(binary, ['mcp', 'auth', 'authed'], {
+    const authHeadless = await run(binary, ['mcp', 'auth', 'authed'], {
       cwd: project,
       environment,
       timeout: 20_000,
@@ -387,7 +384,7 @@ async function probe(binary) {
         !headlessAuthCompleted,
       ),
     );
-    const logout = run(binary, ['mcp', 'logout', 'authed'], {
+    const logout = await run(binary, ['mcp', 'logout', 'authed'], {
       cwd: project,
       environment,
       timeout: 20_000,
@@ -406,9 +403,13 @@ async function probe(binary) {
       ),
     );
 
-    server.close();
     return { version, pinnedVersion: PINNED_VERSION, url, findings };
   } finally {
+    if (serviceIsolated) {
+      await run(binary, ['service', 'stop'], { cwd: project, environment, timeout: 10_000 });
+    }
+    server?.closeAllConnections();
+    if (server) await new Promise((resolveClose) => server.close(resolveClose));
     if (!keepScratch) rmSync(scratch, { recursive: true, force: true });
   }
 }

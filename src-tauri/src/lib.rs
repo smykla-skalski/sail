@@ -2443,10 +2443,23 @@ async fn delete_worktree(
                     terminal_manager.stop_worktree(&directory)?;
                     terminals.stop_worktree(&directory)?;
                     agents.stop_worktree(&directory)?;
-                    worktree_storage::ensure_ready_before_worktree_removal(
-                        &cache_directory,
-                        &managed_data,
-                    )?;
+                    if expected_revision.is_some() && expected_generation.is_some() {
+                        worktree_storage::ensure_ready_before_worktree_removal(
+                            &cache_directory,
+                            &managed_data,
+                        )?;
+                    } else {
+                        if directory.is_dir() {
+                            let overlay = if git_overlay::known_worktree(&directory).is_some() {
+                                git_overlay::GitOverlay::ensure(&cache_directory, &directory)?
+                            } else {
+                                git_overlay::GitOverlay::existing(&cache_directory, &directory)?
+                            };
+                            if let Some(mut overlay) = overlay {
+                                overlay.promote_quiescent(|| Ok(()))?;
+                            }
+                        }
+                    }
                     remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
                         ensure_expected_worktree_generation(
                             &directory,
@@ -2625,7 +2638,14 @@ fn remove_worktree_then_private_data_many<T>(
     remove_worktree: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let result = remove_worktree()?;
-    worktree_storage::remove_after_worktree_removal(cache_directory, managed_data)?;
+    if let Err(error) =
+        worktree_storage::remove_after_worktree_removal(cache_directory, managed_data)
+    {
+        diagnostics::record(
+            "worktree_private_cleanup_pending",
+            serde_json::json!({"error": error}),
+        );
+    }
     Ok(result)
 }
 
@@ -3627,6 +3647,251 @@ where
     )
 }
 
+fn git_remove_worktree(
+    repository: &Path,
+    worktree: &Path,
+    force: bool,
+    original_directory: Option<&WorktreeDirectoryIdentity>,
+    mut check_identity: impl FnMut(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let attempts = if force { 6 } else { 1 };
+    for attempt in 0..attempts {
+        let listed = git_reference(repository, &["worktree", "list", "--porcelain", "-z"])
+            .ok_or("Cannot inspect repository worktrees before deletion.")?;
+        let registered = parse_registered_worktrees(&listed)
+            .into_iter()
+            .any(|entry| {
+                acp_terminal::stable_worktree_identity(Path::new(&entry.path)) == worktree
+            });
+        check_identity(registered)?;
+        // Git unregisters a worktree even when removing its files fails.
+        // The caller still verifies the original directory before each retry.
+        if !registered && force {
+            if let Some(original_directory) = original_directory {
+                return remove_remaining_worktree_files(worktree, original_directory);
+            }
+            return if std::fs::symlink_metadata(worktree)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                Ok(())
+            } else {
+                Err(
+                    "Worktree path was recreated during deletion. Refresh before continuing."
+                        .into(),
+                )
+            };
+        }
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(repository)
+            .args(["worktree", "remove"]);
+        if force {
+            command.args(["--force", "--force"]);
+        }
+        let output = command
+            .arg(worktree)
+            .output()
+            .map_err(|error| format!("Cannot start Git: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let listed = git_reference(repository, &["worktree", "list", "--porcelain", "-z"])
+            .ok_or("Cannot inspect repository worktrees after failed deletion.")?;
+        let registered = parse_registered_worktrees(&listed)
+            .into_iter()
+            .any(|entry| {
+                acp_terminal::stable_worktree_identity(Path::new(&entry.path)) == worktree
+            });
+        if !registered && !worktree.exists() {
+            return Ok(());
+        }
+        let error = format!(
+            "Cannot delete worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        if attempt + 1 == attempts {
+            return Err(error);
+        }
+        diagnostics::record(
+            "worktree_removal_retry",
+            serde_json::json!({
+                "worktree": worktree, "attempt": attempt + 1, "error": error,
+            }),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+    }
+    unreachable!()
+}
+
+fn remove_remaining_worktree_files(
+    worktree: &Path,
+    original: &WorktreeDirectoryIdentity,
+) -> Result<(), String> {
+    let quarantine = worktree
+        .parent()
+        .ok_or("Cannot locate worktree parent.")?
+        .join(format!(".sail-delete-{}", uuid::Uuid::new_v4()));
+    match rename_without_replace(worktree, &quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Cannot isolate remaining worktree files: {error}")),
+    }
+    let result = (|| {
+        let current =
+            worktree_directory_identity(&quarantine).map_err(|error| error.to_string())?;
+        if !same_worktree_directory(original, &current) {
+            return Err(
+                "Worktree identity changed during deletion. Refresh before continuing.".into(),
+            );
+        }
+        for attempt in 0..6 {
+            match make_worktree_files_removable(&quarantine)
+                .and_then(|()| std::fs::remove_dir_all(&quarantine))
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if attempt == 5 => {
+                    return Err(format!("Cannot delete remaining worktree files: {error}"))
+                }
+                Err(error) => diagnostics::record(
+                    "worktree_removal_retry",
+                    serde_json::json!({
+                        "worktree": worktree, "attempt": attempt + 1, "error": error.to_string(),
+                    }),
+                ),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
+        }
+        unreachable!()
+    })();
+    if let Err(error) = result {
+        return match rename_without_replace(&quarantine, worktree) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(format!(
+                "{error} Remaining files are preserved at {}: {restore}",
+                quarantine.display()
+            )),
+        };
+    }
+    Ok(())
+}
+
+fn make_worktree_files_removable(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = metadata.permissions();
+        if metadata.is_dir() {
+            permissions.set_mode(permissions.mode() | 0o700);
+        }
+        if permissions != metadata.permissions() {
+            std::fs::set_permissions(path, permissions)?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+        };
+        let attributes = metadata.file_attributes();
+        if attributes & FILE_ATTRIBUTE_READONLY != 0 {
+            let path = extended_windows_path(path)
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            if unsafe { SetFileAttributesW(path.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) }
+                == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            make_worktree_files_removable(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Eq, PartialEq)]
+struct WorktreeDirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: u64,
+    #[cfg(windows)]
+    file: [u8; 16],
+}
+
+fn worktree_directory_identity(path: &Path) -> std::io::Result<WorktreeDirectoryIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Worktree path is not a directory.",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(WorktreeDirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+        };
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(extended_windows_path(path))?;
+        let mut info = FILE_ID_INFO::default();
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(WorktreeDirectoryIdentity {
+            volume: info.VolumeSerialNumber,
+            file: info.FileId.Identifier,
+        })
+    }
+}
+
+fn same_worktree_directory(
+    original: &WorktreeDirectoryIdentity,
+    current: &WorktreeDirectoryIdentity,
+) -> bool {
+    original == current
+}
+
 #[cfg(test)]
 fn remove_worktree_with_hook<F>(
     repository: String,
@@ -3685,7 +3950,13 @@ where
                     "Worktree identity changed after preview. Refresh before deleting.".into(),
                 );
             }
-            git_overlay::require_no_private_state_at_missing(&requested_worktree)?;
+            let force_missing =
+                force == Some(true) && expected_revision.is_none() && expected_branch.is_none();
+            if force_missing {
+                git_overlay::forget_removed_worktree(&requested_worktree)?;
+            } else {
+                git_overlay::require_no_private_state_at_missing(&requested_worktree)?;
+            }
             let listed = git_reference(&repository, &["worktree", "list", "--porcelain", "-z"])
                 .ok_or("Cannot inspect repository worktrees.")?;
             let still_registered = parse_registered_worktrees(&listed)
@@ -3695,7 +3966,15 @@ where
                         == requested_worktree
                 });
             if still_registered {
-                return Err("Worktree folder no longer exists but is still registered. Refresh before deleting.".into());
+                if !force_missing {
+                    return Err("Worktree folder no longer exists but is still registered. Refresh before deleting.".into());
+                }
+                git_remove_worktree(&repository, &requested_worktree, true, None, |_| {
+                    if std::fs::symlink_metadata(&requested_worktree).is_ok() {
+                        return Err("Worktree path was recreated during deletion. Refresh before continuing.".into());
+                    }
+                    Ok(())
+                })?;
             }
             after_remove()?;
             return Ok(());
@@ -3941,26 +4220,70 @@ where
         } else {
             before_git_remove(removal_target)?;
         }
-        let mut command = Command::new("git");
-        command
-            .arg("-C")
-            .arg(&repository)
-            .args(["worktree", "remove"]);
-        if !preview_guarded && expected_generation.is_some() {
-            // Git requires two force flags to remove a worktree under our lock.
-            command.args(["--force", "--force"]);
-        } else if !preview_guarded && force {
-            command.arg("--force");
-        }
-        let output = command
-            .arg(removal_target)
-            .output()
-            .map_err(|error| format!("Cannot start Git: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "Cannot delete worktree: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+        if stage_guarded {
+            let mut command = Command::new("git");
+            command
+                .arg("-C")
+                .arg(&repository)
+                .args(["worktree", "remove"]);
+            if !preview_guarded && expected_generation.is_some() {
+                // Git requires two force flags to remove a worktree under our lock.
+                command.args(["--force", "--force"]);
+            }
+            let output = command
+                .arg(removal_target)
+                .output()
+                .map_err(|error| format!("Cannot start Git: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Cannot delete worktree: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        } else {
+            let pointer = std::fs::read(worktree.join(".git")).map_err(|error| {
+                format!("Cannot capture worktree identity before deletion: {error}")
+            })?;
+            let directory_identity = worktree_directory_identity(&worktree).map_err(|error| {
+                format!("Cannot capture worktree directory before deletion: {error}")
+            })?;
+            let mut first_attempt = true;
+            git_remove_worktree(
+                &repository,
+                &worktree,
+                force,
+                Some(&directory_identity),
+                |registered| {
+                    match worktree_directory_identity(&worktree) {
+                        Ok(current) => {
+                            let current_pointer = std::fs::read(worktree.join(".git"));
+                            if !same_worktree_directory(&directory_identity, &current)
+                                || (registered
+                                    && current_pointer.as_deref().ok() != Some(pointer.as_slice()))
+                                || current_pointer.is_ok_and(|current| current != pointer)
+                            {
+                                return Err(
+                                    "Worktree identity changed during deletion. Refresh before continuing."
+                                        .into(),
+                                );
+                            }
+                            if !first_attempt && registered {
+                                ensure_expected_revision()?;
+                                ensure_expected_branch()?;
+                                git_overlay::require_shared_current(&worktree)?;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "Cannot verify worktree directory before deletion: {error}"
+                            ))
+                        }
+                    }
+                    first_attempt = false;
+                    Ok(())
+                },
+            )?;
         }
         Ok(())
     })();
@@ -4412,15 +4735,15 @@ mod tests {
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
         move_worktree_for_removal, normalize_picker_path, parse_registered_worktrees,
         pending_cleanup_paths_absent, persist_worktree_data_manifest,
-        register_worktree_terminal_data, registered_worktrees, remove_worktree,
-        remove_worktree_guarded, remove_worktree_then_terminal_data,
-        remove_worktree_then_terminal_data_many, remove_worktree_with_hook,
-        remove_worktree_with_hooks, replacement_worktree_at_checkpoint, repository_namespace,
-        repository_worktrees_inner, restore_pending_worktree_inner, shipping_base_revision,
-        shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
-        version_is_compatible, version_number, working_tree_diff, worktree_overviews,
-        worktree_preview_state_with_hook, ExpectedRegisteredWorktree, WorktreeOperationLocks,
-        NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
+        register_worktree_terminal_data, registered_worktrees, remove_remaining_worktree_files,
+        remove_worktree, remove_worktree_guarded, remove_worktree_then_private_data_many,
+        remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
+        remove_worktree_with_hook, remove_worktree_with_hooks, replacement_worktree_at_checkpoint,
+        repository_namespace, repository_worktrees_inner, restore_pending_worktree_inner,
+        shipping_base_revision, shipping_changed_paths, shipping_default_branch,
+        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
+        worktree_overviews, worktree_preview_state_with_hook, ExpectedRegisteredWorktree,
+        WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::worktree_storage;
@@ -5402,6 +5725,210 @@ mod tests {
         assert!(Path::new(&worktree).exists());
 
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_removal_deletes_a_locked_worktree_and_preserves_its_branch() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-delete-locked-test");
+        git(&repository, &["worktree", "lock", &worktree]);
+        let head = git_reference(Path::new(&worktree), &["rev-parse", "HEAD"]).unwrap();
+        remove_worktree(repository.clone(), worktree.clone(), Some(true), None, None).unwrap();
+        assert!(!Path::new(&worktree).exists());
+        assert_eq!(
+            git_reference(Path::new(&repository), &["rev-parse", "child"]),
+            Some(head)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletion_succeeds_when_private_cache_cleanup_is_pending_and_can_resume() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-delete-cache-test");
+        let cache = root.join("cache");
+        let (data, lease) = worktree_storage::register(&cache, Path::new(&worktree)).unwrap();
+        remove_worktree_then_private_data_many(&cache, std::slice::from_ref(&data), || {
+            remove_worktree(repository.clone(), worktree.clone(), Some(true), None, None)
+        })
+        .unwrap();
+        assert!(!Path::new(&worktree).exists());
+        assert!(data.is_dir(), "Data in active use must remain pending");
+        assert!(worktree_storage::cleanup_status(&cache)
+            .iter()
+            .any(|pending| pending.reason == "active-use"));
+        lease.release_clean().unwrap();
+        remove_worktree_then_private_data_many(
+            &cache,
+            &[data.clone(), cache.join("already-removed")],
+            || remove_worktree(repository, worktree, Some(true), None, None),
+        )
+        .unwrap();
+        assert!(!data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_removal_cleans_only_the_requested_missing_registration() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-delete-missing-test");
+        let sibling = root.join("sibling");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "sibling",
+                sibling.to_str().unwrap(),
+            ],
+        );
+        fs::remove_dir_all(&worktree).unwrap();
+        fs::remove_dir_all(&sibling).unwrap();
+        remove_worktree(repository.clone(), worktree.clone(), Some(true), None, None).unwrap();
+        remove_worktree(repository.clone(), worktree.clone(), Some(true), None, None).unwrap();
+        let listed = git_reference(
+            Path::new(&repository),
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .unwrap();
+        let registered = parse_registered_worktrees(&listed);
+        assert!(!registered
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some("child")));
+        assert!(registered
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some("sibling")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_removal_retries_files_after_git_unregisters_the_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-delete-partial-test");
+        let protected = Path::new(&worktree).join("protected");
+        fs::create_dir(&protected).unwrap();
+        fs::write(protected.join("file"), "transient obstruction").unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o555)).unwrap();
+        remove_worktree(repository.clone(), worktree.clone(), Some(true), None, None).unwrap();
+        assert!(!Path::new(&worktree).exists());
+        assert!(git_reference(Path::new(&repository), &["rev-parse", "child"]).is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remaining_file_cleanup_preserves_a_recreated_directory() {
+        let root =
+            std::env::temp_dir().join(format!("sail-delete-replaced-{}", uuid::Uuid::new_v4()));
+        let worktree = root.join("worktree");
+        let original_path = root.join("original");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join("original.txt"), "original").unwrap();
+        let original = super::worktree_directory_identity(&worktree).unwrap();
+        fs::rename(&worktree, &original_path).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join("replacement.txt"), "retain replacement").unwrap();
+        let error = remove_remaining_worktree_files(&worktree, &original).unwrap_err();
+        assert!(error.contains("identity changed"), "{error}");
+        assert_eq!(
+            fs::read_to_string(worktree.join("replacement.txt")).unwrap(),
+            "retain replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(original_path.join("original.txt")).unwrap(),
+            "original"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remaining_file_cleanup_clears_readonly_without_changing_other_windows_attributes() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
+        };
+        let root =
+            std::env::temp_dir().join(format!("sail-delete-readonly-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("file.txt");
+        fs::write(&file, "read-only content").unwrap();
+        let attributes = fs::metadata(&file).unwrap().file_attributes()
+            | FILE_ATTRIBUTE_READONLY
+            | FILE_ATTRIBUTE_HIDDEN;
+        let wide = super::extended_windows_path(&file)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), attributes) }, 0);
+        assert!(fs::metadata(&file).unwrap().permissions().readonly());
+
+        super::make_worktree_files_removable(&root).unwrap();
+
+        assert!(!fs::metadata(&file).unwrap().permissions().readonly());
+        assert_ne!(
+            fs::metadata(&file).unwrap().file_attributes() & FILE_ATTRIBUTE_HIDDEN,
+            0
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "read-only content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remaining_file_cleanup_preserves_replacement_with_the_same_windows_creation_time() {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileTime, FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        };
+        let root =
+            std::env::temp_dir().join(format!("sail-delete-tunneling-{}", uuid::Uuid::new_v4()));
+        let worktree = root.join("worktree");
+        let saved = root.join("original");
+        fs::create_dir_all(&worktree).unwrap();
+        let creation_time = fs::metadata(&worktree).unwrap().creation_time();
+        let original = super::worktree_directory_identity(&worktree).unwrap();
+        fs::rename(&worktree, &saved).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join("replacement.txt"), "preserve replacement").unwrap();
+        let handle = fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&worktree)
+            .unwrap();
+        let creation = FILETIME {
+            dwLowDateTime: creation_time as u32,
+            dwHighDateTime: (creation_time >> 32) as u32,
+        };
+        assert_ne!(
+            unsafe {
+                SetFileTime(
+                    handle.as_raw_handle(),
+                    &creation,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        drop(handle);
+        assert_eq!(
+            fs::metadata(&worktree).unwrap().creation_time(),
+            creation_time
+        );
+
+        let error = remove_remaining_worktree_files(&worktree, &original).unwrap_err();
+
+        assert!(error.contains("identity changed"), "{error}");
+        assert_eq!(
+            fs::read_to_string(worktree.join("replacement.txt")).unwrap(),
+            "preserve replacement"
+        );
+        assert!(saved.is_dir());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -4,10 +4,11 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 const VERSION: u8 = 1;
+const REF_LOCK_TIMEOUT_MS: &str = "5000";
 static ACTIVE: OnceLock<Mutex<Vec<(PathBuf, PathBuf, PathBuf)>>> = OnceLock::new();
 static CACHE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -373,7 +374,7 @@ fn forget_removed_worktree_in_cache_checked(
     if root.exists() {
         return Err("Removed worktree path was recreated during private Git cleanup.".into());
     }
-    let manifest = read_manifest(&manifest_path)?
+    let mut manifest = read_manifest(&manifest_path)?
         .ok_or("Removed worktree has unregistered private Git state.")?;
     if manifest.version != VERSION || manifest.worktree != root || manifest.promotion.is_some() {
         return Err("Removed worktree private Git state requires recovery.".into());
@@ -394,7 +395,7 @@ fn forget_removed_worktree_in_cache_checked(
             return Err("Overlay manifest backup belongs to another worktree.".into());
         }
     }
-    if present(&private) {
+    if !manifest.removing && present(&private) {
         validate_overlay(&private, &manifest.common_dir)?;
         let head = output(
             git_command()
@@ -407,7 +408,13 @@ fn forget_removed_worktree_in_cache_checked(
         {
             return Err("Removed worktree has unpromoted private Git changes.".into());
         }
-        fs::remove_dir_all(&private).map_err(|error| error.to_string())?;
+        manifest.removing = true;
+        write_manifest(&manifest_path, &manifest)?;
+    }
+    match fs::remove_dir_all(&private) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
     }
     fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
     if present(&backup) {
@@ -484,6 +491,8 @@ struct Manifest {
     promoted_oid: String,
     source_index_hash: Option<String>,
     promotion: Option<Promotion>,
+    #[serde(default)]
+    removing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -521,7 +530,25 @@ fn git_command() -> Command {
     ] {
         command.env_remove(key);
     }
+    command.args(["-c", "core.filesRefLockTimeout=5000"]);
+    #[cfg(windows)]
+    command.args(["-c", "core.longpaths=true"]);
     command
+}
+
+struct OverlayBuild(PathBuf);
+
+impl Drop for OverlayBuild {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "Cannot clean up Git overlay build {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
 }
 
 fn output(command: &mut Command) -> Result<Output, String> {
@@ -887,6 +914,7 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
             .arg(&source.worktree)
             .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
     )?;
+    let mut updates = String::new();
     for line in String::from_utf8(refs.stdout)
         .map_err(|error| error.to_string())?
         .lines()
@@ -894,14 +922,364 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
         let (reference, oid) = line
             .split_once(' ')
             .ok_or("Invalid source Git reference output.")?;
+        updates.push_str(&format!("update {reference} {oid}\n"));
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut child = git_command()
+        .arg("--git-dir")
+        .arg(git_config_path(git_dir))
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or("Git reference update input unavailable.")?
+        .write_all(updates.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let result = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    if !result.status.success() {
+        return Err(String::from_utf8_lossy(&result.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+fn configure_private_git(git_dir: &Path) -> Result<(), String> {
+    let settings = [
+        ("core.filesRefLockTimeout", REF_LOCK_TIMEOUT_MS),
+        #[cfg(windows)]
+        ("core.longpaths", "true"),
+    ];
+    for (key, expected) in settings {
+        let value = git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(git_dir))
+            .args(["config", "--local", "--get", key])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !value.status.success() || String::from_utf8_lossy(&value.stdout).trim() != expected {
+            output(
+                git_command()
+                    .arg("--git-dir")
+                    .arg(git_config_path(git_dir))
+                    .args(["config", "--local", key, expected]),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn private_lock_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut locks = Vec::new();
+    let Some(entries) = skip_missing(fs::read_dir(directory))? else {
+        return Ok(locks);
+    };
+    for entry in entries {
+        let Some(entry) = skip_missing(entry)? else {
+            continue;
+        };
+        let Some(kind) = skip_missing(entry.file_type())? else {
+            continue;
+        };
+        if kind.is_dir() && entry.file_name() == "refs" {
+            locks.extend(ref_lock_files(&entry.path())?);
+        } else if kind.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "lock")
+        {
+            locks.push(entry.path());
+        }
+    }
+    Ok(locks)
+}
+
+fn ref_lock_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut locks = Vec::new();
+    let Some(entries) = skip_missing(fs::read_dir(directory))? else {
+        return Ok(locks);
+    };
+    for entry in entries {
+        let Some(entry) = skip_missing(entry)? else {
+            continue;
+        };
+        let Some(kind) = skip_missing(entry.file_type())? else {
+            continue;
+        };
+        if kind.is_dir() {
+            locks.extend(ref_lock_files(&entry.path())?);
+        } else if kind.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "lock")
+        {
+            locks.push(entry.path());
+        }
+    }
+    Ok(locks)
+}
+
+fn skip_missing<T>(result: std::io::Result<T>) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn recover_stale_private_locks(
+    cache: &Path,
+    worktree: &Path,
+    git_dir: &Path,
+) -> Result<(), String> {
+    let locks = private_lock_files(git_dir)?;
+    recover_stale_private_locks_from_snapshot(cache, worktree, git_dir, locks)
+}
+
+fn recover_stale_private_locks_from_snapshot(
+    cache: &Path,
+    worktree: &Path,
+    git_dir: &Path,
+    locks: Vec<PathBuf>,
+) -> Result<(), String> {
+    if locks.is_empty() {
+        return Ok(());
+    }
+    crate::worktree_storage::with_idle_worktree(cache, worktree, || {
+        if overlay_has_live_processes(worktree, git_dir) {
+            return Ok(());
+        }
+        for path in locks {
+            let Some(metadata) = skip_missing(fs::symlink_metadata(&path))? else {
+                continue;
+            };
+            if !metadata.file_type().is_file()
+                || !metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= std::time::Duration::from_secs(30))
+            {
+                continue;
+            }
+            let retained_root = git_dir.join("sail-stale-locks");
+            fs::create_dir_all(&retained_root).map_err(|error| error.to_string())?;
+            let retained = retained_root.join(uuid::Uuid::new_v4().to_string());
+            if skip_missing(fs::rename(&path, &retained))?.is_none() {
+                continue;
+            }
+            crate::diagnostics::record(
+                "git_overlay_stale_lock_recovered",
+                serde_json::json!({
+                    "worktree": worktree, "lock": path, "retainedLock": retained,
+                }),
+            );
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn overlay_has_live_processes(worktree: &Path, git_dir: &Path) -> bool {
+    let system = sysinfo::System::new_all();
+    system.processes().values().any(|process| {
+        !matches!(
+            process.status(),
+            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+        ) && process_uses_overlay(process, worktree, git_dir)
+    })
+}
+
+fn process_uses_overlay(process: &sysinfo::Process, worktree: &Path, git_dir: &Path) -> bool {
+    if !process_context_uses_overlay(
+        process.cwd(),
+        process.name(),
+        process.cmd(),
+        process.environ(),
+        worktree,
+        git_dir,
+    ) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        windows_process_is_alive(process.pid().as_u32())
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // A Windows process snapshot can retain a Git process that exited while
+    // its cwd was being read. Verify it is still alive before treating missing
+    // process information as an unknown writer. Access failures stay busy.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+    }
+    let mut exit_code = 0;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    unsafe { CloseHandle(handle) };
+    !queried || exit_code == STILL_ACTIVE as u32
+}
+
+fn process_context_uses_overlay(
+    process_cwd: Option<&Path>,
+    name: &std::ffi::OsStr,
+    arguments: &[OsString],
+    environment: &[OsString],
+    worktree: &Path,
+    git_dir: &Path,
+) -> bool {
+    let canonical_worktree =
+        dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let canonical_git_dir = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
+    let worktree = canonical_worktree.as_path();
+    let git_dir = canonical_git_dir.as_path();
+    let points_into_overlay = |value: &Path, cwd: Option<&Path>| {
+        let path = if value.is_absolute() {
+            value.to_path_buf()
+        } else if let Some(cwd) = cwd {
+            cwd.join(value)
+        } else {
+            return false;
+        };
+        let path = dunce::canonicalize(&path).unwrap_or(path);
+        path.starts_with(worktree) || path.starts_with(git_dir)
+    };
+    if process_cwd.is_some_and(|cwd| points_into_overlay(cwd, None)) {
+        return true;
+    }
+    for variable in environment {
+        let variable = variable.to_string_lossy();
+        if let Some((name, value)) = variable.split_once('=') {
+            if matches!(
+                name,
+                "GIT_DIR" | "GIT_COMMON_DIR" | "GIT_WORK_TREE" | "GIT_INDEX_FILE"
+            ) && points_into_overlay(Path::new(value), process_cwd)
+            {
+                return true;
+            }
+        }
+    }
+    let mut cwd = process_cwd.map(Path::to_path_buf);
+    let mut change_directory = false;
+    for argument in arguments {
+        let argument = argument.to_string_lossy();
+        if argument == "-C" {
+            change_directory = true;
+            continue;
+        }
+        let value = argument
+            .split_once('=')
+            .map_or(argument.as_ref(), |(_, value)| value);
+        if points_into_overlay(Path::new(value), cwd.as_deref()) {
+            return true;
+        }
+        if change_directory {
+            cwd = Some(cwd.as_deref().unwrap_or(Path::new("")).join(value));
+            change_directory = false;
+        }
+    }
+    // Command-line directories cannot prove the actual cwd of an unreadable
+    // process: symlinks and directories can move while its writer stays live.
+    process_cwd.is_none() && name.to_string_lossy().starts_with("git")
+}
+
+fn recover_unregistered_overlay(
+    current: &Source,
+    git_dir: &Path,
+    manifest_path: &Path,
+) -> Result<Option<GitOverlay>, String> {
+    reject_links(git_dir)?;
+    let complete = (|| -> Result<(), String> {
+        validate_overlay(git_dir, &current.common_dir)?;
+        if !private_lock_files(git_dir)?.is_empty() {
+            return Err("Unregistered overlay has unfinished Git writes.".into());
+        }
+        let branch = output(
+            git_command()
+                .arg("--git-dir")
+                .arg(git_config_path(git_dir))
+                .args(["symbolic-ref", "-q", "HEAD"]),
+        )?;
+        if String::from_utf8_lossy(&branch.stdout).trim() != current.branch {
+            return Err("Incomplete private branch.".into());
+        }
+        let head = output(
+            git_command()
+                .arg("--git-dir")
+                .arg(git_config_path(git_dir))
+                .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        )?;
+        if String::from_utf8_lossy(&head.stdout).trim() != current.head
+            || index_hash(&git_dir.join("index"))? != index_hash(&current.git_dir.join("index"))?
+        {
+            return Err("Unregistered overlay has private changes.".into());
+        }
+        index_hash(&git_dir.join("index"))?.ok_or("Incomplete private index.")?;
         output(
             git_command()
                 .arg("--git-dir")
                 .arg(git_config_path(git_dir))
-                .args(["update-ref", reference, oid]),
+                .args(["ls-files", "--stage"]),
         )?;
+        Ok(())
+    })();
+    if complete.is_ok() {
+        configure_private_git(git_dir)?;
+        write_manifest(
+            manifest_path,
+            &Manifest {
+                version: VERSION,
+                worktree: current.worktree.clone(),
+                source_git_dir: current.git_dir.clone(),
+                common_dir: current.common_dir.clone(),
+                branch: current.branch.clone(),
+                promoted_oid: current.head.clone(),
+                source_index_hash: index_hash(&current.git_dir.join("index"))?,
+                promotion: None,
+                removing: false,
+            },
+        )?;
+        return GitOverlay::existing(
+            manifest_path
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("Invalid overlay cache path.")?,
+            &current.worktree,
+        );
     }
-    Ok(())
+    // Failed initialization was never published to an agent. Preserve any
+    // unknown objects before rebuilding instead of discarding private commits.
+    let retained = git_dir.with_extension(format!("recovery-{}", uuid::Uuid::new_v4()));
+    fs::rename(git_dir, &retained).map_err(|error| error.to_string())?;
+    crate::diagnostics::record(
+        "git_overlay_initialization_recovered",
+        serde_json::json!({
+            "worktree": current.worktree,
+            "retainedGitDirectory": retained,
+        }),
+    );
+    Ok(None)
 }
 
 impl GitOverlay {
@@ -913,6 +1291,9 @@ impl GitOverlay {
         };
         if manifest.version != VERSION || manifest.worktree != worktree {
             return Err("Git overlay owner does not match this worktree.".into());
+        }
+        if manifest.removing {
+            return Err("Private Git overlay belongs to a removed worktree.".into());
         }
         let current = source(&worktree)?.ok_or("Linked Git worktree is unavailable.")?;
         if manifest.source_git_dir != current.git_dir
@@ -955,13 +1336,48 @@ impl GitOverlay {
             .map_err(|error| error.to_string())?;
         lock.lock().map_err(|error| error.to_string())?;
         if let Some(existing) = Self::existing(cache, &current.worktree)? {
+            recover_stale_private_locks(cache, &existing.worktree, &existing.git_dir)?;
+            configure_private_git(&existing.git_dir)?;
             return Ok(Some(existing));
         }
-        if git_dir.exists() {
-            return Err("Unregistered private Git overlay requires recovery.".into());
+        if fs::symlink_metadata(&git_dir).is_ok() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let recovery =
+                    crate::worktree_storage::with_idle_worktree(cache, &current.worktree, || {
+                        if overlay_has_live_processes(&current.worktree, &git_dir) {
+                            return Ok(None);
+                        }
+                        recover_unregistered_overlay(&current, &git_dir, &manifest_path).map(Some)
+                    })?
+                    .flatten();
+                if let Some(recovered) = recovery {
+                    if recovered.is_some() {
+                        return Ok(recovered);
+                    }
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "Private Git overlay is busy; retry after its writer finishes.".into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
         fs::create_dir_all(git_dir.parent().ok_or("Invalid overlay path.")?)
             .map_err(|error| error.to_string())?;
+        let published_git_dir = git_dir;
+        // Git for Windows rejects GIT_DIR values above PATH_MAX - 40 even
+        // with core.longpaths enabled. Keep staging shorter than the final
+        // hash-named directory instead of appending a UUID to that hash.
+        let build = OverlayBuild(
+            published_git_dir
+                .parent()
+                .ok_or("Invalid overlay path.")?
+                .join(format!("building-{}", uuid::Uuid::new_v4())),
+        );
+        let git_dir = build.0.clone();
         output(
             git_command()
                 .args(["init", "--bare", "--quiet"])
@@ -1005,7 +1421,11 @@ impl GitOverlay {
         }
         // The source includes follow the initial [core] section. A final section
         // overrides any inherited core.splitIndex=true for every task Git command.
-        config_entries.push_str("[core]\n\tbare = false\n\tsplitIndex = false\n");
+        config_entries.push_str(&format!(
+            "[core]\n\tbare = false\n\tsplitIndex = false\n\tfilesRefLockTimeout = {REF_LOCK_TIMEOUT_MS}\n"
+        ));
+        #[cfg(windows)]
+        config_entries.push_str("\tlongpaths = true\n");
         OpenOptions::new()
             .append(true)
             .open(&config)
@@ -1068,11 +1488,20 @@ impl GitOverlay {
             promoted_oid: current.head,
             source_index_hash,
             promotion: None,
+            removing: false,
         };
-        write_manifest(&manifest_path, &manifest)?;
         validate_overlay(&git_dir, &manifest.common_dir)?;
+        fs::rename(&git_dir, &published_git_dir).map_err(|error| error.to_string())?;
+        if let Err(error) = write_manifest(&manifest_path, &manifest) {
+            if !manifest_path.exists() {
+                fs::rename(&published_git_dir, &git_dir).map_err(|rollback| {
+                    format!("{error}; cannot roll back overlay publication: {rollback}")
+                })?;
+            }
+            return Err(error);
+        }
         let overlay = Self {
-            git_dir,
+            git_dir: published_git_dir,
             worktree: current.worktree,
             manifest_path,
             manifest,
@@ -1112,6 +1541,7 @@ impl GitOverlay {
         lock.lock().map_err(|error| error.to_string())?;
         check_quiescence()?;
         validate_overlay(&self.git_dir, &self.manifest.common_dir)?;
+        recover_stale_private_locks(cache, &self.worktree, &self.git_dir)?;
         let current = source(&self.worktree)?.ok_or("Assigned linked worktree is unavailable.")?;
         if current.git_dir != self.manifest.source_git_dir
             || current.common_dir != self.manifest.common_dir
@@ -1235,6 +1665,488 @@ impl GitOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OverlayFixture {
+        root: PathBuf,
+        main: PathBuf,
+        task: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl OverlayFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("sail-overlay-recovery-{}", uuid::Uuid::new_v4()));
+            let main = root.join("main");
+            let task = root.join("task");
+            let cache = root.join("cache");
+            fs::create_dir_all(&main).unwrap();
+            git(&main, &["init", "-q", "-b", "main"]);
+            git(&main, &["config", "user.name", "Sail Test"]);
+            git(&main, &["config", "user.email", "sail@example.test"]);
+            fs::write(main.join("initial.txt"), "base\n").unwrap();
+            git(&main, &["add", "initial.txt"]);
+            git(
+                &main,
+                &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+            );
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "task",
+                    task.to_str().unwrap(),
+                ],
+            );
+            Self {
+                root,
+                main,
+                task: dunce::canonicalize(task).unwrap(),
+                cache,
+            }
+        }
+    }
+
+    impl Drop for OverlayFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ref_lock_contention_waits_for_the_writer() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let lock_path = overlay.git_dir.join("refs/heads/hooks.lock");
+        fs::write(&lock_path, "busy").unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            fs::remove_file(lock_path).unwrap();
+        });
+        overlay_git(&overlay, &["update-ref", "refs/heads/hooks", "HEAD"]);
+        writer.join().unwrap();
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "hooks"]),
+            git(&fixture.task, &["rev-parse", "HEAD"])
+        );
+        assert!(!fixture.main.join(".git/refs/heads/hooks").exists());
+    }
+
+    #[test]
+    fn incomplete_overlay_is_preserved_and_sessions_can_retry() {
+        let fixture = OverlayFixture::new();
+        let (private, manifest, _) = paths(&fixture.cache, &fixture.task);
+        fs::create_dir_all(private.join("refs/heads")).unwrap();
+        fs::write(private.join("refs/heads/hooks.lock"), "stale writer").unwrap();
+        fs::write(private.join("private-data"), "preserve me").unwrap();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        assert!(manifest.is_file());
+        assert!(!overlay.git_dir.join("refs/heads/hooks.lock").exists());
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "HEAD"]),
+            git(&fixture.task, &["rev-parse", "HEAD"])
+        );
+        let retained = fs::read_dir(fixture.cache.join("git-overlays"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.to_string_lossy().starts_with("recovery-"))
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(retained.join("private-data")).unwrap(),
+            "preserve me"
+        );
+        assert_eq!(
+            GitOverlay::ensure(&fixture.cache, &fixture.task)
+                .unwrap()
+                .unwrap()
+                .git_dir,
+            overlay.git_dir
+        );
+    }
+
+    #[test]
+    fn failed_manifest_publication_does_not_poison_next_session() {
+        let fixture = OverlayFixture::new();
+        let (private, manifest, _) = paths(&fixture.cache, &fixture.task);
+        fs::write(fixture.cache.clone(), "blocked cache").unwrap();
+        assert!(GitOverlay::ensure(&fixture.cache, &fixture.task).is_err());
+        fs::remove_file(&fixture.cache).unwrap();
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        // Fail after Git initialization, while publishing the trusted manifest.
+        fs::remove_dir(manifest.parent().unwrap()).unwrap();
+        fs::write(manifest.parent().unwrap(), "blocked manifest directory").unwrap();
+        assert!(GitOverlay::ensure(&fixture.cache, &fixture.task).is_err());
+        assert!(!private.exists());
+        assert_eq!(
+            fs::read_dir(fixture.cache.join("git-overlays"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::remove_file(manifest.parent().unwrap()).unwrap();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        require_shared_current_in_cache(&fixture.cache, &fixture.task).unwrap();
+        assert!(overlay.manifest_path.is_file());
+    }
+
+    #[test]
+    fn missing_manifest_recovers_a_clean_overlay_in_place() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        fs::remove_file(&overlay.manifest_path).unwrap();
+        let recovered = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.git_dir, overlay.git_dir);
+        require_shared_current_in_cache(&fixture.cache, &fixture.task).unwrap();
+        assert_eq!(
+            fs::read_dir(fixture.cache.join("git-overlays"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn finished_writer_missing_from_lock_snapshot_does_not_block_other_recovery() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let finished = overlay.git_dir.join("refs/heads/finished.lock");
+        let stale = overlay.git_dir.join("refs/heads/stale.lock");
+        fs::write(&finished, "finished writer").unwrap();
+        fs::write(&stale, "stale writer").unwrap();
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+                ),
+            )
+            .unwrap();
+        let snapshot = vec![finished.clone(), stale.clone()];
+        fs::remove_file(finished).unwrap();
+
+        recover_stale_private_locks_from_snapshot(
+            &fixture.cache,
+            &fixture.task,
+            &overlay.git_dir,
+            snapshot,
+        )
+        .unwrap();
+
+        assert!(!stale.exists());
+        overlay_git(&overlay, &["update-ref", "refs/heads/stale", "HEAD"]);
+    }
+
+    #[test]
+    fn removed_ref_directory_does_not_block_lock_scan() {
+        let fixture = OverlayFixture::new();
+        let removed = fixture.root.join("removed-refs");
+        fs::create_dir(&removed).unwrap();
+        fs::remove_dir(&removed).unwrap();
+
+        assert!(ref_lock_files(&removed).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unreadable_live_git_remains_protected_with_an_unrelated_change_directory() {
+        let fixture = OverlayFixture::new();
+        let (private, _, _) = paths(&fixture.cache, &fixture.task);
+        let arguments = vec![
+            OsString::from("git"),
+            OsString::from("-C"),
+            fixture.main.as_os_str().to_os_string(),
+            OsString::from("update-ref"),
+            OsString::from("--stdin"),
+        ];
+        assert!(process_context_uses_overlay(
+            None,
+            std::ffi::OsStr::new("git"),
+            &arguments,
+            &[],
+            &fixture.task,
+            &private,
+        ));
+        assert!(process_context_uses_overlay(
+            None,
+            std::ffi::OsStr::new("git"),
+            &[OsString::from("git"), OsString::from("update-ref")],
+            &[],
+            &fixture.task,
+            &private,
+        ));
+    }
+
+    #[test]
+    fn unreadable_git_remains_protected_with_relative_targets() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let relative = overlay.git_dir.strip_prefix(&fixture.root).unwrap();
+        let change_directory = fixture.root.as_os_str().to_os_string();
+        let cases = [
+            (
+                vec![
+                    OsString::from("git"),
+                    OsString::from("-C"),
+                    change_directory.clone(),
+                    OsString::from("update-ref"),
+                ],
+                vec![OsString::from(format!("GIT_DIR={}", relative.display()))],
+            ),
+            (
+                vec![
+                    OsString::from("git"),
+                    OsString::from(format!("--git-dir={}", relative.display())),
+                    OsString::from("-C"),
+                    change_directory,
+                    OsString::from("update-ref"),
+                ],
+                Vec::new(),
+            ),
+        ];
+        for (arguments, environment) in cases {
+            assert!(
+                process_context_uses_overlay(
+                    None,
+                    std::ffi::OsStr::new("git"),
+                    &arguments,
+                    &environment,
+                    &fixture.task,
+                    &overlay.git_dir,
+                ),
+                "Relative Git target must retain its writer: {arguments:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exited_windows_git_process_does_not_block_overlay_recovery() {
+        let fixture = OverlayFixture::new();
+        let mut child = git_command().args(["--version"]).spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!windows_process_is_alive(pid));
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        fs::remove_file(&overlay.manifest_path).unwrap();
+        assert!(GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deep_cache_overlay_supports_long_refs_in_plain_git_commands() {
+        let fixture = OverlayFixture::new();
+        git(&fixture.main, &["config", "core.longpaths", "false"]);
+        let cache = fixture.cache.join("deep-cache-directory");
+        let overlay = GitOverlay::ensure(&cache, &fixture.task).unwrap().unwrap();
+        let reference = format!("refs/heads/{}", "long-ref-".repeat(20));
+        assert!(overlay.git_dir.join(&reference).to_string_lossy().len() > 260);
+        // Use a plain command so this also verifies the published config, not
+        // just the flags used by Sail's internal Git command helper.
+        let mut command = Command::new("git");
+        overlay.apply(&mut command);
+        output(
+            command
+                .arg("-C")
+                .arg(&fixture.task)
+                .args(["update-ref", &reference, "HEAD"]),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(overlay.git_dir.join(&reference))
+                .unwrap()
+                .trim(),
+            git(&fixture.task, &["rev-parse", "HEAD"])
+        );
+        assert!(!fixture.main.join(".git").join(reference).exists());
+    }
+
+    #[test]
+    fn stale_private_lock_is_recovered_only_after_storage_leases_close() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let lock_path = overlay.git_dir.join("refs/heads/task.lock");
+        fs::write(&lock_path, "stale writer").unwrap();
+        File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+                ),
+            )
+            .unwrap();
+        let (_, lease) = crate::worktree_storage::register(&fixture.cache, &fixture.task).unwrap();
+        GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        assert!(
+            lock_path.is_file(),
+            "An active lease must retain its Git locks"
+        );
+        lease.release_clean().unwrap();
+        GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        assert!(!lock_path.exists());
+        overlay_git(&overlay, &["update-ref", "refs/heads/task", "HEAD"]);
+        let retained = fs::read_dir(overlay.git_dir.join("sail-stale-locks"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .next()
+            .unwrap();
+        assert_eq!(fs::read_to_string(retained).unwrap(), "stale writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_private_lock_is_retained_while_an_external_writer_is_alive() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let lock_path = overlay.git_dir.join("refs/heads/task.lock");
+        fs::write(&lock_path, "live writer").unwrap();
+        File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+                ),
+            )
+            .unwrap();
+        let mut command = Command::new("sh");
+        overlay.apply(&mut command);
+        let mut writer = command
+            .args(["-c", "read line"])
+            .current_dir(&fixture.task)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = GitOverlay::ensure(&fixture.cache, &fixture.task);
+        let retained = lock_path.is_file();
+        writer.kill().unwrap();
+        writer.wait().unwrap();
+        result.unwrap();
+        assert!(
+            retained,
+            "The live writer must retain its lock regardless of age"
+        );
+    }
+
+    #[test]
+    fn prepared_transaction_with_relative_git_dir_retains_its_lock() {
+        use std::io::{BufRead, BufReader};
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let head = overlay_git(&overlay, &["rev-parse", "HEAD"]);
+        let relative_git_dir = overlay.git_dir.strip_prefix(&fixture.root).unwrap();
+        let mut writer = git_command()
+            .arg("--git-dir")
+            .arg(relative_git_dir)
+            .args(["update-ref", "--stdin"])
+            .current_dir(&fixture.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = writer.stdin.take().unwrap();
+        input
+            .write_all(format!("start\nupdate refs/heads/task {head} {head}\nprepare\n").as_bytes())
+            .unwrap();
+        input.flush().unwrap();
+        let mut response = BufReader::new(writer.stdout.take().unwrap());
+        let mut line = String::new();
+        response.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "start: ok");
+        line.clear();
+        response.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "prepare: ok");
+        let lock_path = overlay.git_dir.join("refs/heads/task.lock");
+        File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+                ),
+            )
+            .unwrap();
+        let result = GitOverlay::ensure(&fixture.cache, &fixture.task);
+        let retained = lock_path.is_file();
+        fs::remove_file(&overlay.manifest_path).unwrap();
+        let unregistered = GitOverlay::ensure(&fixture.cache, &fixture.task);
+        let unregistered_retained = lock_path.is_file();
+        input.write_all(b"commit\n").unwrap();
+        drop(input);
+        assert!(writer.wait().unwrap().success());
+        result.unwrap();
+        assert!(retained, "A prepared transaction must keep its ref lock");
+        assert!(unregistered.unwrap_err().contains("overlay is busy"));
+        assert!(
+            unregistered_retained,
+            "Recovery must retain an unregistered writer's lock"
+        );
+        GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn interrupted_private_cleanup_resumes_after_the_overlay_directory_is_gone() {
+        let fixture = OverlayFixture::new();
+        let mut overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.task.to_str().unwrap()],
+        );
+        overlay.manifest.removing = true;
+        write_manifest(&overlay.manifest_path, &overlay.manifest).unwrap();
+        fs::copy(
+            &overlay.manifest_path,
+            overlay.manifest_path.with_extension("bak"),
+        )
+        .unwrap();
+        fs::remove_dir_all(&overlay.git_dir).unwrap();
+        forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap();
+        forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap();
+        assert_eq!(known_worktree_in_cache(&fixture.cache, &fixture.task), None);
+    }
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
         let result = output(git_command().arg("-C").arg(directory).args(arguments)).unwrap();
