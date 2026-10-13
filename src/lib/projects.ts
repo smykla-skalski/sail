@@ -332,16 +332,24 @@ export function addWorktree(
 ): ProjectCatalog {
   const entries = catalog.worktrees[repository] ?? [];
   const existing = entries.find((entry) => entry.path === worktree.path);
-  if (existing && (!worktree.generation || existing.generation === worktree.generation))
-    return catalog;
+  const incoming = { ...worktree, setupStatus: worktree.setup ? 'pending' : 'ready' } as const;
+  if (existing && !worktree.generation) return catalog;
+  if (existing && existing.generation === worktree.generation) {
+    const merged = mergeSavedWorktrees(existing, incoming);
+    if (sameSavedValue(existing, merged)) return catalog;
+    return {
+      ...catalog,
+      worktrees: {
+        ...catalog.worktrees,
+        [repository]: entries.map((entry) => (entry === existing ? merged : entry)),
+      },
+    };
+  }
   return {
     ...catalog,
     worktrees: {
       ...catalog.worktrees,
-      [repository]: [
-        ...entries.filter((entry) => entry.path !== worktree.path),
-        { ...worktree, setupStatus: worktree.setup ? 'pending' : 'ready' },
-      ],
+      [repository]: [...entries.filter((entry) => entry.path !== worktree.path), incoming],
     },
   };
 }
@@ -641,6 +649,35 @@ export function setWorktreePullRequest(
   };
 }
 
+function sameSavedValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left))
+    return (
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameSavedValue(value, right[index]))
+    );
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const keys = Object.keys(left);
+  return (
+    keys.length === Object.keys(right).length &&
+    keys.every((key) => Object.hasOwn(right, key) && sameSavedValue(left[key], right[key]))
+  );
+}
+
+function mergeSavedWorktrees(saved: ProjectWorktree, incoming: ProjectWorktree): ProjectWorktree {
+  const merged = { ...saved };
+  for (const key of Object.keys(incoming)) {
+    const value: unknown = Reflect.get(incoming, key);
+    if (value === undefined) continue;
+    const existing: unknown = Reflect.get(saved, key);
+    if (existing !== undefined && !sameSavedValue(existing, value))
+      throw new Error(`Cannot merge conflicting saved worktrees at ${incoming.path}`);
+    if (existing === undefined) Object.assign(merged, { [key]: value });
+  }
+  return merged;
+}
+
 export function replaceRepositoryPath(
   catalog: ProjectCatalog,
   oldPath: string,
@@ -667,11 +704,20 @@ export function replaceRepositoryPath(
     const destination = parent === oldPath ? canonicalPath : parent;
     const merged = (worktrees[destination] ??= []);
     for (const entry of entries) {
+      const renamedPath = entry.path === oldPath ? canonicalPath : entry.path;
       const renamed = {
         ...entry,
-        path: entry.path === oldPath ? canonicalPath : entry.path,
+        path: renamedPath,
         ...(entry.origin?.sourcePath === oldPath
           ? { origin: { ...entry.origin, sourcePath: canonicalPath } }
+          : {}),
+        ...(entry.pendingCleanup && entry.path === oldPath
+          ? {
+              pendingCleanup: {
+                ...entry.pendingCleanup,
+                recoveryPath: canonicalPath,
+              },
+            }
           : {}),
       };
       const index = merged.findIndex((saved) => saved.path === renamed.path);
@@ -679,16 +725,7 @@ export function replaceRepositoryPath(
         merged.push(renamed);
         continue;
       }
-      const saved = merged[index];
-      if (
-        saved.generation !== renamed.generation ||
-        (saved.pendingCleanup &&
-          renamed.pendingCleanup &&
-          JSON.stringify(saved.pendingCleanup) !== JSON.stringify(renamed.pendingCleanup))
-      )
-        throw new Error(`Cannot merge conflicting saved worktrees at ${renamed.path}`);
-      if (renamed.pendingCleanup || (parent === canonicalPath && !saved.pendingCleanup))
-        merged[index] = renamed;
+      merged[index] = mergeSavedWorktrees(merged[index], renamed);
     }
   }
   return {

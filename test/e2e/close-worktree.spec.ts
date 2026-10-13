@@ -1835,7 +1835,7 @@ describe('close worktree shortcut', () => {
             repositories: [repo, aliasPath],
             groups: [],
             worktrees: {
-              [repo]: rows.filter((item: { path: string }) => item.path !== childPath),
+              [repo]: rows,
               [aliasPath]: [
                 {
                   ...rows.find((item: { path: string }) => item.path === childPath),
@@ -1863,16 +1863,20 @@ describe('close worktree shortcut', () => {
     await diagnose('Saved alias merged before preview', () =>
       browser.waitUntil(async () =>
         browser.execute(
-          (repo, aliasPath, childPath) => {
+          (repo, aliasPath, childPath, parentPath) => {
             const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
             return (
               !catalog.repositories?.includes(aliasPath) &&
-              catalog.worktrees?.[repo]?.some((item: { path: string }) => item.path === childPath)
+              catalog.worktrees?.[repo]?.some(
+                (item: { path: string; origin?: { sourcePath: string } }) =>
+                  item.path === childPath && item.origin?.sourcePath === parentPath,
+              )
             );
           },
           repository,
           alias,
           child,
+          parent,
         ),
       ),
     );

@@ -153,6 +153,265 @@ await test('canonicalizing a saved alias preserves pending and canonical worktre
   assert.equal(restored.worktrees['/canonical'][1].pendingCleanup?.recoveryPath, '/shared');
 });
 
+await test('canonicalizing duplicate worktrees preserves every saved field or refuses conflicts', () => {
+  const origin = {
+    sourcePath: '/parent',
+    sourceGeneration: testGeneration(1),
+    agent: 'test',
+    sessionId: 'session',
+    sessionTitle: 'Child',
+  };
+  const pendingCleanup = {
+    originalPath: '/shared',
+    recoveryPath: '/shared',
+    sizeBytes: 12,
+    reason: 'Selected checkout cleanup is pending.',
+    storagePaths: ['/private/cache/child'],
+    storageKeys: ['a'.repeat(64)],
+    selectedWorktreeCleanupConfirmed: true,
+    selectedStorageCleanupConfirmed: true,
+    registeredWorktreesAtMark: [{ path: '/shared', generation: testGeneration(2) }],
+  };
+  const shared = { path: '/shared', branch: 'child', generation: testGeneration(2) };
+  const cases = [
+    {
+      name: 'alias owner survives canonical duplicate',
+      alias: { ...shared, origin },
+      canonical: shared,
+      expected: { ...shared, origin },
+    },
+    {
+      name: 'canonical owner survives alias duplicate',
+      alias: shared,
+      canonical: { ...shared, origin },
+      expected: { ...shared, origin },
+    },
+    {
+      name: 'owner and pending storage survive opposite duplicates',
+      alias: { ...shared, origin },
+      canonical: { ...shared, pendingCleanup },
+      expected: { ...shared, origin, pendingCleanup },
+    },
+    {
+      name: 'pending storage survives an owner on the canonical duplicate',
+      alias: { ...shared, pendingCleanup },
+      canonical: { ...shared, origin },
+      expected: { ...shared, origin, pendingCleanup },
+    },
+    {
+      name: 'generation and metadata survive incomplete duplicate',
+      alias: {
+        ...shared,
+        base: 'main',
+        pullRequest: { number: 42, url: 'https://github.com/owner/repo/pull/42' },
+      },
+      canonical: { path: '/shared', branch: 'child', statusComment: 'Running' },
+      expected: {
+        ...shared,
+        base: 'main',
+        pullRequest: { number: 42, url: 'https://github.com/owner/repo/pull/42' },
+        statusComment: 'Running',
+      },
+    },
+    {
+      name: 'identical owner metadata merges',
+      alias: { ...shared, origin },
+      canonical: { ...shared, origin: { sessionTitle: 'Child', ...origin } },
+      expected: { ...shared, origin },
+    },
+  ];
+  for (const { name, alias, canonical, expected } of cases) {
+    const catalog = loadProjectCatalog(
+      JSON.stringify({
+        repositories: ['/alias', '/canonical'],
+        worktrees: { '/alias': [alias], '/canonical': [canonical] },
+      }),
+      '',
+    );
+    const merged = replaceRepositoryPath(catalog, '/alias', '/canonical');
+    const restored = loadProjectCatalog(JSON.stringify(merged), '');
+    assert.deepEqual(restored.worktrees['/canonical'], [expected], name);
+  }
+
+  const conflicts = [
+    { name: 'branch', alias: { ...shared, branch: 'other' } },
+    { name: 'generation', alias: { ...shared, generation: testGeneration(3) } },
+    {
+      name: 'owner',
+      alias: { ...shared, origin: { ...origin, sessionId: 'other' } },
+      canonical: { ...shared, origin },
+    },
+    {
+      name: 'pending reason',
+      alias: { ...shared, pendingCleanup: { ...pendingCleanup, reason: 'other' } },
+      canonical: { ...shared, pendingCleanup },
+    },
+    {
+      name: 'storage path',
+      alias: {
+        ...shared,
+        pendingCleanup: { ...pendingCleanup, storagePaths: ['/private/cache/other'] },
+      },
+      canonical: { ...shared, pendingCleanup },
+    },
+    {
+      name: 'storage key',
+      alias: { ...shared, pendingCleanup: { ...pendingCleanup, storageKeys: ['b'.repeat(64)] } },
+      canonical: { ...shared, pendingCleanup },
+    },
+    {
+      name: 'selected cleanup confirmation',
+      alias: {
+        ...shared,
+        pendingCleanup: { ...pendingCleanup, selectedStorageCleanupConfirmed: undefined },
+      },
+      canonical: { ...shared, pendingCleanup },
+    },
+    {
+      name: 'mark-time inventory',
+      alias: {
+        ...shared,
+        pendingCleanup: {
+          ...pendingCleanup,
+          registeredWorktreesAtMark: [{ path: '/other', generation: testGeneration(3) }],
+        },
+      },
+      canonical: { ...shared, pendingCleanup },
+    },
+    { name: 'base', alias: { ...shared, base: 'other' }, canonical: { ...shared, base: 'main' } },
+    {
+      name: 'setup status',
+      alias: { ...shared, setupStatus: 'failed' },
+      canonical: { ...shared, setupStatus: 'ready' },
+    },
+  ];
+  for (const { name, alias, canonical } of conflicts) {
+    const catalog = loadProjectCatalog(
+      JSON.stringify({
+        repositories: ['/alias', '/canonical'],
+        worktrees: { '/alias': [alias], '/canonical': [canonical ?? shared] },
+      }),
+      '',
+    );
+    assert.throws(
+      () => replaceRepositoryPath(catalog, '/alias', '/canonical'),
+      /Cannot merge conflicting saved worktrees at \/shared/,
+      name,
+    );
+    assert.deepEqual(catalog.repositories, ['/alias', '/canonical'], name);
+  }
+});
+
+await test('canonicalizing a pending worktree path retains its recovery entry', () => {
+  const pending = {
+    originalPath: '/alias',
+    recoveryPath: '/alias',
+    sizeBytes: 12,
+    reason: 'Selected checkout cleanup is pending.',
+    storagePaths: ['/private/cache/child'],
+    storageKeys: ['a'.repeat(64)],
+    registeredWorktreesAtMark: [
+      { path: '/alias', generation: testGeneration(2) },
+      { path: '/canonical', generation: testGeneration(2) },
+    ],
+  };
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/alias', '/canonical'],
+      worktrees: {
+        '/alias': [
+          {
+            path: '/alias',
+            branch: 'child',
+            generation: testGeneration(2),
+            pendingCleanup: pending,
+          },
+        ],
+        '/canonical': [{ path: '/canonical', branch: 'child', generation: testGeneration(2) }],
+      },
+    }),
+    '',
+  );
+  const merged = replaceRepositoryPath(catalog, '/alias', '/canonical');
+  const restored = loadProjectCatalog(JSON.stringify(merged), '');
+  assert.deepEqual(restored.worktrees['/canonical'], [
+    {
+      path: '/canonical',
+      branch: 'child',
+      generation: testGeneration(2),
+      pendingCleanup: {
+        ...pending,
+        recoveryPath: '/canonical',
+      },
+    },
+  ]);
+});
+
+await test('adding a Sail owner to an adopted generation retains ancestry and pending storage', () => {
+  const generation = testGeneration(2);
+  const owner = {
+    sourcePath: '/parent',
+    sourceGeneration: testGeneration(1),
+    agent: 'test',
+    sessionId: 'session',
+    sessionTitle: 'Child',
+  };
+  const pendingCleanup = {
+    originalPath: '/child',
+    recoveryPath: '/child',
+    sizeBytes: 12,
+    reason: 'Selected checkout cleanup is pending.',
+    storagePaths: ['/private/cache/child'],
+    storageKeys: ['a'.repeat(64)],
+  };
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo'],
+      worktrees: {
+        '/repo': [
+          { path: '/child', branch: 'child', generation, setupStatus: 'ready', pendingCleanup },
+        ],
+      },
+    }),
+    '',
+  );
+  const merged = addWorktree(catalog, '/repo', {
+    path: '/child',
+    branch: 'child',
+    generation,
+    origin: owner,
+  });
+  const restored = loadProjectCatalog(JSON.stringify(merged), '');
+  assert.deepEqual(restored.worktrees['/repo'][0].origin, owner);
+  assert.deepEqual(restored.worktrees['/repo'][0].pendingCleanup, pendingCleanup);
+  assert.equal(
+    addWorktree(catalog, '/repo', { path: '/child', branch: 'child', origin: owner }),
+    catalog,
+  );
+  assert.deepEqual(
+    worktreeDescendants(
+      restored,
+      '/repo',
+      [
+        { path: '/parent', generation: testGeneration(1) },
+        { path: '/child', generation },
+      ],
+      '/parent',
+    ).map((item) => item.path),
+    ['/child'],
+  );
+  assert.throws(
+    () =>
+      addWorktree(merged, '/repo', {
+        path: '/child',
+        branch: 'child',
+        generation,
+        origin: { ...owner, sessionId: 'other' },
+      }),
+    /Cannot merge conflicting saved worktrees at \/child/,
+  );
+});
+
 await test('canonicalizing an already selected repository includes saved alias descendants', async () => {
   const parent = '/worktrees/parent';
   const child = '/worktrees/child';
