@@ -1000,6 +1000,46 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let directory = entry.path();
         pending.extend(temp_directory_status(cache_directory, &directory));
+        if name.starts_with(QUARANTINE_PREFIX) {
+            let temporary = match quarantine_temporary_data(&directory) {
+                Ok(Some(path)) if path == directory.join(TEMP_ROOT) => {
+                    Some((path, "turn-temp-owner-unverifiable"))
+                }
+                Ok(Some(path)) => Some((path, "legacy-temp-owner-unverified")),
+                Err(_) => Some((directory.clone(), "turn-temp-scan-failed")),
+                Ok(None) => None,
+            };
+            if let Some((path, reason)) = temporary {
+                let mut item = pending_item(
+                    cache_key(&path).unwrap_or_else(|_| "unknown".into()),
+                    reason,
+                    Some(&path),
+                    false,
+                );
+                item.path = path.to_str().map(str::to_owned);
+                item.owner_path = name
+                    .strip_prefix(QUARANTINE_PREFIX)
+                    .and_then(|name| name.split_once('-'))
+                    .and_then(|(key, _)| {
+                        durable_cleanup_identity_by_key(cache_directory, key)
+                            .ok()
+                            .flatten()
+                            .filter(|durable| {
+                                identity_data_directory(cache_directory, &durable.owner)
+                                    .ok()
+                                    .and_then(|path| cache_key(&path).ok())
+                                    .as_deref()
+                                    == Some(key)
+                            })
+                    })
+                    .filter(|durable| {
+                        directory_identity(&directory).ok().as_deref()
+                            == Some(&durable.directory_id)
+                    })
+                    .and_then(|durable| durable.owner.root.to_str().map(str::to_owned));
+                pending.push(item);
+            }
+        }
         let reason = if name.starts_with(QUARANTINE_PREFIX) {
             let durable = name
                 .strip_prefix(QUARANTINE_PREFIX)
@@ -2877,6 +2917,60 @@ fn remove_quarantine(path: &Path, key: &str) -> Result<(), String> {
     remove_quarantine_with_identity(path, key, &identity, None)
 }
 
+fn quarantine_temporary_data(path: &Path) -> Result<Option<PathBuf>, String> {
+    let legacy = path.join("tmp");
+    match fs::symlink_metadata(&legacy) {
+        Ok(_) => return Ok(Some(legacy)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect quarantined temporary data: {error}"
+            ))
+        }
+    }
+    let build = path.join("build");
+    match fs::symlink_metadata(&build) {
+        Ok(metadata) if metadata.is_dir() => {
+            let legacy = build.join("go-tmp");
+            match fs::symlink_metadata(&legacy) {
+                Ok(_) => return Ok(Some(legacy)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect quarantined temporary data: {error}"
+                    ))
+                }
+            }
+        }
+        Ok(_) => return Ok(Some(build)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect quarantined temporary data: {error}"
+            ))
+        }
+    }
+    let root = path.join(TEMP_ROOT);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => {
+            let mut entries = fs::read_dir(&root)
+                .map_err(|error| format!("Cannot inspect quarantined temporary data: {error}"))?;
+            match entries.next() {
+                Some(Ok(_)) => Ok(Some(root)),
+                Some(Err(error)) => Err(format!(
+                    "Cannot inspect quarantined temporary data: {error}"
+                )),
+                None => Ok(None),
+            }
+        }
+        Ok(_) => Ok(Some(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Cannot inspect quarantined temporary data: {error}"
+        )),
+    }
+}
+
 fn remove_quarantine_with_identity(
     path: &Path,
     key: &str,
@@ -2924,6 +3018,40 @@ fn remove_quarantine_with_identity(
             return Err("Cannot verify private storage temporary process state.".into());
         }
         Ok(_) => {}
+    }
+    match quarantine_temporary_data(path) {
+        Ok(Some(_)) => {
+            report_pending(path, "turn-temp-owner-unverifiable");
+            return Err("Private storage retains temporary data; review it before cleanup.".into());
+        }
+        Err(error) => {
+            report_pending(path, "turn-temp-scan-failed");
+            return Err(error);
+        }
+        Ok(None) => {}
+    }
+    // Remove the empty temporary root before deleting storage. This fails if a
+    // late writer populated it after the scan and closes an already-open root
+    // directory handle against subsequent child creation on Unix.
+    let temp_root = path.join(TEMP_ROOT);
+    match fs::symlink_metadata(&temp_root) {
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir(&temp_root).map_err(|error| {
+                report_pending(path, "turn-temp-owner-unverifiable");
+                format!("Private storage retains temporary data: {error}")
+            })?;
+        }
+        Ok(_) => {
+            report_pending(path, "turn-temp-owner-unverifiable");
+            return Err("Private storage temporary root changed during cleanup.".into());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            report_pending(path, "turn-temp-scan-failed");
+            return Err(format!(
+                "Cannot inspect quarantined temporary data: {error}"
+            ));
+        }
     }
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -4065,21 +4193,47 @@ mod tests {
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
         let artifact = temp.join("artifact");
+        let ready = fixture.root.join("detached-worker-ready");
         fs::write(&artifact, "live").unwrap();
         let mut worker = std::process::Command::new("python3")
             .arg("-c")
-            .arg("import sys,time; time.sleep(30); open(sys.argv[1]).read()")
+            .arg("import os,sys,time; os.chdir(sys.argv[2]); open(sys.argv[1]).read(); open(sys.argv[3], 'w').write('ready'); time.sleep(30)")
             .arg(&artifact)
+            .arg(&temp)
+            .arg(&ready)
             .env("TMPDIR", &temp)
             .spawn()
             .unwrap();
-        for _ in 0..100 {
-            if temp_directory_in_use(&temp) {
-                break;
-            }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(temp_directory_in_use(&temp));
+        let worker_ready = ready.exists();
+        let observed = if worker_ready {
+            let detection_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if temp_directory_in_use(&temp) {
+                    break true;
+                }
+                if std::time::Instant::now() >= detection_deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        } else {
+            false
+        };
+        if !worker_ready || !observed {
+            if worker.try_wait().unwrap().is_none() {
+                worker.kill().unwrap();
+            }
+            worker.wait().unwrap();
+        }
+        assert!(worker_ready, "detached worker did not open temporary data");
+        assert!(
+            observed,
+            "detached worker was not visible to temporary process detection"
+        );
 
         lease.mark_started();
         assert!(lease.release_clean().is_err());
@@ -4737,6 +4891,58 @@ mod tests {
         )
         .unwrap();
         assert!(!recovery.exists());
+    }
+
+    #[test]
+    fn selected_quarantine_retry_retains_late_temporary_data() {
+        let fixture = GitFixture::new();
+        let expected_generation = generation(&fixture.first).unwrap();
+        let (storage, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&storage))
+            .unwrap();
+        fixture.remove(&fixture.first);
+        let key = cache_key(&storage).unwrap();
+        let selected_key = storage.file_name().unwrap().to_str().unwrap().to_owned();
+        let recovery = quarantine_path(storage.parent().unwrap(), &key).unwrap();
+        fs::rename(&storage, &recovery).unwrap();
+        let late_temp = recovery
+            .join(TEMP_ROOT)
+            .join(format!("run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&late_temp).unwrap();
+        fs::write(late_temp.join("artifact"), "keep").unwrap();
+        let retained =
+            retained_selected_storage_locations(&fixture.cache, std::slice::from_ref(&storage))
+                .unwrap();
+        assert_eq!(retained, vec![(selected_key.clone(), recovery.clone())]);
+
+        let result = retry_selected_removed_worktree_storage(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &expected_generation,
+            &selected_key,
+        );
+
+        let error = result.expect_err("late temporary data was deleted");
+        assert!(error.contains("temporary data"), "{error}");
+        assert_eq!(
+            fs::read_to_string(late_temp.join("artifact")).unwrap(),
+            "keep"
+        );
+        let pending = cleanup_status(&fixture.cache);
+        let temp_root = recovery.join(TEMP_ROOT);
+        let item = pending
+            .iter()
+            .find(|item| item.path.as_deref() == temp_root.to_str())
+            .expect("quarantined temporary data must be visible in Settings");
+        assert_eq!(item.reason, "turn-temp-owner-unverifiable");
+        assert_eq!(
+            item.owner_path.as_deref(),
+            stable_worktree_identity(&fixture.first).to_str()
+        );
+        assert!(item.size_bytes.is_some_and(|size| size > 0));
+        assert!(item.cleanup_token.is_none());
     }
 
     #[test]
