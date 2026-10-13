@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, statSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+  rmSync,
+} from 'node:fs';
 import { createServer } from 'node:net';
 import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -37,6 +45,14 @@ const expectFailure = (executable, args, pattern) => {
     (error) => pattern.test(String(error.stderr)),
   );
 };
+const signing = (bundle) => {
+  const result = spawnSync('codesign', ['-dv', '--verbose=4', bundle], { encoding: 'utf8' });
+  assert.equal(result.status, 0);
+  return {
+    team: result.stderr.match(/^TeamIdentifier=(.+)$/m)?.[1],
+    hash: result.stderr.match(/^CDHash=(.+)$/m)?.[1],
+  };
+};
 const port = await new Promise((resolve, reject) => {
   const server = createServer();
   server.once('error', reject);
@@ -54,6 +70,25 @@ const bundleId = run('plutil', [
   join(app, 'Contents', 'Info.plist'),
 ]);
 const label = `${bundleId}.context-supervisor`;
+assert.match(bundleId, /^dev\.smykla\.sail\.e2e\.[a-f0-9]{32}$/);
+run('codesign', ['--verify', '--deep', '--strict', app]);
+run('codesign', ['--verify', '-v', '-R', '=anchor apple generic', app]);
+const servicePlist = join(app, 'Contents/Library/LaunchAgents', `${label}.plist`);
+assert.equal(
+  run('plutil', [
+    '-extract',
+    'EnvironmentVariables.SAIL_E2E_CONFIG_DIR',
+    'raw',
+    '-o',
+    '-',
+    servicePlist,
+  ]),
+  config,
+);
+assert.equal(
+  run('plutil', ['-extract', 'EnvironmentVariables.TMPDIR', 'raw', '-o', '-', servicePlist]),
+  temporary,
+);
 const project = join(scratch, 'project');
 const other = join(scratch, 'other-project');
 const provider = join(scratch, 'fixture-provider');
@@ -245,9 +280,9 @@ try {
     run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
     'approved',
   );
-  const first = openProbe(project);
+  let first = openProbe(project);
   assert.equal(await first.line(), 'opened');
-  const second = openProbe(project);
+  let second = openProbe(project);
   assert.equal(await second.line(), 'opened');
   assert.equal(await first.check(), 'authorized');
   assert.equal(await second.check(), 'authorized');
@@ -262,9 +297,34 @@ try {
   expectFailure(
     join(copied, 'Contents', 'MacOS', 'sail'),
     ['--context-auth-probe', project],
-    /Sail client signature or path rejected/,
+    /(?:Sail client|Context service) signature or path rejected/,
   );
   console.log('PASS: unapproved project and copied-app client rejected');
+
+  run('codesign', ['--force', '--deep', '--sign', '-', copied]);
+  run('codesign', ['--verify', '--deep', '--strict', copied]);
+  expectFailure(
+    join(copied, 'Contents', 'MacOS', 'sail'),
+    ['--context-auth-probe', project],
+    /(?:Sail client|Context service) signature or path rejected/,
+  );
+  console.log('PASS: differently signed client rejected');
+
+  writeFileSync(provider, '#!/bin/sh\nexit 1\n');
+  assert.match(await first.check(), /^rejected:/);
+  assert.match(await second.check(), /^rejected:/);
+  first.close();
+  second.close();
+  expectFailure(binary, ['--context-auth-probe', project], /Context approval unavailable/);
+  assert.equal(
+    run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
+    'approved',
+  );
+  first = openProbe(project);
+  second = openProbe(project);
+  assert.equal(await first.line(), 'opened');
+  assert.equal(await second.line(), 'opened');
+  console.log('PASS: changed provider invalidates existing sessions and requires new approval');
 
   assert.equal(run(binary, ['--context-auth-revoke-probe', project]), 'revoked');
   assert.match(await first.check(), /^rejected:/);
@@ -289,23 +349,52 @@ try {
   fourth.close();
   console.log('PASS: service restart invalidates old capability and admits new session');
 
-  assert.ok(process.env.APPLE_SIGNING_IDENTITY, 'Signed upgrade requires a signing identity');
-  run('plutil', [
-    '-replace',
-    'CFBundleVersion',
-    '-string',
-    '514.2',
-    join(app, 'Contents', 'Info.plist'),
-  ]);
-  run('codesign', [
-    '--force',
-    '--deep',
-    '--options',
-    'runtime',
-    '--sign',
-    process.env.APPLE_SIGNING_IDENTITY,
-    app,
-  ]);
+  const upgrade = process.env.SAIL_CONTEXT_AUTH_UPGRADE_APP;
+  if (upgrade) {
+    run('codesign', ['--verify', '--deep', '--strict', upgrade]);
+    run('codesign', ['--verify', '-v', '-R', '=anchor apple generic', upgrade]);
+    assert.equal(
+      run('plutil', [
+        '-extract',
+        'CFBundleIdentifier',
+        'raw',
+        '-o',
+        '-',
+        join(upgrade, 'Contents/Info.plist'),
+      ]),
+      bundleId,
+    );
+    const before = signing(app);
+    const after = signing(upgrade);
+    assert.ok(before.team && before.team !== 'not set');
+    assert.equal(after.team, before.team);
+    assert.ok(before.hash && after.hash);
+    assert.notEqual(after.hash, before.hash);
+    const previous = join(scratch, 'previous.app');
+    renameSync(app, previous);
+    run('ditto', [upgrade, app]);
+  } else {
+    assert.ok(
+      process.env.APPLE_SIGNING_IDENTITY,
+      'Signed upgrade requires a signing identity or pre-signed upgrade',
+    );
+    run('plutil', [
+      '-replace',
+      'CFBundleVersion',
+      '-string',
+      '514.2',
+      join(app, 'Contents', 'Info.plist'),
+    ]);
+    run('codesign', [
+      '--force',
+      '--deep',
+      '--options',
+      'runtime',
+      '--sign',
+      process.env.APPLE_SIGNING_IDENTITY,
+      app,
+    ]);
+  }
   run('codesign', ['--verify', '--deep', '--strict', app]);
   expectFailure(
     binary,
