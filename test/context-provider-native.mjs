@@ -294,12 +294,8 @@ try {
   assert.equal(a.result.initializeCount, 1);
   assert.equal(b.result.initializeCount, 1, 'second agent reuses the provider handshake');
   assert.equal(c.result.initializeCount, 1);
-  for (const [client, id] of [
-    [first, 12],
-    [second, 13],
-    [peer, 14],
-  ])
-    assert.equal((await client.request(id)).result.pid, a.result.pid);
+  const forwarded = await Promise.all([first.request(12), second.request(13), peer.request(14)]);
+  for (const response of forwarded) assert.equal(response.result.pid, a.result.pid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),
