@@ -553,8 +553,11 @@ fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<Te
     let mut state_created = false;
     let result = (|| {
         let pid = std::process::id();
-        let started_at = sysinfo::System::new_all()
-            .process(sysinfo::Pid::from_u32(pid))
+        let process_id = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[process_id]), true);
+        let started_at = system
+            .process(process_id)
             .ok_or("Cannot verify the private temporary owner process.")?
             .start_time();
         let contents = format!(
