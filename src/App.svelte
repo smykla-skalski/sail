@@ -9088,7 +9088,7 @@
             !Number.isSafeInteger(pending.sizeBytes) ||
             pending.sizeBytes < 0)) ||
         !Array.isArray(pending.storagePaths) ||
-        !pending.storagePaths.length ||
+        (!pending.storagePaths.length && pending.overlayCleanupPending !== true) ||
         !pending.storagePaths.every((path) => typeof path === 'string' && !!path) ||
         !Array.isArray(pending.storageKeys) ||
         pending.storageKeys.length !== pending.storagePaths.length ||
@@ -9307,6 +9307,11 @@
             };
           }
           if ((!live || live.generation !== entry.generation) && entry.generation) {
+            if (registered.some((item) => !item.generation)) {
+              reason =
+                'A registered worktree has an unverifiable Git generation. Repair its identity before settling this pending cleanup.';
+              return { entry, pending, sizeBytes, reason, completed: false };
+            }
             const moved = registered.find((item) => item.generation === entry.generation);
             if (moved) {
               return {
@@ -9369,6 +9374,14 @@
               const absent = paths.length
                 ? await invoke<boolean>('pending_cleanup_paths_absent', { paths })
                 : true;
+              const overlayAbsent = await invoke<boolean>('pending_cleanup_overlay_absent', {
+                originalWorktree: pending.originalPath,
+              });
+              if (!overlayAbsent) {
+                reason =
+                  'The Git checkout was removed, but private Git state remains pending. Retry selected cleanup after the cause is fixed.';
+                return { entry, pending, sizeBytes: null, reason, completed: false };
+              }
               if (
                 absent &&
                 (pending.selectedWorktreeCleanupConfirmed ||
@@ -9525,6 +9538,30 @@
           worktree.path === pending[0].path && worktree.generation === pending[0].generation,
       )
     ) {
+      if (recovery.selectedWorktreeCleanupConfirmed || recovery.selectedStorageCleanupConfirmed) {
+        try {
+          const overlayAbsent = await invoke<boolean>('pending_cleanup_overlay_absent', {
+            originalWorktree: recovery.originalPath,
+          });
+          if (!overlayAbsent) {
+            await invoke('retry_removed_worktree_overlay_cleanup', {
+              repository,
+              originalWorktree: recovery.originalPath,
+              expectedGeneration: pending[0].generation,
+              confirmedUnused: true,
+            });
+          }
+        } catch (cause) {
+          error = `Private Git cleanup remains pending: ${describe(cause)}`;
+          saveProjectCatalog(
+            markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+              ...recovery,
+              reason: error,
+            }),
+          );
+          return;
+        }
+      }
       await checkPendingWorktreeCleanup(repository, selectedPath);
       if (
         !(projectCatalog.worktrees[repository] ?? []).some(
@@ -9635,6 +9672,17 @@
             }),
           Promise.resolve(),
         );
+        const overlayAbsent = await invoke<boolean>('pending_cleanup_overlay_absent', {
+          originalWorktree: verifiedRecovery.originalPath,
+        });
+        if (!overlayAbsent) {
+          await invoke('retry_removed_worktree_overlay_cleanup', {
+            repository,
+            originalWorktree: verifiedRecovery.originalPath,
+            expectedGeneration: pending[0].generation,
+            confirmedUnused: true,
+          });
+        }
         let remaining: RegisteredWorktree[] | null = null;
         try {
           remaining = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
@@ -9662,7 +9710,7 @@
           }
         }
       } catch (cause) {
-        const reason = `Private storage remains pending: ${describe(cause)}`;
+        const reason = `${remainingStoragePaths.length ? 'Private storage' : 'Private Git cleanup'} remains pending: ${describe(cause)}`;
         saveProjectCatalog(
           markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
             ...verifiedRecovery,
@@ -10030,7 +10078,9 @@
             expected?.generation ?? undefined,
           ),
         );
-        error = `The Git checkout was removed, but private agent storage remains at ${storage.storagePaths!.join(', ')}. ${storage.reason}`;
+        error = storage.storagePaths?.length
+          ? `The Git checkout was removed, but private agent storage remains at ${storage.storagePaths.join(', ')}. ${storage.reason}`
+          : `The Git checkout was removed, but private Git cleanup remains pending. ${storage.reason}`;
         if (wasSelected && directory === path) await loadProject(repository);
         return false;
       }

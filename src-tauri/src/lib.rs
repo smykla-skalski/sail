@@ -544,6 +544,15 @@ fn pending_cleanup_paths_absent(paths: Vec<String>) -> Result<bool, String> {
     Ok(true)
 }
 
+#[tauri::command]
+fn pending_cleanup_overlay_absent(original_worktree: String) -> Result<bool, String> {
+    let original = Path::new(&original_worktree);
+    if !original.is_absolute() {
+        return Err("A pending worktree path is not absolute.".into());
+    }
+    git_overlay::removed_worktree_overlay_absent(original)
+}
+
 fn validate_repository_path(path: String) -> Result<String, String> {
     let directory = Path::new(&path)
         .git_canonical()
@@ -2484,8 +2493,11 @@ async fn delete_worktree(
                 let retained_size = retained.iter().try_fold(0_u64, |total, (_, path)| {
                     worktree_size_bytes(path).map(|size| total.saturating_add(size))
                 });
+                let overlay_cleanup_pending =
+                    !git_overlay::removed_worktree_overlay_absent(&directory).unwrap_or(false);
                 let reason = match inspected {
                     Ok(paths) if !paths.is_empty() => reason,
+                    Ok(_) if overlay_cleanup_pending => reason,
                     Ok(_) => format!("{reason} Retained private storage location could not be verified."),
                     Err(error) => format!("{reason} {error}"),
                 };
@@ -2498,6 +2510,7 @@ async fn delete_worktree(
                         "storageKeys": retained.iter().map(|(key, _)| key).collect::<Vec<_>>(),
                         "sizeBytes": retained_size.ok(),
                         "reason": reason,
+                        "overlayCleanupPending": overlay_cleanup_pending,
                     })
                 ))
             }
@@ -2566,6 +2579,44 @@ fn restore_pending_worktree_inner(
     move_worktree_for_removal(repository, &recovery, &original)?;
     ensure_expected_worktree_generation(&original, Some(expected_generation))?;
     Ok(())
+}
+
+#[tauri::command]
+async fn retry_removed_worktree_overlay_cleanup(
+    operation_locks: State<'_, WorktreeOperationLocks>,
+    repository: String,
+    original_worktree: String,
+    expected_generation: String,
+    confirmed_unused: bool,
+) -> Result<(), String> {
+    if !confirmed_unused || expected_generation.is_empty() {
+        return Err("Private Git cleanup requires a confirmed worktree generation.".into());
+    }
+    let operation_locks = operation_locks.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let checked = validate_repository_path(repository)?;
+        let repository = PathBuf::from(&checked)
+            .git_canonical()
+            .map_err(|_| "Repository folder no longer exists.".to_string())?;
+        let original = PathBuf::from(original_worktree);
+        if !original.is_absolute() || original == repository {
+            return Err("Cannot retry private Git cleanup for this worktree path.".into());
+        }
+        let _lock = operation_locks.lock(&repository)?;
+        let registered = repository_worktrees_inner(checked)?;
+        if registered.iter().any(|item| item.generation.is_none()) {
+            return Err("A registered worktree identity cannot be verified. Private Git state remains intact.".into());
+        }
+        if registered
+            .iter()
+            .any(|item| item.generation.as_deref() == Some(expected_generation.as_str()))
+        {
+            return Err("The selected Git generation is still registered. Private Git state remains intact.".into());
+        }
+        git_overlay::forget_removed_worktree_for_repository(&original, &repository)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn remove_worktree_then_private_data_many<T>(
@@ -4058,6 +4109,7 @@ pub fn run() {
             memory_provider::resolve_memory_provider_pending,
             repository_path_available,
             pending_cleanup_paths_absent,
+            pending_cleanup_overlay_absent,
             opencode_config::opencode_plan_review_plugin,
             validate_repository,
             list_picker_directory,
@@ -4085,6 +4137,7 @@ pub fn run() {
             repository_worktrees,
             worktree_removal_preview,
             restore_pending_worktree,
+            retry_removed_worktree_overlay_cleanup,
             delete_worktree,
             worktree_config,
             context::context_provider_status,

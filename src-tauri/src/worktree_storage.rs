@@ -4556,14 +4556,25 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&selected_artifact).unwrap(), "selected");
 
-        retry_selected_removed_worktree_storage(
-            &fixture.cache,
-            &fixture.repository,
-            &fixture.first,
-            &expected_generation,
-            storage.file_name().unwrap().to_str().unwrap(),
-        )
-        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match retry_selected_removed_worktree_storage(
+                &fixture.cache,
+                &fixture.repository,
+                &fixture.first,
+                &expected_generation,
+                storage.file_name().unwrap().to_str().unwrap(),
+            ) {
+                Ok(()) => break,
+                Err(error)
+                    if error == "Temporary data still has an active owner."
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("selected storage retry failed: {error}"),
+            }
+        }
         assert!(!storage.exists());
         assert_eq!(fs::read_to_string(sibling_artifact).unwrap(), "keep");
     }

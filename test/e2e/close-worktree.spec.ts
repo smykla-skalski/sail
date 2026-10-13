@@ -1,9 +1,17 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { topbarMenuTrigger } from './topbar';
 import { loadProjectCatalog } from '../../src/lib/projects.ts';
 
@@ -416,7 +424,21 @@ describe('close worktree shortcut', () => {
     rmSync(completed, { recursive: true });
     git('worktree', 'add', '-q', '-b', 'completed-replacement', completed);
     await $(`[data-pending-worktree="${completed}"]`).$('button=Recheck worktree').click();
-    await browser.waitUntil(async () =>
+    await diagnose('Replaced checkout remains pending', () =>
+      browser.waitUntil(async () => {
+        const reason = (await pendingCleanup(completed))?.reason;
+        return (
+          reason?.includes('removed outside Sail') ||
+          reason?.includes('private Git state remains pending')
+        );
+      }),
+    );
+    const overlayAbsent = await browser.tauri.execute(
+      async ({ core }, path) =>
+        core.invoke<boolean>('pending_cleanup_overlay_absent', { originalWorktree: path }),
+      completed,
+    );
+    expect(overlayAbsent).toBe(
       (await pendingCleanup(completed))?.reason.includes('removed outside Sail'),
     );
     expect(await catalogPaths()).toContain(completed);
@@ -683,8 +705,7 @@ describe('close worktree shortcut', () => {
     await diagnose('Pending parent row', () =>
       expect($(`.project-worktree-select[title="${parent}"]`)).toBeDisplayed(),
     );
-    await $(`.project-worktree-select[title="${parent}"]`).click({ button: 'right' });
-    await $('[aria-label="Delete worktree inventory-parent"]').click();
+    await openRemovalConfirmation(parent, 'inventory-parent');
     await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(parent)));
     git('worktree', 'add', '-q', '-b', 'inventory-new-child', child);
@@ -1165,6 +1186,151 @@ describe('close worktree shortcut', () => {
     expect(existsSync(recovery)).toBe(false);
     git('worktree', 'remove', original);
     git('worktree', 'remove', parent);
+  });
+
+  it('keeps confirmed cleanup pending when a moved checkout generation cannot be read', async () => {
+    const original = join(worktrees, 'unverifiable-original');
+    const moved = join(worktrees, 'unverifiable-moved');
+    git('worktree', 'add', '-q', '-b', 'unverifiable', original);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = registered.find((item) => item.path === original)?.generation;
+    if (!generation) throw new Error('Missing generation for unverifiable checkout');
+    await select(repository, false);
+    await browser.execute(
+      (repo, path, identity) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push({
+          path,
+          branch: 'unverifiable',
+          generation: identity,
+          pendingCleanup: {
+            originalPath: path,
+            recoveryPath: path,
+            sizeBytes: 0,
+            reason: 'Confirmed cleanup was interrupted.',
+            selectedWorktreeCleanupConfirmed: true,
+          },
+        });
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      original,
+      generation,
+    );
+    git('worktree', 'move', original, moved);
+    const admin = execFileSync('git', ['-C', moved, 'rev-parse', '--absolute-git-dir'], {
+      encoding: 'utf8',
+    }).trim();
+    const marker = join(admin, 'sail-worktree-generation-v1');
+    const savedMarker = readFileSync(marker);
+    writeFileSync(marker, 'malformed generation marker');
+    await browser.refresh();
+    const current = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    expect(current.find((item) => item.path === moved)?.generation).toBeNull();
+    await $(`[data-pending-worktree="${original}"]`).$('button=Recheck worktree').click();
+    await diagnose('Unverifiable moved checkout retained', () =>
+      browser.waitUntil(async () =>
+        (await pendingCleanup(original))?.reason.includes('unverifiable Git generation'),
+      ),
+    );
+    expect(existsSync(moved)).toBe(true);
+    writeFileSync(marker, savedMarker);
+    await $(`[data-pending-worktree="${original}"]`).$('button=Recheck worktree').click();
+    await diagnose('Verified moved checkout recovered', () =>
+      browser.waitUntil(async () => (await pendingCleanup(moved))?.originalPath === original),
+    );
+    git('worktree', 'remove', moved);
+  });
+
+  it('retains and retries an interrupted private Git overlay manifest after checkout deletion', async () => {
+    const path = join(worktrees, 'interrupted-overlay');
+    git('worktree', 'add', '-q', '-b', 'interrupted-overlay', path);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = registered.find((item) => item.path === path)?.generation;
+    if (!generation) throw new Error('Missing generation for overlay checkout');
+    const sourceGitDir = execFileSync('git', ['-C', path, 'rev-parse', '--absolute-git-dir'], {
+      encoding: 'utf8',
+    }).trim();
+    const head = git('-C', path, 'rev-parse', 'HEAD').trim();
+    const cache = await browser.tauri.execute(async ({ core }) =>
+      core.invoke<string>('plugin:path|resolve_directory', { directory: 16 }),
+    );
+    if (!cache.includes('dev.smykla.sail.e2e')) {
+      throw new Error(`Refusing overlay fixture outside the task-owned E2E app: ${cache}`);
+    }
+    await select(repository, false);
+    await browser.execute(
+      (repo, selected, identity) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push({
+          path: selected,
+          branch: 'interrupted-overlay',
+          generation: identity,
+          pendingCleanup: {
+            originalPath: selected,
+            recoveryPath: selected,
+            sizeBytes: 0,
+            reason: 'Confirmed selected cleanup was interrupted.',
+            selectedWorktreeCleanupConfirmed: true,
+          },
+        });
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      path,
+      generation,
+    );
+    git('worktree', 'remove', path);
+    const identity = join(realpathSync(dirname(path)), basename(path));
+    const key = createHash('sha256')
+      .update(Buffer.from(identity, process.platform === 'win32' ? 'utf16le' : 'utf8'))
+      .digest('hex');
+    const manifest = join(cache, 'git-overlay-manifests', `${key}.json`);
+    mkdirSync(dirname(manifest), { recursive: true });
+    writeFileSync(
+      manifest,
+      JSON.stringify({
+        version: 1,
+        worktree: identity,
+        sourceGitDir,
+        commonDir: realpathSync(join(repository, '.git')),
+        branch: 'refs/heads/interrupted-overlay',
+        promotedOid: head,
+        sourceIndexHash: null,
+        promotion: null,
+      }),
+    );
+    await browser.refresh();
+    await $(`[data-pending-worktree="${path}"]`).$('button=Recheck worktree').click();
+    await diagnose('Interrupted overlay retained', () =>
+      browser.waitUntil(async () =>
+        (await pendingCleanup(path))?.reason.includes('private Git state remains pending'),
+      ),
+    );
+    expect(existsSync(manifest)).toBe(true);
+    await $(`[data-pending-worktree="${path}"]`).$('button=Clean up this worktree…').click();
+    await diagnose('Interrupted overlay cleared by selected retry', () =>
+      browser.waitUntil(async () => !(await catalogPaths()).includes(path)),
+    );
+    expect(existsSync(manifest)).toBe(false);
   });
 
   it('settles a confirmed checkout removed before its catalog update after restart', async () => {

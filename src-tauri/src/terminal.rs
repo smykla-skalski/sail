@@ -501,10 +501,17 @@ mod tests {
             Some(&job_pid_file),
         );
         let shell_pid = shell.id();
+        let pid_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let job_pid = loop {
             if let Ok(pid) = std::fs::read_to_string(&job_pid_file) {
-                break pid.trim().parse::<u32>().expect("background job PID");
+                if let Ok(parsed) = pid.trim().parse::<u32>() {
+                    break parsed;
+                }
             }
+            assert!(
+                std::time::Instant::now() < pid_deadline,
+                "background job PID was not published"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert_eq!(

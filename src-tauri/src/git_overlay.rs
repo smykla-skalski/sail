@@ -218,6 +218,32 @@ pub(crate) fn require_no_private_state_at_missing(worktree: &Path) -> Result<(),
     Ok(())
 }
 
+pub(crate) fn removed_worktree_overlay_absent(worktree: &Path) -> Result<bool, String> {
+    let root = crate::acp_terminal::stable_worktree_identity(worktree);
+    let cache = CACHE
+        .get()
+        .ok_or("Private Git cache is unavailable for cleanup verification.")?;
+    if let Some(entries) = ACTIVE.get() {
+        if entries
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|(owner, _, _)| owner == &root)
+        {
+            return Ok(false);
+        }
+    }
+    let (private, manifest, _) = paths(cache, &root);
+    for path in [private, manifest.clone(), manifest.with_extension("bak")] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot verify private Git state: {error}")),
+        }
+    }
+    Ok(true)
+}
+
 /// A staged checkout can still own a synchronized overlay keyed to its old path.
 /// Keep that overlay in place so it becomes usable again after the Git move.
 pub(crate) fn require_recoverable_private_state_at_missing(
@@ -285,7 +311,39 @@ pub(crate) fn forget_removed_worktree(worktree: &Path) -> Result<(), String> {
     forget_removed_worktree_in_cache(cache, &root)
 }
 
+pub(crate) fn forget_removed_worktree_for_repository(
+    worktree: &Path,
+    repository: &Path,
+) -> Result<(), String> {
+    let result = output(
+        git_command()
+            .arg("-C")
+            .arg(repository)
+            .args(["rev-parse", "--git-common-dir"]),
+    )?;
+    let common = String::from_utf8(result.stdout).map_err(|error| error.to_string())?;
+    let common = Path::new(common.trim());
+    let common = dunce::canonicalize(if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        repository.join(common)
+    })
+    .map_err(|error| error.to_string())?;
+    let cache = CACHE
+        .get()
+        .ok_or("Private Git cache is unavailable for selected cleanup.")?;
+    forget_removed_worktree_in_cache_checked(cache, worktree, Some(&common))
+}
+
 fn forget_removed_worktree_in_cache(cache: &Path, worktree: &Path) -> Result<(), String> {
+    forget_removed_worktree_in_cache_checked(cache, worktree, None)
+}
+
+fn forget_removed_worktree_in_cache_checked(
+    cache: &Path,
+    worktree: &Path,
+    expected_common: Option<&Path>,
+) -> Result<(), String> {
     let root = crate::acp_terminal::stable_worktree_identity(worktree);
     if root.exists() {
         return Err("Removed worktree path was recreated before private Git cleanup.".into());
@@ -320,20 +378,41 @@ fn forget_removed_worktree_in_cache(cache: &Path, worktree: &Path) -> Result<(),
     if manifest.version != VERSION || manifest.worktree != root || manifest.promotion.is_some() {
         return Err("Removed worktree private Git state requires recovery.".into());
     }
-    validate_overlay(&private, &manifest.common_dir)?;
-    let head = output(
-        git_command()
-            .arg("--git-dir")
-            .arg(git_config_path(&private))
-            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
-    )?;
-    if String::from_utf8_lossy(&head.stdout).trim() != manifest.promoted_oid
-        || index_hash(&private.join("index"))? != manifest.source_index_hash
-    {
-        return Err("Removed worktree has unpromoted private Git changes.".into());
+    if expected_common.is_some_and(|common| manifest.common_dir.as_path() != common) {
+        return Err("Removed worktree private Git state belongs to another repository.".into());
     }
-    fs::remove_dir_all(&private).map_err(|error| error.to_string())?;
+    let backup = manifest_path.with_extension("bak");
+    if present(&backup) {
+        let previous: Manifest =
+            serde_json::from_slice(&fs::read(&backup).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("Cannot verify previous overlay manifest: {error}"))?;
+        if previous.version != manifest.version
+            || previous.worktree != manifest.worktree
+            || previous.source_git_dir != manifest.source_git_dir
+            || previous.common_dir != manifest.common_dir
+        {
+            return Err("Overlay manifest backup belongs to another worktree.".into());
+        }
+    }
+    if present(&private) {
+        validate_overlay(&private, &manifest.common_dir)?;
+        let head = output(
+            git_command()
+                .arg("--git-dir")
+                .arg(git_config_path(&private))
+                .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        )?;
+        if String::from_utf8_lossy(&head.stdout).trim() != manifest.promoted_oid
+            || index_hash(&private.join("index"))? != manifest.source_index_hash
+        {
+            return Err("Removed worktree has unpromoted private Git changes.".into());
+        }
+        fs::remove_dir_all(&private).map_err(|error| error.to_string())?;
+    }
     fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
+    if present(&backup) {
+        fs::remove_file(&backup).map_err(|error| error.to_string())?;
+    }
     if let Some(entries) = ACTIVE.get() {
         entries
             .lock()
@@ -1665,7 +1744,18 @@ mod tests {
         assert!(overlay.manifest_path.exists());
         require_shared_current_in_cache(&cache, &task).unwrap();
         git(&main, &["worktree", "remove", task.to_str().unwrap()]);
-        forget_removed_worktree_in_cache(&cache, &task).unwrap();
+        fs::remove_dir_all(&overlay.git_dir).unwrap();
+        assert!(overlay.manifest_path.exists());
+        let wrong_common = root.join("unrelated-git");
+        assert!(
+            forget_removed_worktree_in_cache_checked(&cache, &task, Some(&wrong_common)).is_err()
+        );
+        forget_removed_worktree_in_cache_checked(
+            &cache,
+            &task,
+            Some(&main.join(".git").canonicalize().unwrap()),
+        )
+        .unwrap();
         assert!(!overlay.git_dir.exists());
         assert!(!overlay.manifest_path.exists());
         assert_eq!(known_worktree_in_cache(&cache, &task), None);
