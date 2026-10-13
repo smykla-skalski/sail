@@ -175,6 +175,7 @@ describe('ACP agent threads', () => {
     );
     writeFileSync(join(repository, 'agent-change.txt'), 'Changed by agent\n');
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
     await expect($('#session-details')).toHaveText(expect.stringContaining('agent-change.txt'));
     await expect($('.review-evidence')).toHaveText(expect.stringContaining('Review evidence'));
     await expect($('.review-evidence')).toHaveText(
@@ -191,9 +192,11 @@ describe('ACP agent threads', () => {
     );
     await $('#session-details button[aria-label="Close Changes"]').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
-    await $('#session-details .side-tabs button:nth-child(2)').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
+    await $('#session-details button[role="tab"]*=Ship runs').click();
     await $('#session-details button[aria-label="Hide Ship panel"]').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
     await expect($('#session-details')).toHaveText(expect.stringContaining('agent-change.txt'));
     await $('#session-details button[aria-label="Close Changes"]').click();
 

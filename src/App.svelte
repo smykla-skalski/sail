@@ -1456,7 +1456,7 @@
   let diffError = $state('');
   let selectedFilePath = $state<string | null>(null);
   type SideTab = 'tasks' | 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
-  let sideTab = $state<SideTab>('plan');
+  let sideTab = $state<SideTab>('tasks');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
   let diffRevision = '';
@@ -1548,6 +1548,7 @@
       }
     }
     if (acpAgent && focusedPane === 'main') {
+      if (view === 'details' && !agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     }
@@ -1603,15 +1604,10 @@
       return;
     }
     if (acpAgent) {
-      if (agentChangesOpen && activeSideTab === 'ship') {
-        sideTab = 'changes';
-        void refreshAgentDiff();
-        return;
-      }
+      if (!agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = !agentChangesOpen;
       if (window.matchMedia('(max-width: 850px)').matches)
         mobileView = agentChangesOpen ? 'details' : 'chat';
-      if (agentChangesOpen) void refreshAgentDiff();
       return;
     }
     toggleShipRuns();
@@ -12744,6 +12740,11 @@
                     main: { entries, sessionId, ready },
                   })}
                 onnativeplan={(plan) => {
+                  if (plan && !nativePlan) {
+                    sideTab = 'plan';
+                    agentChangesOpen = true;
+                    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+                  }
                   nativePlan = plan;
                   if (!plan) {
                     nativePlanFeedback = '';
@@ -13023,7 +13024,7 @@
             class:active={activeSideTab === 'changes'}
             role="tab"
             aria-selected={activeSideTab === 'changes'}
-            onclick={toggleChanges}>Changes ({diffs.length})</button
+            onclick={() => switchSideTab('changes')}>Changes ({diffs.length})</button
           >{/if}{#if acpAgent && acpPlanHistory.length}<button
             class:active={activeSideTab === 'planhistory'}
             aria-current={activeSideTab === 'planhistory' ? 'page' : undefined}

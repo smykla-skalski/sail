@@ -31,6 +31,7 @@ describe('right details panel', () => {
 
     writeFileSync(join(repository, 'panel-change.txt'), 'Changed for panel test\n');
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
     await expect($('#session-details')).toHaveText(expect.stringContaining('panel-change.txt'));
 
     const desktop = await browser.execute(() => ({
