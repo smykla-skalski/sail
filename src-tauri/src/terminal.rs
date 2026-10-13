@@ -59,6 +59,7 @@ struct TerminalSession {
     owner: Option<String>,
     directory: PathBuf,
     worktree: PathBuf,
+    _storage_lease: Option<std::sync::Arc<crate::worktree_storage::WorktreeDataLease>>,
     process_id: Option<u32>,
     writer: Mutex<Box<dyn Write + Send>>,
     // Close ConPTY input before closing the pseudoconsole master.
@@ -77,6 +78,12 @@ impl TerminalSession {
             .process_group_stop
             .lock()
             .map_err(|error| error.to_string())?;
+        let ownership_stop =
+            if let (Some(owner), Some(pid)) = (self.owner.as_deref(), self.process_id) {
+                crate::owned_processes::stop_pid(owner, pid)
+            } else {
+                Ok(())
+            };
         #[cfg(unix)]
         {
             if self
@@ -86,6 +93,10 @@ impl TerminalSession {
                 .exit_code
                 .is_some()
             {
+                ownership_stop?;
+                if let Some(lease) = &self._storage_lease {
+                    lease.release_clean()?;
+                }
                 return Ok(());
             }
             kill_terminal_process_groups(
@@ -96,6 +107,10 @@ impl TerminalSession {
         #[cfg(windows)]
         {
             self.job.stop()?;
+        }
+        ownership_stop?;
+        if let Some(lease) = &self._storage_lease {
+            lease.release_clean()?;
         }
         Ok(())
     }
@@ -249,7 +264,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn drain_conpty_output(master: &dyn portable_pty::MasterPty) -> std::thread::JoinHandle<()> {
+    fn drain_conpty_output(
+        master: &dyn portable_pty::MasterPty,
+        tail: Option<std::sync::Arc<std::sync::Mutex<VecDeque<u8>>>>,
+    ) -> std::thread::JoinHandle<()> {
         use std::io::Read;
 
         let mut reader = master
@@ -260,7 +278,15 @@ mod tests {
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(count) => {
+                        if let Some(tail) = &tail {
+                            let mut tail = tail.lock().expect("capture ConPTY output");
+                            tail.extend(buffer[..count].iter().copied());
+                            while tail.len() > 4096 {
+                                tail.pop_front();
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -303,7 +329,7 @@ mod tests {
             })
             .expect("open ConPTY");
         let job = WindowsTerminalJob::new().expect("create owned terminal job");
-        let output_drain = drain_conpty_output(pair.master.as_ref());
+        let output_drain = drain_conpty_output(pair.master.as_ref(), None);
         let mut command = CommandBuilder::new(super::shell());
         command.set_job_handle(job.raw_handle());
         let mut child = pair
@@ -345,6 +371,19 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, Condvar, Mutex};
 
+        const HELPER: &str = "SAIL_WINDOWS_PTY_DESCENDANT_HELPER";
+        if std::env::var_os(HELPER).is_some() {
+            let mut descendant = std::process::Command::new("ping.exe")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start descendant inside PTY job");
+            std::thread::spawn(move || descendant.wait().expect("reap PTY descendant"));
+            return;
+        }
+
         let managed =
             std::env::temp_dir().join(format!("sail-owned-terminal-data-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&managed).expect("managed terminal data directory");
@@ -359,14 +398,15 @@ mod tests {
             })
             .expect("open ConPTY");
         let job = WindowsTerminalJob::new().expect("create owned terminal job");
-        let output_drain = drain_conpty_output(pair.master.as_ref());
-        let mut command = CommandBuilder::new("powershell.exe");
+        let output_tail = Arc::new(Mutex::new(VecDeque::new()));
+        let output_drain =
+            drain_conpty_output(pair.master.as_ref(), Some(Arc::clone(&output_tail)));
+        let mut command = CommandBuilder::new(std::env::current_exe().expect("test executable"));
         command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Process -FilePath 'ping.exe' -ArgumentList @('-n','60','127.0.0.1'); exit 0",
+            "--exact",
+            "terminal::tests::worktree_removal_stops_pty_descendant_after_shell_exits",
         ]);
+        command.env(HELPER, "1");
         command.set_job_handle(job.raw_handle());
         let mut child = pair
             .slave
@@ -375,15 +415,23 @@ mod tests {
         drop(pair.slave);
         let writer = pair.master.take_writer().expect("take ConPTY writer");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(10);
         loop {
             if child.try_wait().expect("poll terminal shell").is_some() {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cmd.exe did not exit after starting its descendant"
-            );
+            if std::time::Instant::now() >= deadline {
+                let tail = output_tail.lock().expect("read ConPTY output tail");
+                let output =
+                    String::from_utf8_lossy(&tail.iter().copied().collect::<Vec<_>>()).into_owned();
+                panic!(
+                    "test helper did not exit: pid={:?}, elapsed={:?}, job active processes={:?}, ConPTY output tail={output:?}",
+                    child.process_id(),
+                    started.elapsed(),
+                    job.active_processes(),
+                );
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(
@@ -397,6 +445,7 @@ mod tests {
             owner: None,
             directory: managed.clone(),
             worktree: managed.clone(),
+            _storage_lease: None,
             process_id,
             master: Mutex::new(pair.master),
             process_group_stop: Arc::new(Mutex::new(())),
@@ -747,6 +796,21 @@ impl Drop for TerminalManager {
 }
 
 impl TerminalManager {
+    pub fn stop_owner(&self, owner: &str) -> Result<(), String> {
+        let sessions = self
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .filter(|session| session.owner.as_deref() == Some(owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in sessions {
+            session.stop()?;
+        }
+        Ok(())
+    }
+
     pub fn shutdown(&self) {
         let sessions = self
             .0
@@ -1091,6 +1155,17 @@ fn spawn(
             pixel_height: 0,
         })
         .map_err(|error| error.to_string())?;
+    let background = owner.is_some() && crate::background_priority::enabled(&app);
+    #[cfg(unix)]
+    let mut command = if let Some(nice) = crate::background_priority::nice_program(background) {
+        let mut command = CommandBuilder::new(nice);
+        command.args(["-n", "10"]);
+        command.arg(shell());
+        command
+    } else {
+        CommandBuilder::new(shell())
+    };
+    #[cfg(windows)]
     let mut command = CommandBuilder::new(shell());
     #[cfg(not(windows))]
     if let Some(script) = script {
@@ -1105,31 +1180,55 @@ fn spawn(
         command.arg(script);
     }
     command.cwd(&directory);
+    let mut storage_lease = None;
     if owner.is_some() {
         let cache_directory = app
             .path()
             .app_cache_dir()
             .map_err(|error| error.to_string())?;
-        let data_directory = crate::register_worktree_terminal_data(&cache_directory, &worktree)?;
-        for (key, value) in crate::acp_terminal::terminal_environment(&data_directory) {
+        let (data_directory, lease) =
+            crate::register_worktree_storage(&cache_directory, &worktree)?;
+        for (key, value) in
+            crate::acp_terminal::terminal_environment(&data_directory, lease.temp_directory())
+        {
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);
         }
+        if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(&cache_directory, &worktree)?
+        {
+            command.env("GIT_DIR", &overlay.git_dir);
+            command.env("GIT_WORK_TREE", &overlay.worktree);
+            command.env_remove("GIT_COMMON_DIR");
+            command.env_remove("GIT_INDEX_FILE");
+        }
+        storage_lease = Some(lease);
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     #[cfg(windows)]
     command.env("PROMPT", "$E]9;9;$P$E\\$P$G");
     #[cfg(windows)]
+    let job = crate::acp_terminal::WindowsTerminalJob::new()?;
+    if let Some(lease) = &storage_lease {
+        lease.prepare_process_start()?;
+    }
+    #[cfg(windows)]
     let job = {
-        let job = crate::acp_terminal::WindowsTerminalJob::new()?;
         command.set_job_handle(job.raw_handle());
         job
     };
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| error.to_string())?;
+    let mut child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(lease) = &storage_lease {
+                lease.cancel_process_start()?;
+            }
+            return Err(error.to_string());
+        }
+    };
+    if let Some(lease) = &storage_lease {
+        lease.mark_started();
+    }
     drop(pair.slave);
     let mut reader = pair
         .master
@@ -1151,6 +1250,42 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
+    if let Some(owner) = owner.as_deref() {
+        let Some(pid) = process_id else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cannot identify terminal process.".into());
+        };
+        #[cfg(unix)]
+        let group = pair.master.process_group_leader();
+        #[cfg(windows)]
+        let group = Some(pid as i32);
+        let Some(group) = group else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cannot identify terminal process group.".into());
+        };
+        if let Err(error) = crate::owned_processes::register_session(owner, pid, group as u32) {
+            #[cfg(unix)]
+            if group > 0 && group != nix::unistd::getpgrp().as_raw() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Cannot track terminal ownership: {error}"));
+        }
+    }
+    #[cfg(windows)]
+    if background {
+        if let Some(pid) = process_id {
+            crate::background_priority::lower_process(pid);
+        } else {
+            eprintln!("Background priority unavailable: terminal process ID is missing; continuing at normal priority");
+        }
+    }
     let process_group_stop = Arc::new(Mutex::new(()));
     let background_process_group_stop = Arc::clone(&process_group_stop);
     let master = Mutex::new(pair.master);
@@ -1229,6 +1364,7 @@ fn spawn(
         owner,
         directory,
         worktree,
+        _storage_lease: storage_lease,
         process_id,
         master,
         process_group_stop,
@@ -1420,6 +1556,7 @@ fn git_root_path(mut stdout: Vec<u8>) -> PathBuf {
 pub fn terminal_owned_create(
     app: AppHandle,
     manager: State<'_, TerminalManager>,
+    agents: State<'_, crate::acp::AgentManager>,
     pane_id: String,
     directory: String,
     command: String,
@@ -1438,28 +1575,30 @@ pub fn terminal_owned_create(
         return Err("Terminal directory is not a folder.".into());
     }
     let worktree = git_worktree_root(&directory);
-    manager.with_worktree_creation(&worktree, || {
-        let current_directory = dunce::canonicalize(&directory)
-            .map_err(|_| "Terminal directory no longer exists.".to_string())?;
-        if current_directory != directory || !current_directory.is_dir() {
-            return Err("Terminal directory changed while creating terminal.".into());
-        }
-        let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
-        if sessions.contains_key(&pane_id) {
-            return Err("Terminal pane already exists.".into());
-        }
-        let session = Arc::new(spawn(
-            directory.clone(),
-            80,
-            24,
-            Some(&command),
-            pane_id.clone(),
-            app,
-            Some(owner),
-        )?);
-        let terminal_id = format!("shell:{}", session.inspect_id);
-        sessions.insert(pane_id, session);
-        Ok(terminal_id)
+    crate::acp::with_active_owned_terminal(&agents, &owner, || {
+        manager.with_worktree_creation(&worktree, || {
+            let current_directory = dunce::canonicalize(&directory)
+                .map_err(|_| "Terminal directory no longer exists.".to_string())?;
+            if current_directory != directory || !current_directory.is_dir() {
+                return Err("Terminal directory changed while creating terminal.".into());
+            }
+            let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
+            if sessions.contains_key(&pane_id) {
+                return Err("Terminal pane already exists.".into());
+            }
+            let session = Arc::new(spawn(
+                directory.clone(),
+                80,
+                24,
+                Some(&command),
+                pane_id.clone(),
+                app,
+                Some(owner.clone()),
+            )?);
+            let terminal_id = format!("shell:{}", session.inspect_id);
+            sessions.insert(pane_id, session);
+            Ok(terminal_id)
+        })
     })
 }
 
@@ -1541,9 +1680,21 @@ pub fn terminal_resize(
 }
 
 #[tauri::command]
-pub fn terminal_close(manager: State<'_, TerminalManager>, id: String) -> Result<(), String> {
+pub fn terminal_close(
+    app: AppHandle,
+    manager: State<'_, TerminalManager>,
+    id: String,
+) -> Result<(), String> {
     let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
-    stop_then_remove(&mut sessions, &id, TerminalSession::stop)
+    let worktree = sessions.get(&id).map(|session| session.worktree.clone());
+    stop_then_remove(&mut sessions, &id, TerminalSession::stop)?;
+    drop(sessions);
+    if let Some(worktree) =
+        worktree.filter(|root| crate::git_overlay::known_worktree(root).is_some())
+    {
+        let _ = crate::acp::promote_idle_worktree(&app, &worktree);
+    }
+    Ok(())
 }
 
 fn stop_then_remove<T>(

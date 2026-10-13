@@ -5,6 +5,7 @@ import {
   exportMemories,
   parseMemoryMode,
   parseMemoryTags,
+  resolveHandoffExpiry,
   type MemoryRecord,
 } from '../src/lib/shared-memory.ts';
 
@@ -44,6 +45,12 @@ void test('memory tags are trimmed, empty values removed, and duplicates collaps
     'decision',
     'ux',
   ]);
+});
+
+void test('saving an unchanged handoff expiry preserves its exact timestamp', () => {
+  const laterFold = Date.parse('2026-10-25T01:30:00Z');
+  assert.equal(resolveHandoffExpiry('2026-10-25T02:30', '2026-10-25T02:30', laterFold), laterFold);
+  assert.equal(resolveHandoffExpiry('', '2026-10-25T02:30', laterFold), null);
 });
 
 void test('memory export is a versioned JSON document containing canonical records', () => {

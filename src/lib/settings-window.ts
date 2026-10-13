@@ -30,6 +30,8 @@ export type SettingsSnapshot = {
   personalPostTurnChecks: string[];
   agentWorktreesEnabled: boolean;
   agentTerminalsEnabled: boolean;
+  backgroundPriorityEnabled: boolean;
+  reefCanaryPercent: number | null;
   agentStatusEnabled: boolean;
   agentThreadListEnabled: boolean;
   agentMessagesEnabled: boolean;
@@ -49,6 +51,8 @@ export type SettingsAction =
   | { type: 'personal-post-turn-checks'; value: string[] }
   | { type: 'agent-worktrees'; value: boolean }
   | { type: 'agent-terminals'; value: boolean }
+  | { type: 'background-priority'; value: boolean }
+  | { type: 'reef-canary-percent'; value: number | null }
   | { type: 'agent-status'; value: boolean }
   | { type: 'agent-thread-list'; value: boolean }
   | { type: 'agent-messages'; value: boolean }

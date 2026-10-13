@@ -163,13 +163,9 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   assert.match(handoff, /A claim Sail holds is never taken over or released by the worker/);
 
   const claims = sailModeRule('Claims');
-  assert.match(claims, /Sail holds a visible claim with an exact claim ID for this task/);
-  assert.match(claims, /do not renew, take over or release Sail's claim; Sail does/);
-  assert.match(claims, /Without such a prompt, follow `claims\.md`/);
-  assert.match(
-    claims,
-    /active, unexpired `sail-claim:v1` marker on the issue is a conflicting claim/,
-  );
+  assert.match(claims, /Sail's prompt gives a local claim ID/);
+  assert.match(claims, /Sail keeps the claim in its local store/);
+  assert.match(claims, /Do not create, update, renew, take over or release a GitHub claim comment/);
 
   const checkpoint = sailModeRule('Checkpoint');
   assert.match(checkpoint, /stop on a revision or delivery mismatch, except the merge handoff/);

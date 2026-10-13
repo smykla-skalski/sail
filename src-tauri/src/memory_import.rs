@@ -212,6 +212,7 @@ pub fn import_agent_memories(
                         .file_name()
                         .map(|name| format!("Claude Code memory/{}", name.to_string_lossy())),
                 }),
+                expires_at: None,
             })
             .collect(),
     )
@@ -295,6 +296,7 @@ mod tests {
                 kind: None,
                 tags: None,
                 provenance: None,
+                expires_at: None,
             },
         )
         .unwrap();

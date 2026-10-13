@@ -1,6 +1,6 @@
 import type { PublishedGraph } from './issue-graph';
 import type { RegisteredWorktree } from './coordination';
-import type { SpawnState } from './agent-results';
+import { receiptIsSettled, type SpawnState } from './agent-results.ts';
 import type { AgentActivity, InterruptedAgentTurn } from './acp';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
@@ -41,7 +41,7 @@ export type ShipWorkerPromptInput = {
 
 export function shipWorkerPrompt(input: ShipWorkerPromptInput): string {
   const mergeRule = mergeOwnerRule(input.mergeOwner);
-  return `/ship-it ${input.issueUrl}\n\nSail holds visible claim ${input.claimId} for task ${input.claimTask} on behalf of this worker. Sail already created this issue worktree from ${input.repository}:${input.baseBranch} at ${input.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. Include the economics counters attributable to that activity (role, phase, turns, tools, permissions, compactions, token categories, elapsed time, retries, findings, checks, human interventions, failed commands, approval latency, and repeated work). Classify activity as primary, subagent, validator, guardian, synthetic, or probe. ${input.gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${input.gateReporting}${mergeRule ? ` ${mergeRule}` : ''}`;
+  return `/ship-it ${input.issueUrl}\n\nSail holds local claim ${input.claimId} for task ${input.claimTask} on behalf of this worker. Sail keeps claim state locally; do not create or update a GitHub claim. Never post a GitHub comment, including a bot merge comment. Sail already created this issue worktree from ${input.repository}:${input.baseBranch} at ${input.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. Include the economics counters attributable to that activity (role, phase, turns, tools, permissions, compactions, token categories, elapsed time, retries, findings, checks, human interventions, failed commands, approval latency, and repeated work). Classify activity as primary, subagent, validator, guardian, synthetic, or probe. ${input.gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${input.gateReporting}${mergeRule ? ` ${mergeRule}` : ''}`;
 }
 
 export interface ShippingClaim {
@@ -238,6 +238,7 @@ export interface ShipIssue {
   /** Set after a bot-comment merge request; cleared once a refresh sees the pull request closed. */
   mergeRequested?: ShipMergeRequest;
   blockedReason?: string | null;
+  workerRequest?: string | null;
   models?: string[];
   workerModel?: string;
   workerState?: SpawnState;
@@ -276,6 +277,25 @@ export interface ShipIssue {
   validationPolicyRequired?: boolean;
   validationPolicy?: ShipValidationPolicy;
   shippingTarget?: ShippingTarget;
+}
+
+export function shipOwnerReleaseReady(
+  issue: Pick<ShipIssue, 'path' | 'receiptId' | 'workerSettled' | 'state'>,
+  receipts: Array<{ targetDirectory: string | null; validation?: unknown; state: SpawnState }>,
+): issue is typeof issue & { path: string; receiptId: string } {
+  if (
+    !issue.path ||
+    !issue.receiptId ||
+    !issue.workerSettled ||
+    (issue.state !== 'merged' && issue.state !== 'failed')
+  )
+    return false;
+  return !receipts.some(
+    (receipt) =>
+      receipt.validation &&
+      receipt.targetDirectory === issue.path &&
+      !receiptIsSettled(receipt.state),
+  );
 }
 
 export type ShippingTarget = {
@@ -432,7 +452,7 @@ export function isDirectShipRun(run: ShipRun): boolean {
 }
 
 export function directShipClaimPrompt(claim: ShippingClaim): string {
-  return `\n\nSail holds visible claim ${claim.id} for task ${claim.task} on behalf of this worker. Use this exact claim as your /ship-it ownership; do not acquire another claim. Sail renews and releases it.`;
+  return `\n\nSail holds local claim ${claim.id} for task ${claim.task} on behalf of this worker. Use this exact claim as your /ship-it ownership; do not acquire another claim or write claim state to GitHub. Sail renews and releases it locally. Never post a GitHub comment.`;
 }
 
 export function directClaimHandoffChanges(
@@ -688,6 +708,7 @@ export function claimRefreshRequiresFence(
   const message = cause instanceof Error ? cause.message : String(cause);
   return (
     message === 'Shipping claim fence is no longer owned by this claim.' ||
+    message === 'Local shipping claim no longer exists.' ||
     /superseded|expired|released|comment no longer exists|identity no longer matches|heartbeat is stale|update revision is stale|id already belongs/i.test(
       message,
     )

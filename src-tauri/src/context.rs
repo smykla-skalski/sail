@@ -433,13 +433,7 @@ fn register(store: &mut ApprovalStore, command: &str, executable: &Path) {
 
 #[cfg(feature = "e2e")]
 fn e2e_store_path() -> Result<PathBuf, String> {
-    let root = std::env::var_os("SAIL_E2E_CONFIG_DIR")
-        .ok_or("Set a private SAIL_E2E_CONFIG_DIR for context tests.")?;
-    let root = PathBuf::from(root);
-    if !root.is_absolute() {
-        return Err("SAIL_E2E_CONFIG_DIR must be an absolute private path.".into());
-    }
-    Ok(root.join("context-providers.json"))
+    Ok(crate::e2e_config::root()?.join("context-providers.json"))
 }
 
 fn store_path(_app: &tauri::AppHandle) -> Result<PathBuf, String> {

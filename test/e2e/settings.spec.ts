@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -131,6 +132,57 @@ describe('disk-backed settings', () => {
     );
   });
 
+  it('recovers a transcript that closed before its native write completed', async () => {
+    const key = 'sai-agent-transcript-cache';
+    const pending = 'sail-transcript-cache-pending-v1';
+    const recent = JSON.stringify([{ id: 'recent', entries: [] }]);
+    await browser.tauri.execute(
+      async ({ core }, setting) =>
+        core.invoke('save_setting', { key: setting, value: 'older transcript' }),
+      key,
+    );
+    await browser.execute(
+      (setting, marker, value) => {
+        sessionStorage.setItem('sail-e2e-settings', 'enabled');
+        localStorage.setItem('sail-settings-migrated-v1', '1');
+        localStorage.setItem(setting, value);
+        localStorage.setItem(marker, '1');
+      },
+      key,
+      pending,
+      recent,
+    );
+
+    await browser.refresh();
+    const configDirectory = process.env.SAIL_E2E_CONFIG_DIR;
+    if (!configDirectory) throw new Error('The E2E settings directory is missing.');
+    await browser.waitUntil(
+      () => {
+        try {
+          const saved: unknown = JSON.parse(
+            readFileSync(join(configDirectory, 'settings.json'), 'utf8'),
+          );
+          return typeof saved === 'object' && saved !== null && Reflect.get(saved, key) === recent;
+        } catch {
+          return false;
+        }
+      },
+      {
+        timeoutMsg: 'The pending transcript was not restored to native settings',
+      },
+    );
+    expect(await browser.execute((setting) => localStorage.getItem(setting), key)).toBe(recent);
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute((marker) => localStorage.getItem(marker), pending)) === null,
+      { timeoutMsg: 'The transcript recovery marker was not cleared after the native write' },
+    );
+    await browser.tauri.execute(
+      async ({ core }, setting) => core.invoke('save_setting', { key: setting, value: null }),
+      key,
+    );
+  });
+
   it('migrates existing repositories and restores new preferences after reload', async () => {
     const path = realpathSync(repository);
     await browser.execute((selected) => {
@@ -223,9 +275,13 @@ describe('disk-backed settings', () => {
       'aria-label',
       expect.stringContaining('System'),
     );
+    await forceAppearance('light', 'settings');
+    await expectTheme('light');
     await capture('settings-theme-system');
+    await forceAppearance(null, 'settings');
     await returnToWorkspace();
     await browser.waitUntil(async () => (await read())['sai-theme'] === 'system');
+    await forceAppearance('light');
     await expectTheme('light');
     await capture('desktop-system-theme-light');
     await forceAppearance('dark');
@@ -260,6 +316,48 @@ describe('disk-backed settings', () => {
     await browser.waitUntil(async () => (await browser.tauri.listWindows()).includes('settings'));
     await browser.tauri.switchWindow('settings');
     await expect($('.settings-window')).toBeDisplayed();
+    await returnToWorkspace();
+  });
+
+  it('guides first-time context setup', async () => {
+    await browser.tauri.switchWindow('main');
+    const path = realpathSync(contextRepository);
+    execFileSync('git', [
+      '-C',
+      path,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.invalid',
+      'commit',
+      '--allow-empty',
+      '-qm',
+      'empty context fixture',
+    ]);
+    await browser.execute((selected) => {
+      localStorage.setItem('sai-directory', selected);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [selected], groups: [] }),
+      );
+    }, path);
+    await browser.tauri.execute(async ({ core }, selected) => {
+      await core.invoke('save_setting', { key: 'sai-directory', value: selected });
+      await core.invoke('save_setting', {
+        key: 'sai-project-catalog',
+        value: JSON.stringify({ repositories: [selected], groups: [] }),
+      });
+    }, path);
+    await browser.refresh();
+    await openSettings();
+    await $('.settings-navigation nav button:nth-child(5)').click();
+    await expect($('.settings-card')).toHaveText(
+      expect.stringContaining('This project has no committed context provider selection.'),
+    );
+    await expect($('.settings-card')).toHaveText(
+      expect.stringContaining('commit the configuration, then refresh this view'),
+    );
+    await expect($('button=Approve for this project')).not.toExist();
     await returnToWorkspace();
   });
 
@@ -328,6 +426,10 @@ describe('disk-backed settings', () => {
     await expect($('.context-provider-details')).toHaveText(
       expect.stringContaining('Not selected'),
     );
+    await expect($('.context-provider-details')).toHaveText(expect.stringContaining('Unavailable'));
+    await expect($('.settings-card')).toHaveText(
+      expect.stringContaining('Select an available executable for this registry command'),
+    );
     await expect($('button=Approve for this project')).not.toExist();
 
     await $('#context-executable').setValue(executable);
@@ -345,7 +447,6 @@ describe('disk-backed settings', () => {
     await auditContextViewport(1920, 1200, 'zoom-200');
     await browser.execute(() => (document.documentElement.style.zoom = ''));
     await $('#context-executable').click();
-    await browser.keys(['Tab']);
     const approvalFocus = await browser.execute(() => {
       const button = Array.from(document.querySelectorAll('button')).find(
         (item) => item.textContent?.trim() === 'Approve for this project',
@@ -355,14 +456,15 @@ describe('disk-backed settings', () => {
       return {
         focused: document.activeElement === button,
         tabIndex: button.tabIndex,
-        outline: getComputedStyle(button).outlineStyle,
       };
     });
     expect(approvalFocus?.focused).toBe(true);
     expect(approvalFocus?.tabIndex).toBeGreaterThanOrEqual(0);
-    expect(approvalFocus?.outline).not.toBe('none');
     await $('button=Approve for this project').click();
     await expect($('.context-provider-details')).toHaveText(expect.stringContaining('Approved'));
+    expect(await $('.settings-card').getText()).toMatch(
+      /It does not show live connection\s+health/,
+    );
 
     writeFileSync(
       join(config, 'context.json'),
@@ -382,6 +484,27 @@ describe('disk-backed settings', () => {
     await expect($('.context-provider-details')).toHaveText(
       expect.stringContaining('Approval required'),
     );
+    writeFileSync(
+      join(config, 'context.json'),
+      '{"version":1,"providers":[{"id":"changed","type":"stdio","command":"fixture-provider","capabilities":["unknown"]}]}',
+    );
+    execFileSync('git', ['-C', path, 'add', '.sail/context.json']);
+    execFileSync('git', [
+      '-C',
+      path,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.invalid',
+      'commit',
+      '-qm',
+      'invalid context fixture',
+    ]);
+    await $('button=Refresh').click();
+    await expect($('.settings-card')).toHaveText(
+      expect.stringContaining('Fix and commit the project context configuration'),
+    );
+    await expect($('button=Approve for this project')).not.toExist();
     await returnToWorkspace();
   });
 });

@@ -21,9 +21,27 @@ export type MemoryRecord = {
   provenance: { agent?: string; sessionId?: string; source?: string };
   rating?: { value: -1 | 0 | 1; updatedAt: number };
   forgottenAt?: number;
+  expiresAt?: number;
+  supersededBy?: string;
+  conflictsWith?: string[];
 };
 
 export type MemorySearchResult = { memory: MemoryRecord; score: number };
+
+export type KnowledgePreview = {
+  token: string;
+  memory: string;
+  sourceSession: string;
+  destination: string;
+  revision: string;
+  diff: string;
+};
+
+export type KnowledgeChange = {
+  worktree: string;
+  destination: string;
+  revision: string;
+};
 
 export type MemoryImportCandidate = {
   id: string;
@@ -81,6 +99,16 @@ export function parseMemoryTags(value: string): string[] {
         .filter(Boolean),
     ),
   ];
+}
+
+export function resolveHandoffExpiry(
+  value: string,
+  originalValue: string,
+  originalTimestamp: number | null,
+): number | null {
+  if (!value) return null;
+  if (value === originalValue && originalTimestamp !== null) return originalTimestamp;
+  return new Date(value).getTime();
 }
 
 export function createSerialExecutor(): <T>(work: () => Promise<T>) => Promise<T> {

@@ -276,6 +276,14 @@ export function parseShipReport(value: unknown) {
   return report;
 }
 
+export function shipWorkerProgressChanges(
+  status: 'running' | 'blocked',
+  reason?: string,
+): Pick<ShipIssue, 'reportedStatus' | 'blockedReason' | 'workerRequest'> {
+  const request = status === 'blocked' ? (reason ?? null) : null;
+  return { reportedStatus: status, blockedReason: request, workerRequest: request };
+}
+
 export function requireValidatorEconomics(
   report: ReturnType<typeof parseShipReport>,
   allowLegacyMissing: boolean,
@@ -1459,6 +1467,7 @@ const shipIssueSchema = z.object({
     .object({ at: z.number().int().nonnegative(), head: nullableString, comment: z.string() })
     .optional(),
   blockedReason: nullableString.optional(),
+  workerRequest: nullableString.optional(),
   models: z.array(z.string()).optional(),
   workerModel: z.string().optional(),
   workerState: z
@@ -1624,6 +1633,25 @@ const shipRunSchema = z.object({
 /** Runs Sail can use, plus stored entries it cannot parse and must write back unchanged. */
 export type ShipRunStore = { runs: ShipRun[]; unparsed: unknown[] };
 
+function preserveUnknownFields<T>(stored: unknown, parsed: T): T {
+  if (Array.isArray(stored) && Array.isArray(parsed)) {
+    parsed.forEach((item, index) => {
+      parsed[index] = preserveUnknownFields(stored[index], item);
+    });
+  } else if (stored && parsed && typeof stored === 'object' && typeof parsed === 'object') {
+    for (const [key, value] of Object.entries(stored)) {
+      const known = Object.hasOwn(parsed, key);
+      Object.defineProperty(parsed, key, {
+        value: known ? preserveUnknownFields(value, Reflect.get(parsed, key)) : value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return parsed;
+}
+
 export function loadShipRunStore(raw: string | null): ShipRunStore {
   let value: unknown;
   try {
@@ -1631,7 +1659,7 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
   } catch {
     return { runs: [], unparsed: raw?.trim() ? [raw] : [] };
   }
-  if (!Array.isArray(value)) return { runs: [], unparsed: value == null ? [] : [value] };
+  if (!Array.isArray(value)) return { runs: [], unparsed: [value] };
   const runs: ShipRun[] = [];
   const unparsed: unknown[] = [];
   for (const item of value) {
@@ -1640,7 +1668,13 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
       unparsed.push(item);
       continue;
     }
-    for (const issue of parsed.data.issues)
+    for (const issue of parsed.data.issues) {
+      if (issue.workerRequest === undefined && issue.reportedStatus === 'blocked') {
+        const workerEvent = issue.events?.findLast(
+          (event) => stages.some((stage) => stage === event.stage) && !!event.reason?.trim(),
+        );
+        if (workerEvent) issue.workerRequest = workerEvent.reason;
+      }
       issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
         handoff.outcome === 'pending' &&
         !handoff.toThreadId &&
@@ -1651,7 +1685,8 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
             })
           : handoff,
       );
-    runs.push(parsed.data);
+    }
+    runs.push(preserveUnknownFields(item, parsed.data));
   }
   return { runs, unparsed };
 }

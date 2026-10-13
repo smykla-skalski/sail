@@ -121,6 +121,7 @@ impl BrowserManager {
         session: Option<&str>,
         agent: Option<&str>,
         profile: Option<&str>,
+        background_priority: bool,
     ) -> Result<McpConfig, String> {
         let profile = profile
             .map(|value| {
@@ -130,6 +131,10 @@ impl BrowserManager {
             })
             .transpose()?;
         let mut config = self.config(directory, session, agent)?;
+        config.env.insert(
+            "SAIL_BACKGROUND_PRIORITY".into(),
+            background_priority.to_string(),
+        );
         if let Some(profile) = profile {
             config
                 .env
@@ -479,7 +484,7 @@ impl BrowserManager {
             .copied();
         if policy == Some(false)
             || (policy.is_none()
-                && crate::settings::load_settings(app.clone())?
+                && crate::settings::load_settings_sync(app.clone())?
                     .get(&format!("sai-browser-disabled:{}", directory.display()))
                     .is_some_and(|value| value == "true"))
         {
@@ -566,7 +571,7 @@ impl BrowserManager {
             | "sail_plan_amend" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
-        let settings = crate::settings::load_settings(app.clone())?;
+        let settings = crate::settings::load_settings_sync(app.clone())?;
         if let Some(setting) = setting {
             let enabled = settings.get(setting).is_some_and(|value| value == "true");
             if (setting == "sai-agent-terminals-enabled" && !enabled)
@@ -945,6 +950,33 @@ fn memory_action(
             });
             serde_json::to_value(crate::memory::remember(app, &directory, input)?)
         }
+        "memory_supersede" => {
+            let id = required(&arguments, "id")?.to_string();
+            let resolve_conflicts = arguments
+                .get("resolveConflicts")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut input: crate::memory::MemoryInput =
+                serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+            input.provenance = Some(crate::memory::MemoryProvenance {
+                agent: agent.map(str::to_string),
+                session_id: Some(session.to_string()),
+                source: None,
+            });
+            serde_json::to_value(crate::memory::supersede(
+                app,
+                &directory,
+                &id,
+                input,
+                resolve_conflicts,
+            )?)
+        }
+        "memory_mark_conflict" => serde_json::to_value(crate::memory::mark_conflict(
+            app,
+            &directory,
+            required(&arguments, "firstId")?,
+            required(&arguments, "secondId")?,
+        )?),
         "memory_search" => {
             let query = required(&arguments, "query")?;
             let limit = arguments
@@ -1247,6 +1279,7 @@ pub fn browser_project_access(
 
 #[tauri::command]
 pub fn browser_mcp_config(
+    app: AppHandle,
     manager: State<'_, BrowserManager>,
     directory: String,
     session: Option<String>,
@@ -1258,6 +1291,7 @@ pub fn browser_mcp_config(
         session.as_deref(),
         agent.as_deref(),
         profile.as_deref(),
+        crate::background_priority::enabled(&app),
     )
 }
 
@@ -1476,6 +1510,16 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "memory_remember",
         "Store one concise durable project fact. Never store raw transcripts, complete tool output, secrets, or temporary progress.",
         "content",
+    ),
+    (
+        "memory_supersede",
+        "Replace a current private handoff with a corrected handoff and preserve history.",
+        "id,content,kind",
+    ),
+    (
+        "memory_mark_conflict",
+        "Mark two current private handoffs as unresolved conflicting advice.",
+        "firstId,secondId",
     ),
     (
         "memory_search",
@@ -1799,6 +1843,24 @@ fn memory_tool_schema(name: &str) -> Option<Value> {
             },
             "required":["content"]
         })),
+        "memory_supersede" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "id":{"type":"string","format":"uuid"},
+                "content":{"type":"string","minLength":1,"maxLength":4000},
+                "kind":{"type":"string","enum":["handoff"]},
+                "tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16},
+                "expiresAt":{"type":"integer","minimum":0},
+                "resolveConflicts":{"type":"boolean","description":"Mark existing disagreements resolved by this correction. Defaults to false."}
+            },"required":["id","content","kind"]
+        })),
+        "memory_mark_conflict" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "firstId":{"type":"string","format":"uuid"},
+                "secondId":{"type":"string","format":"uuid"}
+            },"required":["firstId","secondId"]
+        })),
         "memory_search" => Some(json!({
             "type":"object",
             "additionalProperties":false,
@@ -1863,6 +1925,8 @@ impl CapabilityProfile {
             "sail_skill",
             "skill_reference",
             "memory_remember",
+            "memory_supersede",
+            "memory_mark_conflict",
             "memory_search",
             "memory_inspect",
             "memory_forget",
@@ -2294,7 +2358,7 @@ mod skill_tests {
     #[test]
     fn invalid_profile_is_rejected_before_registering_a_client() {
         let manager = BrowserManager::default();
-        let error = match manager.config_for_profile("/not-used", None, None, Some("admin")) {
+        let error = match manager.config_for_profile("/not-used", None, None, Some("admin"), true) {
             Ok(_) => panic!("invalid profile was accepted"),
             Err(error) => error,
         };
@@ -2303,6 +2367,26 @@ mod skill_tests {
             "Unknown capability profile. Expected explore, review, build, or release."
         );
         assert!(manager.0.clients.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_browser_configs_honor_background_priority_setting() {
+        let manager = BrowserManager::default();
+        *manager.0.port.lock().unwrap() = 1;
+        let directory = std::env::temp_dir().canonicalize().unwrap();
+        let directory = directory.to_str().unwrap();
+        for enabled in [true, false] {
+            let config = manager
+                .config_for_profile(directory, None, Some("codex"), Some("build"), enabled)
+                .unwrap();
+            assert_eq!(
+                config
+                    .env
+                    .get("SAIL_BACKGROUND_PRIORITY")
+                    .map(String::as_str),
+                Some(if enabled { "true" } else { "false" })
+            );
+        }
     }
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -2316,6 +2400,8 @@ mod skill_tests {
         assert!(TOOLS.iter().any(|(name, _, _)| *name == "sail_skill"));
         for name in [
             "memory_remember",
+            "memory_supersede",
+            "memory_mark_conflict",
             "memory_search",
             "memory_inspect",
             "memory_forget",

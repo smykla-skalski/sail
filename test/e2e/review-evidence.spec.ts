@@ -56,6 +56,16 @@ describe('review evidence', () => {
     await browser.setWindowSize(390, 600);
     await $('.mobile-switcher button:nth-child(3)').click();
     await expect($('.review-evidence')).toBeDisplayed();
+    await browser.waitUntil(
+      async () =>
+        browser.execute(() => {
+          const details = document.querySelector('#session-details');
+          const topbar = document.querySelector('.topbar');
+          if (!details || !topbar) return false;
+          return details.getBoundingClientRect().top === topbar.getBoundingClientRect().bottom;
+        }),
+      { timeoutMsg: 'Mobile details did not settle below the top bar' },
+    );
     const mobileBounds = await browser.execute(() => ({
       details: document.querySelector('#session-details')!.getBoundingClientRect().toJSON(),
       evidence: document.querySelector('.review-evidence')!.getBoundingClientRect().toJSON(),

@@ -109,6 +109,64 @@ describe('project context menus', () => {
     await expect($('.project-group-label')).toHaveText('Ungrouped');
   });
 
+  it('copies the selected agent session ID from dots and right click', async () => {
+    const path = realpathSync(repository);
+    await browser.execute((selectedPath) => {
+      localStorage.clear();
+      localStorage.setItem('sai-directory', selectedPath);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [selectedPath], groups: [], worktrees: {} }),
+      );
+      localStorage.setItem(
+        'sail-agent-threads',
+        JSON.stringify([
+          {
+            agent: 'claude',
+            directory: selectedPath,
+            sessionId: 'session-first',
+            title: 'First thread',
+            updated: 2,
+          },
+          {
+            agent: 'claude',
+            directory: selectedPath,
+            sessionId: 'session-second',
+            title: 'Second thread',
+            updated: 1,
+          },
+        ]),
+      );
+    }, path);
+    await browser.refresh();
+    await expect($('.project-agent-menu')).toBeDisplayed();
+    await browser.execute(() => {
+      const writes: string[] = [];
+      Reflect.set(window, '__sessionIdWrites', writes);
+      Object.defineProperty(navigator.clipboard, 'writeText', {
+        configurable: true,
+        value: async (text: string) => {
+          writes.push(text);
+        },
+      });
+    });
+
+    await $('[aria-label="Manage thread First thread"]').click();
+    await expect($('.project-menu')).toHaveText(expect.stringContaining('Copy session ID'));
+    await $('button=Copy session ID').click();
+    await expect($('.project-menu')).not.toExist();
+    await expect($('.copy-status[role="status"]')).toHaveText('Copied');
+
+    await $('.project-agent-row[aria-label*="Second thread"]').click({ button: 'right' });
+    await expect($('.project-menu')).toHaveText(expect.stringContaining('Copy session ID'));
+    await $('button=Copy session ID').click();
+    await expect($('.project-menu')).not.toExist();
+    expect(await browser.execute(() => Reflect.get(window, '__sessionIdWrites'))).toEqual([
+      'session-first',
+      'session-second',
+    ]);
+  });
+
   it('shows and hides projects with Command B', async () => {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);

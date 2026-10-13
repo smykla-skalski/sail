@@ -44,7 +44,7 @@ Maya, the AI power user, runs several agents and moves between them while they w
 | Reopen a thread whose agent process dropped the session                                                                                            | The thread recovered on the next activation and answered.                                                                                          |
 | Repeat the long answer in a Codex thread whose agent restarts on any load                                                                          | Switching never restored the running session, and the answer finished.                                                                             |
 
-With the previous per-load MCP settings restored (`SAIL_ACP_PER_LOAD_MCP=1`), four of these tasks fail because switching restarts the session. A real Codex turn kept running through a mid-turn load, but restarted its MCP server; the result is recorded on the tracking issue.
+With the previous per-load MCP settings restored (`SAIL_ACP_PER_LOAD_MCP=1`), four of these tasks fail because switching restarts the session. A real Codex turn kept running through a mid-turn load, but restarted its MCP server; the result is recorded on the tracking issue. This rollback mode mints a new browser MCP token for each load. Sail releases all tokens for a session when the thread is deleted or its agent reader exits, so the mode does not leak browser MCP client entries while Sail keeps running.
 
 # Ship batch walkthrough — 2026-10-08
 

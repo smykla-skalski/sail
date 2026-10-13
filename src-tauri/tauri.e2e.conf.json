@@ -26,7 +26,13 @@
         {
           "identifier": "e2e",
           "webviews": ["main", "settings"],
-          "permissions": ["wdio:default", "wdio-webdriver:default", "core:window:allow-set-theme"]
+          "permissions": [
+            "wdio:default",
+            "wdio-webdriver:default",
+            "core:window:allow-set-theme",
+            "allow-acp-reset-test-runtimes",
+            "allow-reset-test-settings"
+          ]
         }
       ]
     }

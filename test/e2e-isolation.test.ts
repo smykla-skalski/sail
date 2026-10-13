@@ -1,7 +1,49 @@
 import assert from 'node:assert/strict';
 import process from 'node:process';
 import test from 'node:test';
-import { isolatedPaths, privatePort, PrivateEndpointGuard } from './e2e-isolation.ts';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  assertPrivateE2eConfigRoot,
+  isolatedPaths,
+  privatePort,
+  PrivateEndpointGuard,
+} from './e2e-isolation.ts';
+
+await test('attached runner rejects config roots outside its private temporary directory', () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'sail-e2e-isolation-'));
+  const temporary = join(fixture, 'temporary');
+  const outside = join(fixture, 'outside');
+  mkdirSync(temporary);
+  mkdirSync(outside);
+  try {
+    assert.doesNotThrow(() =>
+      assertPrivateE2eConfigRoot(join(temporary, 'run', 'config'), temporary),
+    );
+    assert.throws(() => assertPrivateE2eConfigRoot(temporary, temporary), /inside/);
+    assert.throws(() => assertPrivateE2eConfigRoot(outside, temporary), /inside/);
+    assert.throws(() => assertPrivateE2eConfigRoot(join(temporary, '..', 'outside'), temporary));
+    assert.throws(() => assertPrivateE2eConfigRoot('relative', temporary));
+    if (process.platform !== 'win32') {
+      assert.doesNotThrow(() =>
+        assertPrivateE2eConfigRoot(join(temporary, 'valid\\..', 'config'), temporary),
+      );
+      symlinkSync(outside, join(temporary, 'outside-link'));
+      symlinkSync(join(fixture, 'missing'), join(temporary, 'dangling-link'));
+      assert.throws(
+        () => assertPrivateE2eConfigRoot(join(temporary, 'outside-link', 'config'), temporary),
+        /inside/,
+      );
+      assert.throws(
+        () => assertPrivateE2eConfigRoot(join(temporary, 'dangling-link', 'config'), temporary),
+        /dangling symlink/,
+      );
+    }
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
 
 await test('private desktop runner rejects fallback and malformed ports without connecting', () => {
   for (const value of [undefined, '', '4445', '0', '1023', '65536', '50000junk', '5e4', '-1'])
