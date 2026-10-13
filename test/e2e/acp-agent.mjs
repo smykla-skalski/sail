@@ -145,6 +145,52 @@ function callWorktreeList(server, callback) {
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
+function callContextProvider(server, callback) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let stderr = '';
+  let settled = false;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    child.kill();
+    callback(result);
+  };
+  const timer = setTimeout(() => finish({ error: 'Context provider timed out' }), 15_000);
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+    let index;
+    while ((index = output.indexOf('\n')) >= 0) {
+      const line = output.slice(0, index);
+      output = output.slice(index + 1);
+      try {
+        const response = JSON.parse(line);
+        if (response.id === 2) finish(response);
+      } catch {
+        continue;
+      }
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr = (stderr + chunk).slice(-512);
+  });
+  child.on('error', (error) => finish({ error: error.message }));
+  child.on('exit', (code) => finish({ error: stderr.trim() || `Context bridge exited ${code}` }));
+  child.stdin.on('error', (error) => finish({ error: error.message }));
+  for (const [id, method] of [
+    [1, 'initialize'],
+    [2, 'tools/list'],
+  ])
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method })}\n`);
+}
+
 function terminalRequest(method, params, callback) {
   const id = ++nextTerminalRequest;
   terminalRequests.set(id, callback);
@@ -1095,6 +1141,28 @@ for await (const line of createInterface({ input: process.stdin })) {
         clearTimeout(timer);
         clearInterval(stream);
       });
+      continue;
+    }
+    if (text === 'Check context provider') {
+      const servers = sessions.get(sessionId).mcpServers;
+      const context = servers.filter((server) => server.args?.[0] === '--context-mcp');
+      const report = (response) => {
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: JSON.stringify({
+              agent,
+              context: context.map(({ name, command, args }) => ({ name, command, args })),
+              browserCount: servers.filter((server) => server.name === 'sail-browser').length,
+              response,
+            }),
+          },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      };
+      if (context.length === 1) callContextProvider(context[0], report);
+      else report({ error: `Expected one context server; received ${context.length}` });
       continue;
     }
     if (text === 'Check tools') {
