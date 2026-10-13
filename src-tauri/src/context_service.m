@@ -7,11 +7,22 @@ extern bool sail_context_validate_approval(const char *directory, const char *ex
                                            char *output, size_t length);
 extern bool sail_context_provider_request(const char *directory, const char *expected,
                                           const char *capability, const char *request,
+                                          bool (*notify)(void *, const char *), void *notifyContext,
                                           char *output, size_t length);
 extern void sail_context_provider_stop(const char *projectKey);
 extern void sail_context_provider_stop_if_fingerprint(const char *projectKey, const char *expected);
 extern bool sail_context_session_activate(const char *capability);
 extern void sail_context_session_deactivate(const char *capability);
+
+typedef bool (^SailContextNotification)(NSString *);
+
+static bool deliverNotification(void *context, const char *message) {
+    @autoreleasepool {
+        SailContextNotification notify = (__bridge SailContextNotification)context;
+        NSString *text = message ? [NSString stringWithUTF8String:message] : nil;
+        return text && notify(text);
+    }
+}
 
 static void closeSession(NSMutableDictionary<NSValue *, NSDictionary *> *sessions, NSValue *key) {
     NSDictionary *session = sessions[key];
@@ -169,7 +180,8 @@ int sail_context_service_main(void) {
                             sessions[key] = @{ @"directory": directory,
                                                @"projectKey": binding[@"projectKey"],
                                                @"fingerprint": binding[@"fingerprint"],
-                                               @"capability": capability };
+                                               @"capability": capability,
+                                               @"notifications": [NSMutableString string] };
                             xpc_dictionary_set_string(reply, "capability", capability.UTF8String);
                             xpc_dictionary_set_string(reply, "projectKey", [binding[@"projectKey"] UTF8String]);
                         } else {
@@ -188,6 +200,21 @@ int sail_context_service_main(void) {
                             closeSession(sessions, key);
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         }
+                    } else if ([op isEqualToString:@"notifications"]) {
+                        NSString *capability = field(message, "capability");
+                        NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                        if (session && equalCapability(capability, session[@"capability"])) {
+                            stopInvalidatedProvider(session, binding);
+                        }
+                        if (!session || !equalCapability(capability, session[@"capability"]) ||
+                            ![binding[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
+                            closeSession(sessions, key);
+                            xpc_dictionary_set_string(reply, "error", "Context session revoked.");
+                        } else {
+                            NSMutableString *pending = session[@"notifications"];
+                            xpc_dictionary_set_string(reply, "response", pending.UTF8String);
+                            [pending setString:@""];
+                        }
                     } else if ([op isEqualToString:@"request"]) {
                         NSString *capability = field(message, "capability");
                         NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
@@ -202,11 +229,31 @@ int sail_context_service_main(void) {
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         } else {
                             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                                SailContextNotification notify = ^bool(NSString *text) {
+                                    __block bool accepted = false;
+                                    dispatch_sync(queue, ^{
+                                        NSDictionary *latest = sessions[key] == session
+                                            ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                                        if ([latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
+                                            NSMutableString *pending = session[@"notifications"];
+                                            if ([pending lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
+                                                [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 1024 * 1024) {
+                                                [pending appendString:text];
+                                                accepted = true;
+                                            }
+                                        } else if (sessions[key] == session) {
+                                            stopInvalidatedProvider(session, latest);
+                                            closeSession(sessions, key);
+                                        }
+                                    });
+                                    return accepted;
+                                };
                                 char *output = calloc(1024 * 1024 + 1, 1);
                                 bool success = output && sail_context_provider_request(
                                     [session[@"directory"] UTF8String],
                                     [session[@"fingerprint"] UTF8String],
                                     [session[@"capability"] UTF8String], request.UTF8String,
+                                    deliverNotification, (__bridge void *)notify,
                                     output, 1024 * 1024 + 1);
                                 dispatch_async(queue, ^{
                                     NSDictionary *latest = sessions[key] == session
@@ -403,16 +450,16 @@ bool sail_context_session_check(void *handle, char *error, size_t errorLength) {
     }
 }
 
-bool sail_context_session_request(void *handle, const char *message,
-                                  char *output, size_t outputLength,
-                                  char *error, size_t errorLength) {
+static bool sessionExchange(void *handle, const char *op, const char *message,
+                            char *output, size_t outputLength,
+                            char *error, size_t errorLength) {
     @autoreleasepool {
-        if (!handle || !message || !output || !outputLength) return false;
+        if (!handle || !output || !outputLength) return false;
         SailContextSession *session = (__bridge SailContextSession *)handle;
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
-        xpc_dictionary_set_string(request, "op", "request");
+        xpc_dictionary_set_string(request, "op", op);
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
-        xpc_dictionary_set_string(request, "request", message);
+        if (message) xpc_dictionary_set_string(request, "request", message);
         xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
         if (![senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)]) {
             writeError(error, errorLength, @"Context service signature or path rejected.");
@@ -430,6 +477,17 @@ bool sail_context_session_request(void *handle, const char *message,
                                           : @"Context service disconnected or response too large.");
         return false;
     }
+}
+
+bool sail_context_session_request(void *handle, const char *message,
+                                  char *output, size_t outputLength,
+                                  char *error, size_t errorLength) {
+    return message && sessionExchange(handle, "request", message, output, outputLength, error, errorLength);
+}
+
+bool sail_context_session_notifications(void *handle, char *output, size_t outputLength,
+                                        char *error, size_t errorLength) {
+    return sessionExchange(handle, "notifications", NULL, output, outputLength, error, errorLength);
 }
 
 void sail_context_session_close(void *handle) {

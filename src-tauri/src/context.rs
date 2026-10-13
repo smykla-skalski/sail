@@ -749,6 +749,13 @@ unsafe extern "C" {
         error: *mut std::ffi::c_char,
         error_length: usize,
     ) -> bool;
+    fn sail_context_session_notifications(
+        handle: *mut std::ffi::c_void,
+        output: *mut std::ffi::c_char,
+        output_length: usize,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
     fn sail_context_provider_revoke_remote(
         key: *const std::ffi::c_char,
         error: *mut std::ffi::c_char,
@@ -853,6 +860,28 @@ impl ContextSession {
         }
     }
 
+    pub fn notifications(&self) -> Result<Option<String>, String> {
+        let mut output = vec![0_i8; 1024 * 1024 + 1];
+        let mut error = [0_i8; 512];
+        if !unsafe {
+            sail_context_session_notifications(
+                self.0,
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        } {
+            return Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        let value = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok((!value.is_empty()).then_some(value))
+    }
+
     pub fn request(&self, message: &str) -> Result<Option<String>, String> {
         let message = std::ffi::CString::new(message)
             .map_err(|_| "Context MCP request contains a NUL byte.".to_string())?;
@@ -881,13 +910,40 @@ impl ContextSession {
 
 #[cfg(target_os = "macos")]
 pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
-    use std::io::{BufRead, Write};
+    use std::io::BufRead;
     enum Event {
         Input(Result<Option<String>, String>),
         Response(Result<Option<String>, String>),
+        OutputError(String),
     }
     let session = std::sync::Arc::new(ContextSession::open(directory)?);
     let (send, receive) = std::sync::mpsc::sync_channel(32);
+    let (output, writes) = std::sync::mpsc::sync_channel::<String>(32);
+    let output_errors = send.clone();
+    let writer = std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        let configured = make_provider_stdin_nonblocking(&stdout);
+        if let Err(error) = configured {
+            let _ = output_errors.send(Event::OutputError(error));
+            return;
+        }
+        for message in writes {
+            if let Err(error) = write_provider_request_checked(
+                &mut stdout,
+                &message,
+                std::time::Duration::from_secs(30),
+                || Ok(()),
+            ) {
+                let _ = output_errors.send(Event::OutputError(error));
+                break;
+            }
+        }
+    });
+    let emit = |message| {
+        output
+            .try_send(message)
+            .map_err(|_| "Context MCP output exceeded its bounded queue.".to_string())
+    };
     let inputs = send.clone();
     std::thread::spawn(move || {
         let input = std::io::stdin();
@@ -923,10 +979,23 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
                     let _ = responses.send(Event::Response(session.request(&line)));
                 });
             } else if ended {
-                return Ok(());
+                drop(output);
+                return writer
+                    .join()
+                    .map_err(|_| "Context MCP output worker stopped.".to_string());
             }
         }
-        match receive.recv().map_err(|error| error.to_string())? {
+        if active {
+            if let Some(notifications) = session.notifications()? {
+                emit(notifications)?;
+            }
+        }
+        let event = match receive.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        match event {
             Event::Input(Ok(Some(line))) => {
                 let request = serde_json::from_str::<serde_json::Value>(&line).ok();
                 if request.as_ref().is_some_and(is_cancellation) {
@@ -942,10 +1011,14 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
             Event::Input(Err(error)) => return Err(error),
             Event::Response(response) => {
                 active = false;
+                if let Some(notifications) = session.notifications()? {
+                    emit(notifications)?;
+                }
                 if let Some(response) = response? {
-                    writeln!(std::io::stdout(), "{response}").map_err(|error| error.to_string())?;
+                    emit(response)?;
                 }
             }
+            Event::OutputError(error) => return Err(error),
         }
     }
 }
@@ -1244,8 +1317,7 @@ fn seatbelt_literal(path: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn make_provider_stdin_nonblocking(stdin: &std::process::ChildStdin) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
+fn make_provider_stdin_nonblocking(stdin: &impl std::os::fd::AsRawFd) -> Result<(), String> {
     let fd = stdin.as_raw_fd();
     let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
     if flags < 0
@@ -1270,12 +1342,11 @@ fn write_provider_request(
 
 #[cfg(target_os = "macos")]
 fn write_provider_request_checked(
-    stdin: &mut std::process::ChildStdin,
+    stdin: &mut impl std::io::Write,
     message: &str,
     timeout: std::time::Duration,
     mut check: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
-    use std::io::Write;
     let deadline = std::time::Instant::now() + timeout;
     for bytes in [message.as_bytes(), b"\n".as_slice()] {
         let mut remaining = bytes;
@@ -1440,6 +1511,7 @@ fn provider_request(
     expected: &str,
     capability: &str,
     message: &str,
+    notify: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
     #[cfg(feature = "e2e")]
     let root = PathBuf::from(
@@ -1450,17 +1522,18 @@ fn provider_request(
     let root = dirs::data_dir()
         .ok_or("Cannot locate provider data directory.")?
         .join("sail/context-providers");
-    provider_request_at(
+    provider_request_with_notifications_at(
         directory,
         expected,
         Some(capability),
         message,
         &service_store_path()?,
         &root,
+        Some(notify),
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn provider_request_at(
     directory: &Path,
     expected: &str,
@@ -1468,6 +1541,24 @@ fn provider_request_at(
     message: &str,
     store_path: &Path,
     data_root: &Path,
+) -> Result<Option<String>, String> {
+    provider_request_with_notifications_at(
+        directory, expected, capability, message, store_path, data_root, None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+type NotificationSink<'a> = Option<&'a mut dyn FnMut(&str) -> Result<(), String>>;
+
+#[cfg(target_os = "macos")]
+fn provider_request_with_notifications_at(
+    directory: &Path,
+    expected: &str,
+    capability: Option<&str>,
+    message: &str,
+    store_path: &Path,
+    data_root: &Path,
+    notify: NotificationSink<'_>,
 ) -> Result<Option<String>, String> {
     use std::time::Duration;
     if message.len() > 1024 * 1024 {
@@ -1627,6 +1718,7 @@ fn provider_request_at(
                     capability,
                     &initialize,
                     &initialize.to_string(),
+                    None,
                 )?;
                 if process
                     .initialization
@@ -1648,6 +1740,7 @@ fn provider_request_at(
                         capability,
                         &initialized,
                         &initialized.to_string(),
+                        None,
                     )?;
                 }
             }
@@ -1655,7 +1748,7 @@ fn provider_request_at(
         if method == "notifications/initialized" && process.initialized_notification_sent {
             return Ok(None);
         }
-        exchange_provider_request(process, &key, capability, &request, message)
+        exchange_provider_request(process, &key, capability, &request, message, notify)
     })();
     let response = match response {
         Ok(response) => response,
@@ -1703,6 +1796,7 @@ fn exchange_provider_request(
     capability: Option<&str>,
     request: &serde_json::Value,
     message: &str,
+    mut notify: NotificationSink<'_>,
 ) -> Result<Option<String>, String> {
     use std::time::Duration;
     let session_active = || session_is_active(capability);
@@ -1735,6 +1829,7 @@ fn exchange_provider_request(
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     enum ResponseEvent {
         Ping(serde_json::Value),
+        Notification(String),
         Finished(
             Result<String, String>,
             std::io::BufReader<std::process::ChildStdout>,
@@ -1745,9 +1840,9 @@ fn exchange_provider_request(
     std::thread::spawn(move || {
         let mut reader = reader;
         let result = (|| -> Result<String, String> {
-            let mut messages = String::new();
+            let mut bytes = 0;
             for _ in 0..32 {
-                let line = read_bounded_line(&mut reader, 1024 * 1024 - messages.len())?;
+                let line = read_bounded_line(&mut reader, 1024 * 1024 - bytes)?;
                 let value: serde_json::Value = serde_json::from_str(line.trim_end())
                     .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
                 if value.get("jsonrpc").and_then(|version| version.as_str()) != Some("2.0") {
@@ -1786,10 +1881,12 @@ fn exchange_provider_request(
                 {
                     return Err("Provider returned an invalid notification.".into());
                 }
-                messages.push_str(&line);
+                bytes += line.len();
                 if matched {
-                    return Ok(messages);
+                    return Ok(line);
                 }
+                send.send(ResponseEvent::Notification(line))
+                    .map_err(|_| "Provider request was stopped.".to_string())?;
             }
             Err("Provider sent too many messages before its response.".into())
         })();
@@ -1797,6 +1894,7 @@ fn exchange_provider_request(
     });
     let response = (|| -> Result<String, String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut buffered = String::new();
         loop {
             if !session_active()? {
                 return Err("Context session revoked before provider response.".into());
@@ -1814,9 +1912,17 @@ fn exchange_provider_request(
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string();
                     write_provider_request(&mut process.stdin, &reply, Duration::from_secs(1))?;
                 }
+                Ok(ResponseEvent::Notification(message)) => {
+                    if let Some(notify) = &mut notify {
+                        notify(&message)?;
+                    } else {
+                        buffered.push_str(&message);
+                    }
+                }
                 Ok(ResponseEvent::Finished(response, reader)) => {
                     process.stdout = Some(reader);
-                    return response;
+                    buffered.push_str(&response?);
+                    return Ok(buffered);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1879,6 +1985,8 @@ pub unsafe extern "C" fn sail_context_provider_request(
     expected: *const std::ffi::c_char,
     capability: *const std::ffi::c_char,
     message: *const std::ffi::c_char,
+    notify: extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_char) -> bool,
+    notify_context: *mut std::ffi::c_void,
     output: *mut std::ffi::c_char,
     output_length: usize,
 ) -> bool {
@@ -1905,7 +2013,22 @@ pub unsafe extern "C" fn sail_context_provider_request(
         let message = unsafe { CStr::from_ptr(message) }
             .to_str()
             .map_err(|error| error.to_string())?;
-        provider_request(Path::new(directory), expected, capability, message)
+        let mut emit = |message: &str| {
+            let message = std::ffi::CString::new(message)
+                .map_err(|_| "Provider notification contains a NUL byte.".to_string())?;
+            if notify(notify_context, message.as_ptr()) {
+                Ok(())
+            } else {
+                Err("Provider notification rejected or output queue full.".into())
+            }
+        };
+        provider_request(
+            Path::new(directory),
+            expected,
+            capability,
+            message,
+            &mut emit,
+        )
     })();
     let (ok, text) = match result {
         Ok(Some(response)) => (true, response),
@@ -2544,8 +2667,30 @@ mod tests {
             )
         };
 
+        let (notifications, received) = std::sync::mpsc::sync_channel(1);
         std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| call(request, &owner.0));
+            let waiting = scope.spawn(|| {
+                let mut notify = |message: &str| {
+                    notifications
+                        .send(message.to_owned())
+                        .map_err(|error| error.to_string())
+                };
+                provider_request_with_notifications_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(&owner.0),
+                    request,
+                    &store_path,
+                    &repository.0.join("data"),
+                    Some(&mut notify),
+                )
+            });
+            let notification = received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let notification: serde_json::Value = serde_json::from_str(&notification).unwrap();
+            assert_eq!(notification["method"], "notifications/message");
+            assert_eq!(notification["params"]["data"], "waiting for cancellation");
             assert_eq!(call(other_cancellation, &other.0).unwrap(), None);
             assert_eq!(call(unrelated_cancellation, &owner.0).unwrap(), None);
             assert_eq!(call(cancellation, &owner.0).unwrap(), None);

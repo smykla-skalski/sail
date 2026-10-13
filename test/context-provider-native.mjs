@@ -170,7 +170,7 @@ function startClient(directory) {
   return {
     child,
     stderr: () => stderr,
-    request: async (id, method = 'tools/list', params) => {
+    request: async (id, method = 'tools/list', params, onNotification) => {
       if (method === 'initialize')
         params = {
           protocolVersion: '2025-06-18',
@@ -192,7 +192,10 @@ function startClient(directory) {
           timeout,
         ]).then((line) => {
           const response = JSON.parse(line);
-          if (response.method && response.id === undefined) return readResponse();
+          if (response.method && response.id === undefined) {
+            onNotification?.(response);
+            return readResponse();
+          }
           assert.equal(response.id, id);
           return response;
         });
@@ -344,17 +347,31 @@ try {
   assert.equal(pinged.result.pid, a.result.pid);
   assert.equal(pinged.result.content[0].text, 'fixture reply');
   const cancellationStart = Date.now();
-  const waiting = first.request(18, 'tools/call', {
-    name: 'fixture_wait_cancel',
-    arguments: {},
+  let notificationReceived;
+  const notified = new Promise((resolve) => {
+    notificationReceived = resolve;
   });
-  first.child.stdin.write(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'notifications/cancelled',
-      params: { requestId: 18, reason: 'owner' },
-    }) + '\n',
+  const waiting = first.request(
+    18,
+    'tools/call',
+    {
+      name: 'fixture_wait_cancel',
+      arguments: {},
+    },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/message');
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      notificationReceived();
+      first.child.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/cancelled',
+          params: { requestId: 18, reason: 'owner' },
+        }) + '\n',
+      );
+    },
   );
+  await Promise.race([notified, waiting]);
   const [cancelled, adjacent] = await Promise.all([waiting, second.request(19)]);
   assert.equal(cancelled.result.cancelled, true);
   assert.equal(cancelled.result.cancelledBy, 'owner');
