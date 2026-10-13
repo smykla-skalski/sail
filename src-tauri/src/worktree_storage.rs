@@ -3352,30 +3352,8 @@ mod tests {
             fs::write(repository.join("tracked"), "fixture").unwrap();
             Self::git(&repository, &["add", "tracked"]);
             Self::git(&repository, &["commit", "--quiet", "-m", "fixture"]);
-            Self::git(
-                &repository,
-                &[
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    "--detach",
-                    "--lock",
-                    first.to_str().unwrap(),
-                    "HEAD",
-                ],
-            );
-            Self::git(
-                &repository,
-                &[
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    "--detach",
-                    "--lock",
-                    second.to_str().unwrap(),
-                    "HEAD",
-                ],
-            );
+            Self::add_locked_worktree(&repository, &first);
+            Self::add_locked_worktree(&repository, &second);
             Self {
                 root,
                 repository,
@@ -3399,6 +3377,18 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             output.stdout
+        }
+
+        fn add_locked_worktree(repository: &Path, worktree: &Path) {
+            let path = worktree.to_str().unwrap();
+            Self::git(
+                repository,
+                &["worktree", "add", "--quiet", "--detach", path, "HEAD"],
+            );
+            // Git 2.55 failed in CI while --lock opened its marker in a
+            // missing admin directory. Finish add first, then lock the same
+            // fixture worktree for every test.
+            Self::git(repository, &["worktree", "lock", path]);
         }
 
         fn remove(&self, worktree: &Path) {
@@ -3583,18 +3573,7 @@ mod tests {
     fn unicode_git_worktree_paths_register_and_clean() {
         let fixture = GitFixture::new();
         let worktree = fixture.root.join("café-工作");
-        GitFixture::git(
-            &fixture.repository,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "--detach",
-                "--lock",
-                worktree.to_str().unwrap(),
-                "HEAD",
-            ],
-        );
+        GitFixture::add_locked_worktree(&fixture.repository, &worktree);
         let (directory, lease) = register(&fixture.cache, &worktree).unwrap();
         lease.mark_started();
         lease.release_clean().unwrap();

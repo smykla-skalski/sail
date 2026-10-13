@@ -715,3 +715,45 @@ await test('keeps both selected paths pending when an omitted saved directory st
   assert.equal(reconciled, null);
   assert.deepEqual(pending.storagePaths, ['/cache/a', '/cache/b']);
 });
+
+await test('reconciles the final deleted storage path before retrying a retained Git overlay', async () => {
+  const pending = {
+    originalPath: '/worktrees/child',
+    recoveryPath: '/worktrees/child',
+    sizeBytes: 12,
+    reason: 'Selected private storage remains.',
+    storagePaths: ['/cache/a'],
+    storageKeys: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+    selectedStorageCleanupConfirmed: true,
+  };
+
+  const stillPresent = await reconcileSelectedRemovedWorktreeStorage(pending, [], async (paths) =>
+    paths.every((path) => path !== '/cache/a'),
+  );
+  assert.equal(stillPresent, null);
+
+  const removed = await reconcileSelectedRemovedWorktreeStorage(pending, [], async () => true);
+  assert.deepEqual(removed?.storagePaths, []);
+  assert.deepEqual(removed?.storageKeys, []);
+  assert.equal(removed?.sizeBytes, 0);
+  assert.equal(removed?.selectedStorageCleanupConfirmed, true);
+
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo'],
+      worktrees: {
+        '/repo': [
+          {
+            path: '/worktrees/child',
+            branch: 'child',
+            generation: testGeneration(99),
+            pendingCleanup: removed,
+          },
+        ],
+      },
+    }),
+    '/repo',
+  );
+  assert.deepEqual(catalog.worktrees['/repo'][0].pendingCleanup?.storagePaths ?? [], []);
+  assert.equal(catalog.worktrees['/repo'][0].pendingCleanup?.selectedStorageCleanupConfirmed, true);
+});

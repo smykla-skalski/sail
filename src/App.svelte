@@ -9411,7 +9411,17 @@
               if (!overlayAbsent) {
                 reason =
                   'The Git checkout was removed, but private Git state remains pending. Retry selected cleanup after the cause is fixed.';
-                return { entry, pending, sizeBytes: null, reason, completed: false };
+                const reconciled =
+                  pending.selectedStorageCleanupConfirmed && absent
+                    ? await reconcileSelectedRemovedWorktreeStorage(pending, [], async () => absent)
+                    : null;
+                return {
+                  entry,
+                  pending: reconciled ? { ...reconciled, reason } : pending,
+                  sizeBytes: null,
+                  reason,
+                  completed: false,
+                };
               }
               if (
                 absent &&
@@ -9687,18 +9697,17 @@
               });
               remainingStoragePaths = remainingStoragePaths.slice(1);
               remainingStorageKeys = remainingStorageKeys.slice(1);
-              if (remainingStoragePaths.length) {
-                await saveProjectCatalogDurably(
-                  markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
-                    ...verifiedRecovery,
-                    storagePaths: remainingStoragePaths,
-                    storageKeys: remainingStorageKeys,
-                    sizeBytes: null,
-                    reason:
-                      'Some selected private storage was removed; the remaining paths are pending.',
-                  }),
-                );
-              }
+              await saveProjectCatalogDurably(
+                markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+                  ...verifiedRecovery,
+                  storagePaths: remainingStoragePaths,
+                  storageKeys: remainingStorageKeys,
+                  sizeBytes: null,
+                  reason: remainingStoragePaths.length
+                    ? 'Some selected private storage was removed; the remaining paths are pending.'
+                    : 'Selected private storage was removed; private Git cleanup remains pending.',
+                }),
+              );
               return undefined;
             }),
           Promise.resolve(),

@@ -406,18 +406,50 @@ describe('close worktree shortcut', () => {
           expect.stringContaining('no other process will write to, move, or replace it'),
         );
         await confirmation.$('button=Remove selected temporary data').click();
-        await browser.waitUntil(async () => {
-          const error = $('.settings-window .runtime-diagnostic[role="alert"]');
-          const remainingRows = await $$(selector);
-          const remaining = await Promise.all(
-            Array.from({ length: remainingRows.length }, (_, index) =>
-              remainingRows[index].getAttribute('data-pending-temp-path'),
-            ),
-          );
-          return !remaining.includes(item.tempPath) || (await error.isExisting());
+        await browser.waitUntil(async () => !(await confirmation.isDisplayed()), {
+          timeoutMsg: 'The selected temporary cleanup confirmation stayed open',
         });
+        try {
+          await browser.waitUntil(async () => {
+            const error = $('.settings-window .runtime-diagnostic[role="alert"]');
+            const remainingRows = await $$(selector);
+            const remaining = await Promise.all(
+              Array.from({ length: remainingRows.length }, (_, index) =>
+                remainingRows[index].getAttribute('data-pending-temp-path'),
+              ),
+            );
+            return !remaining.includes(item.tempPath) || (await error.isExisting());
+          });
+        } catch (cause) {
+          const state = await browser.execute(
+            (owner) => ({
+              rows: [...document.querySelectorAll('li[data-pending-temp-owner]')]
+                .filter((row) => row.getAttribute('data-pending-temp-owner') === owner)
+                .map((row) => ({
+                  path: row.getAttribute('data-pending-temp-path'),
+                  text: row.textContent,
+                  disabled: row.querySelector('button')?.hasAttribute('disabled'),
+                })),
+              alerts: [...document.querySelectorAll('.settings-window [role="alert"]')].map(
+                (alert) => alert.textContent,
+              ),
+              dialogs: [...document.querySelectorAll('dialog[open]')].map(
+                (dialog) => dialog.textContent,
+              ),
+            }),
+            path,
+          );
+          throw new Error(
+            `Selected temporary cleanup did not settle for ${item.tempPath}: ${JSON.stringify(state)}`,
+            { cause },
+          );
+        }
         const error = $('.settings-window .runtime-diagnostic[role="alert"]');
         if (await error.isExisting()) throw new Error(await error.getText());
+        await browser.waitUntil(
+          async () => $('.settings-window').$('button=Retry cleanup').isEnabled(),
+          { timeoutMsg: 'Settings remained busy after selected temporary cleanup' },
+        );
         await clearOne(attempt + 1);
       }
       await clearOne(0);
@@ -1614,9 +1646,11 @@ describe('close worktree shortcut', () => {
     if (!cache.includes('dev.smykla.sail.e2e')) {
       throw new Error(`Refusing overlay fixture outside the task-owned E2E app: ${cache}`);
     }
+    const deletedStorage = join(cache, `deleted-selected-storage-${randomUUID()}`);
+    if (existsSync(deletedStorage)) throw new Error('Interrupted storage fixture is not absent');
     await select(repository, false);
     await browser.execute(
-      (repo, selected, identity) => {
+      (repo, selected, identity, missingStorage) => {
         const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
         catalog.worktrees[repo].push({
           path: selected,
@@ -1627,7 +1661,10 @@ describe('close worktree shortcut', () => {
             recoveryPath: selected,
             sizeBytes: 0,
             reason: 'Confirmed selected cleanup was interrupted.',
+            storagePaths: [missingStorage],
+            storageKeys: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
             selectedWorktreeCleanupConfirmed: true,
+            selectedStorageCleanupConfirmed: true,
           },
         });
         localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
@@ -1635,6 +1672,7 @@ describe('close worktree shortcut', () => {
       repository,
       path,
       generation,
+      deletedStorage,
     );
     git('worktree', 'remove', path);
     await carryTaskRegisteredWorktrees();
@@ -1658,12 +1696,19 @@ describe('close worktree shortcut', () => {
       }),
     );
     await browser.refresh();
-    await $(`[data-pending-worktree="${path}"]`).$('button=Recheck worktree').click();
+    expect((await pendingCleanup(path))?.storagePaths).toEqual([deletedStorage]);
+    await expect($(`[data-pending-worktree="${path}"]`)).toHaveText(
+      expect.stringContaining(deletedStorage),
+    );
+    await $(`[data-pending-worktree="${path}"]`).$('button=Recheck storage').click();
     await diagnose('Interrupted overlay retained', () =>
       browser.waitUntil(async () =>
         (await pendingCleanup(path))?.reason.includes('private Git state remains pending'),
       ),
     );
+    expect((await pendingCleanup(path))?.storagePaths ?? []).toEqual([]);
+    await browser.refresh();
+    expect((await pendingCleanup(path))?.storagePaths ?? []).toEqual([]);
     expect(existsSync(manifest)).toBe(true);
     await $(`[data-pending-worktree="${path}"]`).$('button=Clean up this worktree…').click();
     await diagnose('Interrupted overlay cleared by selected retry', () =>
