@@ -1273,10 +1273,7 @@ fn trim_cache_inner(cache_directory: &Path, data_directory: &Path) -> Result<(),
         Err(_) => None,
     };
     let _repository = if let Some(path) = repository_lock {
-        let Ok(lock) = FileLock::try_acquire(&path, true) else {
-            return Ok(());
-        };
-        Some(lock)
+        Some(FileLock::acquire(&path, true)?)
     } else {
         None
     };
@@ -1420,19 +1417,30 @@ fn cache_limit_token(worktree: &Path) -> Result<String, String> {
     }
 }
 
-pub(crate) fn cache_status(cache_directory: &Path, current_worktree: &Path) -> Vec<CacheUsage> {
+pub(crate) fn cache_status(
+    cache_directory: &Path,
+    current_worktree: &Path,
+    known_worktrees: &[PathBuf],
+) -> Vec<CacheUsage> {
     let mut worktrees = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
     let current = crate::terminal::git_worktree_root(current_worktree);
     worktrees.entry(current.clone()).or_default();
-    if let Ok(common_dir) = git_path(
-        &current,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    ) {
-        if let Ok(known) = git_worktrees(&common_dir) {
-            for worktree in known {
-                worktrees
-                    .entry(stable_worktree_identity(&worktree))
-                    .or_default();
+    for requested in std::iter::once(&current).chain(known_worktrees.iter()) {
+        let root = stable_worktree_identity(requested);
+        if !root.is_dir() || cache_limit_token(&root).is_err() {
+            continue;
+        }
+        worktrees.entry(root.clone()).or_default();
+        if let Ok(common_dir) = git_path(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ) {
+            if let Ok(known) = git_worktrees(&common_dir) {
+                for worktree in known {
+                    worktrees
+                        .entry(stable_worktree_identity(&worktree))
+                        .or_default();
+                }
             }
         }
     }
@@ -4405,7 +4413,7 @@ mod tests {
     #[test]
     fn empty_worktrees_report_zero_reusable_cache_usage() {
         let fixture = GitFixture::new();
-        let status = cache_status(&fixture.cache, &fixture.first);
+        let status = cache_status(&fixture.cache, &fixture.first, &[]);
         let first_root = stable_worktree_identity(&fixture.first)
             .to_string_lossy()
             .into_owned();
@@ -4428,13 +4436,35 @@ mod tests {
         }
         set_cache_limit_token(&fixture.cache, &first.worktree_token, 1).unwrap();
         assert_eq!(
-            cache_status(&fixture.cache, &fixture.first)
+            cache_status(&fixture.cache, &fixture.first, &[])
                 .into_iter()
                 .find(|item| item.worktree_token == first.worktree_token)
                 .unwrap()
                 .limit_bytes,
             1
         );
+    }
+
+    #[test]
+    fn saved_worktree_in_another_repository_reports_zero_without_cache_owner() {
+        let fixture = GitFixture::new();
+        let other = GitFixture::new();
+        let other_root = stable_worktree_identity(&other.first)
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(!cache_status(&fixture.cache, &fixture.first, &[])
+            .iter()
+            .any(|item| item.worktree == other_root));
+        let status = cache_status(&fixture.cache, &fixture.first, &[other.first.clone()]);
+        let unused = status
+            .iter()
+            .find(|item| item.worktree == other_root)
+            .unwrap();
+        assert_eq!(unused.usage_bytes, Some(0));
+        assert_eq!(unused.remaining_bytes, Some(0));
+        assert_eq!(unused.limit_bytes, DEFAULT_CACHE_LIMIT_BYTES);
+        assert!(!unused.worktree_token.is_empty());
     }
 
     #[test]
@@ -4459,7 +4489,7 @@ mod tests {
         let root = stable_worktree_identity(&folder)
             .to_string_lossy()
             .into_owned();
-        let status = cache_status(&fixture.cache, &folder);
+        let status = cache_status(&fixture.cache, &folder, &[]);
         let matching = status
             .iter()
             .filter(|item| item.worktree == root)
@@ -4474,7 +4504,7 @@ mod tests {
         set_cache_limit_token(&fixture.cache, &usage.worktree_token, 0).unwrap();
         assert!(plain_artifact.exists());
         assert!(!git_artifact.exists());
-        let after = cache_status(&fixture.cache, &folder)
+        let after = cache_status(&fixture.cache, &folder, &[])
             .into_iter()
             .find(|item| item.worktree == root)
             .unwrap();
@@ -4545,7 +4575,7 @@ mod tests {
         fs::write(shared.join("package"), b"12345678").unwrap();
 
         set_cache_limit(&fixture.cache, &fixture.first, 8, None).unwrap();
-        let active = cache_status(&fixture.cache, &fixture.first);
+        let active = cache_status(&fixture.cache, &fixture.first, &[]);
         let first_root = stable_worktree_identity(&fixture.first)
             .to_string_lossy()
             .into_owned();
@@ -4563,7 +4593,7 @@ mod tests {
         assert!(!known.exists());
         assert!(protected.join("sign-in").exists());
         assert!(shared.join("package").exists());
-        let idle = cache_status(&fixture.cache, &fixture.first);
+        let idle = cache_status(&fixture.cache, &fixture.first, &[]);
         let idle = idle
             .iter()
             .find(|item| item.worktree == first_root)
@@ -4572,6 +4602,49 @@ mod tests {
         assert_eq!(idle.limit_bytes, 8);
         assert_eq!(idle.remaining_bytes, Some(0));
         assert_eq!(idle.reason, None);
+    }
+
+    #[test]
+    fn cache_trim_waits_for_repository_registration_and_reclaims_after_release() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let artifact = directory.join("cache/go-build/artifact");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"reusable").unwrap();
+        set_cache_limit(&fixture.cache, &fixture.first, 0, None).unwrap();
+        let common_dir = read_owner(&directory).unwrap().common_dir;
+        let repository = FileLock::acquire(
+            &lock_path(&fixture.cache, "repo", &common_dir).unwrap(),
+            true,
+        )
+        .unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            finished.send(lease.release_clean()).unwrap();
+        });
+        ready.recv().unwrap();
+        let lease_path = lock_path(&fixture.cache, "lease", &directory).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(released) = FileLock::try_acquire(&lease_path, true) {
+                drop(released);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(done
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        assert!(artifact.exists());
+        drop(repository);
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!artifact.exists());
     }
 
     #[test]
@@ -4584,7 +4657,7 @@ mod tests {
         lease.release_clean().unwrap();
 
         set_cache_limit(&fixture.cache, &fixture.first, 1, None).unwrap();
-        let status = cache_status(&fixture.cache, &fixture.first);
+        let status = cache_status(&fixture.cache, &fixture.first, &[]);
         let first_root = stable_worktree_identity(&fixture.first)
             .to_string_lossy()
             .into_owned();

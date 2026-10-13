@@ -3836,13 +3836,18 @@ async fn retry_worktree_storage_cleanup(
 async fn worktree_cache_status(
     app: tauri::AppHandle,
     current_worktree: String,
+    known_worktrees: Vec<String>,
 ) -> Result<Vec<worktree_storage::CacheUsage>, String> {
     let cache = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
-        worktree_storage::cache_status(&cache, Path::new(&current_worktree))
+        let known_worktrees = known_worktrees
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        worktree_storage::cache_status(&cache, Path::new(&current_worktree), &known_worktrees)
     })
     .await
     .map_err(|error| error.to_string())

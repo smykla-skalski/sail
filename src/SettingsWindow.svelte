@@ -7,6 +7,7 @@
   import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
   import OptionPicker from './OptionPicker.svelte';
   import { getSetting } from './lib/settings';
+  import { loadProjectCatalog } from './lib/projects';
   import {
     parseThemePreference,
     resolveTheme,
@@ -252,6 +253,11 @@
     worktreeStorageError = '';
     const directory = snapshot?.directory ?? '';
     worktreeStorageDirectory = directory;
+    const catalog = loadProjectCatalog(getSetting('sai-project-catalog'), directory);
+    const knownWorktrees = [
+      ...catalog.repositories,
+      ...Object.values(catalog.worktrees).flatMap((entries) => entries.map((entry) => entry.path)),
+    ];
     try {
       const pending = await invoke<WorktreeStoragePending[]>(
         retry ? 'retry_worktree_storage_cleanup' : 'worktree_storage_cleanup_status',
@@ -259,6 +265,7 @@
       const usage = directory
         ? await invoke<WorktreeCacheUsage[]>('worktree_cache_status', {
             currentWorktree: directory,
+            knownWorktrees,
           })
         : [];
       if (worktreeStorageDirectory === directory) {
