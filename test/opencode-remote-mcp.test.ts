@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import process from 'node:process';
@@ -42,6 +42,10 @@ function runProbe(binary: string) {
     encoding: 'utf8',
     timeout: 600_000,
     maxBuffer: 16 * 1024 * 1024,
+    env: {
+      ...process.env,
+      PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ''}`,
+    },
   });
   return probeResultSchema.parse(JSON.parse(stdout));
 }
@@ -52,7 +56,7 @@ await test('the probe serves HTTP requests while its client command is running',
     const binary = join(scratch, 'fixture-client.mjs');
     writeFileSync(
       binary,
-      `#!${process.execPath}
+      `#!/usr/bin/env node
 import { readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args[0] === '--version') {
