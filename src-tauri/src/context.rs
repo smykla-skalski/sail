@@ -3472,9 +3472,8 @@ mod tests {
             .unwrap()
             .unwrap();
             let before: serde_json::Value = serde_json::from_str(&before).unwrap();
-            let started = std::time::Instant::now();
-
             let (notifications, received) = std::sync::mpsc::sync_channel(1);
+            let (completion, completed) = std::sync::mpsc::sync_channel(1);
             std::thread::scope(|scope| {
                 let waiting = scope.spawn(|| {
                     let mut notify = |message: &str| {
@@ -3482,7 +3481,7 @@ mod tests {
                             .send(message.to_owned())
                             .map_err(|error| error.to_string())
                     };
-                    provider_request_with_notifications_at(
+                    let result = provider_request_with_notifications_at(
                         &repository.0,
                         &fingerprint,
                         Some(&owner.0),
@@ -3490,7 +3489,8 @@ mod tests {
                         &store_path,
                         &repository.0.join("data"),
                         Some(&mut notify),
-                    )
+                    );
+                    let _ = completion.send(result);
                 });
                 let notification = received
                     .recv_timeout(std::time::Duration::from_secs(5))
@@ -3500,8 +3500,23 @@ mod tests {
                 assert_eq!(notification["params"]["data"], "waiting for cancellation");
                 assert_eq!(call(other_cancellation, &other.0).unwrap(), None);
                 assert_eq!(call(unrelated_cancellation, &owner.0).unwrap(), None);
+                assert!(
+                    !waiting.is_finished(),
+                    "Unrelated cancellation ended the owner request"
+                );
+                let started = std::time::Instant::now();
                 assert_eq!(call(cancellation, &owner.0).unwrap(), None);
-                let response = waiting.join().unwrap().unwrap().unwrap();
+                let response = completed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("Owner cancellation did not complete within five seconds")
+                    .unwrap()
+                    .unwrap();
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < std::time::Duration::from_secs(5),
+                    "{method}: owner cancellation took {elapsed:?}"
+                );
+                waiting.join().unwrap();
                 let value: serde_json::Value =
                     serde_json::from_str(response.lines().last().unwrap()).unwrap();
                 let next = call(
@@ -3516,7 +3531,6 @@ mod tests {
                 assert_eq!(value["error"]["code"], -32800);
                 assert!(next["result"]["pid"].is_number());
                 assert_eq!(next["result"]["pid"], before["result"]["pid"]);
-                assert!(started.elapsed() < std::time::Duration::from_secs(5));
             });
         }
     }

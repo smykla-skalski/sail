@@ -7139,9 +7139,16 @@ mod session_config_tests {
     #[cfg(unix)]
     #[test]
     fn temporary_cleanup_retries_after_worker_exits() {
+        struct RuntimeGuard(Arc<Connection>);
+        impl Drop for RuntimeGuard {
+            fn drop(&mut self) {
+                let _ = self.0.stop_child();
+            }
+        }
         let scratch =
             std::env::temp_dir().join(format!("sail-turn-temp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch).unwrap();
+        let _scratch = OwnedTempDir(scratch.clone());
         let worktree = scratch.join("plain-folder");
         std::fs::create_dir(&worktree).unwrap();
         let cache = scratch.join("cache");
@@ -7152,7 +7159,10 @@ mod session_config_tests {
 
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 2 & wait; exec sleep 10"])
+            .args([
+                "-c",
+                "exec 3<&0; (read -r release <&3) & wait; read -r release <&3",
+            ])
             .stdin(Stdio::piped());
         unsafe {
             command.pre_exec(|| {
@@ -7172,6 +7182,7 @@ mod session_config_tests {
             child,
         );
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        let _runtime = RuntimeGuard(runtime.clone());
         let root = runtime.child.lock().unwrap().id();
         for _ in 0..100 {
             if runtime_has_live_children(root, None) {
@@ -7183,6 +7194,12 @@ mod session_config_tests {
         start_temp_cleanup_watcher(&runtime).unwrap();
         runtime.clear_idle_temp(true).unwrap();
         assert!(artifact.exists());
+        runtime
+            .input
+            .lock()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
 
         for _ in 0..100 {
             if !artifact.exists() {
@@ -7196,7 +7213,6 @@ mod session_config_tests {
         );
         runtime.stop_child().unwrap();
         drop(runtime);
-        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[cfg(unix)]
