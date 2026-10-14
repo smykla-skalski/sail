@@ -1349,7 +1349,7 @@
                         onclick={() => void onremovependingcleanup(path, worktree.path)}
                         >{worktree.pendingCleanup.storagePaths?.length
                           ? 'Retry selected storage cleanup…'
-                          : 'Clean up this worktree…'}</button
+                          : 'Force delete this worktree…'}</button
                       >
                     </div>
                   {/if}
@@ -1560,7 +1560,7 @@
                       onclick={() => void onremovependingcleanup(path, worktree.path)}
                       >{worktree.pendingCleanup.storagePaths?.length
                         ? 'Retry selected storage cleanup…'
-                        : 'Clean up this worktree…'}</button
+                        : 'Force delete this worktree…'}</button
                     >
                   </div>
                 {/if}
