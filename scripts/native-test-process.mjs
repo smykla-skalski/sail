@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
-import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { realpathSync, writeFileSync } from 'node:fs';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -45,4 +45,46 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal }) 
     await Promise.race([closed, delay(1000)]);
     writeFileSync(log, Buffer.concat(output));
   }
+}
+
+// `open -n` leaves the fixture app running with PPID 1 when a run fails before
+// it learns the listening pid, so match processes by their executable path.
+export async function stopProcessesUnder(directory, { timeout = 5000 } = {}) {
+  const roots = new Set([directory]);
+  try {
+    roots.add(realpathSync(directory));
+  } catch {
+    /* The bundle is already gone; its launch path still identifies the process. */
+  }
+  const prefixes = [...roots].map((root) => (root.endsWith('/') ? root : `${root}/`));
+  const running = () =>
+    execFileSync('ps', ['-axo', 'pid=,comm='], { encoding: 'utf8' })
+      .split('\n')
+      .flatMap((line) => {
+        const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+        const pid = Number(match?.[1]);
+        return match &&
+          pid !== process.pid &&
+          prefixes.some((prefix) => match[2].startsWith(prefix))
+          ? [pid]
+          : [];
+      });
+  const waitUntilGone = async (deadline) => {
+    if (running().length === 0 || Date.now() >= deadline) return running().length === 0;
+    await delay(100);
+    return waitUntilGone(deadline);
+  };
+  const stop = async (signals) => {
+    const pids = running();
+    if (pids.length === 0 || signals.length === 0) return pids.length === 0;
+    for (const pid of pids) {
+      try {
+        process.kill(pid, signals[0]);
+      } catch {
+        /* Already exited. */
+      }
+    }
+    return (await waitUntilGone(Date.now() + timeout)) || stop(signals.slice(1));
+  };
+  return stop(['SIGTERM', 'SIGKILL']);
 }

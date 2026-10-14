@@ -6,7 +6,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{
+    Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind,
+};
 
 const IDLE_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 const MARKER: &str = ".sail-scratch-root";
@@ -17,17 +19,37 @@ const PRIVATE_OWNER: &str = ".sail-cleanup-owner";
 pub(crate) fn sweep_on_startup(cache_directory: Option<&Path>) {
     let root = std::env::temp_dir();
     let now = SystemTime::now();
-    let result = sweep(&root, now, has_open_files).and_then(|bytes| {
-        if let Some(cache_directory) = cache_directory {
-            sweep_worktree_temp_dirs(cache_directory, now, has_open_files)
-                .map(|worktree_bytes| bytes + worktree_bytes)
-        } else {
-            Ok(bytes)
-        }
-    });
+    let result = sweep(&root, now, has_open_files)
+        .and_then(|bytes| {
+            if let Some(cache_directory) = cache_directory {
+                sweep_worktree_temp_dirs(cache_directory, now, has_open_files)
+                    .map(|worktree_bytes| bytes + worktree_bytes)
+            } else {
+                Ok(bytes)
+            }
+        })
+        .and_then(|bytes| {
+            let Some(home) = dirs::home_dir() else {
+                return Ok(bytes);
+            };
+            sweep_native_roots(&home, now, has_open_files).map(|native| bytes + native)
+        });
     match result {
         Ok(bytes) => eprintln!("Sail scratch cleanup freed {bytes} bytes"),
         Err(error) => eprintln!("Sail scratch cleanup unavailable: {error}"),
+    }
+}
+
+/// Native acceptance runs install a signed app under `~/Applications`, outside
+/// the system temporary directory, so the `$TMPDIR` sweep never sees them.
+fn sweep_native_roots(
+    home: &Path,
+    now: SystemTime,
+    open_files: impl Fn(&Path) -> Option<bool>,
+) -> std::io::Result<u64> {
+    match sweep_with(&home.join("Applications"), now, open_files, true) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        result => result,
     }
 }
 
@@ -255,6 +277,17 @@ fn sweep(
     now: SystemTime,
     open_files: impl Fn(&Path) -> Option<bool>,
 ) -> std::io::Result<u64> {
+    sweep_with(temp, now, open_files, false)
+}
+
+// `stop_leftovers` ends processes still running from a dead-owner root before
+// its open-file check. Native fixtures outlive the run that launched them.
+fn sweep_with(
+    temp: &Path,
+    now: SystemTime,
+    open_files: impl Fn(&Path) -> Option<bool>,
+    stop_leftovers: bool,
+) -> std::io::Result<u64> {
     let mut freed = 0;
     let owner = unsafe { nix::libc::geteuid() };
     let mut processes = System::new();
@@ -332,6 +365,9 @@ fn sweep(
         if !marker_owner_dead(&path, &processes) {
             continue;
         }
+        if stop_leftovers {
+            stop_root_processes(&path);
+        }
         // An unknown lsof result is unsafe: lack of permission is not proof of idleness.
         if open_files(&path) != Some(false) {
             continue;
@@ -390,6 +426,54 @@ fn sweep(
         freed += bytes;
     }
     Ok(freed)
+}
+
+fn stop_root_processes(root: &Path) {
+    let Ok(canonical) = fs::canonicalize(root) else {
+        return;
+    };
+    let own = Pid::from_u32(std::process::id());
+    let kind = ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet);
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    let mut running = system
+        .processes()
+        .values()
+        .filter(|process| {
+            process.pid() != own
+                && process
+                    .exe()
+                    .is_some_and(|exe| exe.starts_with(&canonical) || exe.starts_with(root))
+        })
+        .map(|process| (process.pid(), process.start_time()))
+        .collect::<Vec<_>>();
+    for signal in [Signal::Term, Signal::Kill] {
+        for (pid, started) in &running {
+            if let Some(process) = system.process(*pid) {
+                if process.start_time() == *started {
+                    process.kill_with(signal);
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !running.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            let pids = running.iter().map(|(pid, _)| *pid).collect::<Vec<_>>();
+            system.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, kind);
+            running.retain(|(pid, started)| {
+                system.process(*pid).is_some_and(|process| {
+                    process.start_time() == *started && process.status() != ProcessStatus::Zombie
+                })
+            });
+        }
+        if running.is_empty() {
+            return;
+        }
+    }
+    eprintln!(
+        "Sail scratch cleanup could not stop processes in {}",
+        root.display()
+    );
 }
 
 fn private_child(parent: &Path) -> std::io::Result<Option<PathBuf>> {
@@ -782,6 +866,136 @@ mod tests {
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, |_| Some(false)).unwrap();
         assert!(!stale.exists());
+    }
+
+    fn fixture_binary(root: &Path) -> PathBuf {
+        let binary = root.join("run/Sail Native Fixture.app/Contents/MacOS/sail");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::copy("/bin/sleep", &binary).unwrap();
+        // A copied system binary fails macOS signature validation at exec.
+        #[cfg(target_os = "macos")]
+        assert!(Command::new("codesign")
+            .args(["-f", "-s", "-"])
+            .arg(&binary)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        binary
+    }
+
+    // Matches a fixture app that `open` leaves running with PPID 1.
+    fn spawn_orphan(binary: &Path) -> i32 {
+        let output = Command::new("/bin/sh")
+            .args(["-c", "\"$0\" 300 >/dev/null 2>&1 & echo $!"])
+            .arg(binary)
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn alive(pid: i32) -> bool {
+        unsafe { nix::libc::kill(pid, 0) == 0 }
+    }
+
+    fn wait_until_gone(pid: i32) -> bool {
+        for _ in 0..50 {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    #[test]
+    fn startup_reclaims_a_dead_owner_native_root_and_stops_its_fixture() {
+        let home = fixture();
+        let applications = home.join("Applications");
+        let root = applications.join("sail-681-native.dead");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        fs::create_dir_all(root.join("tmp/target/debug/.fingerprint")).unwrap();
+        fs::write(root.join("tmp/target/debug/artifact"), "build output").unwrap();
+        let pid = spawn_orphan(&fixture_binary(&root));
+        assert!(alive(pid));
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        let freed = sweep_native_roots(&home, future, |_| {
+            // The fixture must be stopped before the open-file check.
+            Some(!wait_until_gone(pid))
+        })
+        .unwrap();
+        assert!(freed > 0);
+        assert!(!root.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_fixture_blocks_the_ordinary_sweep_but_not_the_native_one() {
+        let home = fixture();
+        let root = home.join("Applications/sail-681-native.running");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        let pid = spawn_orphan(&fixture_binary(&root));
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&home.join("Applications"), future, has_open_files).unwrap();
+        assert!(root.exists());
+        assert!(alive(pid));
+        sweep_native_roots(&home, future, has_open_files).unwrap();
+        assert!(wait_until_gone(pid));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn native_roots_keep_live_owners_and_unmarked_folders() {
+        let home = fixture();
+        let applications = home.join("Applications");
+        let live = applications.join("sail-681-native.live");
+        let unmarked = applications.join("sail-681-native.unmarked");
+        let app = applications.join("GoLand.app");
+        for path in [&live, &unmarked, &app] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(live.join(MARKER), owner_identity().unwrap()).unwrap();
+        let pid = spawn_orphan(&fixture_binary(&live));
+        fixture_binary(&unmarked);
+        let unmarked_pid =
+            spawn_orphan(&unmarked.join("run/Sail Native Fixture.app/Contents/MacOS/sail"));
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep_native_roots(&home, future, |_| Some(false)).unwrap();
+        assert!(live.exists() && unmarked.exists() && app.exists());
+        assert!(alive(pid));
+        assert!(alive(unmarked_pid));
+        unsafe {
+            nix::libc::kill(pid, nix::libc::SIGKILL);
+            nix::libc::kill(unmarked_pid, nix::libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn a_missing_applications_directory_is_not_an_error() {
+        let home = fixture();
+        assert_eq!(
+            sweep_native_roots(&home, SystemTime::now(), |_| Some(false)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn native_roots_wait_for_the_idle_age() {
+        let home = fixture();
+        let root = home.join("Applications/sail-681-native.recent");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        let pid = spawn_orphan(&fixture_binary(&root));
+        sweep_native_roots(&home, SystemTime::now(), |_| Some(false)).unwrap();
+        assert!(root.exists());
+        assert!(alive(pid));
+        unsafe { nix::libc::kill(pid, nix::libc::SIGKILL) };
     }
 
     #[cfg(target_os = "macos")]

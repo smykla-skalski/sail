@@ -14,6 +14,7 @@ import { createServer } from 'node:net';
 import { isAbsolute, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import process from 'node:process';
+import { stopProcessesUnder } from '../scripts/native-test-process.mjs';
 
 const app = process.env.SAIL_E2E_APP;
 const config = process.env.SAIL_E2E_CONFIG_DIR;
@@ -480,6 +481,10 @@ try {
           /* Already exited. */
         }
       }
+  }
+  if (!(await stopProcessesUnder(app))) {
+    console.error('Fixture app processes did not exit');
+    process.exitCode = 1;
   }
   rmSync(scratch, { recursive: true, force: true });
   if (cleanupError) process.exitCode = 1;
