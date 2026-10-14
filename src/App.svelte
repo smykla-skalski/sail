@@ -256,7 +256,13 @@
   } from './lib/task-economics.ts';
   import DiffPanel from './DiffPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
-  import { createSidebarThreadLoader } from './lib/sidebar-inventory';
+  import {
+    createSidebarThreadLoader,
+    mergeSidebarRefreshPaths,
+    sidebarFocusRefreshDue,
+    unlistedSidebarPaths,
+    type SidebarRefreshPaths,
+  } from './lib/sidebar-inventory';
   import {
     clampSidebarWidth,
     parseSidebarWidth,
@@ -1733,6 +1739,10 @@
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
+  let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
+  let sidebarInventoryLastListing = 0;
+  // Directories already listed; only new ones are listed again without a focus change.
+  const sidebarListedDirectories = new SvelteSet<string>();
   const sidebarInventoryDelay = import.meta.env.MODE === 'e2e' ? 250 : 5_000;
   const foregroundAgentLoading = $derived.by(() =>
     leaves(paneLayout).some((pane) => pane.agent && agentEntrySnapshots[pane.id]?.ready !== true),
@@ -2606,7 +2616,8 @@
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
-    const sidebarRefreshTimer = setInterval(scheduleSidebarInventoryRefresh, 30_000);
+    window.addEventListener('focus', refreshSidebarOnFocus);
+    document.addEventListener('visibilitychange', refreshSidebarOnFocus);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
       if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading)
@@ -2629,7 +2640,8 @@
       clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
-      clearInterval(sidebarRefreshTimer);
+      window.removeEventListener('focus', refreshSidebarOnFocus);
+      document.removeEventListener('visibilitychange', refreshSidebarOnFocus);
       clearTimeout(sidebarInventoryTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
@@ -10932,6 +10944,7 @@
     const results = await request.finally(() => sidebarInventoryRequests.delete(request));
     if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
+    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories.add(path);
     const listed = new Set(paths);
     const retained = sidebarOpenCodeThreads.filter(
       (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
@@ -10957,19 +10970,31 @@
   let sidebarInventoryFailure = '';
 
   function reportSidebarInventoryFailure(failure: string | null) {
-    // The 30 s refresh must not re-raise the same failure over the user's current error.
+    // A repeated refresh must not re-raise the same failure over the user's current error.
     if (failure && failure !== sidebarInventoryFailure) error = failure;
     sidebarInventoryFailure = failure ?? '';
   }
 
-  function scheduleSidebarInventoryRefresh(delay = sidebarInventoryDelay) {
+  function scheduleSidebarInventoryRefresh(
+    delay = sidebarInventoryDelay,
+    paths?: string[] | 'all',
+  ) {
+    sidebarInventoryWaiting = mergeSidebarRefreshPaths(
+      sidebarInventoryTimer === undefined ? undefined : sidebarInventoryWaiting,
+      paths,
+    );
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryReadyKey = '';
     const key = sidebarDirectoryKey;
     const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
       sidebarInventoryTimer = undefined;
-      void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
+      sidebarInventoryLastListing = Date.now();
+      const directories: string[] = JSON.parse(sidebarDirectoryKey);
+      const wanted = sidebarInventoryWaiting;
+      sidebarInventoryWaiting = undefined;
+      const selected = wanted ? directories.filter((path) => wanted.has(path)) : directories;
+      void refreshSidebarOpenCodeThreads(selected.length > 0 ? selected : directories).then(
         (failure) => {
           reportSidebarInventoryFailure(failure);
           if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
@@ -10979,6 +11004,19 @@
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
     }, delay);
+  }
+
+  // OpenCode sessions made outside Sail appear when the window regains focus, not by polling.
+  function refreshSidebarOnFocus() {
+    if (
+      document.visibilityState === 'hidden' ||
+      sidebarInventoryTimer !== undefined ||
+      foregroundAgentLoading ||
+      !agentAvailability.some((agent) => agent.id === 'opencode' && agent.available) ||
+      !sidebarFocusRefreshDue(sidebarInventoryLastListing, Date.now())
+    )
+      return;
+    scheduleSidebarInventoryRefresh(sidebarInventoryDelay, 'all');
   }
 
   if (import.meta.env.MODE === 'e2e') {
@@ -11002,7 +11040,12 @@
       sidebarInventoryReadyKey = '';
       return;
     }
-    scheduleSidebarInventoryRefresh();
+    const fresh = unlistedSidebarPaths(JSON.parse(tracked), sidebarListedDirectories);
+    if (fresh.length === 0) {
+      if (sidebarInventoryTimer === undefined) sidebarInventoryReadyKey = tracked;
+      return;
+    }
+    scheduleSidebarInventoryRefresh(sidebarInventoryDelay, fresh);
   });
 
   function openAgent(agent: AgentId, thread: AgentThread | null = null, preserveCycle = false) {
@@ -12408,7 +12451,7 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
-      scheduleSidebarInventoryRefresh(250);
+      scheduleSidebarInventoryRefresh(250, [thread.directory]);
       return;
     }
     saveAgentThread(thread);

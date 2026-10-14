@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AgentThread } from '../src/lib/acp.ts';
-import { createSidebarThreadLoader } from '../src/lib/sidebar-inventory.ts';
+import {
+  createSidebarThreadLoader,
+  mergeSidebarRefreshPaths,
+  sidebarFocusRefreshDue,
+  unlistedSidebarPaths,
+} from '../src/lib/sidebar-inventory.ts';
 
 const firstThread: AgentThread = {
   agent: 'opencode',
@@ -182,3 +187,29 @@ await test(
     assert.deepEqual(recovered, [firstThread]);
   },
 );
+
+void test('focus refreshes only when the last listing is at least 30 s old', () => {
+  assert.equal(sidebarFocusRefreshDue(1_000, 20_000), false);
+  assert.equal(sidebarFocusRefreshDue(1_000, 31_000), true);
+  assert.equal(sidebarFocusRefreshDue(0, 5_000, 1_000), true);
+});
+
+void test('a catalog change lists only directories not listed before', () => {
+  const listed = new Set(['/repo', '/repo-wt-1']);
+  assert.deepEqual(unlistedSidebarPaths(['/repo', '/repo-wt-1', '/repo-wt-2'], listed), [
+    '/repo-wt-2',
+  ]);
+  assert.deepEqual(unlistedSidebarPaths(['/repo'], listed), []);
+});
+
+void test('queued refresh requests merge instead of replacing each other', () => {
+  const queued = mergeSidebarRefreshPaths(undefined, ['/a']);
+  assert.deepEqual([...(queued ?? [])], ['/a']);
+  assert.deepEqual([...(mergeSidebarRefreshPaths(queued, ['/b']) ?? [])], ['/a', '/b']);
+  // Postponing a queued refresh keeps its directories.
+  assert.deepEqual([...(mergeSidebarRefreshPaths(queued, undefined) ?? [])], ['/a']);
+  // A full refresh absorbs partial ones, and nothing queued means a full refresh.
+  assert.equal(mergeSidebarRefreshPaths(queued, 'all'), null);
+  assert.equal(mergeSidebarRefreshPaths(null, ['/a']), null);
+  assert.equal(mergeSidebarRefreshPaths(undefined, undefined), null);
+});
