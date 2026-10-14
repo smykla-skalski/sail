@@ -1626,6 +1626,16 @@
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
   }
 
+  function setSplitDetails(id: string, open: boolean) {
+    changesPanes = open
+      ? changesPanes.includes(id)
+        ? changesPanes
+        : [...changesPanes, id]
+      : changesPanes.filter((item) => item !== id);
+    if (id === focusedPane && window.matchMedia('(max-width: 850px)').matches)
+      mobileView = open ? 'details' : 'chat';
+  }
+
   async function toggleChanges() {
     if (focusedPane !== 'main') {
       const pane = leaves(paneLayout).find((item) => item.id === focusedPane);
@@ -1633,9 +1643,7 @@
         showShipRuns();
         return;
       }
-      changesPanes = changesPanes.includes(focusedPane)
-        ? changesPanes.filter((id) => id !== focusedPane)
-        : [...changesPanes, focusedPane];
+      setSplitDetails(focusedPane, !changesPanes.includes(focusedPane));
       return;
     }
     if (mainShipFallback) {
@@ -14152,9 +14160,7 @@
         activityReady={acpActivityReady}
         onstatus={updateAgentThreadStatus}
         onreplaychange={setAgentReplay}
-        onchanges={(id) => {
-          changesPanes = changesPanes.filter((item) => item !== id);
-        }}
+        onchanges={(id) => setSplitDetails(id, false)}
         {pendingCommands}
         oncommandstarted={(id) => {
           const next = { ...pendingCommands };

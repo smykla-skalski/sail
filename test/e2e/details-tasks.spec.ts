@@ -74,6 +74,62 @@ describe('Tasks default details tab', () => {
     );
   });
 
+  it('shows split details on mobile and returns to Chat for both close actions', async () => {
+    await browser.setWindowSize(1920, 1200);
+    await browser.execute((directory) => {
+      localStorage.clear();
+      localStorage.setItem('sai-directory', directory);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      );
+    }, realpathSync(repository));
+    await browser.refresh();
+    await chooseTopbarAction('New agent', 'Claude');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.keys(['Meta', 'd']);
+    await $('.pane-leaf.focused [data-pane-picker]').click();
+    await $('.pane-leaf.focused [data-agent-choice]:not(:disabled)').click();
+    await expect($('.pane-leaf.focused .agent-header')).toHaveText(
+      expect.stringContaining('Ready'),
+    );
+    await browser.setWindowSize(390, 600);
+    await $('.mobile-switcher button:nth-child(2)').click();
+    const details = $('.pane-leaf.focused .native-details');
+    const tasks = $('.pane-leaf.focused .native-details button[role="tab"]*=Tasks');
+    const chat = $('.pane-leaf.focused .agent-workspace');
+    async function openAndClose(closeWithButton: boolean) {
+      await toggleDetails();
+      await expect($('.app-shell')).toHaveAttribute('data-mobile-view', 'details');
+      await expect(details).toBeDisplayed();
+      await expect(tasks).toHaveAttribute('aria-selected', 'true');
+      await expect(chat).not.toBeDisplayed();
+      await $('.pane-leaf.focused .native-details button[role="tab"]*=Activity').click();
+      await expect(
+        $('.pane-leaf.focused .native-details button[role="tab"]*=Activity'),
+      ).toHaveAttribute('aria-selected', 'true');
+      if (closeWithButton)
+        await $('.pane-leaf.focused button[aria-label="Close agent details"]').click();
+      else await toggleDetails();
+      await expect($('.app-shell')).toHaveAttribute('data-mobile-view', 'chat');
+      await expect(details).not.toBeDisplayed();
+      await expect(chat).toBeDisplayed();
+    }
+    await openAndClose(false);
+    await openAndClose(true);
+    await $('.mobile-switcher button:nth-child(3)').click();
+    await expect(details).toBeDisplayed();
+    await expect(tasks).toHaveAttribute('aria-selected', 'true');
+    await toggleDetails();
+    await expect($('.app-shell')).toHaveAttribute('data-mobile-view', 'chat');
+    await expect(chat).toBeDisplayed();
+    await browser.execute(() => {
+      if (innerWidth !== 390) throw new Error(`Expected 390px viewport, received ${innerWidth}`);
+      if (document.documentElement.scrollWidth > innerWidth)
+        throw new Error('Mobile split details overflow the viewport');
+    });
+  });
+
   it('resets main and split details to Tasks on each open and preserves tab selection', async () => {
     await browser.setWindowSize(1920, 1200);
     await browser.execute((directory) => {
@@ -145,12 +201,12 @@ describe('Tasks default details tab', () => {
       localStorage.setItem('sai-session-tasks', JSON.stringify(saved));
     });
     await browser.refresh();
-    await $(`.pane-leaf[data-pane-id="${splitId}"] .agent-header`).click();
+    await $(`.pane-leaf[data-pane-id="${splitId}"] [data-pane-prompt]`).click();
     await toggleDetails();
     const taskList = $('.pane-leaf.focused .tasks-view');
     await expect(taskList).toHaveText(expect.stringContaining('Task 100'));
     await taskList.click();
-    await browser.keys(['Control', 'End']);
+    await browser.keys(['Meta', 'ArrowDown']);
     await browser.waitUntil(async () =>
       browser.execute(() => {
         const viewport = document.querySelector('.pane-leaf.focused .tasks-view')!;
