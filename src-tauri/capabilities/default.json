@@ -62,6 +62,7 @@
     "allow-run-shipping-setup",
     "allow-registered-worktrees",
     "allow-repository-worktrees",
+    "allow-worktree-cleanup-summary",
     "allow-worktree-removal-preview",
     "allow-restore-pending-worktree",
     "allow-retry-removed-worktree-overlay-cleanup",

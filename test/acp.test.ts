@@ -39,6 +39,24 @@ import { toolCommand } from '../src/lib/tool-display.ts';
 const normalizeEntries = (entries: AgentEntry[]) =>
   entries.map((entry) => (entry.type === 'tool' ? entry : { ...entry, id: entry.type }));
 
+void test('MCP reporting failures stay failed when the provider marks the call completed', () => {
+  const entries = updateEntries([], {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'report',
+    title: 'sail_tasks_report',
+    status: 'completed',
+    rawOutput: { isError: true, content: [{ type: 'text', text: 'Stale task revision' }] },
+  });
+  assert.equal(entries[0]?.type, 'tool');
+  assert.equal(entries[0]?.type === 'tool' && entries[0].status, 'failed');
+  const updated = updateEntries(entries, {
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'report',
+    status: 'completed',
+  });
+  assert.equal(updated[0]?.type === 'tool' && updated[0].status, 'failed');
+});
+
 void test('owned thread restore chooses the advertised provider mode', () => {
   assert.equal(acpRestoreMode({ sessionCapabilities: { resume: {} } }), 'resume');
   assert.equal(acpRestoreMode({ loadSession: true }), 'load');

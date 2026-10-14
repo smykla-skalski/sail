@@ -21,6 +21,14 @@ const SnapshotSchema = z.strictObject({
   revision: z.number().int().nonnegative(),
   tasks: z.array(TaskSchema).max(200),
   focus: z.string().nullable(),
+  reportedAt: z.number().finite().nonnegative().nullable().optional(),
+  reporting: z
+    .object({
+      turnId: z.string(),
+      state: z.enum(['awaiting', 'correcting', 'reported', 'missing', 'interrupted', 'failed']),
+      correctionRequested: z.boolean(),
+    })
+    .optional(),
 });
 export type TaskSnapshot = z.infer<typeof SnapshotSchema>;
 const SavedSchema = z.object({
@@ -39,8 +47,30 @@ export interface TaskStorage {
   read(): string | null;
   write(value: string): Promise<void>;
 }
-const empty = (): TaskSnapshot => ({ turnId: null, revision: 0, tasks: [], focus: null });
+const empty = (): TaskSnapshot => ({
+  turnId: null,
+  revision: 0,
+  tasks: [],
+  focus: null,
+  reportedAt: null,
+});
 const storageKey = 'sai-session-tasks';
+type TurnOutcome = 'done' | 'interrupted' | 'failed';
+type FinishedTurn = { turnId: string; status: TurnOutcome };
+
+function settledReporting(snapshot: TaskSnapshot, outcome: TurnOutcome) {
+  return (
+    snapshot.reporting && {
+      ...snapshot.reporting,
+      state:
+        snapshot.reporting.state === 'reported'
+          ? ('reported' as const)
+          : snapshot.reporting.correctionRequested || outcome === 'done'
+            ? ('missing' as const)
+            : outcome,
+    }
+  );
+}
 
 export function createTaskStore(storage: TaskStorage, clock = Date.now) {
   let sessions = new Map<string, Saved>();
@@ -60,7 +90,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
   const snapshot = (scope: TaskScope): TaskSnapshot =>
     structuredClone(sessions.get(taskScopeKey(scope))?.snapshot ?? empty());
 
-  function serialize(operation: () => Promise<TaskSnapshot>): Promise<TaskSnapshot> {
+  function serialize<T>(operation: () => Promise<T>): Promise<T> {
     const pending = writes.catch(() => undefined).then(operation);
     writes = pending.then(
       () => undefined,
@@ -95,6 +125,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
       scope: TaskScope,
       activeTurnId: string | null,
       expectedRevision = snapshot(scope).revision,
+      finished?: FinishedTurn,
     ) {
       const observed = snapshot(scope);
       return serialize(async () => {
@@ -110,7 +141,12 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           ...before,
           turnId: null,
           focus: null,
+          reportedAt: null,
           revision: before.revision + 1,
+          reporting: settledReporting(
+            before,
+            finished?.turnId === before.turnId ? finished.status : 'interrupted',
+          ),
         });
       });
     },
@@ -119,7 +155,21 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
         const before = snapshot(scope);
         if (before.turnId === turnId) {
           localTurns.set(taskScopeKey(scope), turnId);
-          return before;
+          if (before.reporting) return before;
+          return commit(scope, {
+            ...before,
+            revision: before.revision + 1,
+            reporting: {
+              turnId,
+              state: before.tasks.some(
+                (task) =>
+                  task.turnId === turnId && (task.origin === 'agent' || task.status === 'done'),
+              )
+                ? 'reported'
+                : 'awaiting',
+              correctionRequested: false,
+            },
+          });
         }
         if (before.turnId) throw new Error('This session already has an active task turn.');
         const task: SessionTask = {
@@ -134,6 +184,13 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           revision: before.revision + 1,
           tasks: [...before.tasks.filter((item) => item.id !== task.id).slice(-199), task],
           focus: task.id,
+          reportedAt: null,
+          reporting: {
+            turnId,
+            state: 'awaiting',
+            correctionRequested:
+              before.reporting?.turnId === turnId && before.reporting.correctionRequested,
+          },
         });
         localTurns.set(taskScopeKey(scope), turnId);
         return started;
@@ -183,10 +240,33 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           revision: before.revision + 1,
           tasks: [...history, ...current],
           focus: report.focus,
+          reportedAt: clock(),
+          reporting: {
+            turnId: report.turnId,
+            state: 'reported',
+            correctionRequested: before.reporting?.correctionRequested ?? false,
+          },
         });
       });
     },
-    finish(scope: TaskScope, turnId: string) {
+    requestCorrection(scope: TaskScope, turnId: string) {
+      return serialize(async () => {
+        const before = snapshot(scope);
+        if (
+          before.turnId !== turnId ||
+          before.reporting?.state !== 'awaiting' ||
+          before.reporting.correctionRequested
+        )
+          return false;
+        await commit(scope, {
+          ...before,
+          revision: before.revision + 1,
+          reporting: { turnId, state: 'correcting', correctionRequested: true },
+        });
+        return true;
+      });
+    },
+    finish(scope: TaskScope, turnId: string, outcome: TurnOutcome = 'done') {
       return serialize(async () => {
         const before = snapshot(scope);
         if (before.turnId !== turnId) return before;
@@ -195,7 +275,9 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           ...before,
           turnId: null,
           focus: null,
+          reportedAt: null,
           revision: before.revision + 1,
+          reporting: settledReporting(before, outcome),
         });
       });
     },

@@ -203,3 +203,166 @@ await test('resuming a saved task turn takes local ownership before backend regi
   assert.equal(restored.snapshot(scope).turnId, 'turn');
   assert.equal(restored.snapshot(scope).tasks.length, 1);
 });
+
+await test('missing reports allow one durable correction and remain explicit after completion', async () => {
+  const { store, storage } = fixture();
+  await store.start(scope, 'turn');
+  const claims = await Promise.all([
+    store.requestCorrection(scope, 'turn'),
+    store.requestCorrection(scope, 'turn'),
+  ]);
+  assert.deepEqual(claims, [true, false]);
+  const restored = createTaskStore(storage);
+  assert.equal(await restored.requestCorrection(scope, 'turn'), false);
+  assert.equal(restored.snapshot(scope).reporting?.state, 'correcting');
+  await restored.finish(scope, 'turn');
+  const completed = createTaskStore(storage).snapshot(scope);
+  assert.equal(completed.reporting?.state, 'missing');
+  assert.equal(completed.tasks[0]?.origin, 'sail');
+  assert.equal(completed.tasks[0]?.status, 'in_progress');
+  assert.equal(completed.focus, null);
+});
+
+await test('a successful empty report counts as reported and prevents correction', async () => {
+  const { store } = fixture();
+  await store.start(scope, 'turn');
+  await store.report(scope, { turnId: 'turn', expectedRevision: 1, tasks: [], focus: null });
+  assert.equal(await store.requestCorrection(scope, 'turn'), false);
+  await store.finish(scope, 'turn');
+  assert.equal(store.snapshot(scope).reporting?.state, 'reported');
+});
+
+await test('reporting failures do not count as progress, and a correction can recover', async () => {
+  const { store, fail, recover } = fixture();
+  await store.start(scope, 'turn');
+  fail();
+  await assert.rejects(store.report(scope, report('turn', 1)), /disk full/);
+  assert.equal(store.snapshot(scope).reporting?.state, 'awaiting');
+  await assert.rejects(store.requestCorrection(scope, 'turn'), /disk full/);
+  recover();
+  assert.equal(await store.requestCorrection(scope, 'turn'), true);
+  await assert.rejects(store.report(scope, report('turn', 1)), /Stale/);
+  const accepted = await store.report(scope, report('turn', 2));
+  assert.equal(accepted.reporting?.state, 'reported');
+  assert.equal(accepted.reporting?.correctionRequested, true);
+  await store.finish(scope, 'turn');
+  assert.equal(store.snapshot(scope).reporting?.state, 'reported');
+});
+
+await test('failed, interrupted and orphan turns never permit a corrective request', async () => {
+  await Promise.all(
+    (['failed', 'interrupted'] as const).map(async (outcome) => {
+      const { store, storage } = fixture();
+      await store.start(scope, 'turn');
+      await store.finish(scope, 'turn', outcome);
+      assert.equal(await store.requestCorrection(scope, 'turn'), false);
+      assert.equal(createTaskStore(storage).snapshot(scope).reporting?.state, outcome);
+    }),
+  );
+  const { store, storage } = fixture();
+  await store.start(scope, 'orphan');
+  const restored = createTaskStore(storage);
+  await restored.reconcile(scope, null);
+  assert.equal(await restored.requestCorrection(scope, 'orphan'), false);
+  assert.equal(restored.snapshot(scope).reporting?.state, 'interrupted');
+});
+
+await test('a new turn resets reporting without accepting another turn or session', async () => {
+  const { store } = fixture();
+  await store.start(scope, 'turn');
+  assert.equal(await store.requestCorrection({ ...scope, sessionId: 'other' }, 'turn'), false);
+  assert.equal(await store.requestCorrection(scope, 'other'), false);
+  await store.requestCorrection(scope, 'turn');
+  await store.finish(scope, 'turn', 'failed');
+  assert.equal(store.snapshot(scope).reporting?.state, 'missing');
+  await store.start(scope, 'next');
+  assert.deepEqual(store.snapshot(scope).reporting, {
+    turnId: 'next',
+    state: 'awaiting',
+    correctionRequested: false,
+  });
+  assert.equal(await store.requestCorrection(scope, 'next'), true);
+});
+
+await test('restoring a legacy active turn creates a missing-report marker', async () => {
+  const storage = {
+    read: () =>
+      JSON.stringify([
+        {
+          scope,
+          updated: 0,
+          snapshot: {
+            turnId: 'legacy',
+            revision: 1,
+            focus: 'sail:legacy',
+            tasks: [
+              {
+                id: 'sail:legacy',
+                title: 'Starting task',
+                status: 'in_progress',
+                origin: 'sail',
+                turnId: 'legacy',
+              },
+            ],
+          },
+        },
+      ]),
+    write: async () => {},
+  };
+  const store = createTaskStore(storage);
+  await store.start(scope, 'legacy');
+  assert.equal(await store.requestCorrection(scope, 'legacy'), true);
+});
+
+await test('restarting the same logical turn cannot repeat its corrective request', async () => {
+  const { store } = fixture();
+  await store.start(scope, 'turn');
+  await store.requestCorrection(scope, 'turn');
+  await store.finish(scope, 'turn');
+  await store.start(scope, 'turn');
+  assert.equal(await store.requestCorrection(scope, 'turn'), false);
+});
+
+await test('restoration retains missing status after a correction completed off screen', async () => {
+  const { store, storage } = fixture();
+  await store.start(scope, 'turn');
+  await store.requestCorrection(scope, 'turn');
+  const restored = createTaskStore(storage);
+  await restored.reconcile(scope, null, store.snapshot(scope).revision, {
+    turnId: 'turn',
+    status: 'done',
+  });
+  assert.equal(restored.snapshot(scope).turnId, null);
+  assert.equal(restored.snapshot(scope).reporting?.state, 'missing');
+  assert.equal(restored.snapshot(scope).reporting?.correctionRequested, true);
+  assert.equal(createTaskStore(storage).snapshot(scope).reporting?.state, 'missing');
+});
+
+await test('restoration uses only matching completed outcomes and preserves reported work', async () => {
+  const outcomes = ['done', 'failed', 'interrupted'] as const;
+  await Promise.all(
+    outcomes.map(async (status) => {
+      const { store, storage } = fixture();
+      await store.start(scope, 'turn');
+      const restored = createTaskStore(storage);
+      await restored.reconcile(scope, null, 1, { turnId: 'turn', status });
+      assert.equal(
+        restored.snapshot(scope).reporting?.state,
+        status === 'done' ? 'missing' : status,
+      );
+    }),
+  );
+  const { store, storage } = fixture();
+  await store.start(scope, 'turn');
+  const restored = createTaskStore(storage);
+  await restored.reconcile(scope, null, 1, { turnId: 'older', status: 'done' });
+  assert.equal(restored.snapshot(scope).reporting?.state, 'interrupted');
+  await restored.start(scope, 'next');
+  await restored.report(scope, report('next', restored.snapshot(scope).revision));
+  const reported = createTaskStore(storage);
+  await reported.reconcile(scope, null, restored.snapshot(scope).revision, {
+    turnId: 'next',
+    status: 'done',
+  });
+  assert.equal(reported.snapshot(scope).reporting?.state, 'reported');
+});

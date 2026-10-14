@@ -216,7 +216,7 @@
     ) => void;
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
-    onnativeplan?: (plan: NativePlan | null) => void;
+    onnativeplan?: (plan: NativePlan | null, live?: boolean) => void;
     planRevision?: { id: string; feedback: string };
     onplanrevisionresult?: (id: string, failure: string | null) => void;
     ondecision?: (thread: AgentThread, permission: AgentPermission, optionId: string) => void;
@@ -741,6 +741,7 @@
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
   let recoveringPromptTurnId: string | null = null;
+  let dispatchingPromptTurnId: string | null = null;
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
   // What the user sees: a turn the app already marked finished no longer reads busy, so the
   // header, the working row and the pickers settle together.
@@ -749,7 +750,7 @@
     agentHeaderStatus({
       connecting,
       ready,
-      waiting: permissions.length > 0,
+      waiting: permissions.length > 0 || elicitations.length > 0,
       sending: busy && !turnEnded,
       hasSession: !!activeSessionId,
       running,
@@ -1053,7 +1054,7 @@
       saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
     if (activeSessionId && !replay.active)
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
-    onnativeplan?.(nativePlan);
+    onnativeplan?.(nativePlan, !replay.active);
     if (replay.active) {
       // ACP does not identify live updates interleaved with session/load replay (#342).
       // A mutable running flag cannot establish provenance for old failed tools.
@@ -1470,16 +1471,18 @@
           }
         };
         const needsReplay = restoreMode === 'load';
-        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
-        if (current !== generation) return;
-        attachedCodexSession =
-          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
-        const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+        const [activity, reservation] = await Promise.all([
+          acp.activity(directory).catch(() => null),
+          acp.beginRestore(agent, directory, id, activeCapabilityProfile),
+        ]);
+        const runtime = activity?.[agent];
         if (current !== generation) {
           if (reservation.restoreToken)
             await acp.endRestore(agent, directory, id, reservation.restoreToken);
           return;
         }
+        attachedCodexSession =
+          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
         if (reservation.liveTurn) {
           await showLiveTurn(reservation.liveTurn, reservation);
         } else if (liveView && attachedCodexSession) {
@@ -1535,18 +1538,18 @@
             updateSkills(session.availableCommands);
           if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         }
-        const waiting = await fencedAcpPermissionInventory(
-          () => acp.pendingPermissions(agent, directory, id),
-          () => permissionInventoryRevision,
-          () => current === generation && activeSessionId === id,
-        );
-        if (waiting) for (const request of waiting) queuePermission(request);
-        const pendingElicitations = await acp
-          .pendingElicitations(agent, directory, id, activeCapabilityProfile)
-          .then(
+        const [waiting, pendingElicitations] = await Promise.all([
+          fencedAcpPermissionInventory(
+            () => acp.pendingPermissions(agent, directory, id),
+            () => permissionInventoryRevision,
+            () => current === generation && activeSessionId === id,
+          ),
+          acp.pendingElicitations(agent, directory, id, activeCapabilityProfile).then(
             (requests) => ({ requests, available: true }),
             () => ({ requests: [], available: false }),
-          );
+          ),
+        ]);
+        if (waiting) for (const request of waiting) queuePermission(request);
         if (current === generation && activeSessionId === id && pendingElicitations.available) {
           const pendingIDs = new Set(
             pendingElicitations.requests.flatMap((request) =>
@@ -2120,8 +2123,9 @@
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
           recoverMissingCodexSession(
             turnAgent,
-            () =>
-              acp.prompt(
+            () => {
+              dispatchingPromptTurnId = turnId;
+              return acp.prompt(
                 turnAgent,
                 directory,
                 id!,
@@ -2130,7 +2134,8 @@
                 promptImagePaths(sentImages, sentClipboard),
                 undefined,
                 true,
-              ),
+              );
+            },
             async () => {
               recoveringPromptTurnId = turnId;
               if (current === generation) turnEnded = false;
@@ -2251,6 +2256,7 @@
       if (external && !queuedMessage && !delivered) throw cause;
     } finally {
       if (recoveringPromptTurnId === turnId) recoveringPromptTurnId = null;
+      if (dispatchingPromptTurnId === turnId) dispatchingPromptTurnId = null;
       releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
         inFlightSteer.finish();
@@ -2529,11 +2535,14 @@
     const current = generation;
     const sessionId = activeSessionId;
     const pending = permissions;
-    let cancelSent = false;
+    const cancelAgent = liveTurn || dispatchingPromptTurnId === activeTurnId;
+    let cancelSent = !cancelAgent;
     try {
-      await acp.cancel(agent, directory, sessionId, activeTurnId);
-      cancelSent = true;
-      // Cancelling the session already settles its pending requests in the backend.
+      if (cancelAgent) {
+        await acp.cancel(agent, directory, sessionId, activeTurnId);
+        cancelSent = true;
+      }
+      // Local cancellation can precede backend prompt dispatch, so settle any visible requests too.
       await Promise.all(
         pending.map((permission) =>
           acp
@@ -2880,6 +2889,11 @@
           {#if taskSnapshot?.tasks.length}<details class="session-tasks">
               <summary>Tasks ({taskSnapshot.tasks.length})</summary><TasksPanel
                 snapshot={taskSnapshot}
+                status={visibleStatus === 'waiting'
+                  ? 'waiting'
+                  : visibleStatus === 'working'
+                    ? 'working'
+                    : null}
               />
             </details>{/if}
           {#if nativePlan}<section class="native-plan" aria-label="Native plan">

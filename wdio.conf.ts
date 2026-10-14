@@ -9,6 +9,7 @@ import {
   PrivateEndpointGuard,
 } from './test/e2e-isolation.ts';
 import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
+import { assertNativeWebviews } from './test/e2e/native-preconditions.ts';
 
 const limitEnvironment = { ...process.env };
 const jobs = new E2eJobQueue(undefined, () => e2eJobLimit(limitEnvironment));
@@ -64,6 +65,11 @@ function failClosedSetup(setup: () => Promise<void>): () => Promise<void> {
       await setup();
     } catch (error) {
       const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      if (process.env.SAIL_E2E_SETUP_REPORT)
+        writeFileSync(
+          process.env.SAIL_E2E_SETUP_REPORT,
+          JSON.stringify({ status: 'failed', precondition: 'fixture/webview setup', detail }),
+        );
       writeSync(2, `Fatal E2E fixture reset: ${detail}\n`);
       process.exit(1);
     }
@@ -114,6 +120,12 @@ export const config = {
   before: failClosedSetup(async () => {
     await browser.switchToWindow('main');
     await browser.setWindowSize(1280, 850);
+    if (process.env.SAIL_NATIVE_RUN_ID)
+      await browser.execute(async (runId) => {
+        const stored = localStorage.getItem('sail-native-run-sentinel');
+        if (stored && stored !== runId)
+          throw new Error('Native precondition: webview state leaked from an earlier run');
+      }, process.env.SAIL_NATIVE_RUN_ID);
     await browser.execute(async () => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
       const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
@@ -207,6 +219,10 @@ export const config = {
       if (typeof invoke !== 'function') throw new Error('Tauri API missing; cannot pin appearance');
       await invoke('plugin:window|set_theme', { label: 'main', value });
     }, e2eAppearance);
+    if (process.env.SAIL_E2E_SETUP_REPORT) {
+      await assertNativeWebviews();
+      writeFileSync(process.env.SAIL_E2E_SETUP_REPORT, JSON.stringify({ status: 'ready' }));
+    }
   }),
   onComplete() {
     jobs.release();

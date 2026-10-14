@@ -223,7 +223,7 @@ function callContextProvider(server, callback) {
   );
 }
 
-function reportSessionTasks(server, callback) {
+function reportSessionTasks(server, callback, focusDuration = 1500, onFocus = () => {}) {
   const child = spawn(server.command, server.args ?? [], {
     env: {
       ...process.env,
@@ -263,6 +263,7 @@ function reportSessionTasks(server, callback) {
           focus: 'smoke',
         });
       } else if (response.id === 3) {
+        onFocus();
         snapshot = JSON.parse(response.result.content[0].text);
         setTimeout(
           () =>
@@ -272,7 +273,7 @@ function reportSessionTasks(server, callback) {
               tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'done' }],
               focus: null,
             }),
-          1500,
+          focusDuration,
         );
       } else if (response.id === 4) finish('Task reporting passed');
     } catch (error) {
@@ -620,17 +621,89 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
-    if (text === 'Report session tasks') {
+    const reportingFixture = sessions.get(sessionId);
+    if (text.startsWith('Task reporting fixture:')) {
+      reportingFixture.reportingMode = text.split(': ')[1];
+      const guidance = message.params.prompt.some((part) =>
+        part.text?.startsWith('Sail Tasks: For this turn'),
+      );
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: guidance ? 'Task guidance received.' : 'Task guidance missing.',
+        },
+      });
+      if (reportingFixture.reportingMode === 'interrupted') {
+        send({ id: message.id, result: { stopReason: 'cancelled' } });
+      } else if (reportingFixture.reportingMode === 'failed') {
+        send({ id: message.id, error: { code: -1, message: 'Reporting fixture failed' } });
+      } else {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }
+      continue;
+    }
+    if (text.startsWith('Sail did not receive a successful task report')) {
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'One task correction received.' },
+      });
+      if (reportingFixture.reportingMode === 'recover') {
+        const server = reportingFixture.mcpServers.find((item) => item.name === 'sail-browser');
+        reportSessionTasks(server, (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        });
+      } else send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (
+      text === 'Report session tasks' ||
+      text === 'Report session focus' ||
+      text === 'Report focus then ask'
+    ) {
       const server = sessions
         .get(sessionId)
         .mcpServers.find((item) => item.name === 'sail-browser');
-      reportSessionTasks(server, (result) => {
-        recordUpdate(sessionId, sessionId, {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: result },
-        });
-        send({ id: message.id, result: { stopReason: 'end_turn' } });
-      });
+      reportSessionTasks(
+        server,
+        (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        text === 'Report session tasks' ? 1500 : 12_000,
+        () => {
+          if (text !== 'Report focus then ask') return;
+          const id = ++nextPermission;
+          elicitations.set(id, { sessionId, promptId: message.id });
+          setTimeout(
+            () =>
+              send({
+                id,
+                method: 'elicitation/create',
+                params: {
+                  sessionId,
+                  mode: 'form',
+                  message: 'Choose the delivery approach',
+                  requestedSchema: {
+                    type: 'object',
+                    properties: {
+                      approach: { type: 'string', enum: ['safe', 'fast'], default: 'safe' },
+                    },
+                    required: ['approach'],
+                  },
+                },
+              }),
+            1000,
+          );
+        },
+      );
       continue;
     }
     if (text === 'Long owned history') {

@@ -1,3 +1,4 @@
+import type { AgentFocusDisplay } from './agent-focus.ts';
 import type { AgentThread } from './acp.ts';
 import type { AgentUsage, RateWindow } from './agent-usage.ts';
 import type { AttentionMap, ThreadStatus } from './attention.ts';
@@ -15,6 +16,7 @@ export type AgentStatusItem = {
   context?: number;
   rates: RateWindow[];
   updated: number;
+  focus?: AgentFocusDisplay;
 };
 
 export type AgentStatusInput = {
@@ -24,6 +26,7 @@ export type AgentStatusInput = {
   agentNames: Record<string, string>;
   usage: Record<string, AgentUsage>;
   rates: Record<string, RateWindow[]>;
+  focusByThread?: Record<string, AgentFocusDisplay>;
 };
 
 const priority: Record<ThreadStatus, number> = {
@@ -59,6 +62,7 @@ export function buildAgentStatusItems(input: AgentStatusInput): AgentStatusItem[
           ...(context === undefined ? {} : { context }),
           rates: input.rates[thread.agent] ?? [],
           updated: thread.updated,
+          focus: input.focusByThread?.[key],
         },
       ];
     })

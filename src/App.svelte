@@ -27,10 +27,18 @@
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import { agentFocusDisplay, type AgentFocusDisplay } from './lib/agent-focus';
   import TasksPanel from './TasksPanel.svelte';
-  import { sessionTasks, TASK_TOOLS } from './lib/session-tasks';
+  import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
+  import { sessionTasks, TASK_TOOLS, taskScopeKey } from './lib/session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
-  import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import {
+    acpPlanBackend,
+    acpPlans,
+    planKey,
+    type PlanChange,
+    type PlanScope,
+  } from './lib/acp-plans';
   import { updateReplayingAgentSessions } from './lib/agent-replay';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
@@ -858,6 +866,7 @@
       | 'task_evidence_record'
       | 'sail_tasks_read'
       | 'sail_tasks_report'
+      | 'sail_task_report_check'
       | 'sail_plan_propose'
       | 'sail_plan_ask'
       | 'sail_plan_step'
@@ -1165,13 +1174,32 @@
         ]),
     ),
   );
+  let focusActiveTurns = $state<Record<string, string>>({});
+  let focusByThread = $derived.by(() => {
+    void tasksTick;
+    const result: Record<string, AgentFocusDisplay> = {};
+    for (const thread of [...agentStatusThreads, ...Object.values(sidebarThreads).flat()]) {
+      const key = threadKey(thread);
+      const focus = agentFocusDisplay(
+        sessionTasks().snapshot(thread),
+        agentStatusStatuses[key] ?? taskOverviewStatuses[key] ?? null,
+        focusActiveTurns[key] ?? null,
+      );
+      if (focus) result[key] = focus;
+    }
+    return result;
+  });
   let taskOverviewAgentNames = $derived(
     Object.fromEntries([
       ['opencode', 'OpenCode'],
       ...agentAvailability.map((agent) => [agent.id, agent.name]),
     ]),
   );
-  let agentStatusThreads = $derived([...agentThreads, ...sidebarOpenCodeThreads]);
+  let agentStatusThreads = $derived([
+    ...agentThreads,
+    ...nativeChildThreads,
+    ...sidebarOpenCodeThreads,
+  ]);
   let agentStatusStatuses = $derived(
     Object.fromEntries(
       agentStatusThreads.map((thread) => [
@@ -1194,6 +1222,7 @@
       agentNames: taskOverviewAgentNames,
       usage: agentUsage,
       rates: agentRates,
+      focusByThread,
     }),
   );
   let sidebarDirectoryKey = $derived(
@@ -1488,7 +1517,7 @@
   let diffError = $state('');
   let selectedFilePath = $state<string | null>(null);
   type SideTab = 'tasks' | 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
-  let sideTab = $state<SideTab>('plan');
+  let sideTab = $state<SideTab>('tasks');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
   let diffRevision = '';
@@ -1580,6 +1609,7 @@
       }
     }
     if (acpAgent && focusedPane === 'main') {
+      if (view === 'details' && !agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     }
@@ -1610,12 +1640,22 @@
     if (tab === 'changes' && acpAgent) void refreshAgentDiff();
   }
 
-  function revealMainPlan(scope: PlanScope, reason: string) {
+  function revealMainPlan(scope: PlanScope, reason: PlanChange['reason']) {
     if (!acpPlanScope || planKey(scope) !== planKey(acpPlanScope)) return;
-    if (!['proposed', 'questions', 'amended', 'checkpoint', 'done'].includes(reason)) return;
+    if (!revealsPlanReview(reason)) return;
     sideTab = 'plan';
     agentChangesOpen = true;
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+  }
+
+  function setSplitDetails(id: string, open: boolean) {
+    changesPanes = open
+      ? changesPanes.includes(id)
+        ? changesPanes
+        : [...changesPanes, id]
+      : changesPanes.filter((item) => item !== id);
+    if (id === focusedPane && window.matchMedia('(max-width: 850px)').matches)
+      mobileView = open ? 'details' : 'chat';
   }
 
   async function toggleChanges() {
@@ -1625,9 +1665,7 @@
         showShipRuns();
         return;
       }
-      changesPanes = changesPanes.includes(focusedPane)
-        ? changesPanes.filter((id) => id !== focusedPane)
-        : [...changesPanes, focusedPane];
+      setSplitDetails(focusedPane, !changesPanes.includes(focusedPane));
       return;
     }
     if (mainShipFallback) {
@@ -1635,15 +1673,10 @@
       return;
     }
     if (acpAgent) {
-      if (agentChangesOpen && activeSideTab === 'ship') {
-        sideTab = 'changes';
-        void refreshAgentDiff();
-        return;
-      }
+      if (!agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = !agentChangesOpen;
       if (window.matchMedia('(max-width: 850px)').matches)
         mobileView = agentChangesOpen ? 'details' : 'chat';
-      if (agentChangesOpen) void refreshAgentDiff();
       return;
     }
     toggleShipRuns();
@@ -1689,6 +1722,10 @@
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
+  const sidebarInventoryDelay = import.meta.env.MODE === 'e2e' ? 250 : 5_000;
+  const foregroundAgentLoading = $derived.by(() =>
+    leaves(paneLayout).some((pane) => pane.agent && agentEntrySnapshots[pane.id]?.ready !== true),
+  );
   let agentDetectionSettled = false;
   let projectLoadGeneration = 0;
 
@@ -5388,10 +5425,10 @@
             if (issue.error !== pendingNotice) await update({ error: pendingNotice });
             return;
           }
-          let preview: WorktreeRemovalPreview[] = [];
+          let preview: WorktreeCleanupSummary[] = [];
           let previewFailure: string | null = null;
           try {
-            preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+            preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
               repository: run.repository,
               paths: targets.map((worktree) => worktree.path),
             });
@@ -5420,7 +5457,7 @@
               {
                 originalPath: worktree.path,
                 recoveryPath: worktree.path,
-                sizeBytes: state?.sizeBytes ?? null,
+                sizeBytes: null,
                 registeredWorktreesAtMark: registered.map(
                   ({ path: registeredPath, generation }) => ({
                     path: registeredPath,
@@ -5429,15 +5466,13 @@
                 ),
                 reason:
                   previewFailure ??
-                  (state.inspectionError
-                    ? `Cannot verify checkout contents: ${state.inspectionError}`
-                    : state.dirty
-                      ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-                      : state.activeSessions.length
-                        ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-                        : index === 0
-                          ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
-                          : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
+                  (state.dirty
+                    ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                    : state.activeSessions.length
+                      ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+                      : index === 0
+                        ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
+                        : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
               },
               worktree.generation,
             );
@@ -6584,15 +6619,21 @@
       request.sessionId,
     );
     const requestedTool =
-      request.name === 'capability_check' && typeof request.arguments.tool === 'string'
-        ? request.arguments.tool
-        : request.name;
+      request.name === 'sail_task_report_check'
+        ? TASK_TOOLS.read
+        : request.name === 'capability_check' && typeof request.arguments.tool === 'string'
+          ? request.arguments.tool
+          : request.name;
     if (!capabilityProfileEnablesTool(effectiveProfile, requestedTool))
       throw new Error(
         `${requestedTool} is unavailable under the ${effectiveProfile} capability profile.`,
       );
     if (request.name === 'capability_check') return { profile: effectiveProfile };
-    if (request.name === TASK_TOOLS.read || request.name === TASK_TOOLS.report) {
+    if (
+      request.name === TASK_TOOLS.read ||
+      request.name === TASK_TOOLS.report ||
+      request.name === 'sail_task_report_check'
+    ) {
       const scope = {
         agent: source.agent,
         directory: request.directory,
@@ -6602,7 +6643,16 @@
       const runtime = (await acp.activity(request.directory))[source.agent];
       if (runtime?.activeTurns[request.sessionId] !== request.arguments.turnId)
         throw new Error('Task report belongs to an inactive or different turn.');
-      return sessionTasks().report(scope, request.arguments);
+      if (request.name === 'sail_task_report_check') {
+        if (typeof request.arguments.turnId !== 'string') throw new Error('Missing task turn.');
+        return {
+          needsCorrection: await sessionTasks().requestCorrection(scope, request.arguments.turnId),
+        };
+      }
+      const snapshot = await sessionTasks().report(scope, request.arguments);
+      if (snapshot.turnId)
+        focusActiveTurns = { ...focusActiveTurns, [taskScopeKey(scope)]: snapshot.turnId };
+      return snapshot;
     }
     if (isPlanTool(request.name)) {
       return acpPlans().runTool(
@@ -9066,6 +9116,11 @@
     inspectionError: string | null;
   };
 
+  type WorktreeCleanupSummary = Pick<
+    WorktreeRemovalPreview,
+    'path' | 'branch' | 'generation' | 'dirty' | 'activeSessions'
+  >;
+
   function pendingRecoveryFromError(cause: unknown): PendingWorktreeCleanup | null {
     const message = describe(cause);
     const prefix = 'SAIL_PENDING_RECOVERY:';
@@ -9146,6 +9201,7 @@
     }
     deletingWorktreeRepositories.add(repository);
     deletingWorktreeRequests.add(path);
+    worktreeDeletions = { ...worktreeDeletions, [path]: 'Inspecting worktree' };
     try {
       const canonicalCatalog = await canonicalizedProjectCatalog(repository);
       if (canonicalCatalog !== projectCatalog) saveProjectCatalog(canonicalCatalog);
@@ -9183,6 +9239,11 @@
     } finally {
       deletingWorktreeRequests.delete(path);
       deletingWorktreeRepositories.delete(repository);
+      if (worktreeDeletions[path] === 'Inspecting worktree') {
+        const remaining = { ...worktreeDeletions };
+        delete remaining[path];
+        worktreeDeletions = remaining;
+      }
     }
   }
 
@@ -9204,7 +9265,7 @@
       error = 'Another descendant deletion is in progress. Retry after it finishes.';
       return;
     }
-    const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+    const preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
       repository,
       paths: targets.map((worktree) => worktree.path),
     });
@@ -9225,11 +9286,10 @@
     const lines = targets.map((worktree, index) => {
       const state = preview[index];
       const warnings = [
-        state.inspectionError ? 'files cannot be fully inspected' : null,
         state.dirty ? 'uncommitted changes' : null,
         state.activeSessions.length ? `connected: ${state.activeSessions.join(', ')}` : null,
       ].filter(Boolean);
-      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}\n  Revision: ${state.revision}\n  Retained size: ${state.sizeBytes === null ? 'unknown' : `${state.sizeBytes} bytes`}`;
+      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}`;
     });
     const e2eAnswer =
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
@@ -9256,13 +9316,11 @@
       // original path and removal snapshot must survive marking its parent.
       if (worktree.pendingCleanup) continue;
       const state = preview[index];
-      const reason = state.inspectionError
-        ? `Cannot verify checkout contents: ${state.inspectionError}`
-        : state.dirty
-          ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-          : state.activeSessions.length
-            ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-            : 'Awaiting explicit confirmation that this worktree is unused.';
+      const reason = state.dirty
+        ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+        : state.activeSessions.length
+          ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+          : 'Awaiting explicit confirmation that this worktree is unused.';
       pendingCatalog = markWorktreeCleanupPending(
         pendingCatalog,
         repository,
@@ -9270,7 +9328,7 @@
         {
           originalPath: worktree.path,
           recoveryPath: worktree.path,
-          sizeBytes: state.sizeBytes,
+          sizeBytes: null,
           registeredWorktreesAtMark: registered.map(({ path: registeredPath, generation }) => ({
             path: registeredPath,
             generation,
@@ -10744,7 +10802,7 @@
     sidebarInventoryFailure = failure ?? '';
   }
 
-  function scheduleSidebarInventoryRefresh() {
+  function scheduleSidebarInventoryRefresh(delay = sidebarInventoryDelay) {
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryReadyKey = '';
     const key = sidebarDirectoryKey;
@@ -10760,7 +10818,7 @@
         },
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
-    }, 250);
+    }, delay);
   }
 
   if (import.meta.env.MODE === 'e2e') {
@@ -10776,11 +10834,20 @@
   $effect(() => {
     const tracked = sidebarDirectoryKey;
     const available = agentAvailability.some((agent) => agent.id === 'opencode' && agent.available);
-    if (tracked && available) scheduleSidebarInventoryRefresh();
+    const loading = foregroundAgentLoading;
+    if (!tracked || !available) return;
+    if (loading) {
+      clearTimeout(sidebarInventoryTimer);
+      sidebarInventoryTimer = undefined;
+      sidebarInventoryReadyKey = '';
+      return;
+    }
+    scheduleSidebarInventoryRefresh();
   });
 
   function openAgent(agent: AgentId, thread: AgentThread | null = null, preserveCycle = false) {
     if (!directory) return;
+    if (sidebarInventoryTimer !== undefined) scheduleSidebarInventoryRefresh();
     sideChat = null;
     if (!preserveCycle) {
       recentCycleKeys = null;
@@ -12181,7 +12248,7 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
-      scheduleSidebarInventoryRefresh();
+      scheduleSidebarInventoryRefresh(250);
       return;
     }
     saveAgentThread(thread);
@@ -12664,11 +12731,13 @@
       if (disposed) return;
       await Promise.all(
         taskObservations.map(({ scope, revision: taskRevision }) => {
-          const active =
-            backendActivity[JSON.stringify([scope.directory, scope.agent])]?.activeTurns[
-              scope.sessionId
-            ];
-          return sessionTasks().reconcile(scope, active ?? null, taskRevision);
+          const runtime = backendActivity[JSON.stringify([scope.directory, scope.agent])];
+          return sessionTasks().reconcile(
+            scope,
+            runtime?.activeTurns[scope.sessionId] ?? null,
+            taskRevision,
+            runtime?.finished[scope.sessionId],
+          );
         }),
       );
       for (const receipt of spawnReceipts.filter(
@@ -12686,6 +12755,15 @@
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
       }
+      focusActiveTurns = Object.fromEntries(
+        agentThreads.flatMap((thread) => {
+          const turn =
+            backendActivity[JSON.stringify([thread.directory, thread.agent])]?.activeTurns[
+              thread.sessionId
+            ];
+          return turn ? [[threadKey(thread), turn]] : [];
+        }),
+      );
       const previousAttention = threadAttention;
       threadAttention = reconcileAttention(
         threadAttention,
@@ -13229,9 +13307,13 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
-      if (typeof sessionId === 'string' && typeof turnId === 'string')
+      if (
+        typeof sessionId === 'string' &&
+        typeof turnId === 'string' &&
+        (status === 'done' || status === 'failed' || status === 'interrupted')
+      )
         void sessionTasks()
-          .finish({ agent: event.agent, directory: eventDirectory, sessionId }, turnId)
+          .finish({ agent: event.agent, directory: eventDirectory, sessionId }, turnId, status)
           .catch((cause) => {
             error = `Could not save task completion: ${describe(cause)}`;
           });
@@ -13956,7 +14038,12 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
-                onnativeplan={(plan) => {
+                onnativeplan={(plan, live) => {
+                  if (revealsNativePlanReview(plan, nativePlan, live ?? false)) {
+                    sideTab = 'plan';
+                    agentChangesOpen = true;
+                    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+                  }
                   nativePlan = plan;
                   if (!plan) {
                     nativePlanFeedback = '';
@@ -14042,6 +14129,7 @@
         agentNames={taskOverviewAgentNames}
         checks={postTurnResults}
         receipts={visibleSpawnReceipts}
+        {focusByThread}
         {directory}
         onopen={openTaskOverviewTarget}
         onopencheck={openTaskOverviewCheck}
@@ -14063,6 +14151,7 @@
     {/if}
     <div class="workspace-pane-host" hidden={workspaceView !== 'workspace'}>
       <PaneTree
+        {agentStatusStatuses}
         active={workspaceView === 'workspace'}
         pane={paneLayout}
         focused={focusedPane}
@@ -14144,9 +14233,7 @@
         activityReady={acpActivityReady}
         onstatus={updateAgentThreadStatus}
         onreplaychange={setAgentReplay}
-        onchanges={(id) => {
-          changesPanes = changesPanes.filter((item) => item !== id);
-        }}
+        onchanges={(id) => setSplitDetails(id, false)}
         {pendingCommands}
         oncommandstarted={(id) => {
           const next = { ...pendingCommands };
@@ -14236,7 +14323,7 @@
             class:active={activeSideTab === 'changes'}
             role="tab"
             aria-selected={activeSideTab === 'changes'}
-            onclick={toggleChanges}>Changes ({diffs.length})</button
+            onclick={() => switchSideTab('changes')}>Changes ({diffs.length})</button
           >{/if}{#if acpAgent && acpPlanHistory.length}<button
             class:active={activeSideTab === 'planhistory'}
             aria-current={activeSideTab === 'planhistory' ? 'page' : undefined}
@@ -14256,7 +14343,10 @@
       </div>
       <div class="side-panel-body">
         {#if acpAgent}<div class:inactive={activeSideTab !== 'tasks'} class="side-view">
-            <TasksPanel snapshot={taskSnapshot} />
+            <TasksPanel
+              snapshot={taskSnapshot}
+              status={acpThread ? (agentStatusStatuses[threadKey(acpThread)] ?? null) : null}
+            />
           </div>{/if}
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
             {#if acpAgent && (acpSnapshot.plan || acpSnapshot.questions)}<PlanPanel

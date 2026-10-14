@@ -95,6 +95,7 @@ fn main() {
             "run_shipping_setup",
             "registered_worktrees",
             "repository_worktrees",
+            "worktree_cleanup_summary",
             "worktree_removal_preview",
             "restore_pending_worktree",
             "retry_removed_worktree_overlay_cleanup",

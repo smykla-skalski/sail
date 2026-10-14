@@ -891,9 +891,6 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             continue;
         }
         reclaim_verified_unstarted_temp(cache_directory, &data_directory);
-        for item in temp_directory_status(cache_directory, &data_directory) {
-            report_pending(&data_directory, &item.reason);
-        }
         // An active sibling shares the repository lock but has a separate lease. Check
         // its lease first so skipping that sibling cannot hold the repository lock
         // while a removed worktree from the same repository is reconciled.
@@ -4529,17 +4526,29 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("artifact"), "new").unwrap();
 
-        let result = clean_pending_temp_checked(
-            &fixture.cache,
-            preview.cleanup_token.as_deref().unwrap(),
-            Path::new(preview.path.as_deref().unwrap()),
-            Path::new(preview.owner_path.as_deref().unwrap()),
-            preview.directory_id.as_deref().unwrap(),
-            preview.size_bytes,
-            &preview.reason,
-        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let result = loop {
+            match clean_pending_temp_checked(
+                &fixture.cache,
+                preview.cleanup_token.as_deref().unwrap(),
+                Path::new(preview.path.as_deref().unwrap()),
+                Path::new(preview.owner_path.as_deref().unwrap()),
+                preview.directory_id.as_deref().unwrap(),
+                preview.size_bytes,
+                &preview.reason,
+            ) {
+                Err(error)
+                    if error == "Private storage still has an active owner."
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result,
+            }
+        };
 
-        assert!(result.unwrap_err().contains("identity"));
+        let error = result.expect_err("replaced temporary directory must be retained");
+        assert!(error.contains("identity"), "{error}");
         assert_eq!(
             fs::read_to_string(original.join("artifact")).unwrap(),
             "old"
