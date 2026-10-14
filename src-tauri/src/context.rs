@@ -2015,6 +2015,13 @@ fn provider_notifications(
             };
             match event {
                 ProviderEvent::Notification(message) => {
+                    let value: serde_json::Value = serde_json::from_str(message.trim_end())
+                        .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                    if value.get("method").and_then(serde_json::Value::as_str)
+                        == Some("notifications/progress")
+                    {
+                        continue;
+                    }
                     if buffered.len() + message.len() > 1024 * 1024 {
                         output.pending = Some(message);
                         break;
@@ -2194,6 +2201,12 @@ fn exchange_provider_request(
     } else {
         None
     };
+    let progress_token = request.pointer("/params/_meta/progressToken");
+    if progress_token.is_some() {
+        if let Some(upstream_id) = upstream_id {
+            upstream["params"]["_meta"]["progressToken"] = serde_json::json!(upstream_id);
+        }
+    }
     if method == "initialize" {
         // A shared provider cannot call back into any individual agent client.
         upstream["params"]["capabilities"] = serde_json::json!({});
@@ -2276,7 +2289,25 @@ fn exchange_provider_request(
             |message| Ok(ProviderEvent::Notification(message)),
         );
         match event {
-            Ok(ProviderEvent::Notification(message)) => {
+            Ok(ProviderEvent::Notification(mut message)) => {
+                let mut value: serde_json::Value = serde_json::from_str(message.trim_end())
+                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                if value.get("method").and_then(serde_json::Value::as_str)
+                    == Some("notifications/progress")
+                {
+                    let Some(progress_token) = progress_token else {
+                        continue;
+                    };
+                    if value
+                        .pointer("/params/progressToken")
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(upstream_id)
+                    {
+                        continue;
+                    }
+                    value["params"]["progressToken"] = progress_token.clone();
+                    message = format!("{value}\n");
+                }
                 if let Some(notify) = &mut notify {
                     notify(&message)?;
                 } else {
@@ -2442,6 +2473,9 @@ mod tests {
     struct StopProvider(String);
 
     #[cfg(target_os = "macos")]
+    struct StopAndWait(String);
+
+    #[cfg(target_os = "macos")]
     struct ActiveSession(String);
 
     #[cfg(target_os = "macos")]
@@ -2467,6 +2501,24 @@ mod tests {
         fn drop(&mut self) {
             let key = std::ffi::CString::new(self.0.clone()).unwrap();
             unsafe { sail_context_provider_stop(key.as_ptr()) };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for StopAndWait {
+        fn drop(&mut self) {
+            let key = std::ffi::CString::new(self.0.clone()).unwrap();
+            unsafe { sail_context_provider_stop(key.as_ptr()) };
+            if let Some(providers) = PROVIDERS.get() {
+                let registry = providers.lock().unwrap();
+                drop(
+                    PROVIDER_STOPPED
+                        .wait_while(registry, |registry| {
+                            registry.get(&self.0).is_some_and(Option::is_none)
+                        })
+                        .unwrap(),
+                );
+            }
         }
     }
 
@@ -3537,6 +3589,139 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn cancelled_progress_never_reaches_the_next_shared_client() {
+        for (token, idle_drain) in [
+            (json!("shared"), false),
+            (json!("shared"), true),
+            (json!(47), false),
+            (json!(-4), false),
+        ] {
+            let repository = Repository::new("runtime-cancelled-progress");
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopAndWait(key.clone());
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let peer = ActiveSession::new();
+            let call = |capability: &str, message: &str| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    message,
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            for capability in [&owner.0, &peer.0] {
+                call(capability, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#)
+                    .unwrap().unwrap();
+                call(
+                    capability,
+                    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                )
+                .unwrap();
+            }
+            let mut cancel = |message: &str| {
+                let value: serde_json::Value = serde_json::from_str(message).unwrap();
+                assert_eq!(value["params"]["data"], "waiting for cancellation");
+                call(&owner.0, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#)
+                    .unwrap();
+                Ok(())
+            };
+            let request = json!({"jsonrpc":"2.0","id":2,"method":"wait-for-cancel-late-progress",
+                "params":{"_meta":{"progressToken":token}}})
+            .to_string();
+            let cancelled = provider_request_with_notifications_at(
+                &repository.0,
+                &fingerprint,
+                Some(&owner.0),
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+                Some(&mut cancel),
+            )
+            .unwrap()
+            .unwrap();
+            let cancelled: serde_json::Value = serde_json::from_str(&cancelled).unwrap();
+            assert_eq!(cancelled["error"]["code"], -32800);
+            let slot = PROVIDERS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            {
+                let mut provider = slot.lock().unwrap();
+                let output = provider.as_mut().unwrap().output.as_mut().unwrap();
+                let ProviderEvent::Notification(message) = output
+                    .receive
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                else {
+                    panic!("Expected the real provider's late progress notification");
+                };
+                let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+                assert_eq!(value["method"], "notifications/progress");
+                assert_eq!(value["params"]["progress"], 999);
+                output.pending = Some(message);
+            }
+            if idle_drain {
+                assert_eq!(
+                    provider_notifications(&key, &fingerprint, &peer.0).unwrap(),
+                    None
+                );
+            }
+            let request = json!({"jsonrpc":"2.0","id":2,"method":"many-progress",
+                "params":{"_meta":{"progressToken":token}}})
+            .to_string();
+            let mut count = 0;
+            let mut notify = |message: &str| {
+                let value: serde_json::Value = serde_json::from_str(message).unwrap();
+                assert_eq!(value["method"], "notifications/progress");
+                assert_eq!(value["params"]["progressToken"], token);
+                assert_eq!(value["params"]["progress"], count);
+                count += 1;
+                Ok(())
+            };
+            let response = provider_request_with_notifications_at(
+                &repository.0,
+                &fingerprint,
+                Some(&peer.0),
+                &request,
+                &store_path,
+                &repository.0.join("data"),
+                Some(&mut notify),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(count, 160);
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            let next = call(
+                &owner.0,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+            )
+            .unwrap()
+            .unwrap();
+            let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+            assert_eq!(response["result"]["pid"], next["result"]["pid"]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn cancellation_interrupts_blocked_provider_stdin_and_allows_replacement() {
         let repository = Repository::new("runtime-blocked-input");
         repository.configure();
@@ -3737,25 +3922,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stopping_a_busy_provider_does_not_wait_on_its_project_lock() {
-        struct StopAndWait(String);
-
-        impl Drop for StopAndWait {
-            fn drop(&mut self) {
-                let key = std::ffi::CString::new(self.0.clone()).unwrap();
-                unsafe { sail_context_provider_stop(key.as_ptr()) };
-                if let Some(providers) = PROVIDERS.get() {
-                    let registry = providers.lock().unwrap();
-                    drop(
-                        PROVIDER_STOPPED
-                            .wait_while(registry, |registry| {
-                                registry.get(&self.0).is_some_and(Option::is_none)
-                            })
-                            .unwrap(),
-                    );
-                }
-            }
-        }
-
         let repository = Repository::new("runtime-stop-busy");
         repository.configure();
         let key = project_key(&repository.0).unwrap();

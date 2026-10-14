@@ -477,6 +477,43 @@ try {
   assert.equal(silent.error.code, -32800);
   assert.equal((await second.request(39)).result.pid, a.result.pid);
   assert.ok(Date.now() - silentStart < 10_000, 'no-response cancellation preserves the provider');
+  const lateCancelled = await first.request(
+    'late-progress-cancellation',
+    'tools/call',
+    {
+      name: 'fixture_wait_cancel_late_progress',
+      arguments: {},
+      _meta: { progressToken: 'shared-progress' },
+    },
+    (notification) => {
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      first.child.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/cancelled',
+          params: { requestId: 'late-progress-cancellation', reason: 'owner' },
+        }) + '\n',
+      );
+    },
+  );
+  assert.equal(lateCancelled.error.code, -32800);
+  let peerProgressCount = 0;
+  const afterCancellation = await second.request(
+    'progress-after-cancellation',
+    'tools/call',
+    {
+      name: 'fixture_many_progress',
+      arguments: {},
+      _meta: { progressToken: 'shared-progress' },
+    },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/progress');
+      assert.equal(notification.params.progressToken, 'shared-progress');
+      assert.equal(notification.params.progress, peerProgressCount++);
+    },
+  );
+  assert.equal(peerProgressCount, 160, 'the next client receives only its own progress');
+  assert.equal(afterCancellation.result.pid, a.result.pid);
   const resourceParams = { uri: 'fixture://shared' };
   await first.request(40, 'resources/subscribe', resourceParams);
   const updates = [0, 0, 0];

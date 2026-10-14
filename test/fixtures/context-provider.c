@@ -53,6 +53,9 @@ int main(void) {
             continue;
         }
         last_request_id = value;
+        char *progress_token = strstr(line, "\"progressToken\"");
+        long progress_id = progress_token && (progress_token = strchr(progress_token, ':'))
+            ? strtol(progress_token + 1, NULL, 10) : 0;
         if (strstr(line, "\"method\":\"resources/subscribe\"")) {
             subscriptions++;
             subscribed = 1;
@@ -93,10 +96,15 @@ int main(void) {
         }
         int cancelled = strstr(line, "\"method\":\"wait-for-cancel\"") != NULL ||
             strstr(line, "\"method\":\"wait-for-cancel-no-response\"") != NULL ||
+            strstr(line, "\"method\":\"wait-for-cancel-late-progress\"") != NULL ||
             (tool_call && (strstr(line, "\"name\":\"fixture_wait_cancel\"") ||
-                          strstr(line, "\"name\":\"fixture_wait_cancel_no_response\"")));
+                          strstr(line, "\"name\":\"fixture_wait_cancel_no_response\"") ||
+                          strstr(line, "\"name\":\"fixture_wait_cancel_late_progress\"")));
+        int late_progress_cancel = strstr(line, "wait-for-cancel-late-progress") != NULL ||
+            (tool_call && strstr(line, "\"name\":\"fixture_wait_cancel_late_progress\""));
         int no_response_cancel = strstr(line, "wait-for-cancel-no-response") != NULL ||
-            (tool_call && strstr(line, "\"name\":\"fixture_wait_cancel_no_response\""));
+            (tool_call && strstr(line, "\"name\":\"fixture_wait_cancel_no_response\"")) ||
+            late_progress_cancel;
         int idle_resource = subscribed && tool_call && strstr(line, "\"name\":\"fixture_idle_resource_updated\"");
         if (subscribed && tool_call && strstr(line, "\"name\":\"fixture_resource_updated\"")) {
             puts("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\","
@@ -123,12 +131,17 @@ int main(void) {
             snprintf(expected, sizeof(expected), "\"requestId\":%ld", value);
             if (!strstr(line, expected)) return 1;
             if (!write_marker("cancellation-received")) return 1;
+            if (late_progress_cancel) {
+                printf("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\","
+                       "\"params\":{\"progressToken\":%ld,\"progress\":999}}\n", progress_id);
+                fflush(stdout);
+            }
             if (no_response_cancel) continue;
         }
         if (progress) {
             for (int count = 0; count < 160; count++) {
                 printf("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\","
-                       "\"params\":{\"progressToken\":\"fixture\",\"progress\":%d,\"total\":160}}\n", count);
+                       "\"params\":{\"progressToken\":%ld,\"progress\":%d,\"total\":160}}\n", progress_id, count);
                 fflush(stdout);
             }
         }
@@ -151,6 +164,7 @@ int main(void) {
                      "{\"name\":\"fixture_resource_updated\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_idle_resource_updated\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_wait_cancel_no_response\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_wait_cancel_late_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_wait_cancel\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
         } else if (tool_call) {
             result = ",\"content\":[{\"type\":\"text\",\"text\":\"fixture reply\"}],\"isError\":false";
