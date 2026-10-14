@@ -1118,7 +1118,8 @@ fn broker_provider_call(
     next_id: &mut u64,
     method: &str,
     params: serde_json::Value,
-) -> Result<serde_json::Value, ()> {
+) -> Result<serde_json::Value, crate::context_broker_mcp::ProviderCallError> {
+    use crate::context_broker_mcp::ProviderCallError;
     if !*initialized {
         let response = broker_provider_request(
             session,
@@ -1135,14 +1136,18 @@ fn broker_provider_call(
             .and_then(serde_json::Value::as_str)
             != Some("2025-06-18")
         {
-            return Err(());
+            return Err(ProviderCallError::Unavailable);
         }
         session
             .request(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-            .map_err(|_| ())?;
+            .map_err(|_| ProviderCallError::Unavailable)?;
         *initialized = true;
     }
-    broker_provider_request(session, next_id, method, params)
+    let response = broker_provider_request(session, next_id, method, params);
+    if matches!(response, Err(ProviderCallError::ResponseTooLarge)) {
+        *initialized = false;
+    }
+    response
 }
 
 #[cfg(target_os = "macos")]
@@ -1151,21 +1156,32 @@ fn broker_provider_request(
     next_id: &mut u64,
     method: &str,
     params: serde_json::Value,
-) -> Result<serde_json::Value, ()> {
+) -> Result<serde_json::Value, crate::context_broker_mcp::ProviderCallError> {
+    use crate::context_broker_mcp::ProviderCallError;
     let id = *next_id;
-    *next_id = next_id.checked_add(1).ok_or(())?;
+    *next_id = next_id
+        .checked_add(1)
+        .ok_or(ProviderCallError::Unavailable)?;
     let request = serde_json::json!({
         "jsonrpc":"2.0","id":id,"method":method,"params":params
     });
     let response = session
         .request(&request.to_string())
-        .map_err(|_| ())?
-        .ok_or(())?;
+        .map_err(|error| {
+            if error.starts_with("MCP message exceeds its limit.")
+                || error.starts_with("Provider response exceeds its limit.")
+            {
+                ProviderCallError::ResponseTooLarge
+            } else {
+                ProviderCallError::Unavailable
+            }
+        })?
+        .ok_or(ProviderCallError::Unavailable)?;
     response
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|value| value.get("id").and_then(serde_json::Value::as_u64) == Some(id))
-        .ok_or(())
+        .ok_or(ProviderCallError::Unavailable)
 }
 
 #[cfg(target_os = "macos")]
@@ -4138,6 +4154,65 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("timed out"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_batch_can_back_off_within_relay_frame() {
+        let repository = Repository::new("runtime-large-search");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let search = |id, limit, query| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"search","arguments":{"query":query,"limit":limit}}})
+        };
+        let call = |request: serde_json::Value| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &request.to_string(),
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+
+        assert!(call(search(1, 8, "plain"))
+            .unwrap_err()
+            .starts_with("MCP message exceeds its limit."));
+        let response = call(search(2, 4, "plain")).unwrap().unwrap();
+        assert!(response.len() < LARGE_PROVIDER_RESPONSE_BYTES);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["structuredContent"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let response = call(search(3, 1, "escaped")).unwrap().unwrap();
+        assert!(response.len() < LARGE_PROVIDER_RESPONSE_BYTES);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["structuredContent"]["items"][0]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+            8 * 1024 * 1024
+        );
+        assert!(call(search(4, 1, "ignore-limit"))
+            .unwrap_err()
+            .starts_with("MCP message exceeds its limit."));
     }
 
     #[cfg(target_os = "macos")]

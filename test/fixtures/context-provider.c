@@ -111,6 +111,33 @@ int main(void) {
             continue;
         }
         int tool_call = strstr(line, "\"method\":\"tools/call\"") != NULL;
+        if (strstr(line, "\"name\":\"search\"")) {
+            char *requested = strstr(line, "\"limit\":");
+            long limit = requested ? strtol(requested + strlen("\"limit\":"), NULL, 10) : 0;
+            if (strstr(line, "ignore-limit")) limit = 8;
+            if (limit < 1 || limit > 8) return 1;
+            char content[8192];
+            memset(content, 'x', sizeof(content));
+            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"structuredContent\":{\"items\":[", value);
+            for (long item = 0; item < limit; item++) {
+                if (item) putchar(',');
+                printf("{\"id\":\"hit-%ld\",\"sourceUri\":\"file:///search\",\"revision\":\"r1\",\"timestampMs\":1760122800000,\"content\":\"", item);
+                if (strstr(line, "escaped")) {
+                    for (size_t index = 0; index < 8 * 1024 * 1024 / 1024; index++) {
+                        for (size_t chunk = 0; chunk < 1024; chunk++) fputs("\\u0000", stdout);
+                    }
+                } else {
+                    for (size_t index = 0; index < 8 * 1024 * 1024 / sizeof(content); index++) {
+                        fwrite(content, 1, sizeof(content), stdout);
+                    }
+                }
+                putchar('"');
+                putchar('}');
+            }
+            puts("]}}}");
+            fflush(stdout);
+            continue;
+        }
         if (tool_call && strstr(line, "\"name\":\"get\"")) {
             printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"content\":\"", value);
             for (size_t index = 0; index < 2 * 1024 * 1024; index++) putchar('x');

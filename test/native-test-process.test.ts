@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { runOwnedCommand } from '../scripts/native-test-process.mjs';
+import { runOwnedCommand, stopProcessesUnder } from '../scripts/native-test-process.mjs';
 
 await test(
   'cancellation reaps an owned descendant after its command leader exits',
@@ -53,5 +53,75 @@ await test(
     assert.throws(() => process.kill(ownedPid, 0), { code: 'ESRCH' });
     assert.doesNotThrow(() => process.kill(unrelated.pid, 0));
     assert.ok(existsSync(join(root, 'command.log')));
+  },
+);
+
+await test(
+  'a leftover fixture app is stopped by its bundle path and others are kept',
+  { skip: process.platform !== 'darwin' },
+  async (context) => {
+    const root = mkdtempSync(join(tmpdir(), 'sail-fixture-stop-'));
+    context.after(() => rmSync(root, { recursive: true, force: true }));
+    const binary = join(root, 'run/Sail Native Fixture.app/Contents/MacOS/sail');
+    mkdirSync(join(root, 'run/Sail Native Fixture.app/Contents/MacOS'), { recursive: true });
+    copyFileSync('/bin/sleep', binary);
+    // A copied system binary fails signature validation at exec.
+    execFileSync('codesign', ['-f', '-s', '-', binary]);
+    const launch = (program: string) => {
+      const pid = Number(
+        execFileSync('/bin/sh', ['-c', '"$0" 300 >/dev/null 2>&1 & echo $!', program], {
+          encoding: 'utf8',
+        }),
+      );
+      context.after(() => {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* Already stopped. */
+        }
+      });
+      return pid;
+    };
+    const leftover = launch(binary);
+    const unrelated = launch('/bin/sleep');
+    assert.doesNotThrow(() => process.kill(leftover, 0));
+    // The /private form of a /var path names the same bundle that `ps` lists as /var.
+    const bundle = join(root, 'run/Sail Native Fixture.app');
+    assert.equal(await stopProcessesUnder(bundle.replace(/^\/var\//, '/private/var/')), true);
+    assert.throws(() => process.kill(leftover, 0), { code: 'ESRCH' });
+    assert.doesNotThrow(() => process.kill(unrelated, 0));
+  },
+);
+
+await test(
+  'a sibling bundle sharing a name prefix keeps its processes',
+  { skip: process.platform !== 'darwin' },
+  async (context) => {
+    const root = mkdtempSync(join(tmpdir(), 'sail-fixture-sibling-'));
+    context.after(() => rmSync(root, { recursive: true, force: true }));
+    const launch = (app: string) => {
+      const binary = join(root, app, 'Contents/MacOS/sail');
+      mkdirSync(join(root, app, 'Contents/MacOS'), { recursive: true });
+      copyFileSync('/bin/sleep', binary);
+      execFileSync('codesign', ['-f', '-s', '-', binary]);
+      const pid = Number(
+        execFileSync('/bin/sh', ['-c', '"$0" 300 >/dev/null 2>&1 & echo $!', binary], {
+          encoding: 'utf8',
+        }),
+      );
+      context.after(() => {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* Already stopped. */
+        }
+      });
+      return pid;
+    };
+    const target = launch('fixture.app');
+    const sibling = launch('fixture.app.old');
+    assert.equal(await stopProcessesUnder(join(root, 'fixture.app')), true);
+    assert.throws(() => process.kill(target, 0), { code: 'ESRCH' });
+    assert.doesNotThrow(() => process.kill(sibling, 0));
   },
 );

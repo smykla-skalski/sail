@@ -130,6 +130,7 @@
     "allow-acp-elicitation",
     "allow-acp-pending-inbox",
     "allow-acp-activity",
+    "allow-acp-session-visible",
     "allow-acp-native-subagents",
     "allow-acp-prepare-restart",
     "allow-acp-set-config",
