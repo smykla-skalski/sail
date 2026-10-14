@@ -57,6 +57,14 @@ const signature = spawnSync('codesign', ['-dv', '--verbose=4', app], {
 });
 assert.equal(signature.status, 0, signature.stderr);
 assert.doesNotMatch(signature.stderr, /^Signature=adhoc$/m);
+const signing = (bundle) => {
+  const result = spawnSync('codesign', ['-dv', '--verbose=4', bundle], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  return {
+    team: result.stderr.match(/^TeamIdentifier=(.+)$/m)?.[1],
+    hash: result.stderr.match(/^CDHash=(.+)$/m)?.[1],
+  };
+};
 run('codesign', ['--verify', '--deep', '--strict', app]);
 run('codesign', ['--verify', '-v', '-R', '=anchor apple generic', app]);
 const bundleId = run('plutil', [
@@ -93,9 +101,69 @@ const broken = join(root, 'broken');
 const revoked = join(root, 'revoked');
 const blocked = join(root, 'blocked-input');
 const empty = join(root, 'empty');
+const upgrade = join(root, 'upgrade');
 const provider = join(root, 'provider');
+const upgradeProvider = join(root, 'upgrade-provider');
+const upgradeBundle = join(root, 'upgrade.app');
 const clients = [];
 let appPid;
+
+function prepareUpgrade() {
+  const exported = process.env.SAIL_CONTEXT_AUTH_UPGRADE_APP;
+  run('ditto', [exported || app, upgradeBundle]);
+  if (!exported) {
+    assert.ok(
+      process.env.APPLE_SIGNING_IDENTITY,
+      'Signed upgrade requires a signing identity or pre-signed upgrade',
+    );
+    run('plutil', [
+      '-replace',
+      'CFBundleVersion',
+      '-string',
+      '553.2',
+      join(upgradeBundle, 'Contents', 'Info.plist'),
+    ]);
+    run('codesign', [
+      '--force',
+      '--deep',
+      '--options',
+      'runtime',
+      '--sign',
+      process.env.APPLE_SIGNING_IDENTITY,
+      upgradeBundle,
+    ]);
+  }
+  run('codesign', ['--verify', '--deep', '--strict', upgradeBundle]);
+  run('codesign', ['--verify', '-v', '-R', '=anchor apple generic', upgradeBundle]);
+  assert.equal(
+    run('plutil', [
+      '-extract',
+      'CFBundleIdentifier',
+      'raw',
+      '-o',
+      '-',
+      join(upgradeBundle, 'Contents/Info.plist'),
+    ]),
+    bundleId,
+  );
+  const before = signing(app);
+  const after = signing(upgradeBundle);
+  assert.ok(before.team && before.team !== 'not set');
+  assert.equal(after.team, before.team);
+  assert.ok(before.hash && after.hash);
+  assert.notEqual(after.hash, before.hash);
+}
+
+function installUpgrade() {
+  const previous = join(root, 'previous.app');
+  renameSync(app, previous);
+  try {
+    renameSync(upgradeBundle, app);
+  } catch (error) {
+    renameSync(previous, app);
+    throw error;
+  }
+}
 
 function makeProject(directory, command, blockInput = false) {
   mkdirSync(join(directory, '.sail'), { recursive: true });
@@ -292,6 +360,7 @@ try {
   makeProject(broken, 'broken-provider');
   makeProject(revoked, 'revoked-provider');
   makeProject(blocked, 'blocked-provider', true);
+  makeProject(upgrade, 'upgrade-provider');
   mkdirSync(empty);
   run('git', ['init', '-q', empty]);
   run('cc', [
@@ -303,6 +372,9 @@ try {
     join(process.cwd(), 'test', 'fixtures', 'context-provider.c'),
   ]);
   run('codesign', ['--force', '--sign', '-', provider]);
+  copyFileSync(provider, upgradeProvider);
+  run('codesign', ['--force', '--sign', '-', upgradeProvider]);
+  prepareUpgrade();
   run('open', [
     '-n',
     '-g',
@@ -721,6 +793,65 @@ try {
   const noContext = startClient(empty);
   await noContext.waitForExit();
   assert.match(noContext.stderr(), /approval unavailable/i);
+
+  assert.equal(
+    run(binary, ['--context-auth-approve-probe', upgrade, 'upgrade-provider', upgradeProvider]),
+    'approved',
+  );
+  const upgradeRequest = startClient(upgrade);
+  const upgradeCancellation = startClient(upgrade);
+  const requestInitialization = await upgradeRequest.request('upgrade-request-init', 'initialize');
+  const cancellationInitialization = await upgradeCancellation.request(
+    'upgrade-cancellation-init',
+    'initialize',
+  );
+  assert.equal(cancellationInitialization.result.pid, requestInitialization.result.pid);
+  let waitingForCancellation;
+  const cancellationReady = new Promise((resolve) => {
+    waitingForCancellation = resolve;
+  });
+  const pendingCancellation = upgradeCancellation.request(
+    'upgrade-cancellation',
+    'tools/call',
+    { name: 'fixture_wait_cancel', arguments: {} },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/message');
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      waitingForCancellation();
+    },
+  );
+  await Promise.race([
+    cancellationReady,
+    pendingCancellation.then(() => {
+      throw new Error('Provider cancellation request completed before the upgrade');
+    }),
+  ]);
+  const cancellationRejected = assert.rejects(
+    pendingCancellation,
+    /stale after upgrade|cancellation delivery failed/i,
+  );
+  for (const client of [upgradeRequest, upgradeCancellation])
+    client.child.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') throw error;
+    });
+  installUpgrade();
+  const requestRejected = assert.rejects(
+    upgradeRequest.request('upgrade-request'),
+    /stale after upgrade|signature or path rejected/i,
+  );
+  upgradeCancellation.child.stdin.write(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId: 'upgrade-cancellation', reason: 'signed upgrade' },
+    }) + '\n',
+  );
+  await Promise.all([requestRejected, cancellationRejected]);
+  await Promise.all([upgradeRequest.waitForExit(), upgradeCancellation.waitForExit()]);
+  assert.match(upgradeRequest.stderr(), /stale after upgrade|signature or path rejected/i);
+  assert.match(upgradeCancellation.stderr(), /stale after upgrade|cancellation delivery failed/i);
+  await waitForProcessExit(requestInitialization.result.pid);
+  console.log('PASS: signed upgrade rejects established request and cancellation sessions');
   console.log(
     'PASS: native MCP forwarding, one provider across agents, idle revocation cleanup, failure isolation, no-context',
   );

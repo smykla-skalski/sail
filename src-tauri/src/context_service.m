@@ -124,6 +124,26 @@ static NSString *selfCodeHash(void) {
     return value.length ? value : nil;
 }
 
+static NSString *staticCodeHash(NSString *path) {
+    SecStaticCodeRef code = NULL;
+    CFURLRef url = (__bridge CFURLRef)[NSURL fileURLWithPath:path];
+    if (SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) != errSecSuccess) return nil;
+    OSStatus status = SecStaticCodeCheckValidity(code, kSecCSDefaultFlags, NULL);
+    CFDictionaryRef details = NULL;
+    if (status == errSecSuccess) {
+        status = SecCodeCopySigningInformation(code, kSecCSSigningInformation, &details);
+    }
+    CFRelease(code);
+    if (status != errSecSuccess || !details) return nil;
+    NSData *hash = [(__bridge NSDictionary *)details objectForKey:(__bridge id)kSecCodeInfoUnique];
+    NSMutableString *value = [NSMutableString string];
+    for (NSUInteger i = 0; i < hash.length; i++) {
+        [value appendFormat:@"%02x", ((const uint8_t *)hash.bytes)[i]];
+    }
+    CFRelease(details);
+    return value.length ? value : nil;
+}
+
 static NSString *senderBundlePath(xpc_object_t message) {
     SecCodeRef code = NULL;
     if (SecCodeCreateWithXPCMessage(message, kSecCSDefaultFlags, &code) != errSecSuccess) return nil;
@@ -209,10 +229,10 @@ int sail_context_service_main(void) {
                 NSString *op = field(message, "op");
                 NSDictionary *session = sessions[key];
                 // The listener's peer requirement applies for the lifetime of this immutable
-                // connection. Resolve the signed bundle path once, before creating a session;
-                // approval and capability state are still validated for every operation below.
-                NSString *sender = session ? bundle : senderBundlePath(message);
-                if (!sender || ![sender isEqualToString:bundle]) {
+                // connection. Reject stale connections after the installed bundle changes.
+                bool currentGeneration = [staticCodeHash(bundle) isEqualToString:hash];
+                NSString *sender = session && currentGeneration ? bundle : senderBundlePath(message);
+                if (!currentGeneration || !sender || ![sender isEqualToString:bundle]) {
                     xpc_dictionary_set_string(reply, "error", "Sail client signature or path rejected.");
                 } else {
                     if ([op isEqualToString:@"begin"]) {
@@ -406,15 +426,23 @@ int sail_context_service_main(void) {
 @interface SailContextSession : NSObject
 @property(nonatomic, strong) xpc_connection_t connection;
 @property(nonatomic, copy) NSString *capability;
+@property(nonatomic, copy) NSString *bundlePath;
+@property(nonatomic, copy) NSString *codeHash;
 @end
 @implementation SailContextSession
 @end
+
+static bool sessionGenerationValid(SailContextSession *session) {
+    return session.bundlePath && session.codeHash &&
+        [staticCodeHash(session.bundlePath) isEqualToString:session.codeHash];
+}
 
 void *sail_context_session_open(const char *directory, char *error, size_t errorLength) {
     @autoreleasepool {
         if (@available(macOS 13.0, *)) {
             NSString *path = directory ? [NSString stringWithUTF8String:directory] : nil;
-            if (!path || ![canonicalPath(NSBundle.mainBundle.bundlePath) hasSuffix:@".app"]) {
+            NSString *bundle = canonicalPath(NSBundle.mainBundle.bundlePath);
+            if (!path || ![bundle hasSuffix:@".app"]) {
                 writeError(error, errorLength, @"Context service requires a signed Sail app bundle.");
                 return NULL;
             }
@@ -434,7 +462,7 @@ void *sail_context_session_open(const char *directory, char *error, size_t error
                 return NULL;
             }
             NSString *hash = selfCodeHash();
-            if (!hash) {
+            if (!hash || ![staticCodeHash(bundle) isEqualToString:hash]) {
                 writeError(error, errorLength, @"Sail code signature unavailable.");
                 return NULL;
             }
@@ -473,6 +501,8 @@ void *sail_context_session_open(const char *directory, char *error, size_t error
             SailContextSession *session = [SailContextSession new];
             session.connection = connection;
             session.capability = [NSString stringWithUTF8String:capability];
+            session.bundlePath = bundle;
+            session.codeHash = hash;
             return (__bridge_retained void *)session;
         }
         writeError(error, errorLength, @"Context service requires macOS 13 or later.");
@@ -529,11 +559,16 @@ bool sail_context_session_check(void *handle, char *error, size_t errorLength) {
     @autoreleasepool {
         if (!handle) return false;
         SailContextSession *session = (__bridge SailContextSession *)handle;
+        if (!sessionGenerationValid(session)) {
+            writeError(error, errorLength, @"Context service unavailable or stale after upgrade.");
+            return false;
+        }
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, "op", "check");
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
         xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
-        if (![senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)]) {
+        if (!sessionGenerationValid(session) ||
+            ![senderBundlePath(reply) isEqualToString:session.bundlePath]) {
             writeError(error, errorLength, @"Context service signature or path rejected.");
             return false;
         }
@@ -552,13 +587,20 @@ static bool sessionExchange(void *handle, const char *op, const char *message,
     @autoreleasepool {
         if (!handle || !output || !outputLength) return false;
         SailContextSession *session = (__bridge SailContextSession *)handle;
+        if (!sessionGenerationValid(session)) {
+            writeError(error, errorLength, @"Context service unavailable or stale after upgrade.");
+            return false;
+        }
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, "op", op);
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
         if (message) xpc_dictionary_set_string(request, "request", message);
         xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
-        // sail_context_session_open authenticated this service on the same immutable XPC
-        // connection. The connection's peer signing requirement remains active for every reply.
+        if (!sessionGenerationValid(session) ||
+            ![senderBundlePath(reply) isEqualToString:session.bundlePath]) {
+            writeError(error, errorLength, @"Context service unavailable or stale after upgrade.");
+            return false;
+        }
         const char *response = xpc_get_type(reply) == XPC_TYPE_DICTIONARY
             ? xpc_dictionary_get_string(reply, "response") : NULL;
         if (response && strlen(response) < outputLength) {
@@ -583,6 +625,7 @@ bool sail_context_session_cancel(void *handle, const char *message) {
     @autoreleasepool {
         if (!handle || !message) return false;
         SailContextSession *session = (__bridge SailContextSession *)handle;
+        if (!sessionGenerationValid(session)) return false;
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, "op", "request");
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
