@@ -308,6 +308,23 @@ await test('native children are read-only because the adapter accepts no child p
   assert.deepEqual(run.controls, { prompt: false, cancel: false });
 });
 
+await test('native child controls follow its advertised capabilities', () => {
+  const native = nativeStore(
+    update('root', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'controlled',
+      name: 'worker',
+      task: 'Task',
+      capabilities: { prompt: {}, cancel: true },
+    }),
+  );
+  assert.deepEqual(subagentRuns({ native })[0].controls, { prompt: true, cancel: true });
+  assert.deepEqual(nativeSubagentReceipts(native)[0].nativeCapabilities, {
+    prompt: {},
+    cancel: true,
+  });
+});
+
 await test('a notification from an entry without a time sorts by the parent transcript', () => {
   const runs = subagentRuns({
     receipts: [receipt({ created: 50, updated: 60 })],

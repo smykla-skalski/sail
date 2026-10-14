@@ -46,6 +46,7 @@ import {
   shippingClockWasSuspended,
   shippingClaimOwnedByInstance,
   shippingWorkerSettled,
+  shipOwnerReleaseReady,
   serializeShippingClaimOperation,
   shippingSetupAction,
   terminalClaimReleaseReady,
@@ -55,6 +56,30 @@ import {
 } from '../src/lib/issue-shipping.ts';
 import { shipOwner } from '../src/lib/ship-progress.ts';
 import type { PublishedGraph } from '../src/lib/issue-graph.ts';
+
+void test('a terminal worker releases its build root after gates settle in either order', () => {
+  const issue = {
+    path: '/tmp/ship-worktree',
+    receiptId: 'worker-owner',
+    workerSettled: true,
+    state: 'working' as 'working' | 'merged',
+  };
+  const gate = {
+    targetDirectory: issue.path,
+    validation: { gate: 'code-adversary' },
+    state: 'working' as 'working' | 'completed',
+  };
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), false);
+  issue.state = 'merged';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), false);
+  gate.state = 'completed';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), true);
+
+  issue.state = 'working';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), false);
+  issue.state = 'merged';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), true);
+});
 
 const graph: PublishedGraph = {
   issues: [
@@ -1396,6 +1421,15 @@ void test('fences a worker only when its monotonic lease expires or ownership is
     true,
   );
   assert.equal(
+    claimRefreshRequiresFence(
+      claim,
+      new Error('Local shipping claim no longer exists.'),
+      119_999,
+      120_000,
+    ),
+    true,
+  );
+  assert.equal(
     claimRefreshRequiresFence(claim, new Error('temporary network failure'), 120_000, 120_000),
     true,
   );
@@ -1775,6 +1809,8 @@ void test('the worker prompt tells the worker to stop at a mergeable pull reques
   assert.match(you, /do not post a merge comment or run a merge command/);
 
   const agent = shipWorkerPrompt({ ...promptInput, mergeOwner: 'agent' });
+  assert.match(agent, /Sail holds local claim claim-1/);
+  assert.match(agent, /Never post a GitHub comment/);
   assert.doesNotMatch(agent, /Merge owner/);
   assert.doesNotMatch(agent, /awaiting_merge/);
   assert.doesNotMatch(agent, /mergeable pull request/);

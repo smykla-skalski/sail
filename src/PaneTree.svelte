@@ -7,6 +7,9 @@
   import DiffPanel from './DiffPanel.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
+  import TasksPanel from './TasksPanel.svelte';
+  import { sessionTasks } from './lib/session-tasks';
+  import { revealsPlanReview } from './lib/details-plan';
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import type { ShipActionId } from './lib/ship-actions';
@@ -57,6 +60,7 @@
   } from './lib/panes';
 
   type Props = {
+    agentStatusStatuses: Record<string, ThreadStatus | null>;
     active: boolean;
     pane: Pane;
     focused: string;
@@ -165,6 +169,7 @@
   };
 
   let {
+    agentStatusStatuses,
     active,
     pane,
     focused,
@@ -270,7 +275,8 @@
   let diffRevision = '';
   let diffRevisionPath = '';
   let diffEvidenceUpdated = $state(Date.now());
-  let acpTab = $state<'plan' | 'history' | 'changes' | 'activity' | 'ship'>('changes');
+  let acpTab = $state<'tasks' | 'plan' | 'history' | 'changes' | 'activity' | 'ship'>('tasks');
+  let tasksTick = $state(0);
   let acpPlanTick = $state(0);
   let planRevealed = false;
   const emptySnapshot: PlanSnapshot = { plan: null, questions: null };
@@ -281,6 +287,12 @@
   const acpSnapshot = $derived.by(() => {
     void acpPlanTick;
     return acpScope ? acpPlans().snapshot(acpScope) : emptySnapshot;
+  });
+  const taskSnapshot = $derived.by(() => {
+    void tasksTick;
+    return acpScope
+      ? sessionTasks().snapshot(acpScope)
+      : { turnId: null, revision: 0, tasks: [], focus: null };
   });
   const acpPlanHistory = $derived.by(() => {
     void acpPlanTick;
@@ -407,20 +419,27 @@
   $effect(() => {
     if ('direction' in pane || !pane.agent) return;
     const open = changesPanes.includes(pane.id);
-    if (open && !previousAcpOpen) acpTab = planRevealed ? 'plan' : 'changes';
+    if (open && !previousAcpOpen) acpTab = planRevealed ? 'plan' : 'tasks';
     planRevealed = false;
     previousAcpOpen = open;
   });
 
   $effect(() => {
     const scope = acpScope;
+    if (!scope) return;
+    return sessionTasks().subscribe((changed) => {
+      if (planKey(changed) === planKey(scope)) tasksTick += 1;
+    });
+  });
+
+  $effect(() => {
+    const scope = acpScope;
     if (!scope || !('id' in pane)) return;
     const paneId = pane.id;
-    const revealing = new Set(['proposed', 'questions', 'amended', 'checkpoint', 'done']);
     return acpPlans().subscribe((change) => {
       if (planKey(change.scope) !== planKey(scope)) return;
       acpPlanTick += 1;
-      if (!revealing.has(change.reason)) return;
+      if (!revealsPlanReview(change.reason)) return;
       planRevealed = true;
       acpTab = 'plan';
       onrevealplan(paneId);
@@ -504,6 +523,7 @@
     bind:clientHeight={splitHeight}
   >
     <PaneTree
+      {agentStatusStatuses}
       {active}
       {coordinationMessages}
       {spawnReceipts}
@@ -618,6 +638,7 @@
       onkeydown={resizeKey}
     ></div>
     <PaneTree
+      {agentStatusStatuses}
       {active}
       {coordinationMessages}
       {spawnReceipts}
@@ -884,6 +905,12 @@
               <section class="native-details side-area" aria-label="Agent details">
                 <nav class="side-tabs" aria-label="Agent detail tabs">
                   <div class="side-tabs-list" role="tablist" aria-label="Agent details">
+                    <button
+                      class:active={acpTab === 'tasks'}
+                      role="tab"
+                      aria-selected={acpTab === 'tasks'}
+                      onclick={() => (acpTab = 'tasks')}>Tasks ({taskSnapshot.tasks.length})</button
+                    >
                     {#if acpSnapshot.plan || acpSnapshot.questions}<button
                         class:active={acpTab === 'plan'}
                         role="tab"
@@ -919,7 +946,21 @@
                     onclick={closeAcpDetails}>×</button
                   >
                 </nav>
-                {#if acpTab === 'plan' && (acpSnapshot.plan || acpSnapshot.questions)}
+                {#if acpTab === 'tasks'}
+                  <div
+                    class="tasks-view"
+                    role="tabpanel"
+                    aria-label="Session task list"
+                    tabindex="0"
+                  >
+                    <TasksPanel
+                      snapshot={taskSnapshot}
+                      status={pane.thread
+                        ? (agentStatusStatuses[threadKey(pane.thread)] ?? null)
+                        : null}
+                    />
+                  </div>
+                {:else if acpTab === 'plan' && (acpSnapshot.plan || acpSnapshot.questions)}
                   <PlanPanel
                     snapshot={acpSnapshot}
                     backend={acpBackend}

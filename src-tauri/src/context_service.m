@@ -7,10 +7,24 @@ extern bool sail_context_validate_approval(const char *directory, const char *ex
                                            char *output, size_t length);
 extern bool sail_context_provider_request(const char *directory, const char *expected,
                                           const char *capability, const char *request,
+                                          bool (*notify)(void *, const char *), void *notifyContext,
                                           char *output, size_t length);
+extern bool sail_context_provider_notifications(const char *projectKey, const char *expected,
+                                                const char *capability, char *output, size_t length);
 extern void sail_context_provider_stop(const char *projectKey);
+extern void sail_context_provider_stop_if_fingerprint(const char *projectKey, const char *expected);
 extern bool sail_context_session_activate(const char *capability);
 extern void sail_context_session_deactivate(const char *capability);
+
+typedef bool (^SailContextNotification)(NSString *);
+
+static bool deliverNotification(void *context, const char *message) {
+    @autoreleasepool {
+        SailContextNotification notify = (__bridge SailContextNotification)context;
+        NSString *text = message ? [NSString stringWithUTF8String:message] : nil;
+        return text && notify(text);
+    }
+}
 
 static void closeSession(NSMutableDictionary<NSValue *, NSDictionary *> *sessions, NSValue *key) {
     NSDictionary *session = sessions[key];
@@ -23,6 +37,53 @@ static void closeSession(NSMutableDictionary<NSValue *, NSDictionary *> *session
         if ([other[@"projectKey"] isEqualToString:projectKey]) return;
     }
     sail_context_provider_stop(projectKey.UTF8String);
+}
+
+static void stopInvalidatedProvider(NSDictionary *session, NSDictionary *binding) {
+    NSString *projectKey = session[@"projectKey"];
+    NSString *fingerprint = session[@"fingerprint"];
+    if (projectKey && fingerprint && ![binding[@"projectKey"] isEqualToString:projectKey]) {
+        sail_context_provider_stop_if_fingerprint(projectKey.UTF8String, fingerprint.UTF8String);
+    }
+}
+
+static bool sharedNotification(NSString *text) {
+    NSData *bytes = [text dataUsingEncoding:NSUTF8StringEncoding];
+    id value = [NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil];
+    if (![value isKindOfClass:NSDictionary.class]) return false;
+    NSString *method = value[@"method"];
+    if (![method isKindOfClass:NSString.class]) return false;
+    return [@[@"notifications/tools/list_changed", @"notifications/resources/list_changed",
+              @"notifications/prompts/list_changed", @"notifications/resources/updated"] containsObject:method];
+}
+
+static bool enqueueNotification(NSMutableDictionary<NSValue *, NSDictionary *> *sessions,
+                                NSValue *key, NSDictionary *session, NSString *text, bool shared) {
+    NSData *bytes = [text dataUsingEncoding:NSUTF8StringEncoding];
+    id value = [NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil];
+    NSString *resource = nil;
+    if ([value isKindOfClass:NSDictionary.class] &&
+        [value[@"method"] isEqual:@"notifications/resources/updated"]) {
+        id params = value[@"params"];
+        id uri = [params isKindOfClass:NSDictionary.class] ? params[@"uri"] : nil;
+        if (![uri isKindOfClass:NSString.class]) return sessions[key] == session;
+        resource = uri;
+    }
+    for (NSValue *otherKey in sessions.allKeys) {
+        NSDictionary *other = sessions[otherKey];
+        if ((!shared && ![otherKey isEqual:key]) ||
+            ![other[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
+            ![other[@"fingerprint"] isEqualToString:session[@"fingerprint"]] ||
+            (resource && ![other[@"subscriptions"] containsObject:resource])) continue;
+        NSMutableString *pending = other[@"notifications"];
+        if ([pending lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
+            [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 1024 * 1024) {
+            [pending appendString:text];
+        } else {
+            closeSession(sessions, otherKey);
+        }
+    }
+    return sessions[key] == session;
 }
 
 static NSString *serviceLabel(void) {
@@ -52,6 +113,26 @@ static NSString *selfCodeHash(void) {
     if (SecCodeCopySelf(kSecCSDefaultFlags, &code) != errSecSuccess) return nil;
     CFDictionaryRef details = NULL;
     OSStatus status = SecCodeCopySigningInformation(code, kSecCSSigningInformation, &details);
+    CFRelease(code);
+    if (status != errSecSuccess || !details) return nil;
+    NSData *hash = [(__bridge NSDictionary *)details objectForKey:(__bridge id)kSecCodeInfoUnique];
+    NSMutableString *value = [NSMutableString string];
+    for (NSUInteger i = 0; i < hash.length; i++) {
+        [value appendFormat:@"%02x", ((const uint8_t *)hash.bytes)[i]];
+    }
+    CFRelease(details);
+    return value.length ? value : nil;
+}
+
+static NSString *staticCodeHash(NSString *path) {
+    SecStaticCodeRef code = NULL;
+    CFURLRef url = (__bridge CFURLRef)[NSURL fileURLWithPath:path];
+    if (SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) != errSecSuccess) return nil;
+    OSStatus status = SecStaticCodeCheckValidity(code, kSecCSDefaultFlags, NULL);
+    CFDictionaryRef details = NULL;
+    if (status == errSecSuccess) {
+        status = SecCodeCopySigningInformation(code, kSecCSSigningInformation, &details);
+    }
     CFRelease(code);
     if (status != errSecSuccess || !details) return nil;
     NSData *hash = [(__bridge NSDictionary *)details objectForKey:(__bridge id)kSecCodeInfoUnique];
@@ -145,12 +226,15 @@ int sail_context_service_main(void) {
                 if (xpc_get_type(message) != XPC_TYPE_DICTIONARY) return;
                 xpc_object_t reply = xpc_dictionary_create_reply(message);
                 if (!reply) return;
-                NSString *sender = senderBundlePath(message);
-                if (!sender || ![sender isEqualToString:bundle]) {
+                NSString *op = field(message, "op");
+                NSDictionary *session = sessions[key];
+                // The listener's peer requirement applies for the lifetime of this immutable
+                // connection. Reject stale connections after the installed bundle changes.
+                bool currentGeneration = [staticCodeHash(bundle) isEqualToString:hash];
+                NSString *sender = session && currentGeneration ? bundle : senderBundlePath(message);
+                if (!currentGeneration || !sender || ![sender isEqualToString:bundle]) {
                     xpc_dictionary_set_string(reply, "error", "Sail client signature or path rejected.");
                 } else {
-                    NSString *op = field(message, "op");
-                    NSDictionary *session = sessions[key];
                     if ([op isEqualToString:@"begin"]) {
                         NSString *directory = field(message, "directory");
                         NSDictionary *binding = directory.length <= 4096 ? approval(directory, nil) : nil;
@@ -160,7 +244,9 @@ int sail_context_service_main(void) {
                             sessions[key] = @{ @"directory": directory,
                                                @"projectKey": binding[@"projectKey"],
                                                @"fingerprint": binding[@"fingerprint"],
-                                               @"capability": capability };
+                                               @"capability": capability,
+                                               @"subscriptions": [NSMutableSet set],
+                                               @"notifications": [NSMutableString string] };
                             xpc_dictionary_set_string(reply, "capability", capability.UTF8String);
                             xpc_dictionary_set_string(reply, "projectKey", [binding[@"projectKey"] UTF8String]);
                         } else {
@@ -169,6 +255,9 @@ int sail_context_service_main(void) {
                     } else if ([op isEqualToString:@"check"]) {
                         NSString *capability = field(message, "capability");
                         NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                        if (session && equalCapability(capability, session[@"capability"])) {
+                            stopInvalidatedProvider(session, binding);
+                        }
                         if (session && equalCapability(capability, session[@"capability"]) &&
                             [binding[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
                             xpc_dictionary_set_bool(reply, "authorized", true);
@@ -176,9 +265,51 @@ int sail_context_service_main(void) {
                             closeSession(sessions, key);
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         }
+                    } else if ([op isEqualToString:@"notifications"]) {
+                        NSString *capability = field(message, "capability");
+                        NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                        if (session && equalCapability(capability, session[@"capability"])) {
+                            stopInvalidatedProvider(session, binding);
+                        }
+                        if (!session || !equalCapability(capability, session[@"capability"]) ||
+                            ![binding[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
+                            closeSession(sessions, key);
+                            xpc_dictionary_set_string(reply, "error", "Context session revoked.");
+                        } else {
+                            char *output = calloc(1024 * 1024 + 1, 1);
+                            bool success = output && sail_context_provider_notifications(
+                                [session[@"projectKey"] UTF8String],
+                                [session[@"fingerprint"] UTF8String],
+                                capability.UTF8String, output, 1024 * 1024 + 1);
+                            NSString *text = output ? [NSString stringWithUTF8String:output] : nil;
+                            free(output);
+                            if (!success) {
+                                xpc_dictionary_set_string(reply, "error", text.UTF8String ?: "Provider notification read failed.");
+                                closeSession(sessions, key);
+                                xpc_connection_send_message(peer, reply);
+                                return;
+                            }
+                            if (text.length) {
+                                for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+                                    if (line.length) enqueueNotification(sessions, key, session,
+                                        [line stringByAppendingString:@"\n"], true);
+                                }
+                            }
+                            if (sessions[key] != session) {
+                                xpc_dictionary_set_string(reply, "error", "Context MCP notification queue exceeded 1 MiB.");
+                                xpc_connection_send_message(peer, reply);
+                                return;
+                            }
+                            NSMutableString *pending = session[@"notifications"];
+                            xpc_dictionary_set_string(reply, "response", pending.UTF8String);
+                            [pending setString:@""];
+                        }
                     } else if ([op isEqualToString:@"request"]) {
                         NSString *capability = field(message, "capability");
                         NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                        if (session && equalCapability(capability, session[@"capability"])) {
+                            stopInvalidatedProvider(session, binding);
+                        }
                         NSString *request = field(message, "request");
                         uint64_t responseLimit = xpc_dictionary_get_uint64(message, "responseLimit");
                         if (!session || !equalCapability(capability, session[@"capability"]) ||
@@ -188,18 +319,68 @@ int sail_context_service_main(void) {
                             closeSession(sessions, key);
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         } else {
+                            NSData *requestBytes = [request dataUsingEncoding:NSUTF8StringEncoding];
+                            id parsed = [NSJSONSerialization JSONObjectWithData:requestBytes options:0 error:nil];
+                            NSString *method = [parsed isKindOfClass:NSDictionary.class] ? parsed[@"method"] : nil;
+                            id params = [parsed isKindOfClass:NSDictionary.class] ? parsed[@"params"] : nil;
+                            id uri = [params isKindOfClass:NSDictionary.class] ? params[@"uri"] : nil;
+                            NSString *resource = [uri isKindOfClass:NSString.class] ? uri : nil;
+                            bool subscribing = resource && [method isEqual:@"resources/subscribe"];
+                            bool unsubscribing = resource && [method isEqual:@"resources/unsubscribe"];
+                            NSMutableSet *subscriptions = session[@"subscriptions"];
+                            bool wasSubscribed = resource && [subscriptions containsObject:resource];
+                            if (subscribing && !wasSubscribed && subscriptions.count >= 1024) {
+                                xpc_dictionary_set_string(reply, "error", "Context resource subscriptions exceeded their bounded queue.");
+                                xpc_connection_send_message(peer, reply);
+                                return;
+                            }
+                            if (subscribing) [subscriptions addObject:resource];
                             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                                SailContextNotification notify = ^bool(NSString *text) {
+                                    __block bool accepted = false;
+                                    dispatch_sync(queue, ^{
+                                        NSDictionary *latest = sessions[key] == session
+                                            ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                                        if ([latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
+                                            accepted = true;
+                                            for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+                                                if (!line.length) continue;
+                                                NSString *notification = [line stringByAppendingString:@"\n"];
+                                                accepted = enqueueNotification(sessions, key, session,
+                                                    notification, sharedNotification(notification));
+                                                if (!accepted) break;
+                                            }
+                                        } else if (sessions[key] == session) {
+                                            stopInvalidatedProvider(session, latest);
+                                            closeSession(sessions, key);
+                                        }
+                                    });
+                                    return accepted;
+                                };
                                 char *output = calloc((size_t)responseLimit, 1);
                                 bool success = output && sail_context_provider_request(
                                     [session[@"directory"] UTF8String],
                                     [session[@"fingerprint"] UTF8String],
                                     [session[@"capability"] UTF8String], request.UTF8String,
+                                    deliverNotification, (__bridge void *)notify,
                                     output, (size_t)responseLimit);
                                 dispatch_async(queue, ^{
+                                    NSString *responseText = output ? [NSString stringWithUTF8String:output] : nil;
+                                    NSString *responseLine = [[responseText componentsSeparatedByString:@"\n"] lastObject];
+                                    NSData *responseBytes = [responseLine dataUsingEncoding:NSUTF8StringEncoding];
+                                    id response = responseBytes ? [NSJSONSerialization JSONObjectWithData:responseBytes options:0 error:nil] : nil;
+                                    bool subscribed = success && [response isKindOfClass:NSDictionary.class] &&
+                                        response[@"result"] && !response[@"error"];
+                                    if ((subscribing && !wasSubscribed && !subscribed) || (unsubscribing && subscribed)) {
+                                        [subscriptions removeObject:resource];
+                                    }
                                     NSDictionary *latest = sessions[key] == session
                                         ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
                                     if (![latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
-                                        if (sessions[key] == session) closeSession(sessions, key);
+                                        if (sessions[key] == session) {
+                                            stopInvalidatedProvider(session, latest);
+                                            closeSession(sessions, key);
+                                        }
                                         xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                                     } else if (success) {
                                         xpc_dictionary_set_string(reply, "response", output);
@@ -247,31 +428,43 @@ int sail_context_service_main(void) {
 @interface SailContextSession : NSObject
 @property(nonatomic, strong) xpc_connection_t connection;
 @property(nonatomic, copy) NSString *capability;
+@property(nonatomic, copy) NSString *bundlePath;
+@property(nonatomic, copy) NSString *codeHash;
 @end
 @implementation SailContextSession
 @end
+
+static bool sessionGenerationValid(SailContextSession *session) {
+    return session.bundlePath && session.codeHash &&
+        [staticCodeHash(session.bundlePath) isEqualToString:session.codeHash];
+}
 
 void *sail_context_session_open(const char *directory, char *error, size_t errorLength) {
     @autoreleasepool {
         if (@available(macOS 13.0, *)) {
             NSString *path = directory ? [NSString stringWithUTF8String:directory] : nil;
-            if (!path || ![canonicalPath(NSBundle.mainBundle.bundlePath) hasSuffix:@".app"]) {
+            NSString *bundle = canonicalPath(NSBundle.mainBundle.bundlePath);
+            if (!path || ![bundle hasSuffix:@".app"]) {
                 writeError(error, errorLength, @"Context service requires a signed Sail app bundle.");
                 return NULL;
             }
             SMAppService *service = [SMAppService agentServiceWithPlistName:servicePlist()];
+            SMAppServiceStatus status = service.status;
             NSError *registrationError = nil;
-            if (service.status == SMAppServiceStatusNotRegistered &&
+            if ((status == SMAppServiceStatusNotRegistered || status == SMAppServiceStatusNotFound) &&
                 ![service registerAndReturnError:&registrationError]) {
                 writeError(error, errorLength, registrationError.localizedDescription ?: @"Context service registration failed.");
                 return NULL;
             }
-            if (service.status != SMAppServiceStatusEnabled) {
-                writeError(error, errorLength, @"Context service needs approval in System Settings.");
+            status = service.status;
+            if (status != SMAppServiceStatusEnabled) {
+                writeError(error, errorLength, status == SMAppServiceStatusRequiresApproval
+                    ? @"Context service needs approval in System Settings."
+                    : @"Context service could not be found after registration.");
                 return NULL;
             }
             NSString *hash = selfCodeHash();
-            if (!hash) {
+            if (!hash || ![staticCodeHash(bundle) isEqualToString:hash]) {
                 writeError(error, errorLength, @"Sail code signature unavailable.");
                 return NULL;
             }
@@ -310,6 +503,8 @@ void *sail_context_session_open(const char *directory, char *error, size_t error
             SailContextSession *session = [SailContextSession new];
             session.connection = connection;
             session.capability = [NSString stringWithUTF8String:capability];
+            session.bundlePath = bundle;
+            session.codeHash = hash;
             return (__bridge_retained void *)session;
         }
         writeError(error, errorLength, @"Context service requires macOS 13 or later.");
@@ -366,11 +561,16 @@ bool sail_context_session_check(void *handle, char *error, size_t errorLength) {
     @autoreleasepool {
         if (!handle) return false;
         SailContextSession *session = (__bridge SailContextSession *)handle;
+        if (!sessionGenerationValid(session)) {
+            writeError(error, errorLength, @"Context service unavailable or stale after upgrade.");
+            return false;
+        }
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, "op", "check");
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
         xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
-        if (![senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)]) {
+        if (!sessionGenerationValid(session) ||
+            ![senderBundlePath(reply) isEqualToString:session.bundlePath]) {
             writeError(error, errorLength, @"Context service signature or path rejected.");
             return false;
         }
@@ -383,20 +583,25 @@ bool sail_context_session_check(void *handle, char *error, size_t errorLength) {
     }
 }
 
-bool sail_context_session_request(void *handle, const char *message,
-                                  char *output, size_t outputLength,
-                                  char *error, size_t errorLength) {
+static bool sessionExchange(void *handle, const char *op, const char *message,
+                            char *output, size_t outputLength,
+                            char *error, size_t errorLength) {
     @autoreleasepool {
-        if (!handle || !message || !output || !outputLength) return false;
+        if (!handle || !output || !outputLength) return false;
         SailContextSession *session = (__bridge SailContextSession *)handle;
+        if (!sessionGenerationValid(session)) {
+            writeError(error, errorLength, @"Context service unavailable or stale after upgrade.");
+            return false;
+        }
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
-        xpc_dictionary_set_string(request, "op", "request");
+        xpc_dictionary_set_string(request, "op", op);
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
-        xpc_dictionary_set_string(request, "request", message);
+        if (message) xpc_dictionary_set_string(request, "request", message);
         xpc_dictionary_set_uint64(request, "responseLimit", outputLength);
         xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
-        if (![senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)]) {
-            writeError(error, errorLength, @"Context service signature or path rejected.");
+        if (!sessionGenerationValid(session) ||
+            ![senderBundlePath(reply) isEqualToString:session.bundlePath]) {
+            writeError(error, errorLength, @"Context service unavailable or stale after upgrade.");
             return false;
         }
         const char *response = xpc_get_type(reply) == XPC_TYPE_DICTIONARY
@@ -413,6 +618,34 @@ bool sail_context_session_request(void *handle, const char *message,
     }
 }
 
+bool sail_context_session_request(void *handle, const char *message,
+                                  char *output, size_t outputLength,
+                                  char *error, size_t errorLength) {
+    return message && sessionExchange(handle, "request", message, output, outputLength, error, errorLength);
+}
+
+bool sail_context_session_cancel(void *handle, const char *message) {
+    @autoreleasepool {
+        if (!handle || !message) return false;
+        SailContextSession *session = (__bridge SailContextSession *)handle;
+        if (!sessionGenerationValid(session)) return false;
+        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(request, "op", "request");
+        xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
+        xpc_dictionary_set_string(request, "request", message);
+        xpc_connection_send_message_with_reply(
+            session.connection, request,
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+            ^(xpc_object_t ignored) { (void)ignored; });
+        return true;
+    }
+}
+
+bool sail_context_session_notifications(void *handle, char *output, size_t outputLength,
+                                        char *error, size_t errorLength) {
+    return sessionExchange(handle, "notifications", NULL, output, outputLength, error, errorLength);
+}
+
 void sail_context_session_close(void *handle) {
     @autoreleasepool {
         if (!handle) return;
@@ -425,33 +658,60 @@ void sail_context_session_close(void *handle) {
 }
 
 #ifdef SAIL_CONTEXT_E2E
+bool sail_context_probe_service_status(char *output, size_t length) {
+    @autoreleasepool {
+        if (@available(macOS 13.0, *)) {
+            NSString *bundle = canonicalPath(NSBundle.mainBundle.bundlePath);
+            NSString *plist = servicePlist();
+            NSString *plistPath = [bundle stringByAppendingPathComponent:
+                [@"Contents/Library/LaunchAgents" stringByAppendingPathComponent:plist]];
+            SMAppService *service = [SMAppService agentServiceWithPlistName:plist];
+            NSDictionary *details = @{
+                @"status": @(service.status),
+                @"bundleIdentifier": NSBundle.mainBundle.bundleIdentifier ?: @"",
+                @"label": serviceLabel(),
+                @"plist": plist,
+                @"plistPresent": @([NSFileManager.defaultManager fileExistsAtPath:plistPath]),
+                @"helperPresent": @([NSFileManager.defaultManager fileExistsAtPath:
+                    [bundle stringByAppendingPathComponent:@"Contents/MacOS/sail"]]),
+            };
+            NSData *json = [NSJSONSerialization dataWithJSONObject:details options:0 error:nil];
+            if (!output || !json || json.length >= length) return false;
+            memcpy(output, json.bytes, json.length);
+            output[json.length] = '\0';
+            return true;
+        }
+        return false;
+    }
+}
+
 bool sail_context_probe_replay(const char *directory, char *error, size_t errorLength) {
     void *handle = sail_context_session_open(directory, error, errorLength);
     if (!handle) return false;
     @autoreleasepool {
         SailContextSession *session = (__bridge SailContextSession *)handle;
-        xpc_connection_t other = xpc_connection_create_mach_service(serviceLabel().UTF8String, NULL, 0);
-        NSString *hash = selfCodeHash();
-        NSString *requirement = [NSString stringWithFormat:@"cdhash H\"%@\"", hash];
-        if (!hash || xpc_connection_set_peer_code_signing_requirement(other, requirement.UTF8String) != 0) {
-            writeError(error, errorLength, @"Replay probe cannot verify service signature.");
-            xpc_connection_set_event_handler(other, ^(xpc_object_t ignored) { (void)ignored; });
-            xpc_connection_resume(other);
-            xpc_connection_cancel(other);
-            sail_context_session_close(handle);
-            return false;
+        bool rejected = true;
+        for (NSString *operation in @[@"check", @"request"]) {
+            void *otherHandle = sail_context_session_open(directory, error, errorLength);
+            if (!otherHandle) {
+                sail_context_session_close(handle);
+                return false;
+            }
+            SailContextSession *other = (__bridge SailContextSession *)otherHandle;
+            xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_string(request, "op", operation.UTF8String);
+            xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
+            if ([operation isEqualToString:@"request"]) {
+                xpc_dictionary_set_string(request, "request", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+            }
+            xpc_object_t reply = xpc_connection_send_message_with_reply_sync(other.connection, request);
+            rejected = rejected && xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+                [senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)] &&
+                !xpc_dictionary_get_bool(reply, "authorized") &&
+                xpc_dictionary_get_string(reply, "response") == NULL &&
+                xpc_dictionary_get_string(reply, "error") != NULL;
+            sail_context_session_close(otherHandle);
         }
-        xpc_connection_set_event_handler(other, ^(xpc_object_t ignored) { (void)ignored; });
-        xpc_connection_resume(other);
-        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
-        xpc_dictionary_set_string(request, "op", "check");
-        xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
-        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(other, request);
-        bool rejected = xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
-            [senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)] &&
-            !xpc_dictionary_get_bool(reply, "authorized") &&
-            xpc_dictionary_get_string(reply, "error") != NULL;
-        xpc_connection_cancel(other);
         bool originalAuthorized = sail_context_session_check(handle, error, errorLength);
         sail_context_session_close(handle);
         if (!rejected) writeError(error, errorLength, @"Cross-connection capability replay was not rejected.");

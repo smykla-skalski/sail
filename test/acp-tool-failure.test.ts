@@ -27,7 +27,7 @@ void test('hook failure exposes action, rule, reason, output, and follow-up prom
   assert.deepEqual(failure, {
     kind: 'hook',
     event: null,
-    action: 'Run command',
+    action: 'git commit -m test',
     rule: 'GIT010',
     reason: 'Add -s -S flags',
     output: 'PreToolUse:Bash says: ❌ GIT010: Add -s -S flags',

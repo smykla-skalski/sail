@@ -3,6 +3,7 @@ name: Desktop packages
 on:
   pull_request:
     paths:
+      - .github/workflows/release.yml
       - package.json
       - package-lock.json
       - scripts/package-release.mjs
@@ -17,6 +18,18 @@ on:
         description: Run the one-off signed private context auth fixture
         type: boolean
         default: false
+      context_auth_export:
+        description: Export signed private bundles for an OS-approved test host
+        type: boolean
+        default: false
+      context_auth_export_config:
+        description: Absolute isolated config path on the private test host
+        type: string
+        default: ''
+      context_auth_export_tmpdir:
+        description: Absolute isolated temporary path on the private test host
+        type: string
+        default: ''
       context_provider_553:
         description: Run the one-off signed private provider relay fixture
         type: boolean
@@ -91,16 +104,20 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [[ -z "$APPLE_CERTIFICATE" ]]; then
-            echo 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
-            echo 'SAIL_SIGNING_MODE=ad-hoc' >> "$GITHUB_ENV"
-            /usr/libexec/PlistBuddy -c 'Delete :com.apple.developer.web-browser.public-key-credential' src-tauri/Entitlements.plist
-          else
-            test -n "$APPLE_CERTIFICATE_PASSWORD"
-            test -n "$APPLE_SIGNING_IDENTITY"
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            test -n "$APPLE_CERTIFICATE"
             test -n "$APPLE_ID"
             test -n "$APPLE_PASSWORD"
             test -n "$APPLE_TEAM_ID"
+          else
+            /usr/libexec/PlistBuddy -c 'Delete :com.apple.developer.web-browser.public-key-credential' src-tauri/Entitlements.plist
+          fi
+          if [[ -z "$APPLE_CERTIFICATE" ]]; then
+            echo 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+            echo 'SAIL_SIGNING_MODE=ad-hoc' >> "$GITHUB_ENV"
+          else
+            test -n "$APPLE_CERTIFICATE_PASSWORD"
+            test -n "$APPLE_SIGNING_IDENTITY"
             certificate="$RUNNER_TEMP/sai-certificate.p12"
             keychain="$RUNNER_TEMP/sai-build.keychain-db"
             keychain_password="$(openssl rand -hex 24)"
@@ -111,13 +128,17 @@ jobs:
             security set-keychain-settings -t 3600 -u "$keychain"
             security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
-            echo 'SAIL_SIGNING_MODE=developer-id' >> "$GITHUB_ENV"
+            if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+              echo 'SAIL_SIGNING_MODE=developer-id-test' >> "$GITHUB_ENV"
+            else
+              echo 'SAIL_SIGNING_MODE=developer-id' >> "$GITHUB_ENV"
+            fi
             echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
           fi
 
       - name: Build development installer
-        if: runner.os != 'macOS' || env.SAIL_SIGNING_MODE == 'ad-hoc'
-        run: npm run tauri build -- --bundles ${{ matrix.bundles }} --ci
+        if: runner.os != 'macOS' || env.SAIL_SIGNING_MODE == 'ad-hoc' || env.SAIL_SIGNING_MODE == 'developer-id-test'
+        run: npm run tauri build -- --bundles ${{ matrix.bundles }} --ci ${{ matrix.target == 'macos-x64' && '-v' || '' }}
 
       - name: Build and notarize Developer ID installer
         if: runner.os == 'macOS' && env.SAIL_SIGNING_MODE == 'developer-id'
@@ -235,7 +256,7 @@ jobs:
     name: Signed private context auth fixture
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.context_auth_514 &&
-      github.ref == 'refs/heads/feat/issue-514-macos-session-auth' && github.actor == 'Automaat'
+      github.ref == 'refs/heads/fix/issue-514-signed-fixture-action' && github.actor == 'Automaat'
     runs-on: macos-15
 
     steps:
@@ -244,89 +265,14 @@ jobs:
       - name: Configure private fixture paths
         shell: bash
         run: |
-          private="$RUNNER_TEMP/sail-514-$GITHUB_RUN_ID"
+          test -n "${HOME:-}"
+          mkdir -p "$HOME/Applications"
+          private="$(mktemp -d "$HOME/Applications/sail-514-context.XXXXXX")"
+          mkdir -p "$private/tmp"
           {
-            echo "SAIL_E2E_CONFIG_DIR=$private/config"
-            echo "SAIL_TEST_SCRATCH=$private/test"
-            echo "CARGO_TARGET_DIR=$private/target"
-            echo "npm_config_cache=$private/npm-cache"
-          } >> "$GITHUB_ENV"
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: '24'
-
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb9281d # stable
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Import existing Apple signing certificate
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: |
-          set -euo pipefail
-          test -n "$APPLE_CERTIFICATE"
-          test -n "$APPLE_CERTIFICATE_PASSWORD"
-          test -n "$APPLE_SIGNING_IDENTITY"
-          private="$RUNNER_TEMP/sail-514-$GITHUB_RUN_ID"
-          mkdir -p "$private"
-          certificate="$private/certificate.p12"
-          keychain="$private/signing.keychain-db"
-          password="$(openssl rand -hex 24)"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
-          security create-keychain -p "$password" "$keychain"
-          security default-keychain -s "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          security set-keychain-settings -t 3600 -u "$keychain"
-          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain"
-          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
-
-      - name: Build signed private app
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$SAIL_E2E_CONFIG_DIR" "$SAIL_TEST_SCRATCH"
-          npm run build:e2e
-          apps=("$CARGO_TARGET_DIR"/debug/bundle/macos/*.app)
-          test "${#apps[@]}" -eq 1
-          codesign --verify --deep --strict "${apps[0]}"
-          test "$(codesign -dv --verbose=4 "${apps[0]}" 2>&1 | sed -n 's/^Signature=//p')" != 'adhoc'
-          echo "SAIL_E2E_APP=${apps[0]}" >> "$GITHUB_ENV"
-
-      - name: Exercise signed native sessions
-        run: node test/context-auth-native.mjs
-
-      - name: Remove private signing material and state
-        if: always()
-        shell: bash
-        run: |
-          private="$RUNNER_TEMP/sail-514-$GITHUB_RUN_ID"
-          if [[ -n "$private" && "$private" == "$RUNNER_TEMP"/sail-514-* ]]; then
-            security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
-            rm -rf "$private"
-          fi
-
-  context-provider-553:
-    name: Signed private provider relay fixture
-    if: >-
-      github.event_name == 'workflow_dispatch' && inputs.context_provider_553 &&
-      github.ref == 'refs/heads/feat/issue-553-provider-bridge' && github.actor == 'Automaat'
-    runs-on: macos-15
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Configure private fixture paths
-        shell: bash
-        run: |
-          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
-          {
-            echo "SAIL_E2E_CONFIG_DIR=$private/config"
+            echo "SAIL_CONTEXT_AUTH_ROOT=$private"
+            echo "TMPDIR=$private/tmp"
+            echo "SAIL_E2E_CONFIG_DIR=$private/tmp/config"
             echo "SAIL_TEST_SCRATCH=$private/test"
             echo "CARGO_TARGET_DIR=$private/target"
             echo "npm_config_cache=$private/npm-cache"
@@ -352,7 +298,7 @@ jobs:
           test -n "$APPLE_CERTIFICATE"
           test -n "$APPLE_CERTIFICATE_PASSWORD"
           test -n "$APPLE_SIGNING_IDENTITY"
-          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
+          private="$SAIL_CONTEXT_AUTH_ROOT"
           mkdir -p "$private"
           certificate="$private/certificate.p12"
           keychain="$private/signing.keychain-db"
@@ -375,18 +321,137 @@ jobs:
           apps=("$CARGO_TARGET_DIR"/debug/bundle/macos/*.app)
           test "${#apps[@]}" -eq 1
           codesign --verify --deep --strict "${apps[0]}"
+          codesign --verify -v -R '=anchor apple generic' "${apps[0]}"
           test "$(codesign -dv --verbose=4 "${apps[0]}" 2>&1 | sed -n 's/^Signature=//p')" != 'adhoc'
           echo "SAIL_E2E_APP=${apps[0]}" >> "$GITHUB_ENV"
 
+      - name: Export signed private fixture bundles
+        if: inputs.context_auth_export
+        run: node scripts/export-context-auth-fixture.mjs
+        env:
+          SAIL_CONTEXT_AUTH_EXPORT_CONFIG: ${{ inputs.context_auth_export_config }}
+          SAIL_CONTEXT_AUTH_EXPORT_TMPDIR: ${{ inputs.context_auth_export_tmpdir }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: inputs.context_auth_export
+        with:
+          name: signed-context-auth-${{ github.sha }}
+          path: ${{ env.SAIL_CONTEXT_AUTH_ROOT }}/artifact/*.app.zip
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Exercise signed native sessions
+        if: '!inputs.context_auth_export'
+        run: node test/context-auth-native.mjs
+
+      - name: Remove private signing material and state
+        if: always()
+        shell: bash
+        run: |
+          private="${SAIL_CONTEXT_AUTH_ROOT:-}"
+          if [[ -n "$private" && -n "${HOME:-}" && "$(dirname "$private")" == "$HOME/Applications" && "$(basename "$private")" == sail-514-context.* ]]; then
+            security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
+            rm -rf "$private"
+          fi
+
+  context-provider-553:
+    name: Signed private provider relay fixture
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.context_provider_553 &&
+      github.ref == 'refs/heads/feat/issue-553-provider-bridge' && github.actor == 'Automaat'
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure private fixture paths
+        shell: bash
+        run: |
+          test -n "${HOME:-}"
+          mkdir -p "$HOME/Applications"
+          private="$(mktemp -d "$HOME/Applications/sail-553-context.XXXXXX")"
+          mkdir -p "$private/tmp"
+          {
+            echo "SAIL_CONTEXT_AUTH_ROOT=$private"
+            echo "TMPDIR=$private/tmp"
+            echo "SAIL_E2E_CONFIG_DIR=$private/tmp/config"
+            echo "SAIL_TEST_SCRATCH=$private/test"
+            echo "CARGO_TARGET_DIR=$private/target"
+            echo "npm_config_cache=$private/npm-cache"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import existing Apple signing certificate
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          private="$SAIL_CONTEXT_AUTH_ROOT"
+          mkdir -p "$private"
+          certificate="$private/certificate.p12"
+          keychain="$private/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$password" "$keychain"
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build signed private app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SAIL_E2E_CONFIG_DIR" "$SAIL_TEST_SCRATCH"
+          npm run build:e2e
+          apps=("$CARGO_TARGET_DIR"/debug/bundle/macos/*.app)
+          test "${#apps[@]}" -eq 1
+          codesign --verify --deep --strict "${apps[0]}"
+          codesign --verify -v -R '=anchor apple generic' "${apps[0]}"
+          test "$(codesign -dv --verbose=4 "${apps[0]}" 2>&1 | sed -n 's/^Signature=//p')" != 'adhoc'
+          echo "SAIL_E2E_APP=${apps[0]}" >> "$GITHUB_ENV"
+
+      - name: Export signed private provider bundles
+        if: inputs.context_auth_export
+        run: node scripts/export-context-auth-fixture.mjs
+        env:
+          SAIL_CONTEXT_AUTH_EXPORT_CONFIG: ${{ inputs.context_auth_export_config }}
+          SAIL_CONTEXT_AUTH_EXPORT_TMPDIR: ${{ inputs.context_auth_export_tmpdir }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: inputs.context_auth_export
+        with:
+          name: signed-context-provider-${{ github.sha }}
+          path: ${{ env.SAIL_CONTEXT_AUTH_ROOT }}/artifact/*.app.zip
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Exercise signed provider relay
+        if: '!inputs.context_auth_export'
         run: node test/context-provider-native.mjs
 
       - name: Remove private signing material and state
         if: always()
         shell: bash
         run: |
-          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
-          if [[ -n "$private" && "$private" == "$RUNNER_TEMP"/sail-553-* ]]; then
+          private="${SAIL_CONTEXT_AUTH_ROOT:-}"
+          if [[ -n "$private" && -n "${HOME:-}" && "$(dirname "$private")" == "$HOME/Applications" && "$(basename "$private")" == sail-553-context.* ]]; then
             security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
             rm -rf "$private"
           fi

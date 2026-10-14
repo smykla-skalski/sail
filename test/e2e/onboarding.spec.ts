@@ -202,15 +202,15 @@ describe('repository setup', () => {
     await $(deleteMenuItem).click();
     await expect($('.worktree-menu')).not.toExist();
     await expect(row).toBeDisplayed();
+    await expect(row).toBeEnabled();
 
     const dirty = join(worktree, 'keep-me.txt');
     writeFileSync(dirty, 'unsaved work\n');
     await row.click({ button: 'right' });
     await expect($('.worktree-menu')).toBeDisplayed();
-    await browser.execute(() => sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes'));
     await $(deleteMenuItem).click();
     await expect($('.confirmation-dialog')).toHaveText(
-      expect.stringContaining('permanently removes uncommitted and ignored files'),
+      expect.stringContaining('permanently removes uncommitted, untracked, and ignored files'),
     );
     await expect($('.app-shell [role="alert"]')).not.toExist();
     expect(existsSync(dirty)).toBe(true);
@@ -223,10 +223,9 @@ describe('repository setup', () => {
     writeFileSync(join(repository, '.git', 'info', 'exclude'), 'ignored-secret.txt\n');
     writeFileSync(ignored, 'local secret\n');
     await row.click({ button: 'right' });
-    await browser.execute(() => sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes'));
     await $(deleteMenuItem).click();
     await expect($('.confirmation-dialog')).toHaveText(
-      expect.stringContaining('permanently removes uncommitted and ignored files'),
+      expect.stringContaining('permanently removes uncommitted, untracked, and ignored files'),
     );
     await expect($('.app-shell > .notice.error')).not.toExist();
     expect(existsSync(ignored)).toBe(true);
@@ -237,7 +236,6 @@ describe('repository setup', () => {
     await expect(row).toBeDisplayed();
 
     await row.click({ button: 'right' });
-    await browser.execute(() => sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes'));
     await $(deleteMenuItem).click();
     await expect($('.confirmation-dialog')).toBeDisplayed();
     await $('.confirmation-dialog .confirmation-primary').click();

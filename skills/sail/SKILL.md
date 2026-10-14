@@ -17,6 +17,18 @@ and disabled tools are rejected even if called from stale schema context. Do not
 work around a missing tool. Permission prompts include Sail's risk classification,
 reason, and policy revision; unknown and high-risk actions require a person.
 
+## Session tasks
+
+- Each turn starts with a Sail starting task. Read `sail_tasks_read` at the start
+  of work, then call `sail_tasks_report` to describe routine tasks and progress.
+- Use stable task IDs within the turn and statuses `pending`, `in_progress`,
+  `done`, `blocked`, or `skipped`. Report updates as work changes.
+- Pass the current `turnId` and `expectedRevision` from the latest snapshot.
+  After a stale error, read again before retrying. Task scope comes from your
+  session; never send another session's work.
+- Set `focus` to the ID of your current `in_progress` task, or `null` when no
+  task is active. Tasks track routine work alongside formal plan review.
+
 ## Workflow references
 
 - Bundled workflow prompts contain the core contract only. When that contract
@@ -31,6 +43,7 @@ reason, and policy revision; unknown and high-risk actions require a person.
 - In Sail sessions, use the `sail-browser` memory tools. A system-wide `sail-shared-memory` installation accesses the same project store; do not search or write through both servers for the same task.
 - When memory tools are available, search for relevant prior decisions or conventions before work that depends on them. Inspect matches before relying on them; skip recall for trivial tasks.
 - Search before saving to avoid duplicates. Remember only confirmed, durable project facts, never secrets, raw transcripts, or temporary progress.
+- Use `memory_supersede` for a corrected handoff. Set `resolveConflicts: true` when that correction settles its existing disagreements; otherwise unresolved conflicts carry forward. Use `memory_mark_conflict` when current handoffs disagree without a chosen replacement. Search omits superseded handoffs; inspect preserves their history.
 - Memory belongs to the current Git project and its linked worktrees, not every project. Current user instructions and repository rules take precedence over stored memories.
 - Forget a memory only when the user asks.
 

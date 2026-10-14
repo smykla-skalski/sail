@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::validate_repository;
+use crate::validate_repository_path;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -334,7 +334,7 @@ fn apply(root: &Path, target: &str, previous: &str) -> Result<(), String> {
 #[tauri::command]
 pub async fn record_turn_snapshot(path: String, thread: String) -> Result<SnapshotInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = PathBuf::from(validate_repository(path)?);
+        let root = PathBuf::from(validate_repository_path(path)?);
         let _lock = lock(&root)?;
         snapshot(&root, &thread, "turn")
     })
@@ -348,7 +348,7 @@ pub async fn list_turn_snapshots(
     thread: String,
 ) -> Result<Vec<SnapshotInfo>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = PathBuf::from(validate_repository(path)?);
+        let root = PathBuf::from(validate_repository_path(path)?);
         list(&root, &thread)
     })
     .await
@@ -362,7 +362,7 @@ pub async fn restore_turn_snapshot(
     id: String,
 ) -> Result<SnapshotInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = PathBuf::from(validate_repository(path)?);
+        let root = PathBuf::from(validate_repository_path(path)?);
         let _lock = lock(&root)?;
         if !list(&root, &thread)?.iter().any(|item| item.id == id) {
             return Err("Snapshot does not belong to this thread and worktree.".into());

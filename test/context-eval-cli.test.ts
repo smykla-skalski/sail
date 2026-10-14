@@ -292,7 +292,7 @@ void test(
             },
           ],
           concurrency: 32,
-          timeoutMs: 1_000,
+          timeoutMs: 10_000,
         }),
       );
 
@@ -309,21 +309,34 @@ void test(
               '--output',
               outputPath,
             ],
-            { cwd: root, timeout: 15_000 },
+            { cwd: root, timeout: 30_000 },
           ),
-        /timed out after 1000 ms/,
+        /timed out after 10000 ms/,
       );
       const runDirectories = await readdir(join(outputPath, 'runs'));
       const childFiles = await Promise.all(
-        runDirectories.map(async (directory) =>
-          readFile(join(outputPath, 'runs', directory, 'observation.json.child-pid'), 'utf8'),
-        ),
+        runDirectories.map(async (directory) => {
+          try {
+            return await readFile(
+              join(outputPath, 'runs', directory, 'observation.json.child-pid'),
+              'utf8',
+            );
+          } catch (error) {
+            if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT'))
+              throw error;
+            return assert.fail(
+              `Fixture descendant was not ready before the runner timeout: ${directory}`,
+            );
+          }
+        }),
       );
       childPids.push(...childFiles.map(Number));
-      const heartbeat = join(outputPath, 'runs', runDirectories[0], 'observation.json.heartbeat');
-      const before = await readFile(heartbeat, 'utf8');
+      const heartbeats = runDirectories.map((directory) =>
+        join(outputPath, 'runs', directory, 'observation.json.heartbeat'),
+      );
+      const before = await Promise.all(heartbeats.map((path) => readFile(path, 'utf8')));
       await new Promise((settled) => setTimeout(settled, 200));
-      assert.equal(await readFile(heartbeat, 'utf8'), before);
+      assert.deepEqual(await Promise.all(heartbeats.map((path) => readFile(path, 'utf8'))), before);
     } finally {
       childPids.forEach(stopFixtureChild);
       await rm(temporary, { recursive: true, force: true });

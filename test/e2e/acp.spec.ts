@@ -1,6 +1,13 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chooseTopbarAction } from './topbar';
@@ -168,6 +175,7 @@ describe('ACP agent threads', () => {
     );
     writeFileSync(join(repository, 'agent-change.txt'), 'Changed by agent\n');
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
     await expect($('#session-details')).toHaveText(expect.stringContaining('agent-change.txt'));
     await expect($('.review-evidence')).toHaveText(expect.stringContaining('Review evidence'));
     await expect($('.review-evidence')).toHaveText(
@@ -184,9 +192,11 @@ describe('ACP agent threads', () => {
     );
     await $('#session-details button[aria-label="Close Changes"]').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
-    await $('#session-details .side-tabs button:nth-child(2)').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
+    await $('#session-details button[role="tab"]*=Ship runs').click();
     await $('#session-details button[aria-label="Hide Ship panel"]').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
     await expect($('#session-details')).toHaveText(expect.stringContaining('agent-change.txt'));
     await $('#session-details button[aria-label="Close Changes"]').click();
 
@@ -611,6 +621,38 @@ describe('ACP agent threads', () => {
     await expect($('.queued-messages')).not.toExist();
   });
 
+  it('does not queue a dispatched prompt again after the agent reports failure', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Ship gate fixture queue ordering');
+    await $(sendButton).click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Prompt failure');
+    await $(sendButton).click();
+    await $('.agent-composer [data-pane-prompt]').setValue('After failed prompt');
+    await $(sendButton).click();
+    await expect($('.agent-error')).toHaveText(expect.stringContaining('Fixture prompt failed'));
+    await expect($('.queued-messages')).toHaveText(expect.stringContaining('After failed prompt'));
+    await expect($('.queued-messages')).not.toHaveText(expect.stringContaining('Prompt failure'));
+    await $('button=Retry queue').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-permission button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: After failed prompt'),
+    );
+    await expect($('.queued-messages')).not.toExist();
+  });
+
   it('keeps an active ACP turn running when closing Sail is cancelled', async () => {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);
@@ -950,5 +992,89 @@ describe('ACP agent threads', () => {
     const titles = await savedTitles();
     expect(titles).toContain('Main action');
     expect(titles).not.toContain('Split action');
+  });
+
+  it('stops a deleted thread before releasing its browser connection', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Delete with browser call');
+    await $(sendButton).click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    const [sessionId] = await activeClaudeSessions();
+    expect(typeof sessionId).toBe('string');
+
+    await chooseTopbarAction('More actions', 'Delete thread');
+    const dialog = $('.confirmation-dialog');
+    await expect(dialog).toHaveText(expect.stringContaining('The active turn will be stopped.'));
+    await dialog.$('.confirmation-primary').click();
+    await expect(dialog).not.toBeDisplayed();
+    expect(await savedTitles()).not.toContain('Delete with browser call');
+
+    const resultFile = join(repository, 'acp-delete-browser-result.txt');
+    await browser.waitUntil(() => existsSync(resultFile), { timeout: 15_000 });
+    expect(readFileSync(resultFile, 'utf8')).toBe('Worktree tool works');
+    await browser.waitUntil(async () => !(await activeClaudeSessions()).includes(sessionId), {
+      timeout: 15_000,
+    });
+  });
+
+  it('keeps a thread visible when stopping it fails, then allows deletion to retry', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Retain on forget error');
+    await $(sendButton).click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Retain on forget error'),
+    );
+    const titles = await savedTitles();
+    await browser.execute(() => {
+      const internals = Reflect.get(window, '__TAURI_INTERNALS__');
+      const original: unknown = Reflect.get(internals, 'invoke');
+      if (typeof original !== 'function') throw new Error('Missing Tauri invoke');
+      Reflect.set(window, '__sailOriginalInvoke', original);
+      Reflect.set(internals, 'invoke', (command: string, ...args: unknown[]) =>
+        command === 'acp_forget_session'
+          ? Promise.reject(new Error('Test cancellation failure'))
+          : Reflect.apply(original, internals, [command, ...args]),
+      );
+    });
+    try {
+      await chooseTopbarAction('More actions', 'Delete thread');
+      await $('.confirmation-dialog .confirmation-primary').click();
+      await expect($('.notice.error[role="alert"]')).toHaveText(
+        expect.stringContaining('Could not stop thread: Test cancellation failure'),
+      );
+      expect(await savedTitles()).toEqual(titles);
+      await expect($('.agent-workspace')).toBeDisplayed();
+    } finally {
+      await browser.execute(() => {
+        const internals = Reflect.get(window, '__TAURI_INTERNALS__');
+        Reflect.set(internals, 'invoke', Reflect.get(window, '__sailOriginalInvoke'));
+        Reflect.deleteProperty(window, '__sailOriginalInvoke');
+      });
+    }
+    await chooseTopbarAction('More actions', 'Delete thread');
+    await $('.confirmation-dialog .confirmation-primary').click();
+    await browser.waitUntil(async () => (await savedTitles()).length < titles.length);
   });
 });

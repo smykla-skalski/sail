@@ -103,6 +103,7 @@ void test('cards expose the most urgent agent and latest meaningful event', () =
       check: checks[0],
       setupFailed: false,
       setupPending: false,
+      agentFocus: [],
     },
   );
 });

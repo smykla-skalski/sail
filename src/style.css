@@ -403,7 +403,7 @@ button:disabled {
 .project-agent-row {
   display: grid;
   flex: 1;
-  grid-template-columns: minmax(0, 1fr) minmax(0, max-content);
+  grid-template-columns: minmax(0, 1fr) fit-content(50%);
   min-width: 0;
   width: 100%;
   min-height: 32px;
@@ -502,6 +502,14 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.project-worktree-origin {
+  margin: 0 8px 4px 45px;
+  overflow: hidden;
+  color: var(--sui-muted);
+  font-size: var(--type-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .project-worktree-status.failed {
   color: var(--sui-danger);
   white-space: normal;
@@ -516,6 +524,18 @@ button:disabled {
   padding: 3px 6px;
   color: var(--sui-primary);
   font-size: var(--type-12);
+}
+.project-worktree-cleanup-pending {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 8px 8px 45px;
+  overflow-wrap: anywhere;
+  color: var(--sui-muted);
+  font-size: var(--type-12);
+}
+.project-worktree-cleanup-pending .project-worktree-retry {
+  align-self: flex-start;
 }
 .project-worktree-spinner {
   width: 12px;
@@ -1465,6 +1485,16 @@ time {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.knowledge-diff {
+  max-width: 100%;
+  max-height: 360px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: var(--radius-8);
+  background: var(--shell-sidebar);
+  font-size: var(--type-13);
+  white-space: pre;
+}
 .memory-search > div,
 .memory-forget-confirm,
 .memory-record-meta {
@@ -1566,7 +1596,7 @@ time {
 .pane-leaf-frame.side-open > .side-chat-leaf {
   border-left: 8px solid var(--shell-divider);
 }
-.pane-leaf.focused {
+.pane-leaf:focus-visible {
   outline-color: var(--sui-primary);
 }
 .pane-leaf > .workspace {
@@ -1614,9 +1644,16 @@ time {
 }
 .native-details > .diff-panel,
 .native-details > .history-panel,
-.native-details > .plan-panel {
+.native-details > .plan-panel,
+.native-details > .tasks-view {
   flex: 1;
   min-height: 0;
+}
+.tasks-view {
+  overflow: auto;
+}
+.tasks-view:focus-visible {
+  box-shadow: inset 3px 0 var(--sui-muted);
 }
 .side-tabs-list {
   display: contents;
@@ -2900,6 +2937,11 @@ time {
 .confirmation-dialog p {
   line-height: 1.5;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.confirmation-dialog p.multi {
+  max-height: 50vh;
+  overflow-y: auto;
 }
 .confirmation-actions,
 .path-picker-actions,

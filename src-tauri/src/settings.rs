@@ -4,16 +4,117 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "e2e")]
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(feature = "e2e")]
+use std::time::{Duration, Instant};
+#[cfg(not(feature = "e2e"))]
 use tauri::Manager;
+
+use crate::settings_records::{self as records, is_record_key};
+use std::sync::Mutex as StdMutex;
 
 type Settings = BTreeMap<String, String>;
 type Deletions = BTreeMap<String, BTreeSet<String>>;
 const DELETIONS_KEY: &str = "sai-settings-deletions";
 const MODIFIED_KEY: &str = "sai-settings-modified";
+const SPAWN_RECEIPTS_KEY: &str = "sai-agent-spawn-receipts";
 const INTERRUPTED_TURNS_KEY: &str = "sai-interrupted-agent-turns";
 const ACP_TURN_EVIDENCE_KEY: &str = "sai-acp-turn-evidence";
 const ACP_TURN_EVIDENCE_LIMIT: usize = 500;
 const ACP_UNSETTLED_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+#[cfg(feature = "e2e")]
+#[derive(Default)]
+struct E2eWriterState {
+    active: usize,
+    resetting: bool,
+}
+
+#[cfg(feature = "e2e")]
+struct E2eWriterGate {
+    state: Mutex<E2eWriterState>,
+    idle: Condvar,
+}
+
+#[cfg(feature = "e2e")]
+static E2E_WRITER_GATE: OnceLock<Arc<E2eWriterGate>> = OnceLock::new();
+
+#[cfg(feature = "e2e")]
+fn e2e_writer_gate() -> Arc<E2eWriterGate> {
+    E2E_WRITER_GATE
+        .get_or_init(|| {
+            Arc::new(E2eWriterGate {
+                state: Mutex::new(E2eWriterState::default()),
+                idle: Condvar::new(),
+            })
+        })
+        .clone()
+}
+
+#[cfg(feature = "e2e")]
+pub(crate) struct E2eWriterGuard(Arc<E2eWriterGate>);
+
+#[cfg(feature = "e2e")]
+impl Drop for E2eWriterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.active -= 1;
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+#[cfg(feature = "e2e")]
+impl E2eWriterGate {
+    fn begin(self: &Arc<Self>) -> Result<E2eWriterGuard, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.resetting {
+            return Err("E2E settings writers are resetting".into());
+        }
+        state.active += 1;
+        Ok(E2eWriterGuard(self.clone()))
+    }
+
+    fn quiesce(&self, timeout: Duration) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.resetting = true;
+        let deadline = Instant::now() + timeout;
+        while state.active > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("Timed out quiescing E2E settings writers".into());
+            }
+            let (next, _) = self
+                .idle
+                .wait_timeout(state, remaining)
+                .map_err(|error| error.to_string())?;
+            state = next;
+        }
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.resetting = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "e2e")]
+pub(crate) fn begin_e2e_settings_write() -> Result<E2eWriterGuard, String> {
+    e2e_writer_gate().begin()
+}
+
+#[cfg(feature = "e2e")]
+fn quiesce_e2e_settings_writes() -> Result<(), String> {
+    e2e_writer_gate().quiesce(Duration::from_secs(10))
+}
+
+#[cfg(feature = "e2e")]
+fn resume_e2e_settings_writes() -> Result<(), String> {
+    e2e_writer_gate().resume()
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +138,8 @@ pub struct AcpTurnEvidence {
     pub error: Option<String>,
     #[serde(default)]
     pub updated_at: u64,
+    #[serde(default)]
+    pub post_turn_pending: bool,
 }
 
 fn acp_turn_evidence(settings: &Settings) -> Vec<AcpTurnEvidence> {
@@ -71,7 +174,7 @@ fn protected_acp_turns(settings: &Settings) -> HashSet<(String, String, String, 
         .map(|turn| (turn.agent, turn.directory, turn.session_id, turn.turn_id))
         .collect::<HashSet<_>>();
     let receipts = settings
-        .get("sai-agent-spawn-receipts")
+        .get(SPAWN_RECEIPTS_KEY)
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
@@ -116,6 +219,10 @@ fn merge_acp_turn_evidence_at(
 ) -> Result<(), String> {
     item.updated_at = now;
     let mut evidence = acp_turn_evidence(settings);
+    let previous_pending = evidence
+        .iter()
+        .filter(|saved| saved.post_turn_pending)
+        .count();
     let protected = protected_acp_turns(settings);
     if item.status == "prepared" {
         evidence.retain(|saved| {
@@ -123,6 +230,7 @@ fn merge_acp_turn_evidence_at(
                 || saved.directory != item.directory
                 || saved.session_id != item.session_id
                 || !unsettled_acp_evidence(&saved.status)
+                || saved.post_turn_pending
                 || protected.contains(&(
                     saved.agent.clone(),
                     saved.directory.clone(),
@@ -130,6 +238,25 @@ fn merge_acp_turn_evidence_at(
                     saved.turn_id.clone(),
                 ))
         });
+    }
+    if let Some(saved) = evidence.iter().find(|saved| {
+        saved.agent == item.agent
+            && saved.directory == item.directory
+            && saved.session_id == item.session_id
+            && saved.turn_id == item.turn_id
+    }) {
+        if matches!(item.status.as_str(), "done" | "failed" | "interrupted") {
+            item.post_turn_pending &= saved.post_turn_pending;
+        } else {
+            item.post_turn_pending |= saved.post_turn_pending;
+        }
+    } else if matches!(item.status.as_str(), "done" | "failed" | "interrupted") {
+        item.post_turn_pending = false;
+    }
+    // A failed request that never reached the dispatch fence is still labeled "prepared",
+    // but it cannot produce a completed turn or post-turn checks.
+    if item.status == "prepared" && item.error.is_some() {
+        item.post_turn_pending = false;
     }
     evidence.retain(|saved| {
         saved.agent != item.agent
@@ -148,14 +275,24 @@ fn merge_acp_turn_evidence_at(
             ))
             || now.saturating_sub(saved.updated_at) <= ACP_UNSETTLED_RETENTION_MS
     });
+    let pending = evidence
+        .iter()
+        .filter(|saved| saved.post_turn_pending)
+        .count();
+    if pending > ACP_TURN_EVIDENCE_LIMIT && pending > previous_pending {
+        return Err(format!(
+            "Post-turn check backlog is full ({ACP_TURN_EVIDENCE_LIMIT} turns). Resolve pending checks before sending another prompt."
+        ));
+    }
     let completed = evidence
         .iter()
-        .filter(|item| !unsettled_acp_evidence(&item.status))
+        .filter(|item| !unsettled_acp_evidence(&item.status) && !item.post_turn_pending)
         .count();
-    if completed > ACP_TURN_EVIDENCE_LIMIT {
-        let mut remove = completed - ACP_TURN_EVIDENCE_LIMIT;
+    let completed_limit = ACP_TURN_EVIDENCE_LIMIT.saturating_sub(pending);
+    if completed > completed_limit {
+        let mut remove = completed - completed_limit;
         evidence.retain(|item| {
-            if remove > 0 && !unsettled_acp_evidence(&item.status) {
+            if remove > 0 && !unsettled_acp_evidence(&item.status) && !item.post_turn_pending {
                 remove -= 1;
                 false
             } else {
@@ -178,11 +315,14 @@ pub fn record_acp_turn_evidence(
     app: &tauri::AppHandle,
     evidence: AcpTurnEvidence,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
+    let before = settings.clone();
     merge_acp_turn_evidence(&mut settings, evidence)?;
-    write_settings(&path, &settings)
+    write_settings(&path, &before, &settings)
 }
 
 #[tauri::command]
@@ -195,7 +335,7 @@ pub fn get_acp_turn_evidence(
 ) -> Result<Option<AcpTurnEvidence>, String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
-    Ok(acp_turn_evidence(&read_settings(&path)?)
+    Ok(acp_turn_evidence(&read_scoped(&path, ACP_KEYS)?)
         .into_iter()
         .find(|item| {
             item.agent == agent
@@ -203,6 +343,45 @@ pub fn get_acp_turn_evidence(
                 && item.session_id == session_id
                 && item.turn_id == turn_id
         }))
+}
+
+#[tauri::command]
+pub fn list_pending_acp_post_turn_checks(
+    app: tauri::AppHandle,
+) -> Result<Vec<AcpTurnEvidence>, String> {
+    let path = settings_path(&app)?;
+    let _lock = lock_settings(&path)?;
+    Ok(acp_turn_evidence(&read_scoped(&path, ACP_KEYS)?)
+        .into_iter()
+        .filter(|item| item.post_turn_pending && item.status == "done")
+        .collect())
+}
+
+#[tauri::command]
+pub fn finish_acp_post_turn_checks(
+    app: tauri::AppHandle,
+    agent: String,
+    directory: String,
+    session_id: String,
+    turn_id: String,
+) -> Result<(), String> {
+    let path = settings_path(&app)?;
+    let _lock = lock_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
+    let before = settings.clone();
+    let mut evidence = acp_turn_evidence(&settings);
+    let Some(item) = evidence.iter_mut().find(|item| {
+        item.agent == agent
+            && item.directory == directory
+            && item.session_id == session_id
+            && item.turn_id == turn_id
+            && item.status == "done"
+    }) else {
+        return Err("Completed ACP turn was not found.".into());
+    };
+    item.post_turn_pending = false;
+    write_acp_turn_evidence(&mut settings, &evidence)?;
+    write_settings(&path, &before, &settings)
 }
 
 fn interrupted_turns(settings: &Settings) -> Vec<InterruptedAgentTurn> {
@@ -264,14 +443,17 @@ pub fn record_interrupted_turns(
     app: &tauri::AppHandle,
     interrupted: Vec<InterruptedAgentTurn>,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     if interrupted.is_empty() {
         return Ok(());
     }
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
+    let before = settings.clone();
     merge_interrupted_turns(&mut settings, interrupted)?;
-    write_settings(&path, &settings)
+    write_settings(&path, &before, &settings)
 }
 
 pub fn clear_interrupted_turn(
@@ -281,14 +463,17 @@ pub fn clear_interrupted_turn(
     session_id: &str,
     turn_id: &str,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
     if !settings.contains_key(INTERRUPTED_TURNS_KEY) {
         return Ok(());
     }
+    let before = settings.clone();
     remove_interrupted_turn(&mut settings, agent, directory, session_id, turn_id)?;
-    write_settings(&path, &settings)
+    write_settings(&path, &before, &settings)
 }
 
 #[tauri::command]
@@ -297,7 +482,7 @@ pub fn list_interrupted_agent_turns(
 ) -> Result<Vec<InterruptedAgentTurn>, String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
-    Ok(interrupted_turns(&read_settings(&path)?))
+    Ok(interrupted_turns(&read_scoped(&path, ACP_KEYS)?))
 }
 
 #[tauri::command]
@@ -313,14 +498,18 @@ pub fn finish_interrupted_agent_turn(
 
 pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("settings.json"));
+    {
+        let _ = app;
+        Ok(crate::e2e_config::root()?.join("settings.json"))
     }
-    let config = app
-        .path()
-        .config_dir()
-        .map_err(|error| format!("Cannot locate the configuration directory: {error}"))?;
-    Ok(config.join("sail").join("settings.json"))
+    #[cfg(not(feature = "e2e"))]
+    {
+        let config = app
+            .path()
+            .config_dir()
+            .map_err(|error| format!("Cannot locate the configuration directory: {error}"))?;
+        Ok(config.join("sail").join("settings.json"))
+    }
 }
 
 fn lock_settings(path: &Path) -> Result<File, String> {
@@ -339,7 +528,13 @@ fn lock_settings(path: &Path) -> Result<File, String> {
     Ok(lock)
 }
 
-fn read_settings(path: &Path) -> Result<Settings, String> {
+const ACP_KEYS: &[&str] = &[
+    ACP_TURN_EVIDENCE_KEY,
+    INTERRUPTED_TURNS_KEY,
+    SPAWN_RECEIPTS_KEY,
+];
+
+fn read_settings_file(path: &Path) -> Result<Settings, String> {
     let backup = path.with_extension("json.bak");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -357,7 +552,92 @@ fn read_settings(path: &Path) -> Result<Settings, String> {
     serde_json::from_str(&contents).map_err(|error| format!("Cannot parse settings: {error}"))
 }
 
-fn write_settings(path: &Path, settings: &Settings) -> Result<(), String> {
+static MIGRATED: StdMutex<BTreeSet<PathBuf>> = StdMutex::new(BTreeSet::new());
+
+/// Moves record keys out of `settings.json` once per process. Records are written
+/// first, so a crash leaves each key in the file, the store, or both; the record
+/// wins and the file copy is dropped on the next pass.
+fn migrate_records(path: &Path) -> Result<(), String> {
+    if MIGRATED
+        .lock()
+        .map_err(|error| error.to_string())?
+        .contains(path)
+    {
+        return Ok(());
+    }
+    let mut file = read_settings_file(path)?;
+    if file.keys().any(|key| is_record_key(key)) {
+        for (key, value) in &file {
+            if is_record_key(key) {
+                records::write(path, key, value)?;
+            }
+        }
+        file.retain(|key, _| !is_record_key(key));
+        write_settings_file(path, &file)?;
+    }
+    MIGRATED
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(path.to_path_buf());
+    Ok(())
+}
+
+fn read_file_settings(path: &Path) -> Result<Settings, String> {
+    migrate_records(path)?;
+    read_settings_file(path)
+}
+
+fn read_settings(path: &Path) -> Result<Settings, String> {
+    let mut settings = read_file_settings(path)?;
+    settings.extend(records::read_all(path)?);
+    Ok(settings)
+}
+
+/// Non-record keys come from `settings.json`; do not write back a scoped read of them.
+fn read_scoped(path: &Path, keys: &[&str]) -> Result<Settings, String> {
+    migrate_records(path)?;
+    let mut settings = Settings::new();
+    for key in keys.iter().filter(|key| is_record_key(key)) {
+        if let Some(value) = records::read(path, key)? {
+            settings.insert((*key).to_string(), value);
+        }
+    }
+    if keys.iter().any(|key| !is_record_key(key)) {
+        let mut file = read_settings_file(path)?;
+        file.retain(|key, _| keys.contains(&key.as_str()));
+        settings.extend(file);
+    }
+    Ok(settings)
+}
+
+/// Persists the difference between `before` and `after`: one record per changed
+/// record key, and `settings.json` only when its own content changed.
+fn write_settings(path: &Path, before: &Settings, after: &Settings) -> Result<(), String> {
+    for (key, value) in after {
+        if is_record_key(key) && before.get(key) != Some(value) {
+            records::write(path, key, value)?;
+        }
+    }
+    for key in before.keys() {
+        if is_record_key(key) && !after.contains_key(key) {
+            records::remove(path, key)?;
+        }
+    }
+    let file_part = |settings: &Settings| -> Settings {
+        settings
+            .iter()
+            .filter(|(key, _)| !is_record_key(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    };
+    let next = file_part(after);
+    if file_part(before) == next {
+        return Ok(());
+    }
+    write_settings_file(path, &next)
+}
+
+fn write_settings_file(path: &Path, settings: &Settings) -> Result<(), String> {
     let temporary = path.with_extension("json.tmp");
     let contents = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("Cannot encode settings: {error}"))?;
@@ -399,6 +679,9 @@ fn write_settings(path: &Path, settings: &Settings) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     fs::rename(&temporary, path).map_err(|error| format!("Cannot save settings: {error}"))?;
+    if let Some(parent) = path.parent() {
+        records::sync_directory(parent);
+    }
     Ok(())
 }
 
@@ -678,22 +961,67 @@ fn filter_legacy(key: &str, raw: &str, deleted: &Deletions) -> String {
 pub fn string_setting(app: &tauri::AppHandle, key: &str) -> Result<Option<String>, String> {
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    Ok(read_settings(&path)?.remove(key))
+    Ok(read_scoped(&path, &[key])?.remove(key))
+}
+
+/// Clear disk-backed fixture settings between E2E specs under the normal settings lock.
+#[tauri::command]
+pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        let path = settings_path(&app)?;
+        crate::post_turn_checks::quiesce_test_checks(&app)?;
+        let result = (|| {
+            quiesce_e2e_settings_writes()?;
+            let _lock = lock_settings(&path)?;
+            write_settings_file(&path, &Settings::new())?;
+            records::clear(&path)?;
+            crate::local_claims::reset_test_store(&app)
+        })();
+        let writers = resume_e2e_settings_writes();
+        let checks = crate::post_turn_checks::resume_test_checks(&app);
+        result?;
+        writers?;
+        checks
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = app;
+        Err("Settings reset requires the E2E build".into())
+    }
 }
 
 #[tauri::command]
-pub fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
+pub async fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(move || load_settings_sync(app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn load_settings_sync(app: tauri::AppHandle) -> Result<Settings, String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
     read_settings(&path)
 }
 
 #[tauri::command]
-pub fn migrate_settings(
+pub async fn migrate_settings(
     app: tauri::AppHandle,
     legacy: Settings,
     prefer_legacy: bool,
 ) -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(move || migrate_settings_sync(app, legacy, prefer_legacy))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn migrate_settings_sync(
+    app: tauri::AppHandle,
+    legacy: Settings,
+    prefer_legacy: bool,
+) -> Result<Settings, String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
     let mut saved = read_settings(&path)?;
@@ -702,10 +1030,7 @@ pub fn migrate_settings(
         .get(DELETIONS_KEY)
         .and_then(|raw| serde_json::from_str(raw).ok())
         .unwrap_or_default();
-    let modified: BTreeSet<String> = saved
-        .get(MODIFIED_KEY)
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
+    let modified = modified_keys(&saved);
     for (key, value) in legacy {
         if (!key.starts_with("sai-") && key != "sail-agent-threads")
             || key == DELETIONS_KEY
@@ -741,27 +1066,48 @@ pub fn migrate_settings(
             Some(_) => {}
         }
     }
-    if saved != before {
-        write_settings(&path, &saved)?;
-    }
+    write_settings(&path, &before, &saved)?;
     Ok(saved)
 }
 
 #[tauri::command]
-pub fn save_setting(
+pub async fn save_setting(
     app: tauri::AppHandle,
     key: String,
     value: Option<String>,
 ) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_setting_sync(app, key, value))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn save_setting_sync(
+    app: tauri::AppHandle,
+    key: String,
+    value: Option<String>,
+) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     if !key.starts_with("sai-") && key != "sail-agent-threads" {
         return Err("Unknown settings key.".to_string());
     }
-    let path = settings_path(&app)?;
-    let _lock = lock_settings(&path)?;
-    let mut saved = read_settings(&path)?;
     if key == DELETIONS_KEY || key == MODIFIED_KEY {
         return Err("Unknown settings key.".to_string());
     }
+    save_setting_at(&settings_path(&app)?, key, value)
+}
+
+fn save_setting_at(path: &Path, key: String, value: Option<String>) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let _lock = lock_settings(&path)?;
+    let mut saved = if is_record_key(&key) {
+        read_scoped(&path, &[&key, MODIFIED_KEY, DELETIONS_KEY])?
+    } else {
+        let mut saved = read_file_settings(&path)?;
+        saved.extend(read_scoped(&path, &[MODIFIED_KEY, DELETIONS_KEY])?);
+        saved
+    };
+    let before = saved.clone();
     let mut modified: BTreeSet<String> = saved
         .get(MODIFIED_KEY)
         .and_then(|raw| serde_json::from_str(raw).ok())
@@ -783,18 +1129,219 @@ pub fn save_setting(
             saved.remove(&key);
         }
     }
-    write_settings(&path, &saved)
+    write_settings(&path, &before, &saved)
+}
+
+fn modified_keys(settings: &Settings) -> BTreeSet<String> {
+    settings
+        .get(MODIFIED_KEY)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        acp_turn_evidence, filter_legacy, interrupted_turns, lock_settings,
+        acp_turn_evidence, filter_legacy, interrupted_turns, is_record_key, lock_settings,
         merge_acp_turn_evidence, merge_acp_turn_evidence_at, merge_catalog,
-        merge_interrupted_turns, merge_threads, read_settings, remove_interrupted_turn,
-        update_deletions, write_settings, AcpTurnEvidence, Deletions, InterruptedAgentTurn,
-        Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS, DELETIONS_KEY,
+        merge_interrupted_turns, merge_threads, modified_keys, read_file_settings, read_scoped,
+        read_settings, read_settings_file, records, remove_interrupted_turn, save_setting_at,
+        update_deletions, write_acp_turn_evidence, write_settings, AcpTurnEvidence, Deletions,
+        InterruptedAgentTurn, Settings, ACP_KEYS, ACP_TURN_EVIDENCE_LIMIT,
+        ACP_UNSETTLED_RETENTION_MS, DELETIONS_KEY, MODIFIED_KEY, SPAWN_RECEIPTS_KEY,
     };
+    #[cfg(feature = "e2e")]
+    use super::{E2eWriterGate, E2eWriterState};
+    #[cfg(feature = "e2e")]
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    #[cfg(feature = "e2e")]
+    use std::time::Duration;
+
+    #[test]
+    fn prepared_turn_keeps_pending_check_until_completion_but_legacy_history_is_silent() {
+        let mut settings = Settings::new();
+        let turn = |status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+            post_turn_pending: pending,
+        };
+        merge_acp_turn_evidence_at(&mut settings, turn("prepared", true), 1).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, turn("dispatched", false), 2).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, turn("done", true), 3).unwrap();
+        assert!(acp_turn_evidence(&settings)[0].post_turn_pending);
+
+        let mut suppressed = Settings::new();
+        merge_acp_turn_evidence_at(&mut suppressed, turn("prepared", true), 1).unwrap();
+        merge_acp_turn_evidence_at(&mut suppressed, turn("done", false), 2).unwrap();
+        assert!(!acp_turn_evidence(&suppressed)[0].post_turn_pending);
+
+        let historical: AcpTurnEvidence = serde_json::from_value(serde_json::json!({
+            "agent": "claude", "directory": "/repo", "sessionId": "old",
+            "turnId": "old", "status": "done", "error": null
+        }))
+        .unwrap();
+        assert!(!historical.post_turn_pending);
+    }
+
+    #[test]
+    fn pending_completed_turn_survives_evidence_history_eviction() {
+        let mut settings = Settings::new();
+        let turn = |id: String, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: id.clone(),
+            turn_id: id,
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+            post_turn_pending: pending,
+        };
+        merge_acp_turn_evidence_at(&mut settings, turn("pending".into(), "prepared", true), 1)
+            .unwrap();
+        merge_acp_turn_evidence_at(&mut settings, turn("pending".into(), "done", true), 2).unwrap();
+        for index in 0..=ACP_TURN_EVIDENCE_LIMIT {
+            merge_acp_turn_evidence_at(
+                &mut settings,
+                turn(format!("old-{index}"), "done", false),
+                index as u64 + 3,
+            )
+            .unwrap();
+        }
+        let saved = acp_turn_evidence(&settings);
+        assert!(saved
+            .iter()
+            .any(|item| item.turn_id == "pending" && item.post_turn_pending));
+        assert!(!saved.iter().any(|item| item.turn_id == "old-0"));
+    }
+
+    #[test]
+    fn pending_check_backlog_refuses_new_dispatch_without_losing_existing_recovery() {
+        let turn = |index: usize, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: format!("session-{index}"),
+            turn_id: format!("turn-{index}"),
+            status: status.into(),
+            error: None,
+            updated_at: 1,
+            post_turn_pending: pending,
+        };
+        let mut settings = Settings::new();
+        let pending = (0..ACP_TURN_EVIDENCE_LIMIT)
+            .map(|index| turn(index, "done", true))
+            .collect::<Vec<_>>();
+        write_acp_turn_evidence(&mut settings, &pending).unwrap();
+
+        let error = merge_acp_turn_evidence_at(
+            &mut settings,
+            turn(ACP_TURN_EVIDENCE_LIMIT, "prepared", true),
+            2,
+        )
+        .unwrap_err();
+        assert!(error.contains("backlog is full"));
+        assert_eq!(acp_turn_evidence(&settings), pending);
+
+        let mut settled = pending;
+        settled[0].post_turn_pending = false;
+        write_acp_turn_evidence(&mut settings, &settled).unwrap();
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            turn(ACP_TURN_EVIDENCE_LIMIT, "prepared", true),
+            3,
+        )
+        .unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT);
+        assert_eq!(
+            saved.iter().filter(|item| item.post_turn_pending).count(),
+            500
+        );
+        assert!(saved.iter().all(|item| item.turn_id != "turn-0"));
+    }
+
+    #[test]
+    fn failed_pre_dispatch_prompt_releases_its_pending_check_slot() {
+        let evidence = |turn: &str, error: Option<&str>| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: "prepared".into(),
+            error: error.map(str::to_string),
+            updated_at: 0,
+            post_turn_pending: error.is_none(),
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(&mut settings, evidence("failed", None), 1).unwrap();
+        assert!(acp_turn_evidence(&settings)[0].post_turn_pending);
+
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            evidence("failed", Some("dispatch fence rejected request")),
+            2,
+        )
+        .unwrap();
+        let failed = &acp_turn_evidence(&settings)[0];
+        assert_eq!(failed.status, "prepared");
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("dispatch fence rejected request")
+        );
+        assert!(!failed.post_turn_pending);
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("next", None), 3).unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].turn_id, "next");
+        assert!(saved[0].post_turn_pending);
+    }
+
+    #[test]
+    fn failed_pre_dispatch_prompt_does_not_exhaust_the_500_turn_backlog() {
+        let mut settings = Settings::new();
+        let pending = (0..ACP_TURN_EVIDENCE_LIMIT - 1)
+            .map(|index| AcpTurnEvidence {
+                agent: "claude".into(),
+                directory: "/repo".into(),
+                session_id: format!("older-{index}"),
+                turn_id: format!("older-{index}"),
+                status: "done".into(),
+                error: None,
+                updated_at: 1,
+                post_turn_pending: true,
+            })
+            .collect::<Vec<_>>();
+        write_acp_turn_evidence(&mut settings, &pending).unwrap();
+        let prepared = |turn: &str, error: Option<&str>| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "current".into(),
+            turn_id: turn.into(),
+            status: "prepared".into(),
+            error: error.map(str::to_string),
+            updated_at: 0,
+            post_turn_pending: error.is_none(),
+        };
+        merge_acp_turn_evidence_at(&mut settings, prepared("failed", None), 2).unwrap();
+        assert_eq!(
+            acp_turn_evidence(&settings)
+                .iter()
+                .filter(|item| item.post_turn_pending)
+                .count(),
+            ACP_TURN_EVIDENCE_LIMIT
+        );
+        merge_acp_turn_evidence_at(&mut settings, prepared("failed", Some("not sent")), 3).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, prepared("next", None), 4).unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT);
+        assert!(saved.iter().any(|item| item.turn_id == "next"));
+        assert!(!saved.iter().any(|item| item.turn_id == "failed"));
+    }
 
     #[test]
     fn acp_turn_evidence_is_provider_correlated_replaced_and_bounded() {
@@ -806,6 +1353,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence(
@@ -868,6 +1416,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence(&mut settings, evidence("prepared", "prepared")).unwrap();
@@ -894,6 +1443,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence_at(
@@ -943,6 +1493,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence_at(&mut settings, evidence("old", "dispatch_uncertain"), 1)
@@ -953,6 +1504,33 @@ mod tests {
         let saved = acp_turn_evidence(&settings);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].turn_id, "new");
+    }
+
+    #[test]
+    fn a_new_prompt_keeps_a_completed_turn_waiting_for_evidence_retry() {
+        let evidence = |turn: &str, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+            post_turn_pending: pending,
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "prepared", true), 1).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "dispatched", false), 2).unwrap();
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("new", "prepared", true), 3).unwrap();
+        assert!(acp_turn_evidence(&settings)
+            .iter()
+            .any(|item| item.turn_id == "old" && item.post_turn_pending));
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "done", true), 4).unwrap();
+        assert!(acp_turn_evidence(&settings)
+            .iter()
+            .any(|item| item.turn_id == "old" && item.status == "done" && item.post_turn_pending));
     }
 
     #[test]
@@ -1053,8 +1631,9 @@ mod tests {
                 std::thread::spawn(move || {
                     let _lock = lock_settings(&path).unwrap();
                     let mut saved = read_settings(&path).unwrap();
+                    let before = saved.clone();
                     saved.insert(format!("sai-key-{index}"), index.to_string());
-                    write_settings(&path, &saved).unwrap();
+                    write_settings(&path, &before, &saved).unwrap();
                 })
             })
             .collect();
@@ -1063,5 +1642,184 @@ mod tests {
         }
         assert_eq!(read_settings(&path).unwrap().len(), 8);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn scratch_settings(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "sail-settings-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory.join("settings.json")
+    }
+
+    #[test]
+    fn upgrade_moves_state_keys_out_of_settings_and_keeps_every_value() {
+        let path = scratch_settings("upgrade");
+        let legacy = Settings::from([
+            ("sai-theme".to_string(), "dark".to_string()),
+            ("sai-agent-transcript-cache".to_string(), "[1]".to_string()),
+            ("sai-agent-spawn-receipts".to_string(), "[2]".to_string()),
+            ("sai-issue-graph:/repo:ses:1".to_string(), "{}".to_string()),
+            (
+                MODIFIED_KEY.to_string(),
+                "[\"sai-theme\",\"sai-agent-spawn-receipts\"]".to_string(),
+            ),
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-agent-transcript-cache"], "[1]");
+        assert_eq!(loaded["sai-agent-spawn-receipts"], "[2]");
+        assert_eq!(loaded["sai-issue-graph:/repo:ses:1"], "{}");
+        assert_eq!(loaded["sai-theme"], "dark");
+        assert_eq!(
+            modified_keys(&loaded),
+            ["sai-agent-spawn-receipts", "sai-theme"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+
+        let on_disk = read_settings_file(&path).unwrap();
+        assert!(on_disk.keys().all(|key| !is_record_key(key)), "{on_disk:?}");
+        assert_eq!(on_disk["sai-theme"], "dark");
+        assert!(!on_disk.contains_key(MODIFIED_KEY));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn settings_file_copy_wins_so_a_downgrade_write_is_not_lost() {
+        let path = scratch_settings("crash");
+        let legacy = Settings::from([
+            ("sai-theme".to_string(), "dark".to_string()),
+            ("sai-ship-runs".to_string(), "[\"old\"]".to_string()),
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        records::write(&path, "sai-ship-runs", "[\"stale\"]").unwrap();
+
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-ship-runs"], "[\"old\"]");
+        assert_eq!(loaded["sai-theme"], "dark");
+        assert!(!read_settings_file(&path)
+            .unwrap()
+            .contains_key("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn saving_a_record_key_leaves_settings_json_untouched() {
+        let path = scratch_settings("isolated");
+        let original = b"{ \"sai-theme\": \"dark\" }";
+        std::fs::write(&path, original).unwrap();
+        let before = read_scoped(&path, ACP_KEYS).unwrap();
+        let mut after = before.clone();
+        after.insert(SPAWN_RECEIPTS_KEY.to_string(), "[3]".to_string());
+        write_settings(&path, &before, &after).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            read_scoped(&path, ACP_KEYS).unwrap()[SPAWN_RECEIPTS_KEY],
+            "[3]"
+        );
+
+        let before = after.clone();
+        after.remove(SPAWN_RECEIPTS_KEY);
+        write_settings(&path, &before, &after).unwrap();
+        assert!(read_scoped(&path, ACP_KEYS).unwrap().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn saving_a_user_setting_does_not_rewrite_records() {
+        let path = scratch_settings("user");
+        let mut saved = Settings::new();
+        saved.insert("sai-ship-runs".to_string(), "[1]".to_string());
+        write_settings(&path, &Settings::new(), &saved).unwrap();
+        let record = path.with_file_name("records");
+        let stamp = |directory: &std::path::Path| -> Vec<std::time::SystemTime> {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().modified().unwrap())
+                .collect()
+        };
+        let first = stamp(&record);
+        let before = read_file_settings(&path).unwrap();
+        let mut after = before.clone();
+        after.insert("sai-theme".to_string(), "light".to_string());
+        write_settings(&path, &before, &after).unwrap();
+        assert_eq!(stamp(&record), first);
+        assert_eq!(read_settings(&path).unwrap()["sai-theme"], "light");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn save_setting_writes_only_the_store_that_owns_the_key() {
+        let path = scratch_settings("owner");
+        std::fs::write(&path, b"{ \"sai-theme\": \"dark\" }").unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        save_setting_at(&path, SPAWN_RECEIPTS_KEY.into(), Some("[1]".into())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        save_setting_at(&path, SPAWN_RECEIPTS_KEY.into(), Some("[2]".into())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        save_setting_at(&path, "sai-theme".into(), Some("light".into())).unwrap();
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-theme"], "light");
+        assert_eq!(loaded[SPAWN_RECEIPTS_KEY], "[2]");
+        assert_eq!(
+            modified_keys(&loaded),
+            ["sai-theme", SPAWN_RECEIPTS_KEY]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+        let on_disk = read_settings_file(&path).unwrap();
+        assert_eq!(on_disk.len(), 1, "{on_disk:?}");
+
+        save_setting_at(&path, SPAWN_RECEIPTS_KEY.into(), None).unwrap();
+        assert!(!read_settings(&path)
+            .unwrap()
+            .contains_key(SPAWN_RECEIPTS_KEY));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(feature = "e2e")]
+    #[test]
+    fn e2e_settings_reset_waits_for_writers_and_fails_closed_on_timeout() {
+        let gate = Arc::new(E2eWriterGate {
+            state: Mutex::new(E2eWriterState::default()),
+            idle: Condvar::new(),
+        });
+        let writer = gate.begin().unwrap();
+        let waiting = gate.clone();
+        let (sender, receiver) = mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            sender
+                .send(waiting.quiesce(Duration::from_secs(1)))
+                .unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(25)).is_err());
+        drop(writer);
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        reset.join().unwrap();
+        assert!(gate.begin().is_err());
+        gate.resume().unwrap();
+        assert!(gate.begin().is_ok());
+
+        let writer = gate.begin().unwrap();
+        assert!(gate.quiesce(Duration::from_millis(1)).is_err());
+        assert!(gate.begin().is_err());
+        drop(writer);
+        gate.resume().unwrap();
+        assert!(gate.begin().is_ok());
     }
 }

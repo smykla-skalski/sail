@@ -65,16 +65,21 @@ Record every selected hosted gate against the current PR head in its evidence re
 
 ## Address required reviewer feedback
 
-When `hosted-review` is selected, handle every unresolved thread from a required reviewer:
+When `hosted-review` is selected, handle every unresolved thread from a required reviewer. In Sail mode, never post a reply comment. Resolve an actionable thread after the code fix when a reply is unnecessary; hand any thread requiring a written response to the user.
 
-- Valid, actionable: fix it, commit (signed, conventional), push, reply with what changed, resolve the thread.
+- Valid, actionable: fix it, commit (signed, conventional), push, then resolve the thread. Outside Sail, reply with what changed first.
 - Questionable: use the codebase to decide; ask only when necessary.
-- Invalid: reply with a concise rationale and resolve the thread.
+- Invalid: outside Sail, reply with a concise rationale and resolve the thread. In Sail mode, hand it to the user.
 
-Reply and resolve with REST or `gh`; when REST is rate-limited, use GraphQL:
+Outside Sail, reply with REST or `gh`; when REST is rate-limited, use GraphQL:
 
 ```bash
 gh api graphql -f query='mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}' -f id=<thread-id> -f body='<reply>'
+```
+
+Resolve with REST or `gh`; when REST is rate-limited, use GraphQL:
+
+```bash
 gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -f id=<thread-id>
 ```
 
@@ -90,7 +95,7 @@ Merge only when all of these hold:
 - When `hosted-review` is selected, every resolved reviewer requirement is satisfied for the current policy. A `review` accepts a submitted no-comment review; an `approval` requires an effective approval.
 - When `hosted-review` is selected, every required reviewer's blocking comment is fixed or answered, and its thread is resolved.
 
-Merge only through the checkpoint's resolved mechanism. For `bot-comment`, post its exact inert comment and wait for the bot; do not fall back to `gh pr merge`. For `github`, pass the resolved `merge|squash|rebase` strategy to `gh pr merge` and request remote-branch deletion only when policy says `delete`. If either mechanism reports that the default branch moved, merge `origin/<default>` (signed), push, rerun every selected gate and retry the same mechanism.
+Merge only through the checkpoint's resolved mechanism. In Sail mode, never post a GitHub comment; leave a `bot-comment` merge to the user. Outside Sail, for `bot-comment`, post its exact inert comment and wait for the bot; do not fall back to `gh pr merge`. For `github`, pass the resolved `merge|squash|rebase` strategy to `gh pr merge` and request remote-branch deletion only when policy says `delete`. If either mechanism reports that the default branch moved, merge `origin/<default>` (signed), push, rerun every selected gate and retry the same mechanism.
 
 Never force-merge or use admin overrides. If branch protection requires extra approvals or admin action, report the exact required action and stop. Confirm the PR shows as merged before reporting. Delete a still-present remote branch only when resolved cleanup policy is `delete`; preserve it when policy says `preserve`.
 

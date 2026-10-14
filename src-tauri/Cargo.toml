@@ -19,6 +19,7 @@ cc = "1.6"
 
 [dependencies]
 tauri = { version = "2", features = ["unstable", "devtools"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.6"
@@ -36,11 +37,12 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 httpdate = "1"
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["dir", "signal"] }
 netstat2 = "0.11.2"
 sysinfo = { version = "0.39.0", default-features = false, features = ["disk", "system"] }
 wait-timeout = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+sail-project-knowledge = { path = "../crates/project-knowledge" }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 keyring = { version = "4.0.0", default-features = false, features = [
@@ -67,7 +69,7 @@ cairo-rs-gtk = { package = "cairo-rs", version = "0.18", features = ["png"] }
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39.1"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
 
 [patch.crates-io]
 portable-pty = { path = "../vendor/portable-pty" }

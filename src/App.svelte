@@ -27,8 +27,19 @@
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import { agentFocusDisplay, type AgentFocusDisplay } from './lib/agent-focus';
+  import TasksPanel from './TasksPanel.svelte';
+  import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
+  import { sessionTasks, TASK_TOOLS, taskScopeKey } from './lib/session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
-  import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import {
+    acpPlanBackend,
+    acpPlans,
+    planKey,
+    type PlanChange,
+    type PlanScope,
+  } from './lib/acp-plans';
+  import { updateReplayingAgentSessions } from './lib/agent-replay';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
   import {
@@ -64,7 +75,6 @@
     refreshedPullRequest,
     closedWithoutMerge,
     shipGatesSettled,
-    shipCleanupRequest,
     shipEvidenceReadiness,
     shipOwnedThreadIds,
     shipOwnershipQuietGeneration,
@@ -79,6 +89,7 @@
     shipOwner,
     shipCheckpointOwner,
     shipTaskReceiptIdsToProtect,
+    shipWorkerProgressChanges,
     authorizeShipCheckpointThread,
     commitRevisionBoundValidation,
     rollbackValidationIssue,
@@ -99,10 +110,13 @@
   import {
     shipArchiveAction,
     shipArchiveConfirmation,
+    shipCheckpointCommit,
     shipMergeAction,
     shipMergeConfirmation,
     shipReopenAction,
     shipReopenConfirmation,
+    shipReplacementConfirmation,
+    shipReopenHeadWarning,
     shipRetryAction,
     shipRetryConfirmation,
     shipStopAction,
@@ -147,6 +161,7 @@
     shippingClockWasSuspended,
     shippingClaimOwnedByInstance,
     shippingWorkerSettled,
+    shipOwnerReleaseReady,
     shipWorkerPrompt,
     parseMergeOwner,
     type MergeOwner,
@@ -242,6 +257,14 @@
   import DiffPanel from './DiffPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
   import {
+    createSidebarThreadLoader,
+    mergeSidebarRefreshPaths,
+    SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS,
+    sidebarFocusRefreshDue,
+    unlistedSidebarPaths,
+    type SidebarRefreshPaths,
+  } from './lib/sidebar-inventory';
+  import {
     clampSidebarWidth,
     parseSidebarWidth,
     sidebarDefaultWidth,
@@ -259,10 +282,14 @@
   import { resolveTaskLocation, type TaskLocation as TaskLocationValue } from './lib/task-location';
   import {
     checkKey,
+    hasDurableCheckOutcome,
     personalChecks,
+    retryInterruptedCheck,
+    uniquePostTurnCheckCommands,
     upsertCheck,
     type PostTurnCheck,
   } from './lib/post-turn-checks';
+  import { createTurnVerificationQueue } from './lib/turn-verification-queue';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import { promptSkill, type SkillChoice } from './lib/skills';
@@ -419,6 +446,9 @@
     acpEventMatchesSession,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
+    acpSessionOwner,
+    forgetAcpConnections,
+    archiveOwnedTranscriptUpdate,
     applyLiveTranscriptUpdate,
     forgetRecentTranscript,
     invalidateLiveTranscript,
@@ -471,6 +501,7 @@
     receiptForSource,
     receiptIsLatestFinishedTurn,
     replayResultForReceipt,
+    completeReceiptFromReplay,
     receiptMatchesTurn,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -491,6 +522,7 @@
     nativeSubagentAcceptsPrompts,
     nativeSubagentId,
     nativeSubagentReceipts,
+    nativeSubagentSupports,
     nativeSubagentThreads as threadsForNativeSubagents,
     reconcileNativeSubagents,
     setNativeSubagentWaiting,
@@ -503,12 +535,15 @@
     setSetting,
     setSettingDurable,
     settingsError,
+    trackSettingsMutation,
   } from './lib/settings';
+  import { parseReefCanaryPercent, reefCanarySettingKey } from './lib/reef-canary';
   import {
     defaultResourceLimits,
     isCheckingMachinePressure,
     parseResourceLimit,
     resourceLimitKeys,
+    resourceQueues,
     setResourceLimit,
     setPressureThresholds,
   } from './lib/resource-limits';
@@ -567,18 +602,28 @@
   import {
     addWorktree,
     assignRepository,
+    canonicalizeRepositoryAliases,
     loadProjectCatalog,
+    markNewWorktreeCleanupPending,
+    markWorktreeCleanupPending,
+    movePendingWorktreeCleanup,
     owningRepository,
     removeRepository,
     removeWorktree,
+    reconcileMovedWorktrees,
+    reconcileSelectedRemovedWorktreeStorage,
+    worktreeDescendants,
     worktreeAt,
     replaceRepositoryPath,
     setWorktreePullRequest,
     setWorktreeSetupStatus,
     setWorktreeStatus,
+    unmergedCatalogDescendants,
     type ProjectCatalog,
     type ProjectWorktree,
+    type PendingWorktreeCleanup,
     type WorktreeCreation,
+    type WorktreeOrigin,
   } from './lib/projects';
 
   let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
@@ -628,7 +673,7 @@
   const initialShipArchiveDelay = parseShipArchiveDelay(getSetting('sai-ship-archive-delay'));
   const storedShipRuns = loadShipRunStore(getSetting('sai-ship-runs'));
   // Entries this build cannot parse are written back with every save instead of being lost.
-  const unparsedShipRuns = storedShipRuns.unparsed;
+  let unparsedShipRuns = $state<unknown[]>(storedShipRuns.unparsed);
   const shipArchiveMigration =
     getSetting(shipArchiveMigrationKey) === 'done'
       ? null
@@ -639,7 +684,7 @@
     : Number(getSetting('sai-ship-archive-notice')) || 0;
   if (shipArchiveMigration) {
     if (shipArchiveMigration.archived > 0) {
-      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, unparsedShipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, storedShipRuns.unparsed));
       setSetting('sai-ship-archive-notice', String(initialShipArchiveNotice));
     }
     setSetting(shipArchiveMigrationKey, 'done');
@@ -759,9 +804,33 @@
     initialSelection: number;
   };
   const worktreeCreationRequests = new SvelteMap<string, WorktreeCreationRequest>();
+  const pendingAgentWorktreeRegistrations = new SvelteMap<string, number>();
+  const deletingWorktreeRepositories = new SvelteSet<string>();
+
+  function beginAgentWorktreeRegistration(repository: string): () => void {
+    if (deletingWorktreeRepositories.has(repository))
+      throw new Error('A worktree deletion is in progress. Retry creation when it finishes.');
+    pendingAgentWorktreeRegistrations.set(
+      repository,
+      (pendingAgentWorktreeRegistrations.get(repository) ?? 0) + 1,
+    );
+    return () => {
+      const remaining = (pendingAgentWorktreeRegistrations.get(repository) ?? 1) - 1;
+      if (remaining) pendingAgentWorktreeRegistrations.set(repository, remaining);
+      else pendingAgentWorktreeRegistrations.delete(repository);
+    };
+  }
+
+  function worktreeRegistrationPending(repository: string): boolean {
+    return (
+      (pendingAgentWorktreeRegistrations.get(repository) ?? 0) > 0 ||
+      worktreeCreations.some((creation) => creation.repository === repository && !creation.error)
+    );
+  }
   type CreatedWorktree = {
     path: string;
     branch: string;
+    generation: string | null;
     base: string;
     setup: string;
     shippingTarget?: ShippingTarget;
@@ -783,12 +852,11 @@
   let memoryRecallEnabled = $state(false);
   let memoryRecallProjectKey = $state('');
   let memoryRecallBusy = $state(false);
-  let memoryRecallRefresh = 0;
+  let memoryStatusRefresh = 0;
   let memoryCaptureAvailable = $state(false);
   let memoryCaptureEnabled = $state(false);
   let memoryCaptureProjectKey = $state('');
   let memoryCaptureBusy = $state(false);
-  let memoryCaptureRefresh = 0;
   type BrowserAccessRequest = { id: string; sessionId: string; directory: string; origin?: string };
   type CoordinationRequest = {
     id: string;
@@ -804,6 +872,9 @@
       | 'task_checkpoint_read'
       | 'task_checkpoint_update'
       | 'task_evidence_record'
+      | 'sail_tasks_read'
+      | 'sail_tasks_report'
+      | 'sail_task_report_check'
       | 'sail_plan_propose'
       | 'sail_plan_ask'
       | 'sail_plan_step'
@@ -858,11 +929,19 @@
     loadCoordinationMessages(getSetting('sai-coordination-messages')),
   );
   const initialSpawnReceipts = loadSpawnReceipts(getSetting('sai-agent-spawn-receipts'));
+  for (const receipt of initialSpawnReceipts)
+    if (receipt.validation && ['starting', 'working', 'waiting'].includes(receipt.state))
+      resourceQueues.validation.restoreActive(receipt.receiptId);
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
+  const receiptReplayNeeded = new SvelteSet<string>();
+  const postReloadReceiptTail = new SvelteMap<string, string>();
+  const recoveringSpawnResults = new SvelteMap<string, Promise<void>>();
   const activeSpawnTargets = new SvelteMap<string, string>();
   const spawnTargetKey = (path: string, targetId: string) => JSON.stringify([path, targetId]);
   for (const receipt of initialSpawnReceipts) {
+    if (receipt.targetId?.startsWith('acp:') && receipt.turnId && !receiptIsSettled(receipt.state))
+      receiptReplayNeeded.add(receipt.receiptId);
     if (
       receipt.targetId &&
       receipt.turnId &&
@@ -886,6 +965,8 @@
   };
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
+  const queueTurnVerification = createTurnVerificationQueue();
+  const pendingCompletionErrors = new SvelteMap<string, string>();
   let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
   let selectedWorktreeConfig = $state<WorktreeConfig | null>(null);
@@ -1104,13 +1185,32 @@
         ]),
     ),
   );
+  let focusActiveTurns = $state<Record<string, string>>({});
+  let focusByThread = $derived.by(() => {
+    void tasksTick;
+    const result: Record<string, AgentFocusDisplay> = {};
+    for (const thread of [...agentStatusThreads, ...Object.values(sidebarThreads).flat()]) {
+      const key = threadKey(thread);
+      const focus = agentFocusDisplay(
+        sessionTasks().snapshot(thread),
+        agentStatusStatuses[key] ?? taskOverviewStatuses[key] ?? null,
+        focusActiveTurns[key] ?? null,
+      );
+      if (focus) result[key] = focus;
+    }
+    return result;
+  });
   let taskOverviewAgentNames = $derived(
     Object.fromEntries([
       ['opencode', 'OpenCode'],
       ...agentAvailability.map((agent) => [agent.id, agent.name]),
     ]),
   );
-  let agentStatusThreads = $derived([...agentThreads, ...sidebarOpenCodeThreads]);
+  let agentStatusThreads = $derived([
+    ...agentThreads,
+    ...nativeChildThreads,
+    ...sidebarOpenCodeThreads,
+  ]);
   let agentStatusStatuses = $derived(
     Object.fromEntries(
       agentStatusThreads.map((thread) => [
@@ -1133,6 +1233,7 @@
       agentNames: taskOverviewAgentNames,
       usage: agentUsage,
       rates: agentRates,
+      focusByThread,
     }),
   );
   let sidebarDirectoryKey = $derived(
@@ -1140,7 +1241,7 @@
       ...new Set([
         ...projectCatalog.repositories,
         ...Object.values(projectCatalog.worktrees).flatMap((worktrees) =>
-          worktrees.map((worktree) => worktree.path),
+          worktrees.filter((worktree) => !worktree.pendingCleanup).map((worktree) => worktree.path),
         ),
       ]),
     ]),
@@ -1160,6 +1261,10 @@
     browser: parseResourceLimit(
       getSetting(resourceLimitKeys.browser),
       defaultResourceLimits.browser,
+    ),
+    validation: parseResourceLimit(
+      getSetting(resourceLimitKeys.validation),
+      defaultResourceLimits.validation,
     ),
     e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
   });
@@ -1182,14 +1287,20 @@
   );
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
+  let worktreeAutodiscoveryEnabled = $state(
+    getSetting('sai-worktree-autodiscovery-enabled') === 'true',
+  );
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  let copiedStatusGeneration = 0;
   let copyStatusRegion: HTMLDivElement;
   let copyStatusHome: { parent: Node; next: Node | null } | undefined;
   let shortcutsDialog: HTMLDialogElement;
   const shortcutPlatform = detectShortcutPlatform();
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
+  let backgroundPriorityEnabled = $state(getSetting('sai-background-priority-enabled') !== 'false');
+  let reefCanaryPercent = $state(parseReefCanaryPercent(getSetting(reefCanarySettingKey)));
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
@@ -1225,6 +1336,7 @@
           visibleSpawnReceipts,
           threadRequestKeys(sessionAttention),
           shipReceiptIds(shipRuns),
+          projectCatalog,
         ),
       ],
       attentionClock,
@@ -1273,6 +1385,7 @@
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
   let inboxRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingStatusRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let inboxGeneration = 0;
   // Requests resolved since a refresh started; that refresh's stale list must not bring them back.
   const resolvedDuringRefresh = new SvelteMap<string, number>();
@@ -1421,8 +1534,8 @@
   let diffLoading = $state(false);
   let diffError = $state('');
   let selectedFilePath = $state<string | null>(null);
-  type SideTab = 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
-  let sideTab = $state<SideTab>('plan');
+  type SideTab = 'tasks' | 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
+  let sideTab = $state<SideTab>('tasks');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
   let diffRevision = '';
@@ -1514,6 +1627,7 @@
       }
     }
     if (acpAgent && focusedPane === 'main') {
+      if (view === 'details' && !agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     }
@@ -1544,12 +1658,22 @@
     if (tab === 'changes' && acpAgent) void refreshAgentDiff();
   }
 
-  function revealMainPlan(scope: PlanScope, reason: string) {
+  function revealMainPlan(scope: PlanScope, reason: PlanChange['reason']) {
     if (!acpPlanScope || planKey(scope) !== planKey(acpPlanScope)) return;
-    if (!['proposed', 'questions', 'amended', 'checkpoint', 'done'].includes(reason)) return;
+    if (!revealsPlanReview(reason)) return;
     sideTab = 'plan';
     agentChangesOpen = true;
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+  }
+
+  function setSplitDetails(id: string, open: boolean) {
+    changesPanes = open
+      ? changesPanes.includes(id)
+        ? changesPanes
+        : [...changesPanes, id]
+      : changesPanes.filter((item) => item !== id);
+    if (id === focusedPane && window.matchMedia('(max-width: 850px)').matches)
+      mobileView = open ? 'details' : 'chat';
   }
 
   async function toggleChanges() {
@@ -1559,9 +1683,7 @@
         showShipRuns();
         return;
       }
-      changesPanes = changesPanes.includes(focusedPane)
-        ? changesPanes.filter((id) => id !== focusedPane)
-        : [...changesPanes, focusedPane];
+      setSplitDetails(focusedPane, !changesPanes.includes(focusedPane));
       return;
     }
     if (mainShipFallback) {
@@ -1569,15 +1691,10 @@
       return;
     }
     if (acpAgent) {
-      if (agentChangesOpen && activeSideTab === 'ship') {
-        sideTab = 'changes';
-        void refreshAgentDiff();
-        return;
-      }
+      if (!agentChangesOpen) sideTab = 'tasks';
       agentChangesOpen = !agentChangesOpen;
       if (window.matchMedia('(max-width: 850px)').matches)
         mobileView = agentChangesOpen ? 'details' : 'chat';
-      if (agentChangesOpen) void refreshAgentDiff();
       return;
     }
     toggleShipRuns();
@@ -1590,7 +1707,7 @@
     try {
       const revision = await invoke<string>('working_tree_revision', { path });
       if (generation !== diffRefresh || path !== directory) return;
-      if (quiet && diffRevisionPath === path && diffRevision === revision) return;
+      if (quiet && !diffError && diffRevisionPath === path && diffRevision === revision) return;
       diffLoading = true;
       const next = await invoke<WorkingDiffInfo[]>('working_tree_diff', { path });
       if (generation !== diffRefresh || path !== directory) return;
@@ -1619,7 +1736,22 @@
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
   let sidebarInventoryGeneration = 0;
+  const sidebarInventoryRequests = new SvelteSet<Promise<unknown>>();
+  let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
+  let sidebarInventoryReadyKey = '';
+  let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
+  let sidebarInventoryLastFullListing = 0;
+  let sidebarInventoryDeferred = false;
+  let sidebarFocusPending = false;
+  let sidebarFocusTimer: ReturnType<typeof setTimeout> | undefined;
+  // Directories already listed; only new ones are listed again without a focus change.
+  let sidebarListedDirectories: Record<string, true> = {};
+  const sidebarInventoryDelay = import.meta.env.MODE === 'e2e' ? 250 : 5_000;
+  const foregroundAgentLoading = $derived.by(() =>
+    leaves(paneLayout).some((pane) => pane.agent && agentEntrySnapshots[pane.id]?.ready !== true),
+  );
+  let agentDetectionSettled = false;
   let projectLoadGeneration = 0;
 
   let actionAgentThread = $derived(
@@ -1664,6 +1796,11 @@
     goToSubagentTarget(direction < 0 ? subagentNav?.previous : subagentNav?.next);
   }
   let answeredPermissions = $state<AnsweredPermission[]>([]);
+  const permissionStatusRevisions = new SvelteMap<string, number>();
+  const pendingStatusRetries = new SvelteMap<
+    string,
+    { agent: AgentId; directory: string; sessionId: string }
+  >();
   // Inbox items can go before their resolution event arrives, so their titles are kept here.
   const permissionTitles = new SvelteMap<string, string>();
   $effect(() => {
@@ -1704,6 +1841,57 @@
         outcome: permissionResolution(params),
       },
     ].slice(-50);
+  }
+  function reconcilePendingSessionStatus(
+    agent: AgentId,
+    worktreeDirectory: string,
+    sessionId: string,
+    pendingSnapshot?: Awaited<ReturnType<typeof acp.pendingInbox>>,
+  ) {
+    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
+    const revision = permissionStatusRevisions.get(key);
+    void (pendingSnapshot ? Promise.resolve(pendingSnapshot) : acp.pendingInbox())
+      .then((pending) => {
+        if (permissionStatusRevisions.get(key) === revision) pendingStatusRetries.delete(key);
+        if (
+          pending.some(
+            (item) =>
+              item.agent === agent &&
+              item.directory === worktreeDirectory &&
+              item.message.params?.sessionId === sessionId,
+          ) ||
+          permissionStatusRevisions.get(key) !== revision
+        )
+          return undefined;
+        nativeSubagents = setNativeSubagentWaiting(
+          nativeSubagents,
+          agent,
+          worktreeDirectory,
+          sessionId,
+          false,
+        );
+        for (const thread of agentThreads.filter(
+          (item) =>
+            item.agent === agent &&
+            item.sessionId === sessionId &&
+            item.directory === worktreeDirectory &&
+            threadAttention[threadKey(item)]?.status === 'waiting',
+        ))
+          updateAgentThreadStatus(thread, 'working');
+        for (const receipt of spawnReceipts.filter(
+          (item) =>
+            item.targetId === `acp:${agent}:${sessionId}` &&
+            item.targetDirectory === worktreeDirectory &&
+            item.state === 'waiting',
+        ))
+          updateSpawnReceipt(receipt.receiptId, { state: 'working' });
+        return undefined;
+      })
+      .catch(() => {
+        if (permissionStatusRevisions.get(key) !== revision) return;
+        pendingStatusRetries.set(key, { agent, directory: worktreeDirectory, sessionId });
+        scheduleInboxRefresh();
+      });
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
@@ -1970,6 +2158,13 @@
     setSidebarWidth(width);
   }
 
+  let tasksTick = $state(0);
+  let taskSnapshot = $derived.by(() => {
+    void tasksTick;
+    return acpPlanScope
+      ? sessionTasks().snapshot(acpPlanScope)
+      : { turnId: null, revision: 0, tasks: [], focus: null };
+  });
   let acpPlanTick = $state(0);
   let acpPlanScope = $derived<PlanScope | null>(
     acpAgent && acpThread ? { agent: acpAgent, directory, sessionId: acpThread.sessionId } : null,
@@ -1991,17 +2186,19 @@
   );
   let showPlanPanel = $derived(!!nativePlan || !!acpSnapshot.plan || !!acpSnapshot.questions);
   let activeSideTab = $derived(
-    sideTab === 'ship'
-      ? 'ship'
-      : showPlanPanel && sideTab === 'plan'
-        ? 'plan'
-        : acpAgent && sideTab === 'planhistory' && acpPlanHistory.length
-          ? 'planhistory'
-          : acpAgent && sideTab !== 'history'
-            ? 'changes'
-            : sideTab === 'history'
-              ? 'history'
-              : 'changes',
+    acpAgent && sideTab === 'tasks'
+      ? 'tasks'
+      : sideTab === 'ship'
+        ? 'ship'
+        : showPlanPanel && sideTab === 'plan'
+          ? 'plan'
+          : acpAgent && sideTab === 'planhistory' && acpPlanHistory.length
+            ? 'planhistory'
+            : acpAgent && sideTab !== 'history'
+              ? 'changes'
+              : sideTab === 'history'
+                ? 'history'
+                : 'changes',
   );
   let mainDetailsVisible = $derived(
     workspaceView === 'workspace' &&
@@ -2063,9 +2260,12 @@
       notificationPrefs,
       notificationSound,
       autoCopyEnabled,
+      worktreeAutodiscoveryEnabled,
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
+      backgroundPriorityEnabled,
+      reefCanaryPercent,
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
@@ -2092,6 +2292,7 @@
     } catch (cause) {
       agentDetectionError = `Could not detect agents: ${describe(cause)}`;
     }
+    agentDetectionSettled = true;
     await sendSettingsState();
   }
 
@@ -2139,8 +2340,12 @@
   onMount(() => {
     window.addEventListener(OPEN_IN_SPLIT_EVENT, openLinkInSplit);
     let unlistenAgentEvents: (() => void) | undefined;
+    let unlistenPostTurnCheckEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
+    const unsubscribeTasks = sessionTasks().subscribe(() => {
+      tasksTick += 1;
+    });
     const unsubscribePlans = acpPlans().subscribe((change) => {
       acpPlanTick += 1;
       revealMainPlan(change.scope, change.reason);
@@ -2254,6 +2459,9 @@
         } else if (action.type === 'auto-copy') {
           autoCopyEnabled = action.value;
           setSetting('sai-auto-copy-enabled', String(action.value));
+        } else if (action.type === 'worktree-autodiscovery') {
+          worktreeAutodiscoveryEnabled = action.value;
+          setSetting('sai-worktree-autodiscovery-enabled', String(action.value));
         } else if (action.type === 'personal-post-turn-checks') {
           personalPostTurnChecks = action.value;
           setSetting('sai-post-turn-personal', JSON.stringify(action.value));
@@ -2263,6 +2471,17 @@
         } else if (action.type === 'agent-terminals') {
           agentTerminalsEnabled = action.value;
           setSetting('sai-agent-terminals-enabled', String(action.value));
+        } else if (action.type === 'background-priority') {
+          backgroundPriorityEnabled = action.value;
+          setSetting('sai-background-priority-enabled', String(action.value));
+        } else if (action.type === 'reef-canary-percent') {
+          if (
+            action.value === null ||
+            (Number.isInteger(action.value) && action.value >= 0 && action.value <= 100)
+          ) {
+            reefCanaryPercent = action.value;
+            setSetting(reefCanarySettingKey, action.value === null ? 'off' : String(action.value));
+          }
         } else if (action.type === 'agent-status') {
           agentStatusEnabled = action.value;
           setSetting('sai-agent-status-enabled', String(action.value));
@@ -2340,22 +2559,40 @@
       void listen<(typeof agentTerminals)[number]>('acp-terminal-created', ({ payload }) => {
         agentTerminals = [...agentTerminals, payload];
       }).then((unlisten) => (unlistenAgentTerminals = unlisten));
-      void listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)).then(
-        (unlisten) => {
-          if (disposed) unlisten();
-          else {
-            unlistenAgentEvents = unlisten;
-            void recoverInterruptedAgentTurns()
-              .then(() => restoreAgentActivity())
-              .finally(() => {
-                acpRecoveryReady = true;
-                void tickShippingRuns();
-              });
-            scheduleInboxRefresh();
-          }
-          return undefined;
-        },
-      );
+      void Promise.all([
+        listen<PostTurnCheck>('post-turn-check-completed', ({ payload }) => {
+          postTurnResults = upsertCheck(postTurnResults, payload);
+          if (!hasDurableCheckOutcome(payload)) return;
+          const match = /^acp:([^:]+):(.+)$/.exec(payload.thread);
+          if (match)
+            void runVerifiedCompletedChecks(match[1], payload.directory, match[2], payload.turn);
+        }),
+        listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)),
+      ]).then(([unlistenChecks, unlistenAgent]) => {
+        if (disposed) {
+          unlistenChecks();
+          unlistenAgent();
+        } else {
+          unlistenPostTurnCheckEvents = unlistenChecks;
+          unlistenAgentEvents = unlistenAgent;
+          if (import.meta.env.MODE === 'e2e')
+            Reflect.set(window, 'sailE2eStopAgentEvents', () => {
+              unlistenAgentEvents?.();
+              unlistenAgentEvents = undefined;
+            });
+          void recoverInterruptedAgentTurns()
+            .then(() => restoreAgentActivity())
+            .then(() => reconcilePendingPostTurnChecks())
+            .finally(() => {
+              acpRecoveryReady = true;
+              if (import.meta.env.MODE === 'e2e')
+                Reflect.set(window, 'sailE2eAcpRecoveryReady', true);
+              void tickShippingRuns();
+            });
+          scheduleInboxRefresh();
+        }
+        return undefined;
+      });
       if (import.meta.env.MODE === 'e2e') {
         const emulateClick = (event: Event) =>
           void openNotificationTarget((event as CustomEvent<unknown>).detail);
@@ -2372,18 +2609,19 @@
       });
       if (directory) {
         const initialDirectory = directory;
-        void canonicalizeProject(initialDirectory).then(() =>
-          Promise.all([
-            refreshAutomaticMemoryRecall(initialDirectory),
-            refreshAutomaticMemoryCapture(initialDirectory),
-          ]),
-        );
+        const initialSelection = selection;
+        void canonicalizeProject(initialDirectory).then(() => {
+          if (initialSelection === selection && directory)
+            return refreshAutomaticMemoryControls(directory);
+          return undefined;
+        });
       }
     }
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
-    const sidebarRefreshTimer = setInterval(scheduleSidebarInventoryRefresh, 30_000);
+    window.addEventListener('focus', refreshSidebarOnFocus);
+    document.addEventListener('visibilitychange', refreshSidebarOnFocus);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
       if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading)
@@ -2403,14 +2641,21 @@
       for (const timer of shipClaimLeaseFenceTimers.values()) clearTimeout(timer);
       shipClaimLeaseFenceTimers.clear();
       clearTimeout(inboxRefreshTimer);
+      clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
-      clearInterval(sidebarRefreshTimer);
+      window.removeEventListener('focus', refreshSidebarOnFocus);
+      document.removeEventListener('visibilitychange', refreshSidebarOnFocus);
       clearTimeout(sidebarInventoryTimer);
+      clearTimeout(sidebarFocusTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
+      unlistenPostTurnCheckEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eAcpRecoveryReady');
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
+      unsubscribeTasks();
       unsubscribePlans();
       unlistenTerminalExit?.();
       unlistenAgentTerminals?.();
@@ -2431,26 +2676,39 @@
     }).catch((cause) => (error = describe(cause)));
   }
 
-  async function refreshAutomaticMemoryRecall(path: string) {
-    const refresh = ++memoryRecallRefresh;
+  function resetAutomaticMemoryControls() {
+    ++memoryStatusRefresh;
     memoryRecallAvailable = false;
     memoryRecallEnabled = false;
     memoryRecallProjectKey = '';
+    memoryCaptureAvailable = false;
+    memoryCaptureEnabled = false;
+    memoryCaptureProjectKey = '';
+  }
+
+  async function refreshAutomaticMemoryControls(path: string) {
+    resetAutomaticMemoryControls();
+    const refresh = memoryStatusRefresh;
     try {
-      const status = await invoke<{ enabled: boolean; projectKey: string }>('memory_status', {
-        directory: path,
-      });
-      if (refresh !== memoryRecallRefresh || directory !== path) return;
-      const control = automaticRecallControl(
+      const status = await invoke<MemoryStatus>('memory_status', { directory: path });
+      if (refresh !== memoryStatusRefresh || directory !== path) return;
+      const recall = automaticRecallControl(
         status,
         getSetting(`sai-memory-auto-recall:${status.projectKey}`),
       );
-      memoryRecallAvailable = control.available;
-      memoryRecallEnabled = control.enabled;
-      memoryRecallProjectKey = control.projectKey;
+      const capture = automaticCaptureControl(
+        status,
+        getSetting(`sai-memory-auto-capture:${status.projectKey}`),
+      );
+      memoryRecallAvailable = recall.available;
+      memoryRecallEnabled = recall.enabled;
+      memoryRecallProjectKey = recall.projectKey;
+      memoryCaptureAvailable = capture.available;
+      memoryCaptureEnabled = capture.enabled;
+      memoryCaptureProjectKey = status.projectKey;
     } catch (cause) {
-      if (refresh === memoryRecallRefresh && directory === path)
-        error = `Could not load automatic memory recall: ${describe(cause)}`;
+      if (refresh === memoryStatusRefresh && directory === path)
+        error = `Could not load automatic memory controls: ${describe(cause)}`;
     }
   }
 
@@ -2466,27 +2724,6 @@
       error = `Could not update automatic memory recall: ${describe(cause)}`;
     } finally {
       if (memoryRecallProjectKey === projectKey) memoryRecallBusy = false;
-    }
-  }
-
-  async function refreshAutomaticMemoryCapture(path: string) {
-    const refresh = ++memoryCaptureRefresh;
-    memoryCaptureAvailable = false;
-    memoryCaptureEnabled = false;
-    memoryCaptureProjectKey = '';
-    try {
-      const status = await invoke<MemoryStatus>('memory_status', { directory: path });
-      if (refresh !== memoryCaptureRefresh || directory !== path) return;
-      const control = automaticCaptureControl(
-        status,
-        getSetting(`sai-memory-auto-capture:${status.projectKey}`),
-      );
-      memoryCaptureAvailable = control.available;
-      memoryCaptureEnabled = control.enabled;
-      memoryCaptureProjectKey = status.projectKey;
-    } catch (cause) {
-      if (refresh === memoryCaptureRefresh && directory === path)
-        error = `Could not load automatic memory capture: ${describe(cause)}`;
     }
   }
 
@@ -2511,9 +2748,48 @@
     scheduleInboxRefresh();
   }
 
+  async function saveProjectCatalogDurably(next: ProjectCatalog): Promise<void> {
+    projectCatalog = next;
+    scheduleInboxRefresh();
+    await setSettingDurable('sai-project-catalog', JSON.stringify(next));
+  }
+
+  async function agentWorktreeOrigin(
+    project: string,
+    sourcePath: string,
+    agent: string,
+    sessionId: string,
+    sessionTitle: string,
+  ): Promise<WorktreeOrigin> {
+    const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+      repository: project,
+      paths: [sourcePath],
+    });
+    const source = registered.find((item) => item.path === sourcePath);
+    if (!source?.generation) throw new Error('Source Git worktree identity is unavailable.');
+    return {
+      sourcePath,
+      sourceGeneration: source.generation,
+      agent,
+      sessionId,
+      sessionTitle,
+    };
+  }
+
   async function saveShipRuns(): Promise<void> {
     const value = serializeShipRuns(shipRuns, unparsedShipRuns);
     await setSettingDurable('sai-ship-runs', value);
+  }
+
+  async function discardUnparsedShipRun(index: number): Promise<void> {
+    const previous = unparsedShipRuns;
+    unparsedShipRuns = unparsedShipRuns.filter((_, itemIndex) => itemIndex !== index);
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      unparsedShipRuns = previous;
+      throw cause;
+    }
   }
 
   async function archiveDueShipRuns(): Promise<void> {
@@ -2558,9 +2834,7 @@
     const ready = shipMergeAction(issue);
     if (!ready.enabled) throw new Error(ready.reason ?? 'This pull request cannot merge.');
     const outcome = await invoke<{
-      method: 'github' | 'bot-comment';
       strategy: string;
-      comment: string | null;
     }>('ship_merge_pull_request', {
       request: {
         repository: run.repository,
@@ -2570,31 +2844,8 @@
         evidenceReady: shipEvidenceReadiness(issue).ready,
       },
     });
-    if (outcome.method !== 'bot-comment') {
-      void tickShippingRuns(true);
-      return `Merged the pull request (${outcome.strategy}).`;
-    }
-    const posted = `Posted “${outcome.comment}” on the pull request. The repository's bot merges it.`;
-    // Kept in memory even if saving fails, so this session cannot post the comment again.
-    await updateShipIssue(
-      run,
-      issue,
-      {
-        mergeRequested: {
-          at: Date.now(),
-          head: issue.pullRequestHead ?? null,
-          comment: outcome.comment ?? '',
-        },
-      },
-      false,
-    );
     void tickShippingRuns(true);
-    try {
-      await saveShipRuns();
-    } catch (cause) {
-      return `${posted} Sail could not save that the merge was requested: ${describe(cause)}`;
-    }
-    return posted;
+    return `Merged the pull request (${outcome.strategy}).`;
   }
 
   function requireShipClaimOwnership(issue: ShipIssue, action: string): void {
@@ -2605,6 +2856,14 @@
       throw new Error(
         `Another Sail instance holds the shipping claim for this issue. ${action} after it releases or expires.`,
       );
+  }
+
+  async function cleanCheckpointCommit(path: string, revision: string): Promise<string | null> {
+    const commit = await invoke<string | null>('working_tree_commit', { path });
+    const after = await invoke<string>('working_tree_revision', { path });
+    if (after !== revision)
+      throw new Error('The worktree changed while recording the checkpoint commit. Retry.');
+    return commit;
   }
 
   /** Stops leftovers and queues a fresh worker that resumes from the saved checkpoint. */
@@ -2638,6 +2897,7 @@
       cancelledAt: undefined,
       stage: undefined,
       reportedStatus: undefined,
+      workerRequest: null,
       claimFencePending: false,
       claimRevalidationPending: false,
       claimHandoffPending: false,
@@ -2672,16 +2932,76 @@
     const ready = shipReopenAction(issue);
     if (!ready.enabled)
       throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
-    const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
-      'ship_reopen_pull_request',
-      {
+    let outcome: { head: string; pullRequest: string; alreadyOpen: boolean };
+    try {
+      outcome = await invoke('ship_reopen_pull_request', {
         request: {
           repository: run.repository,
           expectedRepository: run.remote,
           pullRequest: issue.pullRequest,
         },
-      },
-    );
+      });
+    } catch (cause) {
+      if (!describe(cause).startsWith('GitHub could not reopen the pull request.')) throw cause;
+      const revision = issue.checkpoint?.revision;
+      if (!revision)
+        throw new Error('The saved checkpoint has no revision for a replacement.', { cause });
+      let commit = shipCheckpointCommit(issue);
+      if (!commit && issue.path) {
+        const current = await invoke<string>('working_tree_revision', { path: issue.path });
+        if (current !== revision)
+          throw new Error(
+            'The source worktree differs from the saved checkpoint. Reconcile it before replacement.',
+            { cause },
+          );
+        commit = await cleanCheckpointCommit(issue.path, revision);
+      }
+      if (!commit)
+        throw new Error(
+          'The saved checkpoint has no clean Git commit for a replacement. Restore and bind a clean source worktree first.',
+          { cause },
+        );
+      if (!(await confirmShipAction(shipReplacementConfirmation(issue, run.remote)))) return '';
+      const stillReady = shipReopenAction(issue);
+      if (!stillReady.enabled)
+        throw new Error(stillReady.reason ?? 'This issue changed and cannot start a replacement.', {
+          cause,
+        });
+      if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+        await stopShippingWorker(issue);
+      const created = await invoke<CreatedWorktree>('create_shipping_replacement_worktree', {
+        repository: run.repository,
+        expectedRepository: run.remote,
+        issueNumber: issue.number,
+        pullRequest: issue.pullRequest,
+        checkpointRevision: commit,
+      });
+      saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
+      const key = `${run.id}:${issue.id}`;
+      beginLatestRefresh(shippingPullRequestGenerations, key);
+      shippingPullRequests.delete(key);
+      await restartShipIssue(
+        run,
+        issue,
+        `The closed pull request ${issue.pullRequest} could not reopen. Continue from checkpoint commit ${commit.slice(0, 8)} on replacement branch ${created.branch} and publish a new pull request.`,
+        {
+          branch: created.branch,
+          path: created.path,
+          worktreeUnavailable: false,
+          setupStarted: false,
+          setupCompleted: false,
+          shippingTarget: created.shippingTarget ?? issue.shippingTarget,
+          pullRequest: null,
+          pullRequestState: undefined,
+          pullRequestHead: undefined,
+          pullRequestMergeable: undefined,
+          mergeRequested: undefined,
+          checks: undefined,
+          ciTriages: undefined,
+        },
+      );
+      return `Replacement pull request queued on ${created.branch} from checkpoint commit ${commit.slice(0, 8)}. The original pull request stays closed.`;
+    }
     if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
       await stopShippingWorker(issue);
     const key = `${run.id}:${issue.id}`;
@@ -2689,15 +3009,16 @@
     beginLatestRefresh(shippingPullRequestGenerations, key);
     const cached = shippingPullRequests.get(key);
     if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
+    const warning = shipReopenHeadWarning(outcome.head, shipCheckpointCommit(issue));
     await restartShipIssue(
       run,
       issue,
-      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.`,
+      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.${warning}`,
       { pullRequestState: 'OPEN', pullRequestHead: outcome.head },
     );
     return outcome.alreadyOpen
-      ? 'The pull request was already open. A fresh worker resumes from the saved checkpoint.'
-      : 'Pull request reopened. A fresh worker resumes from the saved checkpoint.';
+      ? `The pull request was already open. A fresh worker resumes from the saved checkpoint.${warning}`
+      : `Pull request reopened. A fresh worker resumes from the saved checkpoint.${warning}`;
   }
 
   async function stopShipRun(run: ShipRun): Promise<string> {
@@ -2718,6 +3039,8 @@
         state: 'failed',
         error: stoppedMessage,
         blockedReason: null,
+        reportedStatus: undefined,
+        workerRequest: null,
         workerSettled: true,
         cancelledAt: Date.now(),
         ...(checkpoint && checkpoint.status !== 'completed'
@@ -2833,6 +3156,23 @@
       setSetting('sai-ship-runs', serializeShipRuns(shipRuns, unparsedShipRuns));
       throw cause;
     }
+    await maybeReleaseShipOwner(current);
+  }
+
+  async function maybeReleaseShipOwner(issue: ShipIssue): Promise<void> {
+    if (!shipOwnerReleaseReady(issue, spawnReceipts)) return;
+    await acp.releaseOwner(issue.path, issue.receiptId).catch((cause) => {
+      if (describe(cause).includes('active validation gate')) return;
+      throw cause;
+    });
+  }
+
+  async function releaseTerminalShipOwners(path: string): Promise<void> {
+    await Promise.all(
+      shipRuns.flatMap((run) =>
+        run.issues.filter((issue) => issue.path === path).map(maybeReleaseShipOwner),
+      ),
+    );
   }
 
   function contextProvider(threadId: string): ContextProvider {
@@ -4064,7 +4404,7 @@
       const available = (await acp.agents()).find((agent) => agent.id === run.provider);
       if (!available?.available)
         throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
-      await acp.connect(run.provider, created.path);
+      await acp.connect(run.provider, created.path, 'build', { owner: receiptId });
       ensureClaimHeld();
       const gateExecution =
         'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
@@ -4329,6 +4669,20 @@
     return waitForAcpWorkerTermination(agent, worktreeDirectory, sessionId, turnId, deadline);
   }
 
+  async function waitForOwnedPromptSettlement(
+    agent: string,
+    worktreeDirectory: string,
+    sessionId: string,
+    deadline: number,
+  ): Promise<void> {
+    const activity = (await acp.activity(worktreeDirectory))[agent];
+    if (!activity?.active.includes(sessionId) && !activity?.waiting.includes(sessionId)) return;
+    if (monotonicDeadlineExpired(performance.now(), deadline))
+      throw new Error('Owned agent prompt did not settle after cancellation.');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return waitForOwnedPromptSettlement(agent, worktreeDirectory, sessionId, deadline);
+  }
+
   async function stopShippingThread(issue: ShipIssue, threadId: string): Promise<void> {
     const match = /^acp:([^:]+):(.+)$/.exec(threadId);
     if (!match) throw new Error('Worker thread cannot be interrupted automatically.');
@@ -4353,10 +4707,24 @@
     } catch (cause) {
       if (!shippingWorkerGone(cause)) throw cause;
     }
+    if (receipt && issue.path) await acp.releaseOwner(issue.path, receipt.receiptId);
     if (receipt) updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
   }
 
   async function stopShippingWorker(issue: ShipIssue): Promise<void> {
+    for (const receipt of spawnReceipts.filter(
+      (item) =>
+        item.validation &&
+        item.sourceDirectory === issue.path &&
+        !item.targetId &&
+        !receiptIsSettled(item.state),
+    )) {
+      if (!resourceQueues.validation.cancel(receipt.receiptId)) continue;
+      updateSpawnReceipt(receipt.receiptId, {
+        state: 'interrupted',
+        error: 'Validation capacity request cancelled before launch.',
+      });
+    }
     const primaryThreadId =
       issue.threadId ?? spawnReceipts.find((item) => item.receiptId === issue.receiptId)?.targetId;
     await fenceShippingTaskThreads(
@@ -5070,16 +5438,114 @@
             confirmedOwnership.ownershipGeneration !== ownership.ownershipGeneration
           )
             return;
-          const archivePath = await invoke<string | null>('delete_worktree', {
-            request: {
-              ...shipCleanupRequest(run.repository, issue, currentRevision),
-              nativeGeneration: confirmedOwnership.nativeGeneration,
-            },
+          const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+            repository: run.repository,
           });
-          saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
-          await updateShipIssue(run, issue, { path: null, archivePath, error: null });
+          const source = registered.find((worktree) => worktree.path === issue.path);
+          if (!source?.generation)
+            throw new Error('Ship worktree identity changed before descendant cleanup.');
+          const catalogued = projectCatalog.worktrees[run.repository] ?? [];
+          const savedSource = catalogued.find((worktree) => worktree.path === issue.path);
+          if (savedSource?.generation !== source.generation)
+            throw new Error('Ship worktree catalog identity changed before descendant cleanup.');
+          const descendants = worktreeDescendants(
+            projectCatalog,
+            run.repository,
+            registered,
+            issue.path,
+          );
+          const targets = [source, ...descendants];
+          const pendingNotice =
+            'Cleanup pending: confirm the merged worktree is unused before removing it.';
+          if (
+            targets.every((worktree) =>
+              catalogued.some(
+                (item) =>
+                  item.path === worktree.path &&
+                  item.generation === worktree.generation &&
+                  item.pendingCleanup,
+              ),
+            )
+          ) {
+            if (issue.error !== pendingNotice) await update({ error: pendingNotice });
+            return;
+          }
+          let preview: WorktreeCleanupSummary[] = [];
+          let previewFailure: string | null = null;
+          try {
+            preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
+              repository: run.repository,
+              paths: targets.map((worktree) => worktree.path),
+            });
+            if (
+              preview.length !== targets.length ||
+              preview.some(
+                (entry, index) =>
+                  entry.path !== targets[index].path ||
+                  entry.generation !== targets[index].generation,
+              )
+            )
+              throw new Error('Ship worktree identities changed before pending cleanup.');
+          } catch (cause) {
+            preview = [];
+            previewFailure = `Cannot verify checkout state: ${describe(cause)}`;
+          }
+          let pendingCatalog = projectCatalog;
+          for (const [index, worktree] of targets.entries()) {
+            if (!worktree.generation)
+              throw new Error('Ship worktree identity changed before pending cleanup.');
+            const state = preview[index];
+            pendingCatalog = markNewWorktreeCleanupPending(
+              pendingCatalog,
+              run.repository,
+              worktree.path,
+              {
+                originalPath: worktree.path,
+                recoveryPath: worktree.path,
+                sizeBytes: null,
+                registeredWorktreesAtMark: registered.map(
+                  ({ path: registeredPath, generation }) => ({
+                    path: registeredPath,
+                    generation,
+                  }),
+                ),
+                reason:
+                  previewFailure ??
+                  (state.dirty
+                    ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                    : state.activeSessions.length
+                      ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+                      : index === 0
+                        ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
+                        : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
+              },
+              worktree.generation,
+            );
+          }
+          await saveProjectCatalogDurably(pendingCatalog);
+          await update({ error: pendingNotice });
         } catch (cause) {
-          await update({ error: `Cleanup: ${describe(cause)}` });
+          const retained = pendingStorageFromError(cause) ?? pendingRecoveryFromError(cause);
+          let catalogError = '';
+          if (retained && issue.path) {
+            const saved = projectCatalog.worktrees[run.repository]?.find(
+              (worktree) => worktree.path === issue.path,
+            );
+            try {
+              await saveProjectCatalogDurably(
+                markWorktreeCleanupPending(
+                  projectCatalog,
+                  run.repository,
+                  issue.path,
+                  retained,
+                  saved?.generation ?? undefined,
+                ),
+              );
+            } catch (failure) {
+              catalogError = ` Recovery details could not be saved: ${describe(failure)}`;
+            }
+          }
+          await update({ error: `Cleanup: ${describe(cause)}${catalogError}` });
         }
       }
       return;
@@ -5281,6 +5747,7 @@
     await settleShipRefresh(
       run.issues.map((issue) =>
         (async () => {
+          await maybeReleaseShipOwner(issue);
           const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
           const claim = issue.claim;
           const claimOwned = shippingClaimOwnedByInstance(claim, shippingInstanceId);
@@ -5482,7 +5949,11 @@
     for (const pendingReceipt of spawnReceipts)
       if (pendingReceipt.dispatchPending) protectedIds.add(pendingReceipt.receiptId);
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
+    if (receipt.validation && receiptIsSettled(receipt.state))
+      resourceQueues.validation.release(receipt.receiptId);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    if (receipt.state === 'completed' && receiptReplayNeeded.has(receipt.receiptId))
+      void recoverAcpSpawnResult(receipt).catch(() => undefined);
     for (const run of shipRuns) {
       const issue = run.issues.find((item) => item.receiptId === receipt.receiptId);
       if (issue) {
@@ -5558,10 +6029,16 @@
       return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     }
     const receiptActivity = await acp.activity(receipt.targetDirectory).then(
-      (states) => states[receipt.provider],
-      () => null,
+      (states) => ({ resolved: true as const, state: states[receipt.provider] ?? null }),
+      () => ({ resolved: false as const, state: null }),
     );
-    reconcileAcpSpawnReceipt(receipt, receiptActivity);
+    if (
+      !receiptActivity.resolved &&
+      receipt.validation &&
+      resourceQueues.validation.isActive(receipt.receiptId)
+    )
+      return receipt;
+    reconcileAcpSpawnReceipt(receipt, receiptActivity.state);
     return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
   }
 
@@ -5725,7 +6202,7 @@
             ? (outcome.error ?? receipt.error)
             : receipt.error,
       });
-      if (state === 'completed' && !spawnOutput.has(receipt.receiptId))
+      if (state === 'completed' && !spawnOutput.has(receipt.receiptId) && !receipt.result)
         void recoverAcpSpawnResult(receipt).catch(() => undefined);
       if (
         receipt.targetId &&
@@ -5736,7 +6213,18 @@
     }
   }
 
-  async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
+  function recoverAcpSpawnResult(receipt: SpawnReceipt): Promise<void> {
+    const existing = recoveringSpawnResults.get(receipt.receiptId);
+    if (existing) return existing;
+    const pending = recoverAcpSpawnResultInner(receipt);
+    recoveringSpawnResults.set(receipt.receiptId, pending);
+    void pending
+      .finally(() => recoveringSpawnResults.delete(receipt.receiptId))
+      .catch(() => undefined);
+    return pending;
+  }
+
+  async function recoverAcpSpawnResultInner(receipt: SpawnReceipt) {
     const targetDirectory = receipt.targetDirectory;
     if (
       !receipt.targetId ||
@@ -5751,35 +6239,69 @@
       const activity = await acp.activity(worktreeDirectory).catch(() => null);
       return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
     }
+    await acp.connect(receipt.provider, worktreeDirectory);
+    const profile = capabilityProfileForAcpSession(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      receipt.validation ? 'review' : undefined,
+    );
+    const reservation = await acp.beginRestore(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      profile,
+    );
+    if (reservation.liveTurn) return;
+    if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
     const replay: AgentEntry[] = [];
-    const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
-      if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId)) return;
-      const update = payload.message.params?.update;
-      if (update && typeof update === 'object')
-        updateEntriesInPlace(replay, update as Record<string, unknown>);
-    });
-    setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+    let unlisten: (() => void) | undefined;
+    let replaying = false;
     try {
-      await acp.connect(receipt.provider, worktreeDirectory);
+      unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
+        if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId))
+          return;
+        const update = payload.message.params?.update;
+        if (update && typeof update === 'object')
+          updateEntriesInPlace(replay, update as Record<string, unknown>);
+      });
+      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+      replaying = true;
       await acp.load(
         receipt.provider,
         worktreeDirectory,
         sessionId,
-        capabilityProfileForAcpSession(
-          receipt.provider,
-          worktreeDirectory,
-          sessionId,
-          receipt.validation ? 'review' : undefined,
-        ),
+        profile,
+        reservation.restoreToken,
       );
       const latestFinished = await isLatestFinishedTurn();
-      const result = replayResultForReceipt(replay, receipt.prompt, latestFinished);
-      if (result) updateSpawnReceipt(receipt.receiptId, { result }, true);
+      const result = completeReceiptFromReplay(
+        replayResultForReceipt(replay, receipt.prompt, latestFinished),
+        postReloadReceiptTail.get(receipt.receiptId) ?? '',
+      );
+      if (result) {
+        receiptReplayNeeded.delete(receipt.receiptId);
+        postReloadReceiptTail.delete(receipt.receiptId);
+        spawnOutput.set(receipt.receiptId, result);
+        updateSpawnReceipt(receipt.receiptId, { result }, true);
+      }
     } catch {
       return;
     } finally {
-      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
-      unlisten();
+      try {
+        if (replaying) setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
+      } finally {
+        try {
+          unlisten?.();
+        } finally {
+          await acp.endRestore(
+            receipt.provider,
+            worktreeDirectory,
+            sessionId,
+            reservation.restoreToken,
+          );
+        }
+      }
     }
   }
 
@@ -5820,7 +6342,9 @@
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
       return threads;
     const known = new Set(threads.map((thread) => thread.id));
-    const listed = await Promise.all(directories.map((path) => listOpenCodeRootThreads(path)));
+    const listed = await Promise.all(
+      directories.map((path) => listOpenCodeRootThreads(path).catch(() => [])),
+    );
     return [
       ...threads,
       ...listed
@@ -5858,6 +6382,47 @@
     setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
   }
 
+  async function resolveCoordinationThread(
+    target: CoordinationThread,
+  ): Promise<AgentThread | null> {
+    const existing = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find(
+      (item) =>
+        item.directory === target.directory && target.id === `acp:${item.agent}:${item.sessionId}`,
+    );
+    if (existing) return existing;
+
+    const match = /^acp:([^:]+):(.+)$/.exec(target.id);
+    if (!match) return null;
+    const [, agent, sessionId] = match;
+    const receipt = spawnReceipts.find(
+      (item) => item.targetId === target.id && item.targetDirectory === target.directory,
+    );
+    const listed =
+      agent === 'opencode'
+        ? await listSidebarAcpThreads(
+            agent,
+            (cursor) => acp.listSessions(agent, target.directory, cursor, 'explore'),
+            target.directory,
+          ).catch(() => [])
+        : [];
+    return (
+      listed.find((item) => item.sessionId === sessionId) ?? {
+        agent,
+        directory: target.directory,
+        sessionId,
+        title: target.title || receipt?.name || 'Recovered session',
+        updated: receipt?.updated ?? Date.now(),
+        model: receipt?.model,
+        capabilityProfile: capabilityProfileForAcpSession(agent, target.directory, sessionId),
+      }
+    );
+  }
+
   function queueCoordinationDelivery(target: CoordinationThread, message: CoordinationMessage) {
     const previous = coordinationDeliveries.get(message.target) ?? Promise.resolve();
     const delivery = previous
@@ -5866,11 +6431,7 @@
         if (disposed || coordinationMessages.find((item) => item.id === message.id)?.delivered)
           return;
         const text = coordinationPrompt(message);
-        const thread = [...agentThreads, ...sidebarOpenCodeThreads].find(
-          (item) =>
-            item.directory === target.directory &&
-            target.id === `acp:${item.agent}:${item.sessionId}`,
-        );
+        const thread = await resolveCoordinationThread(target);
         if (!thread) throw new Error('The receiving thread is unavailable.');
         const info = await acp.connect(thread.agent, thread.directory);
         const agentActivity = (await acp.activity(thread.directory))[thread.agent];
@@ -5891,6 +6452,15 @@
             await acp.resume(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
           else await acp.load(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
         }
+        if (
+          !agentThreads.some(
+            (item) =>
+              item.agent === thread.agent &&
+              item.directory === thread.directory &&
+              item.sessionId === thread.sessionId,
+          )
+        )
+          saveAgentThread(thread);
         await waitForCoordinationThread(thread);
         if (disposed) return;
         await invoke('record_turn_snapshot', {
@@ -6102,14 +6672,41 @@
       request.sessionId,
     );
     const requestedTool =
-      request.name === 'capability_check' && typeof request.arguments.tool === 'string'
-        ? request.arguments.tool
-        : request.name;
+      request.name === 'sail_task_report_check'
+        ? TASK_TOOLS.read
+        : request.name === 'capability_check' && typeof request.arguments.tool === 'string'
+          ? request.arguments.tool
+          : request.name;
     if (!capabilityProfileEnablesTool(effectiveProfile, requestedTool))
       throw new Error(
         `${requestedTool} is unavailable under the ${effectiveProfile} capability profile.`,
       );
     if (request.name === 'capability_check') return { profile: effectiveProfile };
+    if (
+      request.name === TASK_TOOLS.read ||
+      request.name === TASK_TOOLS.report ||
+      request.name === 'sail_task_report_check'
+    ) {
+      const scope = {
+        agent: source.agent,
+        directory: request.directory,
+        sessionId: request.sessionId,
+      };
+      if (request.name === TASK_TOOLS.read) return sessionTasks().snapshot(scope);
+      const runtime = (await acp.activity(request.directory))[source.agent];
+      if (runtime?.activeTurns[request.sessionId] !== request.arguments.turnId)
+        throw new Error('Task report belongs to an inactive or different turn.');
+      if (request.name === 'sail_task_report_check') {
+        if (typeof request.arguments.turnId !== 'string') throw new Error('Missing task turn.');
+        return {
+          needsCorrection: await sessionTasks().requestCorrection(scope, request.arguments.turnId),
+        };
+      }
+      const snapshot = await sessionTasks().report(scope, request.arguments);
+      if (snapshot.turnId)
+        focusActiveTurns = { ...focusActiveTurns, [taskScopeKey(scope)]: snapshot.turnId };
+      return snapshot;
+    }
     if (isPlanTool(request.name)) {
       return acpPlans().runTool(
         { agent: source.agent, directory: request.directory, sessionId: request.sessionId },
@@ -6365,7 +6962,11 @@
         return awaitReceipt(await boundedReceipt(current));
       }
       let current = await awaitReceipt(await boundedReceipt(receipt));
-      if (request.name === 'agent_result' && current.state === 'completed' && !current.result) {
+      if (
+        request.name === 'agent_result' &&
+        current.state === 'completed' &&
+        (!current.result || receiptReplayNeeded.has(current.receiptId))
+      ) {
         await recoverAcpSpawnResult(current);
         current = spawnReceipts.find((item) => item.receiptId === current.receiptId) ?? current;
       }
@@ -6538,6 +7139,7 @@
           request.arguments.expectedRevision,
           request.arguments.rebindRevision,
           Date.now(),
+          await cleanCheckpointCommit(request.directory, execution.revision),
         );
         await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
       } else if (!owner.issue.checkpoint) {
@@ -6655,6 +7257,7 @@
         checkpointBeforePolicy.revision,
         true,
         Date.now(),
+        await cleanCheckpointCommit(request.directory, revision),
       );
       const evidenceManifests = syncEvidenceManifest(
         owner.issue.evidenceManifests ?? [],
@@ -6746,11 +7349,26 @@
     if (!(await approval)) throw new Error('User declined the worktree request.');
     if (Date.now() >= request.expiresAt)
       throw new Error('The worktree request expired before approval.');
-    const created = await invoke<{ path: string; branch: string; base: string; setup: string }>(
-      'create_worktree',
-      { repository: request.directory, name, destinationParent: null, baseRef: null },
-    );
-    saveProjectCatalog(addWorktree(projectCatalog, project, created));
+    const finishRegistration = beginAgentWorktreeRegistration(project);
+    let created: CreatedWorktree;
+    try {
+      const origin = await agentWorktreeOrigin(
+        project,
+        request.directory,
+        source.agent,
+        request.sessionId,
+        source.title,
+      );
+      created = await invoke<CreatedWorktree>('create_worktree', {
+        repository: request.directory,
+        name,
+        destinationParent: null,
+        baseRef: null,
+      });
+      saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
+    } finally {
+      finishRegistration();
+    }
     if (created.setup) {
       await loadProject(created.path);
       if (directory !== created.path) throw new Error('Worktree changed before setup started.');
@@ -7043,8 +7661,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
-        reportedStatus: report.status,
-        blockedReason: report.status === 'blocked' ? report.reason : null,
+        ...shipWorkerProgressChanges(report.status, report.reason),
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
     }
@@ -7204,23 +7821,42 @@
           },
           actual: null,
         },
-        state: 'starting',
+        state: 'queued',
         created: Date.now(),
         updated: Date.now(),
         result: null,
         error: null,
+        activity: 'Waiting for validation capacity…',
       });
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       await saveShipRuns();
       try {
+        const updateCapacityActivity = () => {
+          if (!resourceQueues.validation.isQueued(receiptId)) return;
+          const { active, limit } = resourceQueues.validation.status;
+          updateSpawnReceipt(receiptId, {
+            activity:
+              resourceQueues.validation.reasonFor(receiptId) ??
+              `Waiting for validation capacity (${active}/${limit} running).`,
+          });
+        };
+        const unsubscribeCapacity = resourceQueues.validation.subscribe(updateCapacityActivity);
         try {
-          await acp.connect(choice.agent, request.directory);
-        } catch (cause) {
-          throw new ValidationCandidateUnavailable(
-            `Provider ${choice.agent} is unavailable`,
-            cause,
-          );
+          await resourceQueues.validation.acquire(receiptId, request.directory);
+        } finally {
+          unsubscribeCapacity();
         }
+        const reserved = spawnReceipts.find((receipt) => receipt.receiptId === receiptId);
+        if (!reserved || receiptIsSettled(reserved.state)) {
+          resourceQueues.validation.release(receiptId);
+          throw new Error('Validation capacity request was cancelled.');
+        }
+        updateSpawnReceipt(receiptId, {
+          state: 'starting',
+          activity: 'Starting validation gate…',
+        });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        await saveShipRuns();
         await ensureSelected();
         const [revision, mutationGeneration, baseRevision] = await Promise.all([
           invoke<string>('working_tree_revision', { path: request.directory }),
@@ -7245,6 +7881,19 @@
           },
         });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        try {
+          await acp.connect(choice.agent, request.directory, 'review', {
+            owner: receiptId,
+            ...(gateOwner?.issue.receiptId
+              ? { buildOwner: gateOwner.issue.receiptId, buildRevision: revision }
+              : {}),
+          });
+        } catch (cause) {
+          throw new ValidationCandidateUnavailable(
+            `Provider ${choice.agent} is unavailable`,
+            cause,
+          );
+        }
         const ensureLaunchState = async () => {
           await ensureSelected();
           const currentRevision = await invoke<string>('working_tree_revision', {
@@ -7285,7 +7934,11 @@
           status: 'started',
         };
       } catch (cause) {
-        updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        const current = spawnReceipts.find((receipt) => receipt.receiptId === receiptId);
+        if (!current || !receiptIsSettled(current.state))
+          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        await acp.releaseOwner(request.directory, receiptId);
         if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
         return tryChoice(
           candidates.filter((item) => item !== choice),
@@ -7513,11 +8166,26 @@
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
       if (!destination) {
-        const created = await invoke<{ path: string; branch: string; setup: string }>(
-          'create_worktree',
-          { repository: project, name, destinationParent: null, baseRef: null },
-        );
-        saveProjectCatalog(addWorktree(projectCatalog, project, created));
+        const finishRegistration = beginAgentWorktreeRegistration(project);
+        let created: CreatedWorktree;
+        try {
+          const origin = await agentWorktreeOrigin(
+            project,
+            request.directory,
+            source.agent,
+            request.sessionId,
+            source.title,
+          );
+          created = await invoke<CreatedWorktree>('create_worktree', {
+            repository: project,
+            name,
+            destinationParent: null,
+            baseRef: null,
+          });
+          saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
+        } finally {
+          finishRegistration();
+        }
         destination = created;
         updateSpawnReceipt(receiptId, {
           worktreeId: created.path,
@@ -7638,6 +8306,16 @@
     promptAuthorization?: DirectShipAuthorization,
     onPromptQueue?: (limit: number | null, reason: string | null) => void,
   ) {
+    const receipt = receiptId
+      ? spawnReceipts.find((item) => item.receiptId === receiptId)
+      : undefined;
+    const runOwner =
+      receiptId &&
+      (validation ||
+        receipt?.requestId.startsWith('ship:') ||
+        receipt?.requestId.startsWith('handoff:'))
+        ? receiptId
+        : undefined;
     const requestedModel =
       validation && source.model && hasUnresolvedModelAlias(source.model)
         ? undefined
@@ -7659,11 +8337,12 @@
         ? routedProfile
         : 'build';
     const session = await acp
-      .create(source.agent, created.path, capabilityProfile, nativeGeneration)
+      .create(source.agent, created.path, capabilityProfile, nativeGeneration, runOwner)
       .catch((cause) => {
         if (!validation) throw cause;
         throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
       });
+    let dispatchedTurnId: string | null = null;
     try {
       let configOptions = session.configOptions ?? [];
       const reportedModel = configOptions.find(
@@ -7728,16 +8407,16 @@
       };
       saveAgentThread(thread);
       if (receiptId) {
-        const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+        const existingReceipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         updateSpawnReceipt(receiptId, {
           targetId: `acp:${source.agent}:${session.sessionId}`,
           model: requestedModel ?? reportedModel,
           targetDirectory: created.path,
           worktreeId: created.path,
-          ...(receipt?.routing
+          ...(existingReceipt?.routing
             ? {
                 routing: {
-                  ...receipt.routing,
+                  ...existingReceipt.routing,
                   actual: {
                     provider: source.agent as 'claude' | 'codex' | 'opencode',
                     model: requestedModel ?? reportedModel ?? null,
@@ -7784,7 +8463,7 @@
           activeSpawnTargets.set(spawnTargetKey(created.path, targetId), receiptId);
         }
         try {
-          return acp.prompt(
+          const pending = acp.prompt(
             source.agent,
             created.path,
             session.sessionId,
@@ -7797,6 +8476,8 @@
             },
             false,
           );
+          dispatchedTurnId = turnId;
+          return pending;
         } catch (cause) {
           if (
             receiptId &&
@@ -7833,6 +8514,10 @@
                 spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
               );
           }
+          if (runOwner && validation) {
+            await acp.releaseOwner(created.path, runOwner);
+            await releaseTerminalShipOwners(created.path);
+          }
           return undefined;
         },
         async (cause) => {
@@ -7865,6 +8550,13 @@
               );
           }
           if (!interrupted) error = describe(cause);
+          if (runOwner && validation)
+            await acp
+              .releaseOwner(created.path, runOwner)
+              .then(() => releaseTerminalShipOwners(created.path))
+              .catch((releaseCause) => {
+                error = `Validation agent cleanup failed: ${describe(releaseCause)}`;
+              });
           throw cause;
         },
       );
@@ -7890,6 +8582,23 @@
       };
     } catch (cause) {
       await acp.cancel(source.agent, created.path, session.sessionId, null).catch(() => undefined);
+      if (runOwner) {
+        let cleanupError: unknown;
+        if (dispatchedTurnId)
+          await waitForOwnedPromptSettlement(
+            source.agent,
+            created.path,
+            session.sessionId,
+            performance.now() + 5_000,
+          ).catch((failure) => {
+            cleanupError = failure;
+          });
+        await acp.releaseOwner(created.path, runOwner).catch((failure) => {
+          cleanupError = failure;
+        });
+        if (cleanupError)
+          throw new Error(`Agent run cleanup failed: ${describe(cleanupError)}`, { cause });
+      }
       if (nativeGeneration !== undefined)
         await acp.releaseSessionFence(source.agent, created.path, session.sessionId);
       throw cause;
@@ -8041,7 +8750,17 @@
           )
         : new Map();
     if (generation !== inboxGeneration || disposed) return;
+    clearTimeout(pendingStatusRetryTimer);
+    if (acpResult.status === 'rejected' && pendingStatusRetries.size)
+      pendingStatusRetryTimer = setTimeout(() => scheduleInboxRefresh(), 1000);
     if (acpResult.status === 'fulfilled') {
+      for (const retry of pendingStatusRetries.values())
+        reconcilePendingSessionStatus(
+          retry.agent,
+          retry.directory,
+          retry.sessionId,
+          acpResult.value,
+        );
       for (const pending of acpResult.value) {
         const sessionId = pending.message.params?.sessionId;
         const requestId = pending.message.id;
@@ -8284,6 +9003,10 @@
   }
 
   function removeProjectRepository(path: string) {
+    if ((projectCatalog.worktrees[path] ?? []).some((worktree) => worktree.pendingCleanup)) {
+      error = 'Finish pending worktree cleanup before removing this repository from the sidebar.';
+      return;
+    }
     if (
       path !== directory &&
       !(projectCatalog.worktrees[path] ?? []).some((worktree) => worktree.path === directory)
@@ -8321,6 +9044,29 @@
     return runWorktreeCreation(id, request);
   }
 
+  async function adoptExternalWorktree(repository: string, worktree: ProjectWorktree) {
+    try {
+      const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+      if (canonicalCatalog !== projectCatalog) await saveProjectCatalogDurably(canonicalCatalog);
+      const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      const current = registered.find((entry) => entry.path === worktree.path);
+      if (!current || current.generation !== worktree.generation)
+        throw new Error('The external Git worktree changed. Refresh the list and try again.');
+      const reconciled = reconcileMovedWorktrees(projectCatalog, repository, registered);
+      await saveProjectCatalogDurably(
+        addWorktree(reconciled, repository, {
+          path: worktree.path,
+          branch: current.branch ?? 'detached',
+          generation: current.generation,
+        }),
+      );
+      showWorkspace();
+      await loadProject(worktree.path);
+    } catch (cause) {
+      error = describe(cause);
+    }
+  }
+
   function retryWorktreeCreation(id: string) {
     const request = worktreeCreationRequests.get(id);
     if (!request || !worktreeCreations.some((creation) => creation.id === id && creation.error))
@@ -8356,6 +9102,8 @@
       worktreeCreations = worktreeCreations.map((creation) =>
         creation.id === id ? { ...creation, stage: 'Creating worktree' } : creation,
       );
+      if (deletingWorktreeRepositories.has(path))
+        throw new Error('A worktree deletion is in progress. Retry creation when it finishes.');
       created = await invoke('create_worktree', {
         repository: path,
         name,
@@ -8439,18 +9187,1065 @@
 
   const deletingWorktreeRequests = new SvelteSet<string>();
 
-  async function deleteProjectWorktree(
+  type WorktreeRemovalPreview = {
+    path: string;
+    branch: string | null;
+    generation: string;
+    revision: string;
+    dirty: boolean;
+    activeSessions: string[];
+    sizeBytes: number | null;
+    inspectionError: string | null;
+  };
+
+  type WorktreeCleanupSummary = Pick<
+    WorktreeRemovalPreview,
+    'path' | 'branch' | 'generation' | 'dirty' | 'activeSessions'
+  >;
+
+  type WorktreeRemovalExpectation = Pick<WorktreeRemovalPreview, 'generation'> &
+    Partial<Pick<WorktreeRemovalPreview, 'revision' | 'branch'>>;
+
+  function pendingRecoveryFromError(cause: unknown): PendingWorktreeCleanup | null {
+    const message = describe(cause);
+    const prefix = 'SAIL_PENDING_RECOVERY:';
+    if (!message.startsWith(prefix)) return null;
+    try {
+      const value: unknown = JSON.parse(message.slice(prefix.length));
+      if (!value || typeof value !== 'object') return null;
+      const recovery = value as Record<string, unknown>;
+      if (
+        typeof recovery.originalPath !== 'string' ||
+        typeof recovery.recoveryPath !== 'string' ||
+        typeof recovery.reason !== 'string' ||
+        !recovery.originalPath ||
+        !recovery.recoveryPath ||
+        !recovery.reason ||
+        !(
+          recovery.sizeBytes === null ||
+          (typeof recovery.sizeBytes === 'number' &&
+            Number.isSafeInteger(recovery.sizeBytes) &&
+            recovery.sizeBytes >= 0)
+        )
+      )
+        return null;
+      return recovery as PendingWorktreeCleanup;
+    } catch {
+      return null;
+    }
+  }
+
+  function pendingStorageFromError(cause: unknown): PendingWorktreeCleanup | null {
+    const message = describe(cause);
+    const prefix = 'SAIL_STORAGE_PENDING:';
+    if (!message.startsWith(prefix)) return null;
+    try {
+      const value: unknown = JSON.parse(message.slice(prefix.length));
+      if (!value || typeof value !== 'object') return null;
+      const pending = value as Record<string, unknown>;
+      if (
+        typeof pending.originalPath !== 'string' ||
+        pending.recoveryPath !== pending.originalPath ||
+        typeof pending.reason !== 'string' ||
+        !pending.originalPath ||
+        !pending.reason ||
+        (pending.sizeBytes !== null &&
+          (typeof pending.sizeBytes !== 'number' ||
+            !Number.isSafeInteger(pending.sizeBytes) ||
+            pending.sizeBytes < 0)) ||
+        !Array.isArray(pending.storagePaths) ||
+        (!pending.storagePaths.length && pending.overlayCleanupPending !== true) ||
+        !pending.storagePaths.every((path) => typeof path === 'string' && !!path) ||
+        !Array.isArray(pending.storageKeys) ||
+        pending.storageKeys.length !== pending.storagePaths.length ||
+        !pending.storageKeys.every((key) => typeof key === 'string' && /^[0-9a-f]{64}$/.test(key))
+      )
+        return null;
+      return {
+        originalPath: pending.originalPath,
+        recoveryPath: pending.recoveryPath,
+        sizeBytes: pending.sizeBytes,
+        reason: pending.reason,
+        storagePaths: pending.storagePaths,
+        storageKeys: pending.storageKeys,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function deleteProjectWorktree(repository: string, path: string, branch: string) {
+    if (deletingWorktreeRequests.has(path)) return;
+    if (deletingWorktreeRepositories.has(repository)) {
+      error = 'Another worktree deletion is in progress. Retry when it finishes.';
+      return;
+    }
+    if (worktreeRegistrationPending(repository)) {
+      error = 'A worktree is being created. Retry deletion when it finishes.';
+      return;
+    }
+    deletingWorktreeRepositories.add(repository);
+    deletingWorktreeRequests.add(path);
+    worktreeDeletions = { ...worktreeDeletions, [path]: 'Inspecting worktree' };
+    try {
+      const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+      if (canonicalCatalog !== projectCatalog) saveProjectCatalog(canonicalCatalog);
+      if (
+        projectCatalog.worktrees[repository]?.some(
+          (item) => item.path === path && item.pendingCleanup,
+        )
+      )
+        throw new Error(
+          'This worktree is pending cleanup. Review its retained files before continuing.',
+        );
+      const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      if (worktreeRegistrationPending(repository))
+        throw new Error('A worktree is being created. Retry deletion when it finishes.');
+      const reconciled = reconcileMovedWorktrees(projectCatalog, repository, registered);
+      if (reconciled !== projectCatalog) await saveProjectCatalogDurably(reconciled);
+      if (unmergedCatalogDescendants(projectCatalog, repository, registered, path).length)
+        throw new Error(
+          'A live descendant is saved under another repository path. Restore that repository alias before retrying cleanup.',
+        );
+      const descendants = worktreeDescendants(projectCatalog, repository, registered, path);
+      if (
+        descendants.length ||
+        (import.meta.env.MODE === 'e2e' &&
+          sessionStorage.getItem('sai-e2e-pause-force-cleanup') === 'true')
+      ) {
+        await deleteProjectWorktreeWithDescendants(
+          repository,
+          path,
+          branch,
+          descendants,
+          registered,
+        );
+      } else {
+        const target = registered.find((worktree) => worktree.path === path);
+        if (!target?.generation)
+          throw new Error('The selected worktree identity cannot be verified. Refresh and retry.');
+        await deleteProjectWorktreeOnce(
+          repository,
+          path,
+          branch,
+          true,
+          true,
+          { generation: target.generation },
+          false,
+          registered,
+        );
+      }
+    } catch (cause) {
+      error = describe(cause);
+    } finally {
+      deletingWorktreeRequests.delete(path);
+      deletingWorktreeRepositories.delete(repository);
+      if (worktreeDeletions[path] === 'Inspecting worktree') {
+        const remaining = { ...worktreeDeletions };
+        delete remaining[path];
+        worktreeDeletions = remaining;
+      }
+    }
+  }
+
+  async function deleteProjectWorktreeWithDescendants(
     repository: string,
     path: string,
     branch: string,
-    force = false,
+    descendants: ProjectWorktree[],
+    registered: RegisteredWorktree[],
   ) {
-    if (deletingWorktreeRequests.has(path)) return;
-    deletingWorktreeRequests.add(path);
+    const owner = projectCatalog.worktrees[repository]?.find((worktree) => worktree.path === path);
+    if (!owner?.generation || owner.branch !== branch) {
+      error = 'The selected worktree changed identity. Refresh before marking cleanup pending.';
+      return;
+    }
+    const targets = [...descendants, owner];
+    const live = new Map(registered.map((worktree) => [worktree.path, worktree]));
+    if (descendants.some((worktree) => deletingWorktreeRequests.has(worktree.path))) {
+      error = 'Another descendant deletion is in progress. Retry after it finishes.';
+      return;
+    }
+    const preview = await invoke<WorktreeCleanupSummary[]>('worktree_cleanup_summary', {
+      repository,
+      paths: targets.map((worktree) => worktree.path),
+    });
+    if (
+      preview.length !== targets.length ||
+      preview.some(
+        (entry, index) =>
+          entry.path !== targets[index].path ||
+          !live.get(entry.path)?.generation ||
+          entry.generation !== live.get(entry.path)?.generation ||
+          entry.branch !== live.get(entry.path)?.branch ||
+          entry.generation !== targets[index].generation,
+      )
+    ) {
+      error = 'Worktree identities changed during the preview. Refresh and retry.';
+      return;
+    }
+    const lines = targets.map((worktree, index) => {
+      const state = preview[index];
+      const warnings = [
+        state.dirty ? 'uncommitted changes' : null,
+        state.activeSessions.length ? `connected: ${state.activeSessions.join(', ')}` : null,
+      ].filter(Boolean);
+      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}`;
+    });
+    const e2eAnswer =
+      import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
+    if (e2eAnswer) sessionStorage.removeItem('sai-e2e-delete-worktree');
+    const confirmed =
+      e2eAnswer === 'Yes'
+        ? true
+        : e2eAnswer === 'No'
+          ? false
+          : await confirmInApp(
+              targets.length === 1
+                ? 'Force delete worktree'
+                : 'Force delete worktree and descendants',
+              targets.length === 1
+                ? `Force delete this worktree? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files. Its branch remains. If it cannot be removed safely, it stays visible as pending cleanup. The configured archive command does not run during pending cleanup.\n\n${lines.join('\n')}`
+                : `Force delete these ${targets.length} worktrees? Sail stops agents running in them and permanently removes uncommitted, untracked, and ignored files. Their branches remain. Worktrees that cannot be removed safely stay visible as pending cleanup. Configured archive commands do not run during descendant cleanup.\n\n${lines.join('\n')}`,
+              targets.length === 1 ? 'Force delete' : `Force delete ${targets.length} worktrees`,
+              { destructive: true },
+            );
+    if (!confirmed) return;
+    if (descendants.some((worktree) => deletingWorktreeRequests.has(worktree.path))) {
+      error = 'Another descendant deletion started during the preview. Retry after it finishes.';
+      return;
+    }
+    let pendingCatalog = projectCatalog;
+    for (const [index, worktree] of targets.entries()) {
+      // A pending descendant may already be staged at a recovery path. Its
+      // original path and removal snapshot must survive marking its parent.
+      if (worktree.pendingCleanup) continue;
+      const state = preview[index];
+      const reason = 'Force deletion confirmed; cleanup is in progress.';
+      pendingCatalog = markWorktreeCleanupPending(
+        pendingCatalog,
+        repository,
+        worktree.path,
+        {
+          originalPath: worktree.path,
+          recoveryPath: worktree.path,
+          sizeBytes: null,
+          selectedWorktreeCleanupConfirmed: true,
+          registeredWorktreesAtMark: registered.map(({ path: registeredPath, generation }) => ({
+            path: registeredPath,
+            generation,
+          })),
+          reason,
+        },
+        state.generation,
+      );
+    }
+    const previousCatalog = projectCatalog;
     try {
-      await deleteProjectWorktreeOnce(repository, path, branch, force);
+      await saveProjectCatalogDurably(pendingCatalog);
+    } catch (cause) {
+      saveProjectCatalog(previousCatalog);
+      throw new Error(`Could not persist pending worktrees before cleanup: ${describe(cause)}`, {
+        cause,
+      });
+    }
+    if (
+      import.meta.env.MODE === 'e2e' &&
+      sessionStorage.getItem('sai-e2e-pause-force-cleanup') === 'true'
+    ) {
+      error = '';
+      return;
+    }
+    for (const worktree of descendants) deletingWorktreeRequests.add(worktree.path);
+    const failures: string[] = [];
+    let stopped = false;
+    try {
+      await targets.reduce(
+        (previous, worktree) =>
+          previous.then(async () => {
+            if (stopped) return undefined;
+            let current: RegisteredWorktree[];
+            try {
+              current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+            } catch (cause) {
+              failures.push(`Could not refresh registered worktrees: ${describe(cause)}`);
+              stopped = true;
+              return undefined;
+            }
+            const catalogued = new Map(
+              (projectCatalog.worktrees[repository] ?? []).map((entry) => [
+                entry.path,
+                entry.generation,
+              ]),
+            );
+            if (
+              current.some(
+                (entry) =>
+                  entry.path !== repository && catalogued.get(entry.path) !== entry.generation,
+              )
+            ) {
+              failures.push(
+                'A registered worktree is not in this catalog. Refresh or adopt it before retrying cleanup.',
+              );
+              stopped = true;
+              return undefined;
+            }
+            const descendantReason = selectedCleanupDescendantReason(
+              repository,
+              worktree.path,
+              current,
+            );
+            if (descendantReason) {
+              const retained = projectCatalog.worktrees[repository]?.find(
+                (entry) => entry.path === worktree.path && entry.pendingCleanup,
+              );
+              if (retained?.pendingCleanup)
+                await saveProjectCatalogDurably(
+                  markWorktreeCleanupPending(projectCatalog, repository, worktree.path, {
+                    ...retained.pendingCleanup,
+                    reason: descendantReason,
+                  }),
+                );
+              failures.push(`${worktree.branch}: ${descendantReason}`);
+              return undefined;
+            }
+            const removed = await deleteProjectWorktreeOnce(
+              repository,
+              worktree.path,
+              worktree.branch,
+              true,
+              true,
+              { generation: worktree.generation! },
+              true,
+              current,
+            );
+            if (!removed) failures.push(`${worktree.branch}: ${error || 'cleanup did not finish'}`);
+            return undefined;
+          }),
+        Promise.resolve(),
+      );
     } finally {
-      deletingWorktreeRequests.delete(path);
+      for (const worktree of descendants) deletingWorktreeRequests.delete(worktree.path);
+    }
+    error = failures.length
+      ? `${failures.length} worktree${failures.length === 1 ? '' : 's'} remain pending. ${failures.join(' ')}`
+      : '';
+  }
+
+  async function checkPendingWorktreeCleanup(repository: string, selectedPath?: string) {
+    const entries = (projectCatalog.worktrees[repository] ?? []).filter(
+      (item) => item.pendingCleanup && (!selectedPath || item.path === selectedPath),
+    );
+    if (!entries.length) return;
+    try {
+      const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      const current = new Map(registered.map((item) => [item.path, item]));
+      const updates = await Promise.all(
+        entries.map(async (entry) => {
+          const pending = entry.pendingCleanup!;
+          let reason: string;
+          let sizeBytes = pending.sizeBytes;
+          if (pending.storagePaths?.length && !pending.selectedStorageCleanupConfirmed) {
+            const statuses = await invoke<{ cacheKey: string; reason: string }[]>(
+              'worktree_storage_cleanup_status',
+            );
+            const keys = new Set(pending.storagePaths.map((path) => path.split(/[/\\]/).at(-1)));
+            const retained = statuses.filter((status) => keys.has(status.cacheKey));
+            if (retained.length) {
+              reason = `Git checkout was removed; private storage remains pending: ${retained.map((status) => `${status.cacheKey}: ${status.reason}`).join(', ')}.`;
+              return { entry, pending, sizeBytes, reason, completed: false };
+            }
+          }
+          const live = current.get(entry.path);
+          const recovered =
+            (!live || live.generation !== entry.generation) && entry.generation
+              ? registered.filter(
+                  (item) =>
+                    item.generation === entry.generation &&
+                    /(?:^|[/\\])\.sail-removing-[0-9a-f-]{36}$/i.test(item.path),
+                )
+              : [];
+          if (recovered.length === 1) {
+            const recoveryPath = recovered[0].path;
+            return {
+              entry,
+              pending: movePendingWorktreeCleanup(
+                pending,
+                entry.path,
+                recoveryPath,
+                entry.generation!,
+              ),
+              sizeBytes,
+              reason: `The interrupted cleanup left the same Git generation registered at ${recoveryPath}. Review this recovery checkout before retrying.`,
+              completed: false,
+            };
+          }
+          if ((!live || live.generation !== entry.generation) && entry.generation) {
+            if (registered.some((item) => !item.generation)) {
+              reason =
+                'A registered worktree has an unverifiable Git generation. Repair its identity before settling this pending cleanup.';
+              return { entry, pending, sizeBytes, reason, completed: false };
+            }
+            const moved = registered.find((item) => item.generation === entry.generation);
+            if (moved) {
+              return {
+                entry,
+                pending: movePendingWorktreeCleanup(
+                  pending,
+                  entry.path,
+                  moved.path,
+                  entry.generation,
+                ),
+                sizeBytes,
+                reason: `The same Git generation is registered at ${moved.path}. Its files were kept; inspect the moved checkout.`,
+                completed: false,
+              };
+            }
+            try {
+              const storage = await invoke<
+                { cacheKey: string; path: string; sizeBytes: number | null }[]
+              >('selected_removed_worktree_storage', {
+                repository,
+                originalWorktree: pending.originalPath,
+                expectedGeneration: entry.generation,
+              });
+              if (storage.length) {
+                const reconciled = await reconcileSelectedRemovedWorktreeStorage(
+                  pending,
+                  storage,
+                  (paths) => invoke<boolean>('pending_cleanup_paths_absent', { paths }),
+                );
+                if (!reconciled) {
+                  reason =
+                    'A saved private storage path still exists, but its owner cannot be verified. Inspect it before retrying cleanup.';
+                  return { entry, pending, sizeBytes, reason, completed: false };
+                }
+                return {
+                  entry,
+                  pending: reconciled,
+                  sizeBytes: reconciled.sizeBytes,
+                  reason: reconciled.reason,
+                  completed: false,
+                };
+              }
+              const savedPaths = [
+                pending.originalPath,
+                pending.recoveryPath,
+                ...(pending.storagePaths ?? []),
+              ];
+              // A different registered generation may occupy an old checkout
+              // path. Its bytes belong to that replacement, not this pending row.
+              const paths = savedPaths.filter(
+                (path) =>
+                  !(path === pending.originalPath || path === pending.recoveryPath) ||
+                  !registered.some(
+                    (item) =>
+                      item.path === path &&
+                      !!item.generation &&
+                      item.generation !== entry.generation,
+                  ),
+              );
+              const absent = paths.length
+                ? await invoke<boolean>('pending_cleanup_paths_absent', { paths })
+                : true;
+              const overlayAbsent = await invoke<boolean>('pending_cleanup_overlay_absent', {
+                originalWorktree: pending.originalPath,
+              });
+              if (!overlayAbsent) {
+                const overlay = await invoke<{ path: string; sizeBytes: number | null } | null>(
+                  'pending_cleanup_overlay_status',
+                  { originalWorktree: pending.originalPath },
+                );
+                reason = overlay
+                  ? `The Git checkout was removed, but private Git state remains at ${overlay.path} (${overlay.sizeBytes ?? 'unknown'} bytes). Its use cannot be verified after interruption; leave it pending for separate recovery.`
+                  : 'The Git checkout was removed, but private Git state or an active owner remains. Its use cannot be verified after interruption; leave it pending for separate recovery.';
+                const reconciled =
+                  pending.selectedStorageCleanupConfirmed && absent
+                    ? await reconcileSelectedRemovedWorktreeStorage(pending, [], async () => absent)
+                    : null;
+                return {
+                  entry,
+                  pending: reconciled ? { ...reconciled, reason } : pending,
+                  sizeBytes: null,
+                  reason,
+                  completed: false,
+                };
+              }
+              if (
+                absent &&
+                (pending.selectedWorktreeCleanupConfirmed ||
+                  pending.selectedStorageCleanupConfirmed)
+              ) {
+                return {
+                  entry,
+                  pending,
+                  sizeBytes: null,
+                  reason: 'Confirmed selected cleanup completed after interruption.',
+                  completed: true,
+                };
+              }
+              if (absent) {
+                reason =
+                  'The Git checkout was removed outside Sail. Private storage without a durable cleanup marker cannot be ruled out; inspect its cache before clearing this pending entry.';
+                return { entry, pending, sizeBytes: null, reason, completed: false };
+              }
+              reason = `The Git generation is unregistered, but a saved checkout or storage path still exists. Inspect ${paths.join(', ')} before clearing this pending entry.`;
+              return { entry, pending, sizeBytes: null, reason, completed: false };
+            } catch (cause) {
+              reason = `Could not verify retained private storage: ${describe(cause)}`;
+              return { entry, pending, sizeBytes, reason, completed: false };
+            }
+          }
+          if (!live || !entry.generation || live.generation !== entry.generation) {
+            reason =
+              'The registered worktree identity changed. Its files were kept; inspect the recovery path.';
+          } else {
+            try {
+              const [state] = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+                repository,
+                paths: [entry.path],
+              });
+              if (!state || state.generation !== entry.generation || state.branch !== live.branch) {
+                reason = 'The worktree identity changed during recheck. Its files were kept.';
+              } else {
+                sizeBytes = state.sizeBytes;
+                reason = state.inspectionError
+                  ? `Cannot verify checkout contents: ${state.inspectionError}`
+                  : state.dirty
+                    ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                    : state.activeSessions.length
+                      ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+                      : 'Checkout verified clean and registered. Awaiting explicit unused confirmation.';
+              }
+            } catch (cause) {
+              reason = `Could not verify checkout: ${describe(cause)}`;
+            }
+          }
+          return { entry, pending, sizeBytes, reason, completed: false };
+        }),
+      );
+      let catalog = projectCatalog;
+      const completedPaths: string[] = [];
+      let confirmedStorageRechecked = false;
+      let recoveryPathChanged = false;
+      for (const { entry, pending, sizeBytes, reason, completed } of updates) {
+        const currentEntry = catalog.worktrees[repository]?.find(
+          (worktree) =>
+            worktree.path === entry.path &&
+            worktree.generation === entry.generation &&
+            worktree.pendingCleanup,
+        );
+        if (!currentEntry) continue;
+        if (pending.selectedStorageCleanupConfirmed) confirmedStorageRechecked = true;
+        if (completed) {
+          completedPaths.push(entry.path);
+          catalog = removeWorktree(catalog, repository, entry.path);
+          continue;
+        }
+        if (pending.recoveryPath !== entry.path) recoveryPathChanged = true;
+        catalog = markWorktreeCleanupPending(catalog, repository, entry.path, {
+          ...pending,
+          sizeBytes,
+          reason,
+        });
+      }
+      if (completedPaths.length) {
+        await completedPaths.reduce(
+          (previous, path) => previous.then(() => settleMergedShipCleanup(repository, path)),
+          Promise.resolve(),
+        );
+      }
+      if (completedPaths.length || confirmedStorageRechecked || recoveryPathChanged) {
+        const previousCatalog = projectCatalog;
+        try {
+          await saveProjectCatalogDurably(catalog);
+        } catch (cause) {
+          saveProjectCatalog(previousCatalog);
+          throw cause;
+        }
+      } else {
+        saveProjectCatalog(catalog);
+      }
+      error = '';
+    } catch (cause) {
+      error = `Could not recheck pending worktrees: ${describe(cause)}`;
+    }
+  }
+
+  async function removePendingWorktreeCleanup(repository: string, selectedPath: string) {
+    try {
+      await removeSelectedPendingWorktreeCleanup(repository, selectedPath);
+    } catch (cause) {
+      const reason = `Pending worktree cleanup stopped: ${describe(cause)}`;
+      const pending = projectCatalog.worktrees[repository]?.find(
+        (item) => item.path === selectedPath && item.pendingCleanup,
+      );
+      if (pending?.pendingCleanup) {
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+            ...pending.pendingCleanup,
+            reason,
+          }),
+        );
+      }
+      error = reason;
+    }
+  }
+
+  async function settleMergedShipCleanup(repository: string, path: string) {
+    const matches = shipRuns
+      .filter((run) => run.repository === repository)
+      .flatMap((run) =>
+        run.issues
+          .filter((issue) => issue.state === 'merged' && issue.path === path)
+          .map((issue) => ({ run, issue })),
+      );
+    await matches.reduce(
+      (previous, { run, issue }) =>
+        previous.then(() =>
+          updateShipIssue(run, issue, { path: null, archivePath: null, error: null }),
+        ),
+      Promise.resolve(),
+    );
+  }
+
+  function selectedCleanupDescendantReason(
+    repository: string,
+    path: string,
+    registered: RegisteredWorktree[],
+  ): string | null {
+    if (unmergedCatalogDescendants(projectCatalog, repository, registered, path).length)
+      return 'A live descendant is saved under another repository path. Restore that alias before retrying selected cleanup.';
+    if (worktreeDescendants(projectCatalog, repository, registered, path).length)
+      return 'A live descendant remains registered. Clean up that child before retrying its parent.';
+    return null;
+  }
+
+  async function removeSelectedPendingWorktreeCleanup(repository: string, selectedPath: string) {
+    if (deletingWorktreeRepositories.has(repository) || worktreeRegistrationPending(repository)) {
+      error = 'A worktree operation is in progress. Retry cleanup when it finishes.';
+      return;
+    }
+    const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+    if (canonicalCatalog !== projectCatalog) await saveProjectCatalogDurably(canonicalCatalog);
+    const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+    const selectedGeneration = projectCatalog.worktrees[repository]?.find(
+      (worktree) => worktree.path === selectedPath && worktree.pendingCleanup,
+    )?.generation;
+    try {
+      const reconciled = reconcileMovedWorktrees(projectCatalog, repository, registered);
+      if (reconciled !== projectCatalog) await saveProjectCatalogDurably(reconciled);
+    } catch (cause) {
+      error = `Could not verify moved worktree ancestry: ${describe(cause)}`;
+      return;
+    }
+    if (
+      selectedGeneration &&
+      !projectCatalog.worktrees[repository]?.some(
+        (worktree) => worktree.path === selectedPath && worktree.generation === selectedGeneration,
+      )
+    ) {
+      selectedPath =
+        projectCatalog.worktrees[repository]?.find(
+          (worktree) => worktree.generation === selectedGeneration && worktree.pendingCleanup,
+        )?.path ?? selectedPath;
+    }
+    const pending = (projectCatalog.worktrees[repository] ?? []).filter(
+      (worktree) => worktree.pendingCleanup && worktree.path === selectedPath,
+    );
+    if (!pending.length) return;
+    const recovery = pending[0].pendingCleanup!;
+    const descendantReason = selectedCleanupDescendantReason(repository, selectedPath, registered);
+    if (descendantReason) {
+      error = descendantReason;
+      saveProjectCatalog(
+        markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+          ...recovery,
+          reason: error,
+        }),
+      );
+      return;
+    }
+    if (
+      !recovery.storagePaths?.length &&
+      !registered.some(
+        (worktree) =>
+          worktree.path === pending[0].path && worktree.generation === pending[0].generation,
+      )
+    ) {
+      if (recovery.selectedWorktreeCleanupConfirmed || recovery.selectedStorageCleanupConfirmed) {
+        try {
+          const overlayAbsent = await invoke<boolean>('pending_cleanup_overlay_absent', {
+            originalWorktree: recovery.originalPath,
+          });
+          if (!overlayAbsent) {
+            const overlay = await invoke<{ path: string; sizeBytes: number | null } | null>(
+              'pending_cleanup_overlay_status',
+              { originalWorktree: recovery.originalPath },
+            );
+            const reason = overlay
+              ? `Private Git state at ${overlay.path} (${overlay.sizeBytes ?? 'unknown'} bytes) remains pending. Its use cannot be verified after interruption; recover it separately.`
+              : 'Private Git state or an active owner remains pending. Its use cannot be verified after interruption; recover it separately.';
+            throw new Error(reason);
+          }
+        } catch (cause) {
+          error = `Private Git cleanup remains pending: ${describe(cause)}`;
+          saveProjectCatalog(
+            markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+              ...recovery,
+              reason: error,
+            }),
+          );
+          return;
+        }
+      }
+      await checkPendingWorktreeCleanup(repository, selectedPath);
+      if (
+        !(projectCatalog.worktrees[repository] ?? []).some(
+          (worktree) => worktree.path === selectedPath && worktree.pendingCleanup,
+        )
+      ) {
+        error = '';
+        return;
+      }
+      error =
+        'The pending worktree moved or was removed during cleanup. Review its updated recovery location and retry.';
+      return;
+    }
+    if (recovery.storagePaths?.length) {
+      if (!pending[0].generation) {
+        error =
+          'The removed worktree generation cannot be verified. Private storage remains intact.';
+        return;
+      }
+      let currentStorage: { cacheKey: string; path: string; sizeBytes: number | null }[];
+      try {
+        currentStorage = await invoke('selected_removed_worktree_storage', {
+          repository,
+          originalWorktree: recovery.originalPath,
+          expectedGeneration: pending[0].generation,
+        });
+      } catch (cause) {
+        error = `Cannot verify the retained private storage before confirmation: ${describe(cause)}`;
+        return;
+      }
+      const savedStorage = new Map(
+        recovery.storagePaths.map((path, index) => [
+          recovery.storageKeys?.[index] ?? path.split(/[/\\]/).at(-1),
+          path,
+        ]),
+      );
+      if (
+        currentStorage.length !== recovery.storagePaths.length ||
+        savedStorage.size !== recovery.storagePaths.length ||
+        currentStorage.some((item) => savedStorage.get(item.cacheKey) !== item.path)
+      ) {
+        error =
+          'The selected private storage locations changed. Recheck the pending entry before confirming cleanup.';
+        return;
+      }
+      const currentSize = currentStorage.every((item) => item.sizeBytes !== null)
+        ? currentStorage.reduce((total, item) => total + item.sizeBytes!, 0)
+        : null;
+      const verifiedRecovery = {
+        ...recovery,
+        storagePaths: recovery.storagePaths,
+        sizeBytes: currentSize,
+      };
+      if (currentSize !== recovery.sizeBytes)
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, verifiedRecovery),
+        );
+      const confirmed = await confirmInApp(
+        'Retry selected private storage cleanup',
+        `The Git checkout was removed. Confirm this private storage is unused and no other process will write to, move, or replace it until cleanup finishes? Sail verifies its owner and Git generation before deleting it. Changes Sail detects stop cleanup. Files written after the final check can be deleted.\n\nOriginal worktree: ${verifiedRecovery.originalPath}\nRetained storage: ${verifiedRecovery.storagePaths.join(', ')}\nRetained size: ${verifiedRecovery.sizeBytes ?? 'unknown'} bytes\nPending reason: ${verifiedRecovery.reason}`,
+        'Clean up selected storage',
+        { destructive: true },
+      );
+      if (!confirmed) return;
+      verifiedRecovery.selectedStorageCleanupConfirmed = true;
+      const previousCatalog = projectCatalog;
+      try {
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, verifiedRecovery),
+        );
+      } catch (cause) {
+        saveProjectCatalog(previousCatalog);
+        throw new Error(`Could not record selected storage confirmation: ${describe(cause)}`, {
+          cause,
+        });
+      }
+      let remainingStoragePaths = [...verifiedRecovery.storagePaths];
+      let remainingStorageKeys = [...(verifiedRecovery.storageKeys ?? [])];
+      try {
+        await verifiedRecovery.storagePaths.reduce(
+          (previous, storagePath, index) =>
+            previous.then(async () => {
+              const current = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+                repository,
+              });
+              const reason = selectedCleanupDescendantReason(repository, selectedPath, current);
+              if (reason) throw new Error(reason);
+              const cacheKey =
+                verifiedRecovery.storageKeys?.[index] ?? storagePath.split(/[/\\]/).at(-1);
+              if (!cacheKey) throw new Error('The selected private storage key is missing.');
+              await invoke('retry_selected_removed_worktree_storage', {
+                repository,
+                originalWorktree: verifiedRecovery.originalPath,
+                expectedGeneration: pending[0].generation,
+                cacheKey,
+                confirmedUnused: true,
+              });
+              remainingStoragePaths = remainingStoragePaths.slice(1);
+              remainingStorageKeys = remainingStorageKeys.slice(1);
+              await saveProjectCatalogDurably(
+                markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+                  ...verifiedRecovery,
+                  storagePaths: remainingStoragePaths,
+                  storageKeys: remainingStorageKeys,
+                  sizeBytes: null,
+                  reason: remainingStoragePaths.length
+                    ? 'Some selected private storage was removed; the remaining paths are pending.'
+                    : 'Selected private storage was removed; private Git cleanup remains pending.',
+                }),
+              );
+              return undefined;
+            }),
+          Promise.resolve(),
+        );
+        const overlayAbsent = await invoke<boolean>('pending_cleanup_overlay_absent', {
+          originalWorktree: verifiedRecovery.originalPath,
+        });
+        if (!overlayAbsent) {
+          const current = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+            repository,
+          });
+          const reason = selectedCleanupDescendantReason(repository, selectedPath, current);
+          if (reason) throw new Error(reason);
+          await invoke('retry_removed_worktree_overlay_cleanup', {
+            repository,
+            originalWorktree: verifiedRecovery.originalPath,
+            expectedGeneration: pending[0].generation,
+            confirmedUnused: true,
+          });
+        }
+        let remaining: RegisteredWorktree[] | null = null;
+        try {
+          remaining = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+        } catch {
+          // The selected storage is gone; keep path-scoped UI state if a replacement cannot be ruled out.
+        }
+        if (remaining && !remaining.some((worktree) => worktree.path === selectedPath)) {
+          try {
+            await removeMissingWorktreeFromGui(repository, selectedPath);
+          } catch (cause) {
+            saveProjectCatalog(removeWorktree(projectCatalog, repository, selectedPath));
+            error = `Private storage was removed, but workspace state could not be cleared: ${describe(cause)}`;
+          }
+        } else {
+          saveProjectCatalog(removeWorktree(projectCatalog, repository, selectedPath));
+          error = remaining
+            ? ''
+            : 'Private storage was removed, but worktree registration could not be rechecked. Refresh before clearing saved workspace state.';
+        }
+        if (remaining) {
+          try {
+            await settleMergedShipCleanup(repository, selectedPath);
+          } catch (cause) {
+            error = `Private storage was removed, but the Ship cleanup record could not be saved: ${describe(cause)}`;
+          }
+        }
+      } catch (cause) {
+        const reason = `${remainingStoragePaths.length ? 'Private storage' : 'Private Git cleanup'} remains pending: ${describe(cause)}`;
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+            ...verifiedRecovery,
+            storagePaths: remainingStoragePaths,
+            storageKeys: remainingStorageKeys,
+            sizeBytes: null,
+            reason,
+          }),
+        );
+        error = reason;
+      }
+      return;
+    }
+    if (recovery.recoveryPath !== recovery.originalPath) {
+      if (
+        projectCatalog.worktrees[repository]?.some(
+          (item) => item.path === recovery.originalPath && item.path !== selectedPath,
+        )
+      ) {
+        error =
+          'The original path belongs to another catalogued worktree. The recovery worktree remains intact.';
+        return;
+      }
+      try {
+        await invoke('restore_pending_worktree', {
+          repository,
+          recoveryPath: recovery.recoveryPath,
+          originalPath: recovery.originalPath,
+          expectedGeneration: pending[0].generation,
+        });
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, recovery.recoveryPath, {
+            ...movePendingWorktreeCleanup(
+              recovery,
+              recovery.recoveryPath,
+              recovery.originalPath,
+              pending[0].generation!,
+            ),
+            reason:
+              'Restored to its original path. Recheck and confirm it is unused before cleanup.',
+          }),
+        );
+        error = '';
+      } catch (cause) {
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, recovery.recoveryPath, {
+            ...recovery,
+            reason: `Recovery remains registered: ${describe(cause)}`,
+          }),
+        );
+        error = `Recovery worktree kept at ${recovery.recoveryPath}. ${describe(cause)}`;
+      }
+      return;
+    }
+    const target = pending[0];
+    const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+      repository,
+      paths: [target.path],
+    });
+    const live = new Map(registered.map((worktree) => [worktree.path, worktree]));
+    if (
+      preview.length !== 1 ||
+      preview[0].path !== target.path ||
+      preview[0].generation !== target.generation ||
+      preview[0].generation !== live.get(target.path)?.generation ||
+      preview[0].branch !== live.get(target.path)?.branch
+    ) {
+      error =
+        'A pending worktree changed identity. It remains registered; refresh before retrying.';
+      return;
+    }
+    let archiveCommand: string;
+    try {
+      archiveCommand =
+        (await invoke<WorktreeConfig | null>('worktree_config', { worktree: target.path }))
+          ?.archive ?? '';
+    } catch (cause) {
+      error = `Could not check the worktree archive command: ${describe(cause)}`;
+      return;
+    }
+    const confirmed = await confirmInApp(
+      'Force delete pending worktree',
+      `Force delete this pending worktree? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files. The branch remains.${archiveCommand ? ' The configured archive command will not run during pending cleanup; run it before confirming if needed.' : ''}\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
+      'Force delete',
+      { destructive: true },
+    );
+    if (!confirmed) return;
+    deletingWorktreeRepositories.add(repository);
+    try {
+      const current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      const catalogued = new Map(
+        (projectCatalog.worktrees[repository] ?? []).map((worktree) => [
+          worktree.path,
+          worktree.generation,
+        ]),
+      );
+      if (
+        recovery.registeredWorktreesAtMark &&
+        current.some(
+          (worktree) =>
+            worktree.path !== repository && catalogued.get(worktree.path) !== worktree.generation,
+        )
+      ) {
+        error =
+          'A registered worktree is not in this catalog. Refresh or adopt it before selected cleanup.';
+        return;
+      }
+      const reason = selectedCleanupDescendantReason(repository, target.path, current);
+      if (reason) {
+        error = `${reason} Remaining worktrees were kept.`;
+        return;
+      }
+      const previousCatalog = projectCatalog;
+      const confirmedRecovery = { ...recovery, selectedWorktreeCleanupConfirmed: true };
+      try {
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, target.path, confirmedRecovery),
+        );
+      } catch (cause) {
+        saveProjectCatalog(previousCatalog);
+        throw new Error(`Could not record selected worktree confirmation: ${describe(cause)}`, {
+          cause,
+        });
+      }
+      if (
+        import.meta.env.MODE === 'e2e' &&
+        sessionStorage.getItem('sai-e2e-pause-selected-force-cleanup') === 'true'
+      ) {
+        error =
+          'Cleanup stopped: Private agent data is retained while temporary data is still in use or cannot be verified.';
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, target.path, {
+            ...confirmedRecovery,
+            reason: error,
+          }),
+        );
+        return;
+      }
+      const removed = await deleteProjectWorktreeOnce(
+        repository,
+        target.path,
+        target.branch,
+        true,
+        true,
+        { generation: target.generation! },
+        true,
+        current,
+      );
+      if (removed) {
+        try {
+          await settleMergedShipCleanup(repository, target.path);
+        } catch (cause) {
+          error = `The worktree was removed, but the Ship cleanup record could not be saved: ${describe(cause)}`;
+        }
+      }
+      if (!removed && error) {
+        const retained = projectCatalog.worktrees[repository]?.find(
+          (item) => item.path === target.path && item.pendingCleanup,
+        );
+        if (retained?.pendingCleanup) {
+          let stillRegistered = false;
+          try {
+            stillRegistered = (
+              await invoke<RegisteredWorktree[]>('repository_worktrees', {
+                repository,
+              })
+            ).some(
+              (worktree) =>
+                worktree.path === target.path && worktree.generation === target.generation,
+            );
+          } catch {
+            // Keep the confirmation receipt when native state cannot be verified.
+          }
+          const pendingAfterRefusal = markWorktreeCleanupPending(
+            projectCatalog,
+            repository,
+            target.path,
+            {
+              ...retained.pendingCleanup,
+              ...(stillRegistered ? { selectedWorktreeCleanupConfirmed: undefined } : {}),
+              reason: error,
+            },
+          );
+          if (stillRegistered) await saveProjectCatalogDurably(pendingAfterRefusal);
+          else saveProjectCatalog(pendingAfterRefusal);
+        }
+      }
+    } finally {
+      deletingWorktreeRepositories.delete(repository);
     }
   }
 
@@ -8467,8 +10262,9 @@
     forgetMissingRecentThreads();
     for (const thread of [...removedThreads, ...removedNative]) {
       forgetThreadAttention(thread);
-      if (thread.agent !== 'opencode') {
+      if (thread.agent !== 'opencode' || acpSessionOwner(thread.sessionId))
         forgetRecentTranscript(thread);
+      if (thread.agent !== 'opencode') {
         void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
       }
     }
@@ -8490,7 +10286,11 @@
   }
 
   function hasActiveAgentSessions(message: string) {
-    return message.startsWith('Worktree has active agent sessions');
+    return (
+      message.startsWith('Worktree has active agent sessions') ||
+      message.startsWith('Worktree has connected agent sessions') ||
+      message === 'An agent session is starting in this worktree.'
+    );
   }
 
   async function deleteProjectWorktreeOnce(
@@ -8499,7 +10299,11 @@
     branch: string,
     force: boolean,
     stopAgents = false,
-  ) {
+    expected?: WorktreeRemovalExpectation,
+    preconfirmed = false,
+    expectedRegisteredWorktrees?: RegisteredWorktree[],
+    confirmedUnused = false,
+  ): Promise<boolean> {
     let retryForce = false;
     let retryStop = false;
     let config: WorktreeConfig | null;
@@ -8507,43 +10311,47 @@
       config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
     } catch (cause) {
       if (missingRepositoryPath(cause)) {
+        if (expected) {
+          error = `Worktree “${branch}” changed after preview. Refresh before deleting.`;
+          return false;
+        }
         await removeMissingWorktreeFromGui(repository, path);
-        return;
+        return true;
       }
       error = describe(cause);
-      return;
+      return false;
     }
     const e2eAnswer =
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
     if (e2eAnswer) sessionStorage.removeItem('sai-e2e-delete-worktree');
     const confirmed =
-      stopAgents || e2eAnswer === 'Yes'
+      preconfirmed || e2eAnswer === 'Yes'
         ? true
         : e2eAnswer === 'No'
           ? false
           : await confirmInApp(
               force ? 'Force delete worktree' : 'Delete worktree',
               force || config
-                ? `Delete worktree “${branch}” at ${path}? This permanently removes uncommitted and ignored files, including copied files. The branch will remain.`
+                ? `Delete worktree “${branch}” at ${path}? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files, including copied files. The branch will remain.`
                 : `Delete worktree “${branch}” at ${path}? Uncommitted and ignored files block deletion. The branch will remain.`,
               force ? 'Force delete' : 'Delete worktree',
               { destructive: true },
             );
-    if (!confirmed) return;
+    if (!confirmed) return false;
     const wasSelected = directory === path;
     worktreeDeletions = {
       ...worktreeDeletions,
-      [path]: config?.archive ? 'Archiving' : 'Preparing deletion',
+      [path]: config?.archive && !preconfirmed ? 'Archiving' : 'Preparing deletion',
     };
     try {
-      if (config?.archive && !stopAgents) {
+      if (config?.archive && !preconfirmed) {
         if (!wasSelected) await loadProject(path);
         const paneId = splitFocusedPane('row', 'terminal', config.archive);
-        if (!paneId) return;
+        if (!paneId) return false;
         const code = await new Promise<number>((resolve) =>
           terminalExitWaiters.set(paneId, resolve),
         );
-        if (code < 0) return;
+        if (code < 0) return false;
         if (code !== 0) {
           const deleteAnyway = await confirmInApp(
             'Archive failed',
@@ -8551,7 +10359,7 @@
             'Delete anyway',
             { destructive: true },
           );
-          if (!deleteAnyway) return;
+          if (!deleteAnyway) return false;
         }
       }
       if (directory === path) await loadProject(repository);
@@ -8567,8 +10375,15 @@
           repository,
           worktree: path,
           force: force || !!config,
-          expectedRevision: null,
-          expectedBranch: null,
+          expectedRevision: expected?.revision ?? null,
+          expectedBranch: expected?.branch ?? null,
+          expectedGeneration:
+            expected?.generation ??
+            expectedRegisteredWorktrees?.find((registered) => registered.path === path)?.generation,
+          expectedRegisteredWorktrees: expectedRegisteredWorktrees?.map(
+            ({ path: registeredPath, generation }) => ({ path: registeredPath, generation }),
+          ),
+          ...(confirmedUnused ? { confirmedUnused: true } : {}),
           ...(stopAgents ? { stopAgents: true } : {}),
         },
       });
@@ -8583,8 +10398,9 @@
       forgetMissingRecentThreads();
       for (const thread of [...removedThreads, ...removedNative]) {
         forgetThreadAttention(thread);
-        if (thread.agent !== 'opencode') {
+        if (thread.agent !== 'opencode' || acpSessionOwner(thread.sessionId))
           forgetRecentTranscript(thread);
+        if (thread.agent !== 'opencode') {
           void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
         }
       }
@@ -8596,10 +10412,68 @@
       removeSetting(`sai-pending-worktree-start:${path}`);
       removeSetting(`sai-main-pane-empty:${path}`);
       error = '';
+      return true;
     } catch (cause) {
+      const storage = pendingStorageFromError(cause);
+      if (storage) {
+        const prior = projectCatalog.worktrees[repository]?.find((item) => item.path === path);
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(
+            projectCatalog,
+            repository,
+            path,
+            {
+              ...prior?.pendingCleanup,
+              ...storage,
+              originalPath: prior?.pendingCleanup?.originalPath ?? storage.originalPath,
+            },
+            expected?.generation ?? undefined,
+          ),
+        );
+        error = storage.storagePaths?.length
+          ? `The Git checkout was removed, but private agent storage remains at ${storage.storagePaths.join(', ')}. ${storage.reason}`
+          : `The Git checkout was removed, but private Git cleanup remains pending. ${storage.reason}`;
+        if (wasSelected && directory === path) await loadProject(repository);
+        return false;
+      }
+      const recovery = pendingRecoveryFromError(cause);
+      if (recovery) {
+        const prior = projectCatalog.worktrees[repository]?.find((item) => item.path === path);
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(
+            projectCatalog,
+            repository,
+            path,
+            movePendingWorktreeCleanup(
+              {
+                ...prior?.pendingCleanup,
+                ...recovery,
+                originalPath: prior?.pendingCleanup?.originalPath ?? recovery.originalPath,
+              },
+              path,
+              recovery.recoveryPath,
+              expected?.generation ?? prior?.generation ?? '',
+            ),
+            expected?.generation ?? prior?.generation ?? undefined,
+          ),
+        );
+        error = `Cleanup stopped. The worktree and its files remain at ${recovery.recoveryPath}. ${recovery.reason}`;
+        if (wasSelected && directory === repository) {
+          try {
+            await loadProject(recovery.recoveryPath);
+          } catch {
+            // The registered recovery path remains visible in the catalog.
+          }
+        }
+        return false;
+      }
       if (wasSelected && directory === repository) await loadProject(path);
       const deletionError = describe(cause);
-      if (!stopAgents && hasActiveAgentSessions(deletionError)) {
+      if (confirmedUnused) {
+        error = `Cleanup stopped at “${branch}”. The checkout and its files remain intact; inspect them before retrying. ${deletionError}`;
+      } else if (preconfirmed) {
+        error = `Could not delete “${branch}” at ${path}: ${deletionError}. Remaining worktrees were kept; fix the cause and retry.`;
+      } else if (!stopAgents && hasActiveAgentSessions(deletionError)) {
         error = '';
         retryStop = true;
       } else if (!force && needsForceDelete(deletionError)) {
@@ -8613,13 +10487,34 @@
     }
     if (retryStop) {
       const stopConfirmed = await confirmInApp(
-        'Agent is running',
-        `An agent is still running in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
+        'Agent is running or starting',
+        `An agent is running or starting in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
         'Stop agent and delete',
         { destructive: true },
       );
-      if (stopConfirmed) await deleteProjectWorktreeOnce(repository, path, branch, true, true);
-    } else if (retryForce) await deleteProjectWorktreeOnce(repository, path, branch, true);
+      if (stopConfirmed)
+        return deleteProjectWorktreeOnce(
+          repository,
+          path,
+          branch,
+          true,
+          true,
+          expected,
+          true,
+          expectedRegisteredWorktrees,
+        );
+    } else if (retryForce)
+      return deleteProjectWorktreeOnce(
+        repository,
+        path,
+        branch,
+        true,
+        stopAgents,
+        expected,
+        preconfirmed,
+        expectedRegisteredWorktrees,
+      );
+    return false;
   }
 
   let closingWorktree: string | null = null;
@@ -8860,7 +10755,8 @@
     }
     ++projectLoadGeneration;
     error = '';
-    ++selection;
+    const currentSelection = ++selection;
+    resetAutomaticMemoryControls();
     directory = path;
     mainPickerDirectory = getSetting(`sai-main-pane-empty:${path}`) === 'true' ? path : null;
     browserAccessDisabled = getSetting(`sai-browser-disabled:${path}`) === 'true';
@@ -8887,8 +10783,8 @@
     ++diffRefresh;
     diffLoading = false;
     await canonicalizeProject(path);
-    if (directory) await refreshAutomaticMemoryRecall(directory);
-    if (directory) await refreshAutomaticMemoryCapture(directory);
+    if (currentSelection !== selection || !directory) return;
+    await refreshAutomaticMemoryControls(directory);
   }
 
   async function selectDefaultWorktree(path: string) {
@@ -8918,13 +10814,30 @@
     }, 0);
   }
 
+  async function canonicalizedProjectCatalog(
+    repository: string,
+    attempt = 0,
+  ): Promise<ProjectCatalog> {
+    const snapshot = projectCatalog;
+    const canonicalCatalog = await canonicalizeRepositoryAliases(snapshot, repository, (path) =>
+      invoke<string>('validate_repository', { path }),
+    );
+    if (snapshot === projectCatalog) return canonicalCatalog;
+    if (attempt >= 2)
+      throw new Error('Saved projects changed while checking repository aliases. Retry.');
+    return canonicalizedProjectCatalog(repository, attempt + 1);
+  }
+
   /** Moves saved state to Git's canonical repository path, or falls back when the path is gone. */
   async function canonicalizeProject(path: string) {
     const current = selection;
     try {
       const repository = await invoke<string>('validate_repository', { path });
       if (current !== selection) return;
+      const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+      if (current !== selection) return;
       if (path === repository) {
+        if (canonicalCatalog !== projectCatalog) saveProjectCatalog(canonicalCatalog);
         setSetting('sai-directory', repository);
         return;
       }
@@ -8936,7 +10849,7 @@
         delete paneLayouts[path];
         persistPaneLayouts();
       }
-      saveProjectCatalog(replaceRepositoryPath(projectCatalog, path, repository));
+      saveProjectCatalog(replaceRepositoryPath(canonicalCatalog, path, repository));
       const knownThreads = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads];
       if (recentCycleKeys) {
         const selectedKey = recentCycleKeys[recentCycleIndex];
@@ -9012,25 +10925,31 @@
     return unique.find((_, index) => available[index]) ?? null;
   }
 
-  async function listOpenCodeRootThreads(path: string): Promise<AgentThread[]> {
-    const threads = await listSidebarAcpThreads(
-      'opencode',
-      (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
-      path,
-    );
-    // OpenCode's session/list has no parent marker, so only children Sail has seen are hidden.
-    return threads.filter(
-      (thread) =>
-        !nativeSubagents[nativeSubagentId('opencode', thread.directory, thread.sessionId)],
-    );
-  }
+  const listOpenCodeRootThreads = createSidebarThreadLoader(
+    (path) => invoke<boolean>('repository_path_available', { path }),
+    async (path) => {
+      const threads = await listSidebarAcpThreads(
+        'opencode',
+        (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
+        path,
+      );
+      // OpenCode's session/list has no parent marker, so only children Sail has seen are hidden.
+      return threads.filter(
+        (thread) =>
+          !nativeSubagents[nativeSubagentId('opencode', thread.directory, thread.sessionId)],
+      );
+    },
+  );
 
   async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;
     const generation = ++sidebarInventoryGeneration;
-    const results = await Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
+    const request = Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
+    sidebarInventoryRequests.add(request);
+    const results = await request.finally(() => sidebarInventoryRequests.delete(request));
     if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
+    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories[path] = true;
     const listed = new Set(paths);
     const retained = sidebarOpenCodeThreads.filter(
       (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
@@ -9056,29 +10975,115 @@
   let sidebarInventoryFailure = '';
 
   function reportSidebarInventoryFailure(failure: string | null) {
-    // The 30 s refresh must not re-raise the same failure over the user's current error.
+    // A repeated refresh must not re-raise the same failure over the user's current error.
     if (failure && failure !== sidebarInventoryFailure) error = failure;
     sidebarInventoryFailure = failure ?? '';
   }
 
-  function scheduleSidebarInventoryRefresh() {
+  function scheduleSidebarInventoryRefresh(
+    delay = sidebarInventoryDelay,
+    paths?: string[] | 'all',
+  ) {
+    sidebarInventoryWaiting = mergeSidebarRefreshPaths(sidebarInventoryWaiting, paths);
     clearTimeout(sidebarInventoryTimer);
+    sidebarInventoryReadyKey = '';
+    const key = sidebarDirectoryKey;
+    const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
-      void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
-        reportSidebarInventoryFailure,
+      sidebarInventoryTimer = undefined;
+      const directories: string[] = JSON.parse(sidebarDirectoryKey);
+      const wanted = sidebarInventoryWaiting;
+      sidebarInventoryWaiting = undefined;
+      if (!wanted) sidebarInventoryLastFullListing = Date.now();
+      const selected = wanted ? directories.filter((path) => wanted.has(path)) : directories;
+      void refreshSidebarOpenCodeThreads(selected.length > 0 ? selected : directories).then(
+        (failure) => {
+          reportSidebarInventoryFailure(failure);
+          if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
+            sidebarInventoryReadyKey = key;
+          return undefined;
+        },
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
-    }, 250);
+    }, delay);
+  }
+
+  // OpenCode sessions made outside Sail appear when the window regains focus, not by polling.
+  function refreshSidebarOnFocus() {
+    clearTimeout(sidebarFocusTimer);
+    sidebarFocusTimer = undefined;
+    if (
+      document.visibilityState === 'hidden' ||
+      !agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)
+    )
+      return;
+    if (foregroundAgentLoading) {
+      sidebarFocusPending = true;
+      return;
+    }
+    const now = Date.now();
+    if (!sidebarFocusRefreshDue(sidebarInventoryLastFullListing, now)) {
+      // Focus stays put after this event, so check again once the last listing is old enough.
+      sidebarFocusTimer = setTimeout(
+        refreshSidebarOnFocus,
+        SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - sidebarInventoryLastFullListing),
+      );
+      return;
+    }
+    if (sidebarInventoryTimer === undefined)
+      scheduleSidebarInventoryRefresh(sidebarInventoryDelay, 'all');
+  }
+
+  if (import.meta.env.MODE === 'e2e') {
+    Object.assign(window, {
+      __SAIL_E2E_SIDEBAR_INVENTORY_READY__: () =>
+        agentDetectionSettled &&
+        (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available) ||
+          (sidebarInventoryReadyKey === sidebarDirectoryKey &&
+            sidebarInventoryTimer === undefined)),
+    });
   }
 
   $effect(() => {
     const tracked = sidebarDirectoryKey;
     const available = agentAvailability.some((agent) => agent.id === 'opencode' && agent.available);
-    if (tracked && available) scheduleSidebarInventoryRefresh();
+    const loading = foregroundAgentLoading;
+    if (!tracked) return;
+    if (!available) {
+      // Re-detection must list every directory again.
+      sidebarListedDirectories = {};
+      return;
+    }
+    if (loading) {
+      // A queued request waits for the pane instead of being dropped.
+      if (sidebarInventoryTimer !== undefined) sidebarInventoryDeferred = true;
+      clearTimeout(sidebarInventoryTimer);
+      sidebarInventoryTimer = undefined;
+      sidebarInventoryReadyKey = '';
+      return;
+    }
+    const directories: string[] = JSON.parse(tracked);
+    // A directory that left the catalog is listed again if it returns.
+    sidebarListedDirectories = Object.fromEntries(
+      directories.filter((path) => sidebarListedDirectories[path]).map((path) => [path, true]),
+    );
+    const fresh = unlistedSidebarPaths(directories, sidebarListedDirectories);
+    const deferred = sidebarInventoryDeferred;
+    sidebarInventoryDeferred = false;
+    if (sidebarFocusPending) {
+      sidebarFocusPending = false;
+      refreshSidebarOnFocus();
+    }
+    if (fresh.length === 0 && !deferred) {
+      if (sidebarInventoryTimer === undefined) sidebarInventoryReadyKey = tracked;
+      return;
+    }
+    scheduleSidebarInventoryRefresh(sidebarInventoryDelay, fresh);
   });
 
   function openAgent(agent: AgentId, thread: AgentThread | null = null, preserveCycle = false) {
     if (!directory) return;
+    if (sidebarInventoryTimer !== undefined) scheduleSidebarInventoryRefresh();
     sideChat = null;
     if (!preserveCycle) {
       recentCycleKeys = null;
@@ -9301,10 +11306,19 @@
     shortcutsDialog.showModal();
   }
 
-  function placeCopyStatus() {
-    const node = window.getSelection()?.anchorNode;
-    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
-    const host = copyStatusHost(anchor, [...document.querySelectorAll('dialog:modal')]);
+  function currentCopyStatusHost(anchor: Element | null) {
+    const focused = document.activeElement;
+    const hit = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+    return copyStatusHost(
+      anchor?.closest<HTMLDialogElement>('dialog') ?? null,
+      [...document.querySelectorAll<HTMLDialogElement>('dialog:modal')],
+      focused instanceof Element ? focused.closest<HTMLDialogElement>('dialog') : null,
+      hit?.closest<HTMLDialogElement>('dialog') ?? null,
+    );
+  }
+
+  function placeCopyStatus(preferredHost: HTMLDialogElement | null) {
+    const host = currentCopyStatusHost(preferredHost);
     copyStatusHome ??= {
       parent: copyStatusRegion.parentNode as Node,
       next: copyStatusRegion.nextSibling,
@@ -9312,6 +11326,13 @@
     if (host) {
       if (copyStatusRegion.parentNode === host) return false;
       host.append(copyStatusRegion);
+      host.addEventListener(
+        'close',
+        () => {
+          if (copyStatusRegion.parentNode === host && copiedStatus) void announceCopied(null);
+        },
+        { once: true },
+      );
       return true;
     }
     const { parent, next } = copyStatusHome;
@@ -9320,20 +11341,39 @@
     return true;
   }
 
-  async function announceCopied() {
+  async function waitForCopyStatusPlacement(
+    preferredHost: HTMLDialogElement | null,
+    generation: number,
+  ): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (generation !== copiedStatusGeneration) return;
+    if (placeCopyStatus(preferredHost)) await waitForCopyStatusPlacement(preferredHost, generation);
+  }
+
+  async function announceCopied(preferredHost: HTMLDialogElement | null) {
+    const generation = ++copiedStatusGeneration;
     clearTimeout(copiedStatusTimer);
-    const moved = placeCopyStatus();
+    const moved = placeCopyStatus(preferredHost);
     copiedStatus = '';
     // A cleared region makes a repeated "Copied" a new live-region change.
     await tick();
     // Screen readers skip changes made as a live region is inserted.
-    if (moved) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (moved) await waitForCopyStatusPlacement(preferredHost, generation);
+    if (generation !== copiedStatusGeneration) return;
     copiedStatus = 'Copied';
-    copiedStatusTimer = setTimeout(() => (copiedStatus = ''), 2000);
+    copiedStatusTimer = setTimeout(() => {
+      if (generation === copiedStatusGeneration) copiedStatus = '';
+    }, 2000);
   }
 
   function copySelection() {
-    copyCompletedSelection({ enabled: autoCopyEnabled, oncopied: () => void announceCopied() });
+    const node = window.getSelection()?.anchorNode;
+    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
+    const host = currentCopyStatusHost(anchor);
+    copyCompletedSelection({
+      enabled: autoCopyEnabled,
+      oncopied: () => void announceCopied(host),
+    });
   }
 
   async function choosePaletteEntry(entry: PaletteEntry | null) {
@@ -9615,15 +11655,6 @@
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
     if (thread.directory === directory) {
-      const available = await invoke<boolean>('repository_path_available', {
-        path: directory,
-      }).catch(() => false);
-      if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
-        return false;
-      if (!available) {
-        jumpFailure = 'This session is no longer available.';
-        return false;
-      }
       showSidebarThread(thread);
       focusMainPane();
       openAgent(thread.agent, thread, true);
@@ -10453,7 +12484,7 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
-      scheduleSidebarInventoryRefresh();
+      scheduleSidebarInventoryRefresh(250, [thread.directory]);
       return;
     }
     saveAgentThread(thread);
@@ -10592,12 +12623,18 @@
     const confirmed = await confirmInApp(
       'Delete thread',
       `Delete “${thread.title}” from Sail? Its transcript and status are removed from Sail.${
-        stillRunning ? ' The agent is still working, and deleting the thread does not stop it.' : ''
+        stillRunning ? ' The active turn will be stopped.' : ''
       }`,
       'Delete thread',
       { destructive: true },
     );
-    if (confirmed) removeAgentThread(thread);
+    if (!confirmed) return;
+    try {
+      await acp.forget(thread.agent, thread.directory, thread.sessionId);
+      removeAgentThread(thread);
+    } catch (cause) {
+      error = `Could not stop thread: ${describe(cause)}`;
+    }
   }
 
   function removeAgentThread(thread: AgentThread) {
@@ -10644,7 +12681,6 @@
       // session/list keeps returning a deleted OpenCode session.
       removeSidebarThread(thread);
     }
-    void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
@@ -10917,6 +12953,9 @@
           directory,
         ]),
       ];
+      const taskObservations = sessionTasks()
+        .scopes()
+        .map((scope) => ({ scope, revision: sessionTasks().snapshot(scope).revision }));
       const backendActivity: Record<string, AgentActivity> = {};
       await Promise.all(
         activityDirectories.map(async (path) => {
@@ -10926,6 +12965,17 @@
         }),
       );
       if (disposed) return;
+      await Promise.all(
+        taskObservations.map(({ scope, revision: taskRevision }) => {
+          const runtime = backendActivity[JSON.stringify([scope.directory, scope.agent])];
+          return sessionTasks().reconcile(
+            scope,
+            runtime?.activeTurns[scope.sessionId] ?? null,
+            taskRevision,
+            runtime?.finished[scope.sessionId],
+          );
+        }),
+      );
       for (const receipt of spawnReceipts.filter(
         (item) =>
           item.provider !== 'opencode' &&
@@ -10941,6 +12991,15 @@
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
       }
+      focusActiveTurns = Object.fromEntries(
+        agentThreads.flatMap((thread) => {
+          const turn =
+            backendActivity[JSON.stringify([thread.directory, thread.agent])]?.activeTurns[
+              thread.sessionId
+            ];
+          return turn ? [[threadKey(thread), turn]] : [];
+        }),
+      );
       const previousAttention = threadAttention;
       threadAttention = reconcileAttention(
         threadAttention,
@@ -11058,15 +13117,22 @@
       }).catch(() => undefined),
   });
 
-  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
+  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false): Promise<boolean> {
     const key = checkKey(check);
-    if (
-      pendingPostTurnChecks.has(key) ||
-      (!retry && postTurnResults.some((item) => checkKey(item) === key))
-    )
-      return;
+    if (pendingPostTurnChecks.has(key)) return false;
     pendingPostTurnChecks.add(key);
+    let retryRecovered = false;
     try {
+      if (!retry) {
+        const stored = (await invoke<PostTurnCheck[]>('list_post_turn_checks')).find(
+          (item) => checkKey(item) === key,
+        );
+        if (stored) {
+          postTurnResults = upsertCheck(postTurnResults, stored);
+          retryRecovered = retryInterruptedCheck(stored);
+          if (!retryRecovered) return hasDurableCheckOutcome(stored);
+        }
+      }
       if (check.source === 'repository') {
         const approved = await invoke<boolean>('is_post_turn_check_approved', {
           directory: check.directory,
@@ -11079,21 +13145,26 @@
             'Approve command',
           );
           if (!allow) {
-            const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
+            const canceled = await trackSettingsMutation(() =>
+              invoke<PostTurnCheck>('cancel_post_turn_check', check),
+            );
             postTurnResults = upsertCheck(postTurnResults, canceled);
-            return;
+            return hasDurableCheckOutcome(canceled);
           }
-          await invoke('approve_post_turn_check', {
-            directory: check.directory,
-            command: check.command,
-          });
+          await trackSettingsMutation(() =>
+            invoke('approve_post_turn_check', {
+              directory: check.directory,
+              command: check.command,
+            }),
+          );
         }
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });
       const result = await invoke<PostTurnCheck>('run_post_turn_check', {
-        request: { ...check, retry },
+        request: { ...check, retry: retry || retryRecovered },
       });
       postTurnResults = upsertCheck(postTurnResults, result);
+      return hasDurableCheckOutcome(result);
     } catch (cause) {
       postTurnResults = upsertCheck(postTurnResults, {
         ...check,
@@ -11101,18 +13172,21 @@
         output: describe(cause),
         code: null,
       });
+      return false;
     } finally {
       pendingPostTurnChecks.delete(key);
       scheduleInboxRefresh();
     }
   }
 
-  async function runCompletedChecks(path: string, thread: string, turn: string) {
-    if (!path || !thread || !turn) return;
+  async function runCompletedChecks(path: string, thread: string, turn: string): Promise<boolean> {
+    if (!path || !thread || !turn) return false;
     const entries: { source: 'repository' | 'personal'; command: string }[] =
       personalPostTurnChecks.map((command) => ({ source: 'personal', command }));
+    let configLoaded = false;
     try {
       const config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
+      configLoaded = true;
       entries.push(
         ...(config?.postTurnChecks ?? []).map((command) => ({
           source: 'repository' as const,
@@ -11122,22 +13196,76 @@
     } catch (cause) {
       error = `Could not load repository post-turn checks: ${describe(cause)}`;
     }
-    for (const entry of entries) {
-      void runOnePostTurnCheck({
-        id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
-        updated: Date.now(),
-        directory: path,
-        thread,
-        turn,
-        ...entry,
-        status: 'running',
-        output: '',
-        code: null,
-      });
+    const durable = await Promise.all(
+      uniquePostTurnCheckCommands(entries).map((entry) =>
+        runOnePostTurnCheck({
+          id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
+          updated: Date.now(),
+          directory: path,
+          thread,
+          turn,
+          ...entry,
+          status: 'running',
+          output: '',
+          code: null,
+        }),
+      ),
+    );
+    return configLoaded && durable.every(Boolean);
+  }
+
+  async function runVerifiedCompletedChecks(
+    agent: AgentId,
+    path: string,
+    sessionId: string,
+    turnId: string,
+  ) {
+    const key = JSON.stringify([agent, path, sessionId, turnId]);
+    await queueTurnVerification(key, async () => {
+      try {
+        const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
+        if (
+          evidence?.status !== 'done' ||
+          !evidence.postTurnPending ||
+          evidence.agent !== agent ||
+          evidence.directory !== path ||
+          evidence.sessionId !== sessionId ||
+          evidence.turnId !== turnId
+        )
+          return;
+        const warning = pendingCompletionErrors.get(key);
+        pendingCompletionErrors.delete(key);
+        if (warning && error === warning) error = '';
+        if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
+        await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
+      } catch (cause) {
+        error = `Could not verify completed agent turn: ${describe(cause)}`;
+      }
+    });
+  }
+
+  async function retryPostTurnCheck(check: PostTurnCheck) {
+    if (!(await runOnePostTurnCheck(check, true))) return;
+    const match = /^acp:([^:]+):(.+)$/.exec(check.thread);
+    if (!match) return;
+    await runVerifiedCompletedChecks(match[1], check.directory, match[2], check.turn);
+  }
+
+  async function reconcilePendingPostTurnChecks() {
+    try {
+      const pending = await acp.pendingPostTurnChecks();
+      await Promise.all(
+        pending.map((turn) =>
+          runVerifiedCompletedChecks(turn.agent, turn.directory, turn.sessionId, turn.turnId),
+        ),
+      );
+    } catch (cause) {
+      error = `Could not restore completed agent checks: ${describe(cause)}`;
     }
   }
 
   function handleAgentEvent(event: AgentEvent) {
+    if (event.message.method === 'sail/disconnected') forgetAcpConnections(event.agent);
     if (event.message.method === 'sail/disconnected' && !event.directory) {
       const sessionDirectories = event.message.params?.sessionDirectories;
       if (sessionDirectories && typeof sessionDirectories === 'object') {
@@ -11158,6 +13286,22 @@
     const eventDirectory = event.directory ?? event.worktree;
     if (!eventDirectory) return;
     const eventSessionId = event.message.params?.sessionId;
+    const permissionStatusKey =
+      typeof eventSessionId === 'string'
+        ? JSON.stringify([event.agent, eventDirectory, eventSessionId])
+        : null;
+    if (
+      permissionStatusKey &&
+      (event.message.method === 'session/request_permission' ||
+        event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === 'elicitation/create' ||
+        event.message.method === '$/cancel_request')
+    )
+      permissionStatusRevisions.set(
+        permissionStatusKey,
+        (permissionStatusRevisions.get(permissionStatusKey) ?? 0) + 1,
+      );
     const eventThread =
       typeof eventSessionId === 'string'
         ? [...agentThreads, ...nativeChildThreads].find(
@@ -11205,14 +13349,13 @@
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
-      nativeSubagents = setNativeSubagentWaiting(
-        nativeSubagents,
-        event.agent,
-        eventDirectory,
-        eventSessionId,
-        false,
-      );
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === '$/cancel_request') &&
+      typeof eventSessionId === 'string'
+    )
+      reconcilePendingSessionStatus(event.agent, eventDirectory, eventSessionId);
     if (event.message.method === 'session/update') {
       const params = event.message.params;
       const sessionId = params?.sessionId;
@@ -11220,6 +13363,10 @@
         const update = params?.update;
         if (update && typeof update === 'object') {
           const data = update as Record<string, unknown>;
+          if (!replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])])
+            void archiveOwnedTranscriptUpdate(event.agent, eventDirectory, sessionId, data).catch(
+              (cause) => (error = `Could not save owned conversation: ${describe(cause)}`),
+            );
           const thread = [...agentThreads, ...nativeChildThreads].find(
             (item) =>
               item.agent === event.agent &&
@@ -11282,6 +13429,11 @@
             const result = `${receipt.result ?? ''}${text}`.slice(-16_000);
             updateSpawnReceipt(receipt.receiptId, { result, activity: 'Writing response…' });
             spawnOutput.set(receipt.receiptId, result);
+            if (receiptReplayNeeded.has(receipt.receiptId))
+              postReloadReceiptTail.set(
+                receipt.receiptId,
+                `${postReloadReceiptTail.get(receipt.receiptId) ?? ''}${text}`.slice(-16_000),
+              );
           }
         const toolTitle =
           update &&
@@ -11351,9 +13503,14 @@
         }
       }
     }
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved') &&
+      typeof eventSessionId === 'string'
+    ) {
       // The scheduled refresh lags; the thread header already shows the request answered.
-      const resolvedKey = `acp:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      const prefix = event.message.method === 'sail/permission_resolved' ? 'acp' : 'elicitation';
+      const resolvedKey = `${prefix}:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
       resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
       if (inboxItems.some((item) => item.key === resolvedKey))
         inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
@@ -11363,6 +13520,7 @@
       event.message.method === 'elicitation/create' ||
       event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
+      event.message.method === 'sail/elicitation_resolved' ||
       event.message.method === 'sail/disconnected'
     )
       scheduleInboxRefresh();
@@ -11375,29 +13533,47 @@
       )
         removeStructuredQuestion(event.agent, eventDirectory, sessionId, requestID);
     }
+    if (event.message.method === 'sail/post_turn_evidence_ready') {
+      const sessionId = event.message.params?.sessionId;
+      const turnId = event.message.params?.turnId;
+      if (typeof sessionId === 'string' && typeof turnId === 'string') {
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
+      }
+    }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
       if (
+        typeof sessionId === 'string' &&
+        typeof turnId === 'string' &&
+        (status === 'done' || status === 'failed' || status === 'interrupted')
+      )
+        void sessionTasks()
+          .finish({ agent: event.agent, directory: eventDirectory, sessionId }, turnId, status)
+          .catch((cause) => {
+            error = `Could not save task completion: ${describe(cause)}`;
+          });
+      const promotionError = event.message.params?.gitPromotionError;
+      if (typeof promotionError === 'string')
+        error = `Private Git changes remain pending: ${promotionError}`;
+      else if (error.startsWith('Private Git changes remain pending: ')) error = '';
+      if (
         typeof sessionId !== 'string' ||
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
       )
         return;
-      if (
-        status === 'done' &&
-        typeof turnId === 'string' &&
-        event.message.params?.notify !== false
-      ) {
-        const thread = agentThreads.find(
-          (item) =>
-            item.agent === event.agent &&
-            item.sessionId === sessionId &&
-            item.directory === eventDirectory,
+      const evidenceError = event.message.params?.evidenceError;
+      if (typeof evidenceError === 'string' && typeof turnId === 'string') {
+        const warning = `Completed turn is waiting for its post-turn check record: ${evidenceError}`;
+        pendingCompletionErrors.set(
+          JSON.stringify([event.agent, eventDirectory, sessionId, turnId]),
+          warning,
         );
-        if (thread)
-          void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
+        error = warning;
       }
+      if (status === 'done' && typeof turnId === 'string' && event.message.params?.notify !== false)
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
@@ -11455,6 +13631,7 @@
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
     } else if (event.message.method === 'sail/disconnected') {
+      const releasedOwner = event.message.params?.releasedOwner === true;
       const disconnectedSessionIds =
         acpDisconnectedSessionIds(event.message) ??
         Object.values(nativeSubagents)
@@ -11477,6 +13654,7 @@
             item.sessionId,
             item.capabilityProfile ?? 'build',
           ) &&
+          !releasedOwner &&
           ['working', 'waiting'].includes(threadAttention[threadKey(item)]?.status ?? ''),
       ))
         updateAgentThreadStatus(thread, 'failed');
@@ -11489,6 +13667,7 @@
           item.provider === event.agent &&
           item.targetDirectory === eventDirectory &&
           acpDisconnectAffectsSession(event.message, sessionId) &&
+          !releasedOwner &&
           !receiptIsSettled(item.state)
         );
       }))
@@ -11503,12 +13682,13 @@
     replaying: boolean,
   ) {
     if (!sessionId) return;
-    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
-    const next = { ...replayingAgentSessions };
-    const count = (next[key] ?? 0) + (replaying ? 1 : -1);
-    if (count > 0) next[key] = count;
-    else delete next[key];
-    replayingAgentSessions = next;
+    replayingAgentSessions = updateReplayingAgentSessions(
+      replayingAgentSessions,
+      agent,
+      worktreeDirectory,
+      sessionId,
+      replaying,
+    );
     if (!replaying && sessionId)
       nativeSubagents = finalizeNativeSubagentRestore(
         nativeSubagents,
@@ -11820,7 +14000,7 @@
   function focusWorkspace() {
     if (detectShippingClockResume()) void tickShippingRuns();
     for (const pane of leaves(paneLayout)) if (pane.thread) markThreadRead(pane.thread);
-    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
+    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff(true);
   }
 
   function describe(cause: unknown): string {
@@ -11875,6 +14055,7 @@
         worktreeDialogRequest={paletteWorktreeRequest}
         {worktreeCreations}
         {worktreeDeletions}
+        {worktreeAutodiscoveryEnabled}
         onretryworktree={retryWorktreeCreation}
         ondismissworktree={dismissWorktreeCreation}
         onworktreecancelled={(repository) =>
@@ -11883,9 +14064,11 @@
           showWorkspace();
           if (path !== directory) void loadProject(path);
         }}
+        onadoptworktree={(repository, worktree) => void adoptExternalWorktree(repository, worktree)}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
         onselectthread={(key) => void selectSidebarThread(key)}
         onremovethread={removeSidebarThread}
+        oncopied={() => void announceCopied(null)}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}
@@ -11896,6 +14079,8 @@
         onremoverepository={removeProjectRepository}
         oncreateworktree={createProjectWorktree}
         ondeleteworktree={deleteProjectWorktree}
+        oncheckpendingcleanup={checkPendingWorktreeCleanup}
+        onremovependingcleanup={removePendingWorktreeCleanup}
         oncreatepullrequest={createProjectPullRequest}
         onsendchecklog={sendFailedCheckLog}
       />
@@ -12058,6 +14243,14 @@
                       ],
                     )
                   : false}
+                childStops={acpThread
+                  ? nativeSubagentSupports(
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ]?.capabilities,
+                      'cancel',
+                    )
+                  : false}
                 nativeEntries={acpThread
                   ? nativeSubagents[
                       nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
@@ -12083,7 +14276,12 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
-                onnativeplan={(plan) => {
+                onnativeplan={(plan, live) => {
+                  if (revealsNativePlanReview(plan, nativePlan, live ?? false)) {
+                    sideTab = 'plan';
+                    agentChangesOpen = true;
+                    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+                  }
                   nativePlan = plan;
                   if (!plan) {
                     nativePlanFeedback = '';
@@ -12131,7 +14329,7 @@
                     check.directory === directory &&
                     check.thread === `acp:${acpAgent}:${acpThread.sessionId}`,
                 )}
-                onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+                onretrycheck={(check) => void retryPostTurnCheck(check)}
               />
             {/key}
           {:else}
@@ -12169,6 +14367,7 @@
         agentNames={taskOverviewAgentNames}
         checks={postTurnResults}
         receipts={visibleSpawnReceipts}
+        {focusByThread}
         {directory}
         onopen={openTaskOverviewTarget}
         onopencheck={openTaskOverviewCheck}
@@ -12190,6 +14389,7 @@
     {/if}
     <div class="workspace-pane-host" hidden={workspaceView !== 'workspace'}>
       <PaneTree
+        {agentStatusStatuses}
         active={workspaceView === 'workspace'}
         pane={paneLayout}
         focused={focusedPane}
@@ -12224,7 +14424,7 @@
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRunWithAuthorization}
         postTurnChecks={postTurnResults}
-        onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+        onretrycheck={(check) => void retryPostTurnCheck(check)}
         {agentUsage}
         {agentRates}
         onentries={(id, entries, sessionId, ready) =>
@@ -12271,9 +14471,7 @@
         activityReady={acpActivityReady}
         onstatus={updateAgentThreadStatus}
         onreplaychange={setAgentReplay}
-        onchanges={(id) => {
-          changesPanes = changesPanes.filter((item) => item !== id);
-        }}
+        onchanges={(id) => setSplitDetails(id, false)}
         {pendingCommands}
         oncommandstarted={(id) => {
           const next = { ...pendingCommands };
@@ -12300,6 +14498,8 @@
       <ShipPanel
         repository={coordinationProject(directory) ?? directory}
         runs={shipRuns}
+        unparsedRuns={unparsedShipRuns}
+        ondiscardunparsed={discardUnparsedShipRun}
         busy={shippingBusy}
         {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
@@ -12346,6 +14546,12 @@
       onpointerdown={() => focusPane('main')}
     >
       <div class="side-tabs" role="tablist" aria-label="Session detail tabs">
+        {#if acpAgent}<button
+            class:active={activeSideTab === 'tasks'}
+            role="tab"
+            aria-selected={activeSideTab === 'tasks'}
+            onclick={() => switchSideTab('tasks')}>Tasks ({taskSnapshot.tasks.length})</button
+          >{/if}
         {#if showPlanPanel && acpAgent}<button
             class:active={activeSideTab === 'plan'}
             role="tab"
@@ -12355,7 +14561,7 @@
             class:active={activeSideTab === 'changes'}
             role="tab"
             aria-selected={activeSideTab === 'changes'}
-            onclick={toggleChanges}>Changes ({diffs.length})</button
+            onclick={() => switchSideTab('changes')}>Changes ({diffs.length})</button
           >{/if}{#if acpAgent && acpPlanHistory.length}<button
             class:active={activeSideTab === 'planhistory'}
             aria-current={activeSideTab === 'planhistory' ? 'page' : undefined}
@@ -12374,6 +14580,12 @@
         >
       </div>
       <div class="side-panel-body">
+        {#if acpAgent}<div class:inactive={activeSideTab !== 'tasks'} class="side-view">
+            <TasksPanel
+              snapshot={taskSnapshot}
+              status={acpThread ? (agentStatusStatuses[threadKey(acpThread)] ?? null) : null}
+            />
+          </div>{/if}
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
             {#if acpAgent && (acpSnapshot.plan || acpSnapshot.questions)}<PlanPanel
                 snapshot={acpSnapshot}
@@ -12478,6 +14690,8 @@
             repository={coordinationProject(directory) ?? directory}
             active={activeSideTab === 'ship' && detailsOpen && (acpAgent ? agentChangesOpen : true)}
             runs={shipRuns}
+            unparsedRuns={unparsedShipRuns}
+            ondiscardunparsed={discardUnparsedShipRun}
             busy={shippingBusy}
             {mergeOwner}
             nativeSubagents={Object.values(nativeSubagents)}

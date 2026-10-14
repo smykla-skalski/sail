@@ -15,9 +15,19 @@ Remote MCP registration behavior of the pinned client is re-verified by `node sc
 
 Run `npm ci && npm run build:e2e && npm run test:e2e` on a desktop. WDIO launches the actual Tauri binary against the scripted ACP agent in `test/e2e/acp-agent.mjs` and checks repository setup, missing paths, agent threads, Ship runs and settings.
 
-On macOS, set `SAIL_E2E_CONFIG_DIR` to an absolute private directory before `build:e2e` and keep the same value when launching the app or running `test:e2e`. The bundled context LaunchAgent uses this path for its approval store and the build fails when it is absent.
+On macOS, use the supported entry point after `npm ci`:
 
-Settings > Agents > Concurrent jobs caps active agent turns, embedded browser tabs, and E2E test runs separately. The WebdriverIO runner reads the E2E limit before launching workers and queues concurrent invocations in launch order. `SAIL_E2E_JOB_LIMIT` overrides the saved E2E limit for an isolated runner; `SAIL_E2E_LIMIT_DIR` selects a private queue directory when independent test environments must not share slots.
+```sh
+SAIL_NATIVE_ROOT=/absolute/task-owned/sail-native npm run test:native -- --spec test/e2e/native-isolation.spec.ts
+```
+
+Keep the same task-owned root for sequential runs. The runner validates the source revision and contents, Rust, Node and Apple SDK/compiler toolchains, architecture, private bundle identity, binary hash, ad-hoc signature and E2E entitlements before reusing a build. Apple Command Line Tools and full Xcode are supported through `xcrun`. Each invocation copies it to a new app with a fresh macOS bundle identity, matching context service and signature, canonical temporary/config paths, private XDG/worktree/agent/fixture directories, and a free WebDriver port. It launches with `open -n -g`, verifies that the private app owns the ready endpoint, then checks Main and Settings navigation and required webview capabilities before product assertions. A setup failure cannot produce a PASS result.
+
+`SAIL_NATIVE_SETUP_ATTEMPTS` sets the setup attempt limit (1–5, default 2). Only setup failures are retried; product failures stop immediately. `result.json`, per-attempt setup failures, build/WDIO logs and the redacted fixture environment remain in the printed diagnostics directory. Interrupts and failures stop only this invocation's app and command processes. Keep the root until its evidence is reviewed, then remove only that task-owned directory. A default private root is created when `SAIL_NATIVE_ROOT` is absent; pass an explicit root to reuse artifacts. The runner supports macOS ad-hoc development signing; it does not assert trusted distribution signing.
+
+On macOS, set `SAIL_E2E_CONFIG_DIR` to a private directory strictly inside the app process’s temporary directory before `build:e2e`, and keep the same value when launching the app or running `test:e2e`. Pass the same private `TMPDIR` to the build, app, and runner. The E2E app rejects config paths outside its temporary directory, including symlink aliases. The bundled context LaunchAgent uses this path for its approval store and the build fails when it is absent.
+
+Settings > Agents > Concurrent jobs caps active agent turns, embedded browser tabs, Ship validation gates, and E2E test runs separately. Validation gates queue against the same machine-pressure and workspace-disk policy as other Sail work, hold capacity until their owned session ends, and resume automatically when capacity returns. The WebdriverIO runner reads the E2E limit before launching workers and queues concurrent invocations in launch order. `SAIL_E2E_JOB_LIMIT` overrides the saved E2E limit for an isolated runner; `SAIL_E2E_LIMIT_DIR` selects a private queue directory when independent test environments must not share slots.
 
 CI runs the frontend and Rust checks on Ubuntu, macOS, and Windows. The desktop WDIO suite requires a graphical runner and is a release check on each supported platform until hosted graphical runners are configured.
 

@@ -127,6 +127,29 @@ export const contextEvalMatrixSchema = z
         code: 'custom',
         message: 'Context eval arms must contain exactly one baseline and one hub arm.',
       });
+    if (hubArms !== 1 || matrix.arms.length !== 2) return;
+    const baseline = matrix.arms.find((arm) => !arm.hub)!;
+    const hub = matrix.arms.find((arm) => arm.hub)!;
+    const baselinePermissions = new Set(baseline.toolPermissions);
+    const hubPermissions = new Set(hub.toolPermissions);
+    if (
+      baselinePermissions.size !== baseline.toolPermissions.length ||
+      hubPermissions.size !== hub.toolPermissions.length
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Context eval arm permissions must be unique.',
+      });
+    if (
+      baselinePermissions.has('read:hub') ||
+      !hubPermissions.has('read:hub') ||
+      hubPermissions.size !== baselinePermissions.size + 1 ||
+      [...baselinePermissions].some((permission) => !hubPermissions.has(permission))
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Hub permissions must equal baseline permissions plus read:hub.',
+      });
   });
 
 export type ContextEvalMatrix = z.infer<typeof contextEvalMatrixSchema>;

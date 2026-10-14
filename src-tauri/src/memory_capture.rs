@@ -91,7 +91,7 @@ fn enabled(app: &tauri::AppHandle, directory: &str) -> Result<bool, String> {
         return Ok(false);
     }
     let project_key = crate::memory::memory_project_key(directory.to_string())?;
-    let settings = crate::settings::load_settings(app.clone())?;
+    let settings = crate::settings::load_settings_sync(app.clone())?;
     Ok(settings
         .get(&format!("sai-memory-auto-capture:{project_key}"))
         .is_some_and(|value| value == "true"))
@@ -129,6 +129,7 @@ pub fn store_completed(app: &tauri::AppHandle, candidates: Vec<MemoryCaptureCand
                     session_id: Some(candidate.session_id.clone()),
                     source: None,
                 }),
+                expires_at: None,
             };
             if let Err(error) = crate::memory::remember(&app, &candidate.directory, input) {
                 crate::diagnostics::record(

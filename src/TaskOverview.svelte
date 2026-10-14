@@ -2,6 +2,8 @@
   import { onMount, tick, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import ActivityStatus from './ActivityStatus.svelte';
+  import AgentFocus from './AgentFocus.svelte';
+  import type { AgentFocusDisplay } from './lib/agent-focus';
   import HarnessIcon from './HarnessIcon.svelte';
   import type { AgentThread } from './lib/acp';
   import type { SpawnReceipt } from './lib/agent-results';
@@ -23,6 +25,7 @@
     path: string;
     branch: string | null;
     changedFiles: number | null;
+    gitState: string | null;
     error: string | null;
   };
   type PullRequestCheck = {
@@ -47,6 +50,7 @@
     agentNames: Record<string, string>;
     checks: PostTurnCheck[];
     receipts: SpawnReceipt[];
+    focusByThread?: Record<string, AgentFocusDisplay>;
     directory: string;
     onopen: (path: string, threadKey: string | null) => Promise<void>;
     onopencheck: (check: PostTurnCheck) => Promise<void>;
@@ -64,6 +68,7 @@
     agentNames,
     checks,
     receipts,
+    focusByThread = {},
     directory,
     onopen,
     onopencheck,
@@ -89,7 +94,15 @@
   let scrollRevision = 0;
   let restoreGeneration = 0;
   let baseCards = $derived(
-    buildTaskOverviewCards({ catalog, threads, statuses, agentNames, checks, receipts }),
+    buildTaskOverviewCards({
+      catalog,
+      threads,
+      statuses,
+      agentNames,
+      checks,
+      receipts,
+      focusByThread,
+    }),
   );
   let searchableCards = $derived(
     baseCards.map((card) => ({
@@ -396,6 +409,9 @@
         <button class="task-card-main" data-overview-control="main" onclick={() => void open(card)}>
           <strong>{card.task}</strong>
           <span class="task-card-branch" title={card.path}>⑂ {cardBranch(card)}</span>
+          {#if metadata[card.path]?.gitState}<span class="task-card-git-state" role="status"
+              >{metadata[card.path].gitState}</span
+            >{/if}
           <span class="task-card-agent">
             {#if card.agent}<HarnessIcon agent={card.agent} size={14} />{/if}
             {card.agentName}
@@ -403,6 +419,18 @@
           </span>
           <span class="task-card-event">{card.latestEvent}</span>
         </button>
+        {#if card.agentFocus.length}<div class="task-card-focus-list">
+            {#each card.agentFocus as entry (entry.key)}<button
+                class="task-card-focus"
+                onclick={() => void onopen(card.path, entry.key)}
+              >
+                <span
+                  ><HarnessIcon agent={entry.agent} size={14} />
+                  {entry.agentName} · {entry.title}</span
+                >
+                <AgentFocus focus={entry.focus} />
+              </button>{/each}
+          </div>{/if}
         <dl class="task-card-facts">
           <div>
             <dt>Changes</dt>
@@ -520,6 +548,31 @@
     border-color: color-mix(in srgb, var(--sui-primary) 60%, var(--shell-divider));
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--sui-primary) 12%, transparent);
   }
+  .task-card-focus-list {
+    border-top: 1px solid var(--shell-divider);
+  }
+  .task-card-focus {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    padding: 12px 16px;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    border: 0;
+    border-bottom: 1px solid var(--shell-divider);
+    background: transparent;
+    overflow-wrap: anywhere;
+  }
+  .task-card-focus:hover {
+    background: var(--shell-selected);
+  }
+  .task-card-focus > span {
+    color: var(--shell-muted);
+    font-size: var(--type-12);
+  }
   .task-card-topline {
     display: flex;
     align-items: center;
@@ -578,6 +631,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .task-card-git-state {
+    color: var(--shell-muted);
+    font-size: var(--type-12);
   }
   .task-card-agent :global(.activity-status) {
     margin-left: auto;

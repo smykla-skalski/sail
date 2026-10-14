@@ -62,11 +62,14 @@ export function copyCompletedSelection(
  * so a region outside it is neither shown nor announced.
  */
 export function copyStatusHost<T>(
-  anchor: { closest(selector: string): T | null } | null,
+  owner: T | null,
   openModals: readonly T[],
+  focused: T | null = null,
+  topmost: T | null = null,
 ): T | null {
   if (!openModals.length) return null;
-  const owner = anchor?.closest('dialog');
+  if (topmost && openModals.includes(topmost)) return topmost;
+  if (focused && openModals.includes(focused)) return focused;
   if (owner && openModals.includes(owner)) return owner;
   return openModals[openModals.length - 1];
 }

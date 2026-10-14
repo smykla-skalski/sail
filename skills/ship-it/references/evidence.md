@@ -2,6 +2,8 @@
 
 Keep one portable evidence record per committed task revision. Claude Code, Codex, OpenCode, Copilot CLI and Sail read and write this contract directly; do not translate it into conversation state or a harness-specific format.
 
+In Sail mode, use Sail's local claim for ownership and keep portable comment-backed claim fields null. Do not write a GitHub claim comment.
+
 ## Location and identity
 
 Store records under `${XDG_DATA_HOME:-$HOME/.local/share}/sai/ship-it/evidence/<checkpoint-id>/`. Create directories and files with owner-only permissions. A record is named `<revision>.json`, where `revision` is the full hexadecimal commit SHA it proves. Never put evidence in the repository, plugin cache or system temporary directory.

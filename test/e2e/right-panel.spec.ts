@@ -31,6 +31,7 @@ describe('right details panel', () => {
 
     writeFileSync(join(repository, 'panel-change.txt'), 'Changed for panel test\n');
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
     await expect($('#session-details')).toHaveText(expect.stringContaining('panel-change.txt'));
 
     const desktop = await browser.execute(() => ({
@@ -60,6 +61,13 @@ describe('right details panel', () => {
     await browser.setWindowSize(390, 600);
     await $('.mobile-switcher button:nth-child(3)').click();
     await expect($('#session-details')).toBeDisplayed();
+    await browser.waitUntil(async () =>
+      browser.execute(() => {
+        const topbar = document.querySelector('.topbar')?.getBoundingClientRect();
+        const details = document.querySelector('#session-details')?.getBoundingClientRect();
+        return !!topbar && !!details && details.top === topbar.bottom;
+      }),
+    );
     const mobile = await browser.execute(() => ({
       topbar: document.querySelector('.topbar')!.getBoundingClientRect().toJSON(),
       details: document.querySelector('#session-details')!.getBoundingClientRect().toJSON(),

@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -21,6 +21,11 @@ const terminalRequests = new Map();
 let terminalSupport = false;
 let nextTerminalRequest = 3000;
 const agent = process.argv[2];
+if (process.env.SAIL_E2E_ACP_START_LOG)
+  appendFileSync(
+    process.env.SAIL_E2E_ACP_START_LOG,
+    `${JSON.stringify({ agent, directory: process.cwd(), pid: process.pid })}\n`,
+  );
 let authenticated = agent !== 'codex';
 let nextSession = 0;
 // A provider can run under several capability profiles in separate processes.
@@ -145,6 +150,143 @@ function callWorktreeList(server, callback) {
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
+function callContextProvider(server, callback) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let stderr = '';
+  let settled = false;
+  let initialized = false;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    child.kill();
+    callback(result);
+  };
+  let timer = setTimeout(
+    () => finish({ error: 'Context provider initialization timed out' }),
+    30_000,
+  );
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+    let index;
+    while ((index = output.indexOf('\n')) >= 0) {
+      const line = output.slice(0, index);
+      output = output.slice(index + 1);
+      try {
+        const response = JSON.parse(line);
+        if (response.id === 1 && !initialized) {
+          if (response.error || !response.result?.protocolVersion) {
+            finish({ error: 'Context provider initialization failed' });
+            continue;
+          }
+          initialized = true;
+          clearTimeout(timer);
+          timer = setTimeout(
+            () => finish({ error: 'Context provider tool discovery timed out' }),
+            30_000,
+          );
+          child.stdin.write(
+            `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`,
+          );
+          child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
+        }
+        if (response.id === 2) finish(response);
+      } catch {
+        continue;
+      }
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr = (stderr + chunk).slice(-512);
+  });
+  child.on('error', (error) => finish({ error: error.message }));
+  child.on('exit', (code) => finish({ error: stderr.trim() || `Context bridge exited ${code}` }));
+  child.stdin.on('error', (error) => finish({ error: error.message }));
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'sail-acp-fixture', version: '1.0' },
+      },
+    })}\n`,
+  );
+}
+
+function reportSessionTasks(server, callback, focusDuration = 1500, onFocus = () => {}) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  const lines = createInterface({ input: child.stdout });
+  const request = (id, name, args) =>
+    child.stdin.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } })}\n`,
+    );
+  let snapshot;
+  let finished = false;
+  const finish = (result) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeout);
+    lines.close();
+    child.kill();
+    callback(result);
+  };
+  const timeout = setTimeout(() => finish('Task reporting timed out'), 20_000);
+  lines.on('line', (line) => {
+    try {
+      const response = JSON.parse(line);
+      if (response.result?.isError || response.error) {
+        finish(`Task reporting failed: ${line}`);
+        return;
+      }
+      if (response.id === 2) {
+        snapshot = JSON.parse(response.result.content[0].text);
+        request(3, 'sail_tasks_report', {
+          turnId: snapshot.turnId,
+          expectedRevision: snapshot.revision,
+          tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'in_progress' }],
+          focus: 'smoke',
+        });
+      } else if (response.id === 3) {
+        onFocus();
+        snapshot = JSON.parse(response.result.content[0].text);
+        setTimeout(
+          () =>
+            request(4, 'sail_tasks_report', {
+              turnId: snapshot.turnId,
+              expectedRevision: snapshot.revision,
+              tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'done' }],
+              focus: null,
+            }),
+          focusDuration,
+        );
+      } else if (response.id === 4) finish('Task reporting passed');
+    } catch (error) {
+      finish(`Task reporting failed: ${String(error)}`);
+    }
+  });
+  child.on('error', (error) => finish(`Task reporting failed: ${String(error)}`));
+  child.stdin.write(
+    `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {} } })}\n`,
+  );
+  setTimeout(() => request(2, 'sail_tasks_read', {}), 1500);
+}
+
 function terminalRequest(method, params, callback) {
   const id = ++nextTerminalRequest;
   terminalRequests.set(id, callback);
@@ -157,9 +299,12 @@ function runTerminal(sessionId, text, promptId) {
     return;
   }
   const stop = text.includes('stop');
-  const script = stop
-    ? 'echo started; sleep 30; echo done'
-    : 'echo started; sleep 1; echo finished; exit 7';
+  const script =
+    text === 'Terminal: Native build'
+      ? 'mkdir -p "$CARGO_TARGET_DIR"; printf marker > "$CARGO_TARGET_DIR/terminal-marker"; printf "CARGO_TARGET_DIR=%s\\n" "$CARGO_TARGET_DIR"'
+      : stop
+        ? 'echo started; sleep 30; echo done'
+        : 'echo started; sleep 1; echo finished; exit 7';
   terminalRequest(
     'terminal/create',
     { sessionId, command: '/bin/sh', args: ['-c', script], outputByteLimit: 1024 },
@@ -326,17 +471,25 @@ for await (const line of createInterface({ input: process.stdin })) {
       message.params.cwd.includes('sail-attention-') &&
       !delayedSessionDirectories.has(message.params.cwd);
     if (delayFirstAttentionSession) delayedSessionDirectories.add(message.params.cwd);
+    const delayWorktreeDeleteSession = message.params.cwd.includes('sail-force-delete-');
+    if (delayWorktreeDeleteSession) {
+      writeFileSync(join(message.params.cwd, '.sail-e2e-session-starting'), 'ready');
+    }
     setTimeout(
       () =>
         send({
           id: message.id,
           result: { sessionId, configOptions: configOptions(sessionId), availableCommands },
         }),
-      delayFirstAttentionSession ? 3000 : 1000,
+      delayWorktreeDeleteSession ? 10_000 : delayFirstAttentionSession ? 3000 : 1000,
     );
   } else if (message.method === 'session/list') {
     const pageSize = 2;
     const cwd = message.params.cwd;
+    if (agent === 'opencode' && existsSync(join(cwd, '.acp-session-list-error'))) {
+      send({ id: message.id, error: { code: -1, message: 'Session listing unavailable' } });
+      continue;
+    }
     const known = [...sessions.entries()]
       .filter(([, session]) => !cwd || session.cwd === cwd)
       .map(([sessionId, session]) => ({
@@ -373,6 +526,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         },
       });
   } else if (message.method === 'session/load') {
+    const failLoad = join(message.params.cwd, 'codex-fail-next-load.txt');
+    if (agent === 'codex' && existsSync(failLoad)) {
+      unlinkSync(failLoad);
+      send({ id: message.id, error: { code: -32002, message: 'Injected history load failure' } });
+      continue;
+    }
     adoptExternalSession(message.params.sessionId, message.params.cwd);
     applyClaudeDefaults(message.params.sessionId);
     const session = sessions.get(message.params.sessionId);
@@ -446,12 +605,145 @@ for await (const line of createInterface({ input: process.stdin })) {
     setTimeout(() => send({ id: message.id, result: { outcome: 'injected' } }), 200);
   } else if (message.method === 'session/prompt') {
     const { sessionId } = message.params;
+    const controlledChild = sessions.get(sessionId);
+    if (controlledChild?.nativeControlParent) {
+      const text = message.params.prompt[0].text;
+      recordUpdate(controlledChild.nativeControlParent, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Child follow-up: ${text}` },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (sessions.get(sessionId)?.evicted) {
       send({ id: message.id, error: { code: -32002, message: `Session not found: ${sessionId}` } });
       continue;
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    const reportingFixture = sessions.get(sessionId);
+    if (text.startsWith('Task reporting fixture:')) {
+      reportingFixture.reportingMode = text.split(': ')[1];
+      const guidance = message.params.prompt.some((part) =>
+        part.text?.startsWith('Sail Tasks: For this turn'),
+      );
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: guidance ? 'Task guidance received.' : 'Task guidance missing.',
+        },
+      });
+      if (reportingFixture.reportingMode === 'interrupted') {
+        send({ id: message.id, result: { stopReason: 'cancelled' } });
+      } else if (reportingFixture.reportingMode === 'failed') {
+        send({ id: message.id, error: { code: -1, message: 'Reporting fixture failed' } });
+      } else {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }
+      continue;
+    }
+    if (text.startsWith('Sail did not receive a successful task report')) {
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'One task correction received.' },
+      });
+      if (reportingFixture.reportingMode === 'recover') {
+        const server = reportingFixture.mcpServers.find((item) => item.name === 'sail-browser');
+        reportSessionTasks(server, (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        });
+      } else send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (
+      text === 'Report session tasks' ||
+      text === 'Report session focus' ||
+      text === 'Report focus then ask'
+    ) {
+      const server = sessions
+        .get(sessionId)
+        .mcpServers.find((item) => item.name === 'sail-browser');
+      reportSessionTasks(
+        server,
+        (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        text === 'Report session tasks' ? 1500 : 12_000,
+        () => {
+          if (text !== 'Report focus then ask') return;
+          const id = ++nextPermission;
+          elicitations.set(id, { sessionId, promptId: message.id });
+          setTimeout(
+            () =>
+              send({
+                id,
+                method: 'elicitation/create',
+                params: {
+                  sessionId,
+                  mode: 'form',
+                  message: 'Choose the delivery approach',
+                  requestedSchema: {
+                    type: 'object',
+                    properties: {
+                      approach: { type: 'string', enum: ['safe', 'fast'], default: 'safe' },
+                    },
+                    required: ['approach'],
+                  },
+                },
+              }),
+            1000,
+          );
+        },
+      );
+      continue;
+    }
+    if (text === 'Long owned history') {
+      for (let index = 0; index < 80; index++)
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: `owned-history-${index}`,
+          title: `Owned history ${index}`,
+          status: 'completed',
+        });
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Long history complete.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Native child controls') {
+      for (const suffix of ['first', 'sibling']) {
+        const childId = `${sessionId}:${suffix}`;
+        sessions.set(childId, {
+          ...sessions.get(sessionId),
+          history: [],
+          nativeControlParent: sessionId,
+        });
+        update(sessionId, {
+          sessionUpdate: 'subagent_spawned',
+          subagentSessionId: childId,
+          name: suffix,
+          task: `Controlled ${suffix}`,
+          capabilities: { prompt: {}, cancel: {} },
+        });
+      }
+      const timer = setTimeout(() => {
+        stop();
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }, 120_000);
+      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      continue;
+    }
     if (text === 'Ask structured question') {
       const id = ++nextPermission;
       elicitations.set(id, { sessionId, promptId: message.id });
@@ -882,20 +1174,56 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
-    if (text === 'Background task') {
+    if (text === 'Thinking demo') {
+      const thought = {
+        sessionUpdate: 'agent_thought_chunk',
+        content: { type: 'text', text: 'I should inspect the result.' },
+      };
+      const answer = {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'The result is ready.' },
+      };
+      sessions.get(sessionId).history.push(thought, answer);
+      update(sessionId, thought);
+      update(sessionId, answer);
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Background task' || text === 'Background task with history') {
+      if (text === 'Background task with history')
+        for (let index = 1; index <= 60; index += 1) {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'tool_call',
+            toolCallId: `background-history-${message.id}-${index}`,
+            title: `History step ${index}`,
+            status: 'completed',
+          });
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `History marker ${index}. ` },
+          });
+        }
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Background task started.' },
       });
       send({ id: message.id, result: { stopReason: 'end_turn' } });
-      const timer = setTimeout(() => {
+      const started = Date.now();
+      const finish = () => {
         stop();
+        clearInterval(timer);
         recordUpdate(sessionId, sessionId, {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: ' Background task finished.' },
         });
-      }, 6000);
-      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      };
+      const timer = setInterval(() => {
+        if (agent === 'codex') {
+          if (existsSync(join(sessions.get(sessionId).cwd, 'codex-background-release.txt')))
+            finish();
+        } else if (Date.now() - started >= 6000) finish();
+      }, 100);
+      const stop = trackWork(sessionId, () => clearInterval(timer));
       continue;
     }
     if (text === 'Second live subagent') {
@@ -996,6 +1324,28 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
+    if (text === 'Check context provider') {
+      const servers = sessions.get(sessionId).mcpServers;
+      const context = servers.filter((server) => server.args?.[0] === '--context-mcp');
+      const report = (response) => {
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: JSON.stringify({
+              agent,
+              context: context.map(({ name, command, args }) => ({ name, command, args })),
+              browserCount: servers.filter((server) => server.name === 'sail-browser').length,
+              response,
+            }),
+          },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      };
+      if (context.length === 1) callContextProvider(context[0], report);
+      else report({ error: `Expected one context server; received ${context.length}` });
+      continue;
+    }
     if (text === 'Check tools') {
       const [server] = sessions.get(sessionId).mcpServers;
       callWorktreeList(server, (result) => {
@@ -1061,7 +1411,11 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
-    if (text === 'Native child permission') {
+    if (
+      text === 'Native child permission' ||
+      text === 'Native child permission and question' ||
+      text === 'Native child permission and cancelled question'
+    ) {
       const child = `${sessionId}:permission-child`;
       update(sessionId, {
         sessionUpdate: 'subagent_spawned',
@@ -1074,6 +1428,24 @@ for await (const line of createInterface({ input: process.stdin })) {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Child waits for approval.' },
       });
+      if (text !== 'Native child permission') {
+        const id = ++nextPermission;
+        elicitations.set(id, { sessionId: child, promptId: message.id });
+        send({
+          id,
+          method: 'elicitation/create',
+          params: {
+            sessionId: child,
+            mode: 'form',
+            message: 'Choose the delivery approach',
+            requestedSchema: {
+              type: 'object',
+              properties: { approach: { type: 'string', enum: ['safe', 'fast'] } },
+              required: ['approach'],
+            },
+          },
+        });
+      }
       requestPermission(child, text, message.id, sessionId);
       continue;
     }
@@ -1249,6 +1621,15 @@ for await (const line of createInterface({ input: process.stdin })) {
       setTimeout(() => requestPermission(sessionId, text, message.id, undefined, toolCallId), 1500);
     else requestPermission(sessionId, text, message.id, undefined, toolCallId);
   } else if (message.method === 'session/cancel') {
+    const child = sessions.get(message.params.sessionId);
+    if (child?.nativeControlParent) {
+      update(child.nativeControlParent, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: message.params.sessionId,
+        state: 'cancelled',
+      });
+      continue;
+    }
     const activePromptId = activePrompts.get(message.params.sessionId);
     const awaitingPermission = [...permissions.values()].some(
       (pending) => pending.sessionId === message.params.sessionId,
@@ -1271,7 +1652,16 @@ for await (const line of createInterface({ input: process.stdin })) {
               result: { stopReason: pending.text === 'Cancel ignored' ? 'end_turn' : 'cancelled' },
             });
         };
-        if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
+        if (pending.text === 'Delete with browser call') {
+          setTimeout(() => {
+            const session = sessions.get(pending.sessionId);
+            const server = session.mcpServers.find((item) => item.name === 'sail-browser');
+            callWorktreeList(server, (result) => {
+              writeFileSync(join(session.cwd, 'acp-delete-browser-result.txt'), result);
+              finish();
+            });
+          }, 250);
+        } else if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
         else finish();
       }
     }
@@ -1298,6 +1688,13 @@ for await (const line of createInterface({ input: process.stdin })) {
       status: 'completed',
     });
     if (pending.parent) {
+      if (pending.text === 'Native child permission and cancelled question') {
+        for (const [id, question] of elicitations) {
+          if (question.sessionId !== pending.sessionId) continue;
+          elicitations.delete(id);
+          send({ method: '$/cancel_request', params: { id } });
+        }
+      }
       // The child keeps working after the answer, as a real one does.
       update(pending.sessionId, {
         sessionUpdate: 'agent_message_chunk',

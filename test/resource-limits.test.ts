@@ -2,8 +2,26 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ResourceQueue } from '../src/lib/resource-queue.ts';
 import { isSetting } from '../src/lib/settings.ts';
-import { acp } from '../src/lib/acp.ts';
-import { pressureReasonsForResults, resourceQueues } from '../src/lib/resource-limits.ts';
+import {
+  acp,
+  rememberSessionState,
+  sessionState,
+  trackLiveTranscript,
+  tracksLiveTranscript,
+} from '../src/lib/acp.ts';
+import { acpPlans } from '../src/lib/acp-plans.ts';
+import {
+  loadNativePlan,
+  loadStructuredQuestions,
+  saveNativePlan,
+  saveStructuredQuestions,
+} from '../src/lib/planning-state.ts';
+import {
+  defaultResourceLimits,
+  pressureReasonsForResults,
+  resourceLimitKeys,
+  resourceQueues,
+} from '../src/lib/resource-limits.ts';
 import {
   defaultPressureThresholds,
   parsePressureThreshold,
@@ -194,6 +212,12 @@ void test('E2E job limit loads with user settings, unlike test-only E2E keys', (
   assert.equal(isSetting('sai-e2e-delete-worktree'), false);
 });
 
+void test('validation capacity has a durable setting and conservative default', () => {
+  assert.equal(isSetting(resourceLimitKeys.validation), true);
+  assert.equal(defaultResourceLimits.validation, 1);
+  assert.ok(resourceQueues.validation instanceof ResourceQueue);
+});
+
 void test('queued agent startup can be cancelled before acquiring a slot', async () => {
   resourceQueues.agent.setLimit(0);
   const limits: (number | null)[] = [];
@@ -210,6 +234,201 @@ void test('queued agent startup can be cancelled before acquiring a slot', async
     assert.equal(resourceQueues.agent.status.active, 0);
   } finally {
     resourceQueues.agent.setLimit(4);
+  }
+});
+
+void test('Stop cancels queued workspace turns with or without a session', async () => {
+  resourceQueues.agent.setLimit(0);
+  try {
+    const stopQueuedTurn = async (sessionId: string | null) => {
+      const pending = acp.acquireTurnSlot('workspace-turn', undefined, '/repo');
+      assert.equal(await settled(pending), false);
+      assert.equal(acp.cancelQueuedTurn('codex', '/repo', sessionId, 'workspace-turn'), true);
+      await assert.rejects(pending, /cancelled/);
+      assert.equal(resourceQueues.agent.status.waiting, 0);
+    };
+    await stopQueuedTurn(null);
+    await stopQueuedTurn('existing-session');
+    resourceQueues.agent.setLimit(1);
+    assert.equal(resourceQueues.agent.status.active, 0);
+  } finally {
+    resourceQueues.agent.setLimit(4);
+  }
+});
+
+void test('cancelling a queued owned prompt prevents late dispatch', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const invoked: string[] = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          if (command === 'machine_pressure') return healthy;
+          invoked.push(command);
+          return undefined;
+        },
+      },
+    },
+  });
+  resourceQueues.agent.setLimit(0);
+  try {
+    const prompt = acp.prompt('codex', '/repo', 'owned-session', 'work', 'queued-turn');
+    assert.equal(await settled(prompt), false);
+    await acp.cancel('codex', '/repo', 'owned-session', null);
+    resourceQueues.agent.setLimit(1);
+    await assert.rejects(prompt, /cancelled/i);
+    assert.ok(!invoked.includes('acp_prompt'));
+  } finally {
+    resourceQueues.agent.setLimit(4);
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
+
+void test('closed pane turns run when retained and cancel before deletion', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const settings = new Map<string, string>();
+  const invokes: { command: string; waiting: number }[] = [];
+  let forgetGate: Promise<void> | undefined;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          if (command === 'machine_pressure') return healthy;
+          invokes.push({ command, waiting: resourceQueues.agent.status.waiting });
+          if (command === 'acp_forget_session') await forgetGate;
+          return undefined;
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => settings.get(key) ?? null,
+      setItem: (key: string, value: string) => settings.set(key, value),
+    },
+  });
+  resourceQueues.agent.setLimit(0);
+  try {
+    const retained = acp.acquireTurnSlot('retained-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'retained-thread',
+    });
+    assert.equal(await settled(retained), false);
+    resourceQueues.agent.setLimit(1);
+    const releaseRetained = await retained;
+    assert.equal(resourceQueues.agent.status.active, 1);
+    releaseRetained();
+    resourceQueues.agent.setLimit(0);
+
+    const queued = acp.acquireTurnSlot('closed-pane-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'saved-thread',
+    });
+    assert.equal(await settled(queued), false);
+    assert.equal(resourceQueues.agent.status.waiting, 1);
+
+    // Closing the pane leaves the turn queued; deletion happens after reopening the thread.
+    await acp.forget('codex', '/repo', 'saved-thread');
+    await assert.rejects(queued, /cancelled/);
+    assert.deepEqual(invokes, [{ command: 'acp_forget_session', waiting: 0 }]);
+    resourceQueues.agent.setLimit(1);
+    assert.equal(resourceQueues.agent.status.active, 0);
+    const release = await acp.acquireTurnSlot('granted-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'granted-thread',
+    });
+    try {
+      await acp.forget('codex', '/repo', 'granted-thread');
+      await assert.rejects(
+        acp.prompt(
+          'codex',
+          '/repo',
+          'granted-thread',
+          'late prompt',
+          'granted-turn',
+          [],
+          undefined,
+          true,
+        ),
+        /cancelled/,
+      );
+    } finally {
+      release();
+    }
+
+    const scope = { agent: 'codex' as const, directory: '/repo', sessionId: 'saved-state-thread' };
+    const nativePlan = {
+      provider: 'codex' as const,
+      markdown: 'Keep the plan',
+      updated: 1,
+      tasks: [{ title: 'One step', status: 'pending' }],
+    };
+    const questions = [
+      { id: 'question-1', sessionId: scope.sessionId, message: 'Keep the question?', schema: {} },
+    ];
+    rememberSessionState(scope.agent, scope.directory, scope.sessionId, { configOptions: [] });
+    trackLiveTranscript(scope.agent, scope.directory, scope.sessionId, [], true);
+    saveNativePlan(scope, nativePlan);
+    saveStructuredQuestions(scope, questions);
+    const plans = acpPlans();
+    assert.match(
+      plans.runTool(scope, 'sail_plan_propose', {
+        title: 'Keep history',
+        summary: 'A saved plan.',
+        sequence: ['User->>Agent: plan', 'Agent-->>User: review'],
+        overview: ['Agent[agent] --> Plan[plan]'],
+        steps: [{ id: 'step-1', title: 'Work', detail: 'Do the work.', files: ['file.ts'] }],
+      }),
+      /Plan v1/,
+    );
+    plans.runTool(scope, 'sail_plan_ask', {
+      questions: [{ id: 'question-2', question: 'Proceed?', kind: 'confirm' }],
+    });
+    const savedPlan = plans.snapshot(scope);
+    const savedHistory = plans.history(scope);
+    assert.equal(savedHistory.length, 1);
+
+    let rejectForget: ((error: Error) => void) | undefined;
+    forgetGate = new Promise<void>((_resolve, reject) => {
+      rejectForget = reject;
+    });
+    const failedForget = acp.forget(scope.agent, scope.directory, scope.sessionId);
+    assert.equal(
+      sessionState(scope.agent, scope.directory, scope.sessionId)?.configOptions?.length,
+      0,
+    );
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), true);
+    assert.deepEqual(loadNativePlan(scope), nativePlan);
+    assert.deepEqual(loadStructuredQuestions(scope), questions);
+    assert.deepEqual(plans.snapshot(scope), savedPlan);
+    assert.deepEqual(plans.history(scope), savedHistory);
+    rejectForget!(new Error('cancel timed out'));
+    await assert.rejects(failedForget, /cancel timed out/);
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), true);
+    assert.deepEqual(loadNativePlan(scope), nativePlan);
+    assert.deepEqual(loadStructuredQuestions(scope), questions);
+    assert.deepEqual(plans.snapshot(scope), savedPlan);
+    assert.deepEqual(plans.history(scope), savedHistory);
+
+    forgetGate = undefined;
+    await acp.forget(scope.agent, scope.directory, scope.sessionId);
+    assert.equal(sessionState(scope.agent, scope.directory, scope.sessionId), undefined);
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), false);
+    assert.equal(loadNativePlan(scope), null);
+    assert.deepEqual(loadStructuredQuestions(scope), []);
+    assert.deepEqual(plans.snapshot(scope), { plan: null, questions: null });
+    assert.deepEqual(plans.history(scope), []);
+  } finally {
+    resourceQueues.agent.setLimit(4);
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+    if (previousStorage) Object.defineProperty(globalThis, 'localStorage', previousStorage);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
   }
 });
 
@@ -269,4 +488,42 @@ void test('lowering a limit keeps active work and blocks new starts', async () =
   second();
   (await third)();
   assert.equal(queue.status.active, 0);
+});
+
+void test('restored work holds capacity until its receipt releases it', async () => {
+  const queue = new ResourceQueue(1);
+  queue.restoreActive('restored');
+  queue.restoreActive('restored');
+  assert.deepEqual(queue.status, { active: 1, waiting: 0, limit: 1 });
+  assert.equal(queue.isActive('restored'), true);
+
+  const pending = queue.acquire('queued');
+  assert.equal(await settled(pending), false);
+  assert.equal(queue.release('restored'), true);
+  assert.equal(queue.release('restored'), false);
+  const release = await pending;
+  assert.equal(queue.isActive('queued'), true);
+  release();
+  assert.deepEqual(queue.status, { active: 0, waiting: 0, limit: 1 });
+});
+
+void test('cancelled capacity never starts after an active receipt releases', async () => {
+  const queue = new ResourceQueue(1);
+  const releaseActive = await queue.acquire('active');
+  const cancelled = queue.acquire('cancelled');
+  assert.equal(queue.cancel('cancelled'), true);
+  await assert.rejects(cancelled, /cancelled/);
+  releaseActive();
+  assert.deepEqual(queue.status, { active: 0, waiting: 0, limit: 1 });
+});
+
+void test('capacity request identifiers cannot be active or queued twice', async () => {
+  const queue = new ResourceQueue(1);
+  const release = await queue.acquire('same');
+  await assert.rejects(queue.acquire('same'), /already exists/);
+  const waiting = queue.acquire('waiting');
+  await assert.rejects(queue.acquire('waiting'), /already exists/);
+  assert.equal(queue.cancel('waiting'), true);
+  await assert.rejects(waiting, /cancelled/);
+  release();
 });

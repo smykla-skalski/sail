@@ -2,7 +2,7 @@
 
 Confirm the PR is merged and record its merge commit. Apply the checkpoint's resolved issue-closing behavior: verify keyword closure, close manually only when policy says `manual-after-merge`, or preserve the source state for `unchanged`. Leave Jira unchanged unless the user explicitly requested otherwise.
 
-For a GitHub implementation issue with claims enabled, release the current work claim with reason `merged` after the merge and issue state are verified. Reread the released comment and store it in the checkpoint before finalizing. On explicit cancellation or terminal failure, release with the matching reason before reporting when GitHub remains reachable. With claims disabled, keep `claim: null` and perform no claim write.
+In Sail mode, Sail releases its local claim after merge, cancellation or terminal failure; keep the portable checkpoint's `claim` null and never write a GitHub claim comment. Outside Sail, for a GitHub implementation issue with claims enabled, release the current work claim with reason `merged` after the merge and issue state are verified. Reread the released comment and store it in the checkpoint before finalizing. On explicit cancellation or terminal failure, release with the matching reason before reporting when GitHub remains reachable. With claims disabled, keep `claim: null` and perform no claim write.
 
 Cancellation and terminal failure are durable terminal outcomes. After releasing the claim, set `phase: complete`, set status to `cancelled` or `failed`, clear the blocker and next action, and record the reason, unchanged source state and completion time in `outcome`. A later run reports that outcome and stops unless the user explicitly restarts it through the checkpoint recovery contract.
 

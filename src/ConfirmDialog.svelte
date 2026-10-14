@@ -40,7 +40,7 @@
 >
   {#if request}
     <h2 id="confirmation-title">{request.title}</h2>
-    <p>{request.message}</p>
+    <p class:multi={request.message.includes('\n')}>{request.message}</p>
     <div class="confirmation-actions">
       <Button variant="secondary" onclick={() => onanswer(false)}>Cancel</Button>
       <Button

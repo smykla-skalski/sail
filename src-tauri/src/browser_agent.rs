@@ -121,6 +121,7 @@ impl BrowserManager {
         session: Option<&str>,
         agent: Option<&str>,
         profile: Option<&str>,
+        background_priority: bool,
     ) -> Result<McpConfig, String> {
         let profile = profile
             .map(|value| {
@@ -130,6 +131,10 @@ impl BrowserManager {
             })
             .transpose()?;
         let mut config = self.config(directory, session, agent)?;
+        config.env.insert(
+            "SAIL_BACKGROUND_PRIORITY".into(),
+            background_priority.to_string(),
+        );
         if let Some(profile) = profile {
             config
                 .env
@@ -479,7 +484,7 @@ impl BrowserManager {
             .copied();
         if policy == Some(false)
             || (policy.is_none()
-                && crate::settings::load_settings(app.clone())?
+                && crate::settings::load_settings_sync(app.clone())?
                     .get(&format!("sai-browser-disabled:{}", directory.display()))
                     .is_some_and(|value| value == "true"))
         {
@@ -530,6 +535,25 @@ impl BrowserManager {
         Ok(())
     }
 
+    pub(crate) fn check_task_report(
+        &self,
+        app: &AppHandle,
+        agent: &str,
+        directory: &Path,
+        session: &str,
+        turn: &str,
+    ) -> Result<bool, String> {
+        self.coordinate(
+            app,
+            session,
+            Some(agent),
+            directory,
+            "sail_task_report_check",
+            json!({"turnId":turn}),
+        )
+        .map(|value| value.get("needsCorrection").and_then(Value::as_bool) == Some(true))
+    }
+
     fn coordinate(
         &self,
         app: &AppHandle,
@@ -560,13 +584,16 @@ impl BrowserManager {
             | "task_checkpoint_update"
             | "task_evidence_record"
             | "validation_policy"
+            | "sail_tasks_read"
+            | "sail_tasks_report"
+            | "sail_task_report_check"
             | "sail_plan_propose"
             | "sail_plan_ask"
             | "sail_plan_step"
             | "sail_plan_amend" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
-        let settings = crate::settings::load_settings(app.clone())?;
+        let settings = crate::settings::load_settings_sync(app.clone())?;
         if let Some(setting) = setting {
             let enabled = settings.get(setting).is_some_and(|value| value == "true");
             if (setting == "sai-agent-terminals-enabled" && !enabled)
@@ -583,6 +610,11 @@ impl BrowserManager {
             .lock()
             .map_err(|error| error.to_string())?
             .insert(id.clone(), sender);
+        let timeout = if name == "sail_task_report_check" {
+            15
+        } else {
+            300
+        };
         let event = CoordinationRequest {
             id: id.clone(),
             session_id: session.to_string(),
@@ -594,7 +626,11 @@ impl BrowserManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|error| error.to_string())?
                 .as_millis() as u64
-                + 110_000,
+                + if name == "sail_task_report_check" {
+                    10_000
+                } else {
+                    110_000
+                },
         };
         if let Err(error) = app.emit_to("main", "agent:coordination-request", event) {
             self.0
@@ -604,7 +640,7 @@ impl BrowserManager {
                 .and_then(|mut map| map.remove(&id));
             return Err(error.to_string());
         }
-        let response = receiver.recv_timeout(Duration::from_secs(300));
+        let response = receiver.recv_timeout(Duration::from_secs(timeout));
         self.0
             .coordination
             .lock()
@@ -624,10 +660,14 @@ impl BrowserManager {
             .ok_or("Unknown browser tool connection.")?;
         if matches!(
             request.name.as_str(),
-            "terminal_create" | "terminal_write" | "terminal_stop"
+            "terminal_create"
+                | "terminal_write"
+                | "terminal_stop"
+                | "sail_tasks_read"
+                | "sail_tasks_report"
         ) && (client.session.is_none() || client.agent.is_none())
         {
-            return Err("Terminal control requires a session-bound agent connection.".into());
+            return Err("This tool requires a session-bound agent connection.".into());
         }
         let directory = client.directory.clone();
         let source_agent = client.agent.clone();
@@ -680,6 +720,8 @@ impl BrowserManager {
                 | "task_checkpoint_read"
                 | "task_checkpoint_update"
                 | "task_evidence_record"
+                | "sail_tasks_read"
+                | "sail_tasks_report"
                 | "sail_plan_propose"
                 | "sail_plan_ask"
                 | "sail_plan_step"
@@ -945,6 +987,33 @@ fn memory_action(
             });
             serde_json::to_value(crate::memory::remember(app, &directory, input)?)
         }
+        "memory_supersede" => {
+            let id = required(&arguments, "id")?.to_string();
+            let resolve_conflicts = arguments
+                .get("resolveConflicts")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut input: crate::memory::MemoryInput =
+                serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+            input.provenance = Some(crate::memory::MemoryProvenance {
+                agent: agent.map(str::to_string),
+                session_id: Some(session.to_string()),
+                source: None,
+            });
+            serde_json::to_value(crate::memory::supersede(
+                app,
+                &directory,
+                &id,
+                input,
+                resolve_conflicts,
+            )?)
+        }
+        "memory_mark_conflict" => serde_json::to_value(crate::memory::mark_conflict(
+            app,
+            &directory,
+            required(&arguments, "firstId")?,
+            required(&arguments, "secondId")?,
+        )?),
         "memory_search" => {
             let query = required(&arguments, "query")?;
             let limit = arguments
@@ -1247,6 +1316,7 @@ pub fn browser_project_access(
 
 #[tauri::command]
 pub fn browser_mcp_config(
+    app: AppHandle,
     manager: State<'_, BrowserManager>,
     directory: String,
     session: Option<String>,
@@ -1258,6 +1328,7 @@ pub fn browser_mcp_config(
         session.as_deref(),
         agent.as_deref(),
         profile.as_deref(),
+        crate::background_priority::enabled(&app),
     )
 }
 
@@ -1478,6 +1549,16 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "content",
     ),
     (
+        "memory_supersede",
+        "Replace a current private handoff with a corrected handoff and preserve history.",
+        "id,content,kind",
+    ),
+    (
+        "memory_mark_conflict",
+        "Mark two current private handoffs as unresolved conflicting advice.",
+        "firstId,secondId",
+    ),
+    (
         "memory_search",
         "Search this Git project's durable memories. In Sail, prefer this server over any system-wide Sail memory server; they share one store.",
         "query",
@@ -1532,6 +1613,8 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "Report your assigned Ship issue stage, an inline gate verdict, or your own validation verdict. Structured reports appear in the native Ship view. Blocked or failing reports require a reason.",
         "",
     ),
+    ("sail_tasks_read", "Read this session's Tasks snapshot, including current turnId and revision. Read before reporting task progress.", ""),
+    ("sail_tasks_report", "Report routine work live in Sail Tasks. Upsert stable task IDs with pending/in_progress/done/blocked/skipped status. Pass turnId and expectedRevision from sail_tasks_read; read again after stale errors. Set focus to an in_progress task ID or null. Never report another session's work. Successful writes are durable.", ""),
     (
         "sail_plan_propose",
         "Submit a structured implementation plan for the user to review step by step in Sail. Use it for risky, ambiguous or multi-file work; small, obvious changes need no plan. Always include an overview flowchart and a sequenceDiagram, as lists of lines. Replaces any previous version; approved and finished steps keep their status if you keep their id, title, detail and files unchanged. Mark only the steps that need a human decision with needsYou. After calling this, end your turn and wait for a <plan-review> message.",
@@ -1691,6 +1774,28 @@ fn plan_step_schema() -> Value {
     })
 }
 
+fn task_tool_schema(name: &str) -> Option<Value> {
+    match name {
+        "sail_tasks_read" => {
+            Some(json!({"type":"object","properties":{},"additionalProperties":false}))
+        }
+        "sail_tasks_report" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "turnId":{"type":"string","minLength":1},
+                "expectedRevision":{"type":"integer","minimum":0},
+                "tasks":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{
+                    "id":{"type":"string","minLength":1,"maxLength":100},
+                    "title":{"type":"string","minLength":1,"maxLength":300},
+                    "status":{"type":"string","enum":["pending","in_progress","done","blocked","skipped"]}
+                },"required":["id","title","status"]}},
+                "focus":{"type":["string","null"]}
+            },"required":["turnId","expectedRevision","tasks","focus"]
+        })),
+        _ => None,
+    }
+}
+
 fn plan_tool_schema(name: &str) -> Option<Value> {
     match name {
         "sail_plan_propose" => Some(json!({
@@ -1799,6 +1904,24 @@ fn memory_tool_schema(name: &str) -> Option<Value> {
             },
             "required":["content"]
         })),
+        "memory_supersede" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "id":{"type":"string","format":"uuid"},
+                "content":{"type":"string","minLength":1,"maxLength":4000},
+                "kind":{"type":"string","enum":["handoff"]},
+                "tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16},
+                "expiresAt":{"type":"integer","minimum":0},
+                "resolveConflicts":{"type":"boolean","description":"Mark existing disagreements resolved by this correction. Defaults to false."}
+            },"required":["id","content","kind"]
+        })),
+        "memory_mark_conflict" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "firstId":{"type":"string","format":"uuid"},
+                "secondId":{"type":"string","format":"uuid"}
+            },"required":["firstId","secondId"]
+        })),
         "memory_search" => Some(json!({
             "type":"object",
             "additionalProperties":false,
@@ -1863,6 +1986,8 @@ impl CapabilityProfile {
             "sail_skill",
             "skill_reference",
             "memory_remember",
+            "memory_supersede",
+            "memory_mark_conflict",
             "memory_search",
             "memory_inspect",
             "memory_forget",
@@ -1883,6 +2008,8 @@ impl CapabilityProfile {
             "task_checkpoint_read",
             "task_checkpoint_update",
             "ship_progress",
+            "sail_tasks_read",
+            "sail_tasks_report",
             "sail_plan_propose",
             "sail_plan_ask",
             "sail_plan_step",
@@ -1956,6 +2083,9 @@ pub fn run_mcp_stdio() {
             "tools/list" => {
                 json!({"tools": TOOLS.iter().filter(|(name, _, _)| tool_listed(profile, name, plan_tools)).map(|(name, description, fields)| {
                 if let Some(schema) = memory_tool_schema(name) {
+                    return json!({"name":name,"description":description,"inputSchema":schema});
+                }
+                if let Some(schema) = task_tool_schema(name) {
                     return json!({"name":name,"description":description,"inputSchema":schema});
                 }
                 if let Some(schema) = plan_tool_schema(name) {
@@ -2192,9 +2322,30 @@ mod picker_tests {
 mod skill_tests {
     use super::{
         call_bridge, economics_input_schema, mcp_initialize, memory_tool_schema, plan_tool_schema,
-        requires_phase_lease, skill_text, thread_keywords_schema, tool_listed, BrowserManager,
-        CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
+        requires_phase_lease, skill_text, task_tool_schema, thread_keywords_schema, tool_listed,
+        BrowserManager, CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
     };
+
+    #[test]
+    fn task_tools_reach_all_profiles_and_providers() {
+        for name in ["sail_tasks_read", "sail_tasks_report"] {
+            assert!(task_tool_schema(name).is_some());
+            assert!(TOOLS.iter().any(|(tool, _, _)| *tool == name));
+            for profile in [
+                CapabilityProfile::Explore,
+                CapabilityProfile::Review,
+                CapabilityProfile::Build,
+                CapabilityProfile::Release,
+            ] {
+                assert!(tool_listed(profile, name, true));
+                assert!(tool_listed(profile, name, false));
+            }
+        }
+        assert_eq!(
+            task_tool_schema("sail_tasks_report").unwrap()["additionalProperties"],
+            false
+        );
+    }
 
     #[test]
     fn capability_profiles_expose_only_role_tools() {
@@ -2294,7 +2445,7 @@ mod skill_tests {
     #[test]
     fn invalid_profile_is_rejected_before_registering_a_client() {
         let manager = BrowserManager::default();
-        let error = match manager.config_for_profile("/not-used", None, None, Some("admin")) {
+        let error = match manager.config_for_profile("/not-used", None, None, Some("admin"), true) {
             Ok(_) => panic!("invalid profile was accepted"),
             Err(error) => error,
         };
@@ -2303,6 +2454,26 @@ mod skill_tests {
             "Unknown capability profile. Expected explore, review, build, or release."
         );
         assert!(manager.0.clients.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_browser_configs_honor_background_priority_setting() {
+        let manager = BrowserManager::default();
+        *manager.0.port.lock().unwrap() = 1;
+        let directory = std::env::temp_dir().canonicalize().unwrap();
+        let directory = directory.to_str().unwrap();
+        for enabled in [true, false] {
+            let config = manager
+                .config_for_profile(directory, None, Some("codex"), Some("build"), enabled)
+                .unwrap();
+            assert_eq!(
+                config
+                    .env
+                    .get("SAIL_BACKGROUND_PRIORITY")
+                    .map(String::as_str),
+                Some(if enabled { "true" } else { "false" })
+            );
+        }
     }
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -2316,6 +2487,8 @@ mod skill_tests {
         assert!(TOOLS.iter().any(|(name, _, _)| *name == "sail_skill"));
         for name in [
             "memory_remember",
+            "memory_supersede",
+            "memory_mark_conflict",
             "memory_search",
             "memory_inspect",
             "memory_forget",

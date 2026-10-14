@@ -6,7 +6,7 @@ type Waiter = {
 };
 
 export class ResourceQueue {
-  private active = 0;
+  private active = new Set<string>();
   private waiters: Waiter[] = [];
   private limit: number;
   private blockedReason: string | null;
@@ -30,7 +30,7 @@ export class ResourceQueue {
   }
 
   get status() {
-    return { active: this.active, waiting: this.waiters.length, limit: this.limit };
+    return { active: this.active.size, waiting: this.waiters.length, limit: this.limit };
   }
 
   setLimit(limit: number): void {
@@ -61,12 +61,26 @@ export class ResourceQueue {
     return this.waiters.some((waiter) => waiter.id === id);
   }
 
+  isActive(id: string): boolean {
+    return this.active.has(id);
+  }
+
+  restoreActive(id: string): void {
+    if (this.active.has(id)) return;
+    this.active.add(id);
+    this.emit();
+  }
+
   waitingDirectories(): string[] {
     return this.waiters.map((waiter) => waiter.directory);
   }
 
   acquire(id: string, directory = ''): Promise<() => void> {
     return new Promise((resolve, reject) => {
+      if (this.active.has(id) || this.waiters.some((waiter) => waiter.id === id)) {
+        reject(new Error('Resource request already exists.'));
+        return;
+      }
       this.waiters.push({ id, directory, resolve, reject });
       this.onEnqueue?.();
       this.drain();
@@ -84,21 +98,26 @@ export class ResourceQueue {
     return true;
   }
 
+  release(id: string): boolean {
+    if (!this.active.delete(id)) return false;
+    this.drain();
+    this.emit();
+    return true;
+  }
+
   private drain(): void {
-    while (!this.blockedReason && this.active < this.limit && this.waiters.length) {
+    while (!this.blockedReason && this.active.size < this.limit && this.waiters.length) {
       const index = this.waiters.findIndex(
         (waiter) => !this.directoryReasons.has(waiter.directory),
       );
       if (index < 0) break;
       const [waiter] = this.waiters.splice(index, 1);
-      this.active++;
+      this.active.add(waiter.id);
       let released = false;
       waiter.resolve(() => {
         if (released) return;
         released = true;
-        this.active--;
-        this.drain();
-        this.emit();
+        this.release(waiter.id);
       });
     }
   }
