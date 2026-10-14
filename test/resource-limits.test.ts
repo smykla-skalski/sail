@@ -16,7 +16,12 @@ import {
   saveNativePlan,
   saveStructuredQuestions,
 } from '../src/lib/planning-state.ts';
-import { pressureReasonsForResults, resourceQueues } from '../src/lib/resource-limits.ts';
+import {
+  defaultResourceLimits,
+  pressureReasonsForResults,
+  resourceLimitKeys,
+  resourceQueues,
+} from '../src/lib/resource-limits.ts';
 import {
   defaultPressureThresholds,
   parsePressureThreshold,
@@ -205,6 +210,12 @@ void test('cancelled agent connection never reaches process startup', async () =
 void test('E2E job limit loads with user settings, unlike test-only E2E keys', () => {
   assert.equal(isSetting('sai-e2e-job-limit'), true);
   assert.equal(isSetting('sai-e2e-delete-worktree'), false);
+});
+
+void test('validation capacity has a durable setting and conservative default', () => {
+  assert.equal(isSetting(resourceLimitKeys.validation), true);
+  assert.equal(defaultResourceLimits.validation, 1);
+  assert.ok(resourceQueues.validation instanceof ResourceQueue);
 });
 
 void test('queued agent startup can be cancelled before acquiring a slot', async () => {
@@ -477,4 +488,42 @@ void test('lowering a limit keeps active work and blocks new starts', async () =
   second();
   (await third)();
   assert.equal(queue.status.active, 0);
+});
+
+void test('restored work holds capacity until its receipt releases it', async () => {
+  const queue = new ResourceQueue(1);
+  queue.restoreActive('restored');
+  queue.restoreActive('restored');
+  assert.deepEqual(queue.status, { active: 1, waiting: 0, limit: 1 });
+  assert.equal(queue.isActive('restored'), true);
+
+  const pending = queue.acquire('queued');
+  assert.equal(await settled(pending), false);
+  assert.equal(queue.release('restored'), true);
+  assert.equal(queue.release('restored'), false);
+  const release = await pending;
+  assert.equal(queue.isActive('queued'), true);
+  release();
+  assert.deepEqual(queue.status, { active: 0, waiting: 0, limit: 1 });
+});
+
+void test('cancelled capacity never starts after an active receipt releases', async () => {
+  const queue = new ResourceQueue(1);
+  const releaseActive = await queue.acquire('active');
+  const cancelled = queue.acquire('cancelled');
+  assert.equal(queue.cancel('cancelled'), true);
+  await assert.rejects(cancelled, /cancelled/);
+  releaseActive();
+  assert.deepEqual(queue.status, { active: 0, waiting: 0, limit: 1 });
+});
+
+void test('capacity request identifiers cannot be active or queued twice', async () => {
+  const queue = new ResourceQueue(1);
+  const release = await queue.acquire('same');
+  await assert.rejects(queue.acquire('same'), /already exists/);
+  const waiting = queue.acquire('waiting');
+  await assert.rejects(queue.acquire('waiting'), /already exists/);
+  assert.equal(queue.cancel('waiting'), true);
+  await assert.rejects(waiting, /cancelled/);
+  release();
 });

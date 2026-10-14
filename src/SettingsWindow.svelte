@@ -1366,7 +1366,7 @@
           Extra work waits in launch order. Zero pauses new work. Lowering a limit leaves active
           work running. The E2E limit applies to this repository's WebdriverIO runner.
         </p>
-        {#each [['agent', 'Running agent turns'], ['browser', 'Browser tabs'], ['e2e', 'E2E test runs']] as const as [kind, label] (kind)}
+        {#each [['agent', 'Running agent turns'], ['browser', 'Browser tabs'], ['validation', 'Validation gates'], ['e2e', 'E2E test runs']] as const as [kind, label] (kind)}
           <label for={`resource-limit-${kind}`}>{label}</label>
           <input
             id={`resource-limit-${kind}`}

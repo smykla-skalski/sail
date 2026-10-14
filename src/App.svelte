@@ -536,6 +536,7 @@
     isCheckingMachinePressure,
     parseResourceLimit,
     resourceLimitKeys,
+    resourceQueues,
     setResourceLimit,
     setPressureThresholds,
   } from './lib/resource-limits';
@@ -921,6 +922,9 @@
     loadCoordinationMessages(getSetting('sai-coordination-messages')),
   );
   const initialSpawnReceipts = loadSpawnReceipts(getSetting('sai-agent-spawn-receipts'));
+  for (const receipt of initialSpawnReceipts)
+    if (receipt.validation && ['starting', 'working', 'waiting'].includes(receipt.state))
+      resourceQueues.validation.restoreActive(receipt.receiptId);
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
   const receiptReplayNeeded = new SvelteSet<string>();
@@ -1250,6 +1254,10 @@
     browser: parseResourceLimit(
       getSetting(resourceLimitKeys.browser),
       defaultResourceLimits.browser,
+    ),
+    validation: parseResourceLimit(
+      getSetting(resourceLimitKeys.validation),
+      defaultResourceLimits.validation,
     ),
     e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
   });
@@ -4680,6 +4688,19 @@
   }
 
   async function stopShippingWorker(issue: ShipIssue): Promise<void> {
+    for (const receipt of spawnReceipts.filter(
+      (item) =>
+        item.validation &&
+        item.sourceDirectory === issue.path &&
+        !item.targetId &&
+        !receiptIsSettled(item.state),
+    )) {
+      if (!resourceQueues.validation.cancel(receipt.receiptId)) continue;
+      updateSpawnReceipt(receipt.receiptId, {
+        state: 'interrupted',
+        error: 'Validation capacity request cancelled before launch.',
+      });
+    }
     const primaryThreadId =
       issue.threadId ?? spawnReceipts.find((item) => item.receiptId === issue.receiptId)?.targetId;
     await fenceShippingTaskThreads(
@@ -5904,6 +5925,8 @@
     for (const pendingReceipt of spawnReceipts)
       if (pendingReceipt.dispatchPending) protectedIds.add(pendingReceipt.receiptId);
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
+    if (receipt.validation && receiptIsSettled(receipt.state))
+      resourceQueues.validation.release(receipt.receiptId);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
     if (receipt.state === 'completed' && receiptReplayNeeded.has(receipt.receiptId))
       void recoverAcpSpawnResult(receipt).catch(() => undefined);
@@ -5982,10 +6005,16 @@
       return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     }
     const receiptActivity = await acp.activity(receipt.targetDirectory).then(
-      (states) => states[receipt.provider],
-      () => null,
+      (states) => ({ resolved: true as const, state: states[receipt.provider] ?? null }),
+      () => ({ resolved: false as const, state: null }),
     );
-    reconcileAcpSpawnReceipt(receipt, receiptActivity);
+    if (
+      !receiptActivity.resolved &&
+      receipt.validation &&
+      resourceQueues.validation.isActive(receipt.receiptId)
+    )
+      return receipt;
+    reconcileAcpSpawnReceipt(receipt, receiptActivity.state);
     return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
   }
 
@@ -7768,15 +7797,42 @@
           },
           actual: null,
         },
-        state: 'starting',
+        state: 'queued',
         created: Date.now(),
         updated: Date.now(),
         result: null,
         error: null,
+        activity: 'Waiting for validation capacity…',
       });
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       await saveShipRuns();
       try {
+        const updateCapacityActivity = () => {
+          if (!resourceQueues.validation.isQueued(receiptId)) return;
+          const { active, limit } = resourceQueues.validation.status;
+          updateSpawnReceipt(receiptId, {
+            activity:
+              resourceQueues.validation.reasonFor(receiptId) ??
+              `Waiting for validation capacity (${active}/${limit} running).`,
+          });
+        };
+        const unsubscribeCapacity = resourceQueues.validation.subscribe(updateCapacityActivity);
+        try {
+          await resourceQueues.validation.acquire(receiptId, request.directory);
+        } finally {
+          unsubscribeCapacity();
+        }
+        const reserved = spawnReceipts.find((receipt) => receipt.receiptId === receiptId);
+        if (!reserved || receiptIsSettled(reserved.state)) {
+          resourceQueues.validation.release(receiptId);
+          throw new Error('Validation capacity request was cancelled.');
+        }
+        updateSpawnReceipt(receiptId, {
+          state: 'starting',
+          activity: 'Starting validation gate…',
+        });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        await saveShipRuns();
         await ensureSelected();
         const [revision, mutationGeneration, baseRevision] = await Promise.all([
           invoke<string>('working_tree_revision', { path: request.directory }),
@@ -7854,7 +7910,9 @@
           status: 'started',
         };
       } catch (cause) {
-        updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        const current = spawnReceipts.find((receipt) => receipt.receiptId === receiptId);
+        if (!current || !receiptIsSettled(current.state))
+          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
         await acp.releaseOwner(request.directory, receiptId);
         if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
@@ -9232,7 +9290,7 @@
           registered,
         );
       } else {
-        await deleteProjectWorktreeWithDescendants(repository, path, branch, [], registered);
+        await deleteProjectWorktreeOnce(repository, path, branch, false);
       }
     } catch (cause) {
       error = describe(cause);

@@ -10,13 +10,14 @@ import {
   type PressureThresholds,
 } from './machine-pressure.ts';
 
-export type ResourceKind = 'agent' | 'browser';
+export type ResourceKind = 'agent' | 'browser' | 'validation';
 export const resourceLimitKeys = {
   agent: 'sai-agent-job-limit',
   browser: 'sai-browser-job-limit',
+  validation: 'sai-validation-job-limit',
   e2e: 'sai-e2e-job-limit',
 } as const;
-export const defaultResourceLimits = { agent: 4, browser: 2, e2e: 1 } as const;
+export const defaultResourceLimits = { agent: 4, browser: 2, validation: 1, e2e: 1 } as const;
 const checkingReason = 'Checking machine pressure…';
 
 export function isCheckingMachinePressure(reason: string | null): boolean {
@@ -69,6 +70,14 @@ export const resourceQueues: Record<ResourceKind, ResourceQueue> = {
     parseResourceLimit(
       typeof localStorage === 'undefined' ? null : getSetting(resourceLimitKeys.browser),
       defaultResourceLimits.browser,
+    ),
+    checkingReason,
+    checkNewWork,
+  ),
+  validation: new ResourceQueue(
+    parseResourceLimit(
+      typeof localStorage === 'undefined' ? null : getSetting(resourceLimitKeys.validation),
+      defaultResourceLimits.validation,
     ),
     checkingReason,
     checkNewWork,

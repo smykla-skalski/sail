@@ -202,6 +202,7 @@ describe('repository setup', () => {
     await $(deleteMenuItem).click();
     await expect($('.worktree-menu')).not.toExist();
     await expect(row).toBeDisplayed();
+    await expect(row).toBeEnabled();
 
     const dirty = join(worktree, 'keep-me.txt');
     writeFileSync(dirty, 'unsaved work\n');
