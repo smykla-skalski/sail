@@ -1151,6 +1151,78 @@ await test('a moved child under an unavailable alias keeps ancestry before and a
   }
 });
 
+await test('a moved pending parent keeps alias-child ancestry and repairs older saved origins', () => {
+  const parent = testGeneration(1);
+  const child = testGeneration(2);
+  const pending = {
+    originalPath: '/old-parent',
+    recoveryPath: '/new-parent',
+    sizeBytes: 12,
+    reason: 'Awaiting selected cleanup.',
+  };
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo', '/unavailable-alias'],
+      worktrees: {
+        '/repo': [
+          {
+            path: '/old-parent',
+            branch: 'parent',
+            generation: parent,
+            pendingCleanup: { ...pending, recoveryPath: '/old-parent' },
+          },
+        ],
+        '/unavailable-alias': [
+          {
+            path: '/child',
+            branch: 'child',
+            generation: child,
+            origin: movedChildOrigin('/old-parent', parent),
+          },
+        ],
+      },
+    }),
+    '/repo',
+  );
+  const registered = [
+    { path: '/new-parent', generation: parent, branch: 'parent' },
+    { path: '/child', generation: child, branch: 'child' },
+  ];
+  const moved = markWorktreeCleanupPending(catalog, '/repo', '/old-parent', pending, parent);
+  assert.equal(moved.worktrees['/unavailable-alias'][0].origin?.sourcePath, '/new-parent');
+  assert.deepEqual(
+    worktreeDescendants(
+      reconcileMovedWorktrees(moved, '/repo', registered),
+      '/repo',
+      registered,
+      '/new-parent',
+    ).map((entry) => entry.path),
+    ['/child'],
+  );
+
+  const olderSavedState = {
+    ...moved,
+    worktrees: {
+      ...moved.worktrees,
+      '/unavailable-alias': [
+        {
+          ...moved.worktrees['/unavailable-alias'][0],
+          origin: movedChildOrigin('/old-parent', parent),
+        },
+      ],
+    },
+  };
+  const repaired = reconcileMovedWorktrees(olderSavedState, '/repo', registered);
+  assert.equal(
+    repaired.worktrees['/repo'].find((entry) => entry.path === '/child')?.origin?.sourcePath,
+    '/new-parent',
+  );
+  assert.deepEqual(
+    worktreeDescendants(repaired, '/repo', registered, '/new-parent').map((entry) => entry.path),
+    ['/child'],
+  );
+});
+
 await test('ambiguous moved generations refuse catalog adoption without losing saved rows', () => {
   const generation = testGeneration(2);
   const saved = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {

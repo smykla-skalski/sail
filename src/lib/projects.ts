@@ -448,6 +448,18 @@ export function reconcileMovedWorktrees(
     };
     changed = true;
   }
+  worktrees = Object.fromEntries(
+    Object.entries(worktrees).map(([savedRepository, entries]) => [
+      savedRepository,
+      entries.map((entry) => {
+        if (!entry.origin) return entry;
+        const source = liveByGeneration.get(entry.origin.sourceGeneration);
+        if (!source || source.path === entry.origin.sourcePath) return entry;
+        changed = true;
+        return { ...entry, origin: { ...entry.origin, sourcePath: source.path } };
+      }),
+    ]),
+  );
   if (!changed) return catalog;
   return { ...catalog, worktrees };
 }
@@ -708,13 +720,22 @@ export function markWorktreeCleanupPending(
       };
     }
   }
-  return {
-    ...catalog,
-    worktrees: {
-      ...catalog.worktrees,
-      [repository]: updated,
-    },
-  };
+  const worktrees = { ...catalog.worktrees, [repository]: updated };
+  if (owner.generation && path !== pendingCleanup.recoveryPath) {
+    for (const [savedRepository, savedEntries] of Object.entries(worktrees)) {
+      if (savedRepository === repository) continue;
+      const updatedSavedEntries = savedEntries.slice();
+      for (const [index, item] of savedEntries.entries()) {
+        if (item.origin?.sourcePath === path && item.origin.sourceGeneration === owner.generation)
+          updatedSavedEntries[index] = {
+            ...item,
+            origin: { ...item.origin, sourcePath: pendingCleanup.recoveryPath },
+          };
+      }
+      worktrees[savedRepository] = updatedSavedEntries;
+    }
+  }
+  return { ...catalog, worktrees };
 }
 
 export function markNewWorktreeCleanupPending(
