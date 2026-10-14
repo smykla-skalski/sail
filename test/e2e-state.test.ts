@@ -157,3 +157,18 @@ await test(
     }
   },
 );
+
+await test('a corrupted owner record is treated as missing', (context) => {
+  const base = privateBase(context);
+  const fresh = join(base, 'sail-e2e-fresh2');
+  const idle = join(base, 'sail-e2e-idle03');
+  for (const root of [fresh, idle]) {
+    mkdirSync(root);
+    writeFileSync(join(root, 'owner.json'), JSON.stringify({ pid: '123', started: null }));
+  }
+  const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+  utimesSync(idle, longAgo, longAgo);
+
+  assert.deepEqual(sweepStateRoots(base), { removed: [idle], failed: [] });
+  assert.ok(existsSync(fresh));
+});

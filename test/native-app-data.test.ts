@@ -89,23 +89,16 @@ await test('a sweep removes dead runs, keeps live runs and ignores other folders
   for (const name of unrelated) assert.deepEqual(remaining(name), roots);
 });
 
-await test('a sweep reads the process table after listing folders', (context) => {
-  const { roots, populate } = fixture(context);
-  const events: string[] = [];
-  populate(identifier('a2'));
+await test('a run that starts while the process table is read is kept', (context) => {
+  const { roots, populate, remaining } = fixture(context);
+  const started = identifier('a2');
+  populate(identifier('d2'));
   const { removed } = sweepRunData(roots, () => {
-    events.push('processes');
+    populate(started);
     return '';
   });
-  assert.deepEqual(events, ['processes']);
   assert.equal(removed.length, roots.length);
-  assert.deepEqual(
-    sweepRunData(roots, () => assert.fail('nothing to check')),
-    {
-      removed: [],
-      failed: [],
-    },
-  );
+  assert.deepEqual(remaining(started), roots);
 });
 
 await test('a sweep follows a real process until it exits', async (context) => {

@@ -42,8 +42,9 @@ const cancel = () => {
   cancelled = true;
   cancellation.abort();
 };
-process.once('SIGINT', cancel);
-process.once('SIGTERM', cancel);
+process.on('SIGINT', cancel);
+process.on('SIGTERM', cancel);
+process.on('SIGHUP', cancel);
 
 function command(program, args, options = {}) {
   const result = spawnSync(program, args, { cwd: checkout, encoding: 'utf8', ...options });
@@ -409,12 +410,16 @@ async function main() {
       };
       writeFileSync(join(attempt, 'failure.json'), JSON.stringify(result, null, 2));
     } finally {
-      if (env.SAIL_E2E_BINARY) await stopApp(env.SAIL_E2E_BINARY);
-      if (runIdentifier) {
-        const leftovers = await removeRunData(runIdentifier, dataRoots);
-        result.leftovers = leftovers;
-        if (leftovers.length > 0)
-          process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
+      try {
+        if (env.SAIL_E2E_BINARY) await stopApp(env.SAIL_E2E_BINARY);
+      } finally {
+        sweepStateRoots(env.TMPDIR);
+        if (runIdentifier) {
+          const leftovers = await removeRunData(runIdentifier, dataRoots);
+          result.leftovers = leftovers;
+          if (leftovers.length > 0)
+            process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
+        }
       }
     }
     if (result.verdict === 'SETUP_FAILED') return runAttempt(index + 1);

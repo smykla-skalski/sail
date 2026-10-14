@@ -25,6 +25,7 @@ const knownEntries = new Set([
   'external-link.log',
   'fake-gh',
   'hook-connection.json',
+  'owner.json',
   'state',
   'worktrees',
 ]);
@@ -70,7 +71,8 @@ export function createStateRoot(base) {
 
 function ownerOf(root) {
   try {
-    return JSON.parse(readFileSync(join(root, markerName), 'utf8'));
+    const owner = JSON.parse(readFileSync(join(root, markerName), 'utf8'));
+    return Number.isInteger(owner?.pid) && owner.pid > 0 ? owner : null;
   } catch (error) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return null;
     throw error;
