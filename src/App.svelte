@@ -259,6 +259,7 @@
   import {
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
+    SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS,
     sidebarFocusRefreshDue,
     unlistedSidebarPaths,
     type SidebarRefreshPaths,
@@ -1740,9 +1741,12 @@
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
   let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
-  let sidebarInventoryLastListing = 0;
+  let sidebarInventoryLastFullListing = 0;
+  let sidebarInventoryDeferred = false;
+  let sidebarFocusPending = false;
+  let sidebarFocusTimer: ReturnType<typeof setTimeout> | undefined;
   // Directories already listed; only new ones are listed again without a focus change.
-  const sidebarListedDirectories = new SvelteSet<string>();
+  let sidebarListedDirectories: Record<string, true> = {};
   const sidebarInventoryDelay = import.meta.env.MODE === 'e2e' ? 250 : 5_000;
   const foregroundAgentLoading = $derived.by(() =>
     leaves(paneLayout).some((pane) => pane.agent && agentEntrySnapshots[pane.id]?.ready !== true),
@@ -2643,6 +2647,7 @@
       window.removeEventListener('focus', refreshSidebarOnFocus);
       document.removeEventListener('visibilitychange', refreshSidebarOnFocus);
       clearTimeout(sidebarInventoryTimer);
+      clearTimeout(sidebarFocusTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
       if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
@@ -10944,7 +10949,7 @@
     const results = await request.finally(() => sidebarInventoryRequests.delete(request));
     if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
-    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories.add(path);
+    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories[path] = true;
     const listed = new Set(paths);
     const retained = sidebarOpenCodeThreads.filter(
       (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
@@ -10979,20 +10984,17 @@
     delay = sidebarInventoryDelay,
     paths?: string[] | 'all',
   ) {
-    sidebarInventoryWaiting = mergeSidebarRefreshPaths(
-      sidebarInventoryTimer === undefined ? undefined : sidebarInventoryWaiting,
-      paths,
-    );
+    sidebarInventoryWaiting = mergeSidebarRefreshPaths(sidebarInventoryWaiting, paths);
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryReadyKey = '';
     const key = sidebarDirectoryKey;
     const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
       sidebarInventoryTimer = undefined;
-      sidebarInventoryLastListing = Date.now();
       const directories: string[] = JSON.parse(sidebarDirectoryKey);
       const wanted = sidebarInventoryWaiting;
       sidebarInventoryWaiting = undefined;
+      if (!wanted) sidebarInventoryLastFullListing = Date.now();
       const selected = wanted ? directories.filter((path) => wanted.has(path)) : directories;
       void refreshSidebarOpenCodeThreads(selected.length > 0 ? selected : directories).then(
         (failure) => {
@@ -11008,15 +11010,28 @@
 
   // OpenCode sessions made outside Sail appear when the window regains focus, not by polling.
   function refreshSidebarOnFocus() {
+    clearTimeout(sidebarFocusTimer);
+    sidebarFocusTimer = undefined;
     if (
       document.visibilityState === 'hidden' ||
-      sidebarInventoryTimer !== undefined ||
-      foregroundAgentLoading ||
-      !agentAvailability.some((agent) => agent.id === 'opencode' && agent.available) ||
-      !sidebarFocusRefreshDue(sidebarInventoryLastListing, Date.now())
+      !agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)
     )
       return;
-    scheduleSidebarInventoryRefresh(sidebarInventoryDelay, 'all');
+    if (foregroundAgentLoading) {
+      sidebarFocusPending = true;
+      return;
+    }
+    const now = Date.now();
+    if (!sidebarFocusRefreshDue(sidebarInventoryLastFullListing, now)) {
+      // Focus stays put after this event, so check again once the last listing is old enough.
+      sidebarFocusTimer = setTimeout(
+        refreshSidebarOnFocus,
+        SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - sidebarInventoryLastFullListing),
+      );
+      return;
+    }
+    if (sidebarInventoryTimer === undefined)
+      scheduleSidebarInventoryRefresh(sidebarInventoryDelay, 'all');
   }
 
   if (import.meta.env.MODE === 'e2e') {
@@ -11033,15 +11048,33 @@
     const tracked = sidebarDirectoryKey;
     const available = agentAvailability.some((agent) => agent.id === 'opencode' && agent.available);
     const loading = foregroundAgentLoading;
-    if (!tracked || !available) return;
+    if (!tracked) return;
+    if (!available) {
+      // Re-detection must list every directory again.
+      sidebarListedDirectories = {};
+      return;
+    }
     if (loading) {
+      // A queued request waits for the pane instead of being dropped.
+      if (sidebarInventoryTimer !== undefined) sidebarInventoryDeferred = true;
       clearTimeout(sidebarInventoryTimer);
       sidebarInventoryTimer = undefined;
       sidebarInventoryReadyKey = '';
       return;
     }
-    const fresh = unlistedSidebarPaths(JSON.parse(tracked), sidebarListedDirectories);
-    if (fresh.length === 0) {
+    const directories: string[] = JSON.parse(tracked);
+    // A directory that left the catalog is listed again if it returns.
+    sidebarListedDirectories = Object.fromEntries(
+      directories.filter((path) => sidebarListedDirectories[path]).map((path) => [path, true]),
+    );
+    const fresh = unlistedSidebarPaths(directories, sidebarListedDirectories);
+    const deferred = sidebarInventoryDeferred;
+    sidebarInventoryDeferred = false;
+    if (sidebarFocusPending) {
+      sidebarFocusPending = false;
+      refreshSidebarOnFocus();
+    }
+    if (fresh.length === 0 && !deferred) {
       if (sidebarInventoryTimer === undefined) sidebarInventoryReadyKey = tracked;
       return;
     }

@@ -195,7 +195,7 @@ void test('focus refreshes only when the last listing is at least 30 s old', () 
 });
 
 void test('a catalog change lists only directories not listed before', () => {
-  const listed = new Set(['/repo', '/repo-wt-1']);
+  const listed = { '/repo': true, '/repo-wt-1': true };
   assert.deepEqual(unlistedSidebarPaths(['/repo', '/repo-wt-1', '/repo-wt-2'], listed), [
     '/repo-wt-2',
   ]);

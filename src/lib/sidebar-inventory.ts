@@ -53,7 +53,7 @@ export function mergeSidebarRefreshPaths(
 
 export function unlistedSidebarPaths(
   directories: readonly string[],
-  listed: ReadonlySet<string>,
+  listed: Readonly<Record<string, unknown>>,
 ): string[] {
-  return directories.filter((path) => !listed.has(path));
+  return directories.filter((path) => !Object.hasOwn(listed, path));
 }
