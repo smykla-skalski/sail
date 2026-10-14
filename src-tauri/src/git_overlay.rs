@@ -980,7 +980,18 @@ fn process_uses_overlay(process: &sysinfo::Process, worktree: &Path, git_dir: &P
     {
         windows_process_is_alive(process.pid().as_u32())
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        // Process metadata can outlive its writer while cwd is being read.
+        !matches!(
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(process.pid().as_u32() as i32),
+                None
+            ),
+            Err(nix::errno::Errno::ESRCH)
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         true
     }
@@ -1803,6 +1814,78 @@ mod tests {
                 "Relative Git target must retain its writer: {arguments:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_unix_git_snapshot_does_not_block_overlay_recovery() {
+        use std::io::{BufRead, BufReader};
+
+        struct OwnedWriter(std::process::Child);
+        impl Drop for OwnedWriter {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let mut command = git_command();
+        overlay.apply(&mut command);
+        let mut writer = OwnedWriter(
+            command
+                .args(["update-ref", "--stdin"])
+                .current_dir(&fixture.task)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        writer
+            .0
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"start\n")
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(writer.0.stdout.take().unwrap())
+            .read_line(&mut response)
+            .unwrap();
+        assert_eq!(response.trim(), "start: ok");
+
+        let pid = sysinfo::Pid::from_u32(writer.0.id());
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            false,
+            sysinfo::ProcessRefreshKind::everything(),
+        );
+        let snapshot = system.process(pid).unwrap();
+        assert!(process_uses_overlay(
+            snapshot,
+            &fixture.task,
+            &overlay.git_dir
+        ));
+
+        writer.0.kill().unwrap();
+        writer.0.wait().unwrap();
+        assert!(process_context_uses_overlay(
+            snapshot.cwd(),
+            snapshot.name(),
+            snapshot.cmd(),
+            snapshot.environ(),
+            &fixture.task,
+            &overlay.git_dir,
+        ));
+        assert!(!process_uses_overlay(
+            snapshot,
+            &fixture.task,
+            &overlay.git_dir
+        ));
     }
 
     #[cfg(windows)]
