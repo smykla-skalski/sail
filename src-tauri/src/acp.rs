@@ -522,6 +522,8 @@ struct Connection {
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
     stopped: AtomicBool,
     released_owner: AtomicBool,
+    idle_exit: AtomicBool,
+    last_activity: Mutex<Instant>,
     input: Mutex<ChildStdin>,
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
     reader_progress: ReaderProgress,
@@ -1668,6 +1670,72 @@ impl Connection {
         Ok(())
     }
 
+    /// An OpenCode agent with no running turn, subagent, pending request or command exits once it
+    /// has been silent for `timeout`. Attached sessions come back through resume on their next use.
+    fn exit_if_idle(&self, timeout: Duration, commands_running: impl Fn() -> bool) -> bool {
+        if self.agent != "opencode" || self.owner.is_some() || self.stopped.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let silent = self
+            .last_activity
+            .lock()
+            .map_or(Duration::ZERO, |last| last.elapsed());
+        if silent < timeout || self.capabilities.lock().is_ok_and(|value| value.is_null()) {
+            return false;
+        }
+        // A prompt being dispatched holds this lock; leave it alone.
+        let Ok(_dispatch) = self.prompt_dispatch.try_lock() else {
+            return false;
+        };
+        if self.has_pending_work() || commands_running() {
+            // Look again after another full timeout instead of rescanning every tick.
+            self.touch();
+            return false;
+        }
+        self.idle_exit.store(true, Ordering::Release);
+        if let Err(error) = self.terminate() {
+            self.idle_exit.store(false, Ordering::Release);
+            crate::diagnostics::record(
+                "agent_idle_exit_failed",
+                json!({"agent":self.agent,"error":error}),
+            );
+            return false;
+        }
+        crate::diagnostics::record(
+            "agent_idle_exit",
+            json!({"agent":self.agent,"idleSeconds":silent.as_secs()}),
+        );
+        true
+    }
+
+    fn has_pending_work(&self) -> bool {
+        let locked = (|| -> Result<bool, ()> {
+            let prompts = self.prompt_state.lock().map_err(|_| ())?;
+            if !prompts.active.is_empty() || !prompts.finishing.is_empty() {
+                return Ok(true);
+            }
+            drop(prompts);
+            let busy = !self.pending.lock().map_err(|_| ())?.is_empty()
+                || !self
+                    .permission_state
+                    .lock()
+                    .map_err(|_| ())?
+                    .pending
+                    .is_empty()
+                || !self.elicitation_state.lock().map_err(|_| ())?.is_empty()
+                || !self.restores.lock().map_err(|_| ())?.is_empty()
+                || !self
+                    .native_subagents
+                    .lock()
+                    .map_err(|_| ())?
+                    .active_in(&self.worktree)
+                    .is_empty();
+            Ok(busy)
+        })();
+        locked.unwrap_or(true)
+    }
+
     fn stop_child(&self) -> Result<(), String> {
         let _temp_gate = self
             .temp_cleanup_gate
@@ -1713,7 +1781,14 @@ impl Connection {
         result
     }
 
+    fn touch(&self) {
+        if let Ok(mut last) = self.last_activity.lock() {
+            *last = Instant::now();
+        }
+    }
+
     fn write(&self, message: &Value) -> Result<(), String> {
+        self.touch();
         let mut input = self.input.lock().map_err(|error| error.to_string())?;
         let mut message = message.clone();
         if let Some(owner) = &self.owner {
@@ -2123,6 +2198,8 @@ pub struct AgentManager(
     Arc<Mutex<ForgetGenerations>>,
     Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
     Arc<AtomicU64>,
+    /// Serializes listing-agent startup so a sidebar refresh spawns one agent, not one per directory.
+    Arc<Mutex<()>>,
 );
 
 impl AgentManager {
@@ -5136,6 +5213,8 @@ fn connect_blocking_inner(
         watchdog: Mutex::new(watchdog),
         stopped: AtomicBool::new(false),
         released_owner: AtomicBool::new(false),
+        idle_exit: AtomicBool::new(false),
+        last_activity: Mutex::new(Instant::now()),
         input: Mutex::new(input),
         pending: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
@@ -5163,6 +5242,7 @@ fn connect_blocking_inner(
         _owned_temp: owned_temp,
     });
     start_temp_cleanup_watcher(&runtime)?;
+    start_idle_exit_watcher(&runtime, app.clone())?;
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
     let agent_id = agent.clone();
@@ -5170,6 +5250,7 @@ fn connect_blocking_inner(
     std::thread::spawn(move || {
         for line in BufReader::new(output).lines() {
             let Ok(line) = line else { break };
+            reader.touch();
             let Ok(mut message) = serde_json::from_str::<Value>(&line) else {
                 crate::diagnostics::record(
                     "acp_invalid_json",
@@ -5561,7 +5642,8 @@ fn connect_blocking_inner(
                 message: json!({"method":"sail/disconnected","params":{
                     "profile":profile.as_str(),"sessionIds":session_ids,
                     "sessionDirectories":session_directories,
-                    "releasedOwner":reader.released_owner.load(Ordering::Acquire)
+                    "releasedOwner":reader.released_owner.load(Ordering::Acquire),
+                    "idle":reader.idle_exit.load(Ordering::Acquire)
                 }}),
             },
         );
@@ -6278,6 +6360,53 @@ pub async fn acp_resume_session(
     restore_session(manager, app, browser, params, "session/resume").await
 }
 
+/// OpenCode lists any directory's sessions from one agent, so the sidebar shares a single explore
+/// agent instead of starting one per repository and worktree.
+fn listing_connection(
+    app: &AppHandle,
+    manager: &AgentManager,
+    agent: &str,
+    profile: CapabilityProfile,
+    cwd: &Path,
+) -> Result<(Arc<Connection>, Value), String> {
+    let shared = agent == "opencode" && profile == CapabilityProfile::Explore;
+    let _gate = if shared {
+        Some(manager.4.lock().map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    if shared {
+        let existing = manager
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .find(|runtime| {
+                runtime.agent == agent
+                    && runtime.profile == profile
+                    && runtime.owner.is_none()
+                    && runtime.alive.load(Ordering::Acquire)
+                    && runtime
+                        .capabilities
+                        .lock()
+                        .is_ok_and(|capabilities| !capabilities.is_null())
+            })
+            .cloned();
+        if let Some(runtime) = existing {
+            runtime.touch();
+            let capabilities = runtime
+                .capabilities
+                .lock()
+                .map_err(|error| error.to_string())?
+                .clone();
+            return Ok((runtime, capabilities));
+        }
+    }
+    let capabilities = connect_blocking(app.clone(), manager, agent.to_string(), profile, cwd)?;
+    let runtime = connection_for_profile(manager, agent, profile, cwd)?;
+    Ok((runtime, capabilities))
+}
+
 /// One page of the agent's own session history for a working directory.
 #[tauri::command]
 pub async fn acp_list_sessions(
@@ -6291,20 +6420,32 @@ pub async fn acp_list_sessions(
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let capabilities =
-            connect_blocking(app, &manager, agent.clone(), profile, Path::new(&cwd))?;
-        if capabilities
-            .pointer("/agentCapabilities/sessionCapabilities/list")
-            .is_none()
-        {
-            return Ok(json!({"sessions": []}));
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let (runtime, capabilities) =
+                listing_connection(&app, &manager, &agent, profile, Path::new(&cwd))?;
+            if capabilities
+                .pointer("/agentCapabilities/sessionCapabilities/list")
+                .is_none()
+            {
+                return Ok(json!({"sessions": []}));
+            }
+            let mut params = json!({"cwd": cwd});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let result = runtime.request("session/list", params, Duration::from_secs(30));
+            // The agent may exit for idleness between lookup and request; the next lookup respawns it.
+            if result.is_err()
+                && attempts < 2
+                && runtime.idle_exit.load(Ordering::Acquire)
+                && !runtime.alive.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            return result;
         }
-        let runtime = connection_for_profile(&manager, &agent, profile, Path::new(&cwd))?;
-        let mut params = json!({"cwd": cwd});
-        if let Some(cursor) = cursor {
-            params["cursor"] = json!(cursor);
-        }
-        runtime.request("session/list", params, Duration::from_secs(30))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -7239,6 +7380,61 @@ fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
         }
         false
     })
+}
+
+const OPENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Idle limit for OpenCode agents; `SAIL_OPENCODE_IDLE_TIMEOUT_SECS=0` keeps them until app exit.
+fn opencode_idle_timeout() -> Option<Duration> {
+    match std::env::var("SAIL_OPENCODE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(OPENCODE_IDLE_TIMEOUT),
+    }
+}
+
+fn start_idle_exit_watcher(runtime: &Arc<Connection>, app: AppHandle) -> Result<(), String> {
+    let Some(timeout) = opencode_idle_timeout() else {
+        return Ok(());
+    };
+    if runtime.agent != "opencode" || runtime.owner.is_some() {
+        return Ok(());
+    }
+    let weak = Arc::downgrade(runtime);
+    let tick = (timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    std::thread::Builder::new()
+        .name("sail-agent-idle-exit".into())
+        .spawn(move || loop {
+            std::thread::sleep(tick);
+            let Some(runtime) = weak.upgrade() else {
+                break;
+            };
+            if runtime.stopped.load(Ordering::Acquire) || !runtime.alive.load(Ordering::Acquire) {
+                break;
+            }
+            let exited = runtime.exit_if_idle(timeout, || {
+                let session_ids = runtime
+                    .session_profiles
+                    .lock()
+                    .map(|profiles| profiles.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                app.state::<crate::acp_terminal::AcpTerminalManager>()
+                    .has_running_sessions(
+                        &runtime.agent,
+                        runtime.profile,
+                        &runtime.worktree,
+                        &session_ids,
+                    )
+            });
+            if exited {
+                break;
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Cannot watch agent idle time: {error}"))
 }
 
 fn start_temp_cleanup_watcher(runtime: &Arc<Connection>) -> Result<(), String> {
@@ -8415,6 +8611,8 @@ time.sleep(10)
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             released_owner: AtomicBool::new(false),
+            idle_exit: AtomicBool::new(false),
+            last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
@@ -8450,6 +8648,79 @@ time.sleep(10)
             ready: Condvar::new(),
             _owned_temp: None,
         })
+    }
+
+    #[cfg(unix)]
+    fn idle_runtime(agent: &str, owner: Option<&str>) -> Arc<Connection> {
+        let runtime = test_runtime(
+            agent,
+            CapabilityProfile::Explore,
+            Path::new("/worktree"),
+            "session",
+            owner,
+        );
+        runtime.elicitation_state.lock().unwrap().clear();
+        *runtime.capabilities.lock().unwrap() = json!({"agentCapabilities":{}});
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        runtime
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_opencode_agent_exits_and_reports_idleness() {
+        let runtime = idle_runtime("opencode", None);
+
+        assert!(runtime.exit_if_idle(Duration::from_secs(30), || false));
+        assert!(!runtime.alive.load(Ordering::Acquire));
+        assert!(runtime.idle_exit.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_activity_keeps_opencode_agent_alive() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.touch();
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(30), || false));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn busy_opencode_agent_defers_idle_exit_by_a_full_timeout() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.elicitation_state.lock().unwrap().insert(
+            "7".into(),
+            PendingElicitation {
+                message: json!({"method":"elicitation/create","id":7,"params":{"sessionId":"session"}}),
+                received_at: 1,
+            },
+        );
+        assert!(!runtime.exit_if_idle(Duration::from_secs(30), || false));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.elicitation_state.lock().unwrap().clear();
+        assert!(
+            !runtime.exit_if_idle(Duration::from_secs(30), || false),
+            "a deferred check must wait out the timeout again"
+        );
+
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        assert!(!runtime.exit_if_idle(Duration::from_secs(30), || true));
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_exit_applies_only_to_unowned_opencode_agents() {
+        for runtime in [
+            idle_runtime("codex", None),
+            idle_runtime("opencode", Some("0b7a7c41-5f3e-4f4a-9f0c-8f6f3f0d9a11")),
+        ] {
+            assert!(!runtime.exit_if_idle(Duration::from_secs(30), || false));
+            assert!(runtime.alive.load(Ordering::Acquire));
+            runtime.terminate().unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -8797,6 +9068,8 @@ time.sleep(10)
                 watchdog: Mutex::new(watchdog),
                 stopped: AtomicBool::new(false),
                 released_owner: AtomicBool::new(false),
+                idle_exit: AtomicBool::new(false),
+                last_activity: Mutex::new(Instant::now()),
                 input: Mutex::new(input),
                 pending: Mutex::new(HashMap::new()),
                 reader_progress: ReaderProgress::default(),
@@ -9900,6 +10173,8 @@ mod native_subagent_fence_tests {
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             released_owner: AtomicBool::new(false),
+            idle_exit: AtomicBool::new(false),
+            last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),

@@ -338,6 +338,48 @@ impl AcpTerminalManager {
             .unwrap_or_default()
     }
 
+    /// True while a command started by one of these sessions is still running.
+    pub fn has_running_sessions(
+        &self,
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_ids: &[String],
+    ) -> bool {
+        let scope = TerminalConnectionScope {
+            agent,
+            profile,
+            worktree,
+            session_ids,
+        };
+        let Ok(active) = self.active.lock() else {
+            // An unreadable registry must not let an agent exit under a running command.
+            return true;
+        };
+        active.values().any(|terminal| {
+            if !terminal_belongs_to_connection(
+                &terminal.agent,
+                terminal.profile,
+                &terminal.session_id,
+                &terminal.directory,
+                &scope,
+            ) {
+                return false;
+            }
+            #[cfg(unix)]
+            let exited = terminal
+                .child
+                .lock()
+                .is_ok_and(|child| exited_without_reaping(&child).unwrap_or(false));
+            #[cfg(not(unix))]
+            let exited = terminal
+                .child
+                .lock()
+                .is_ok_and(|mut child| child.try_wait().ok().flatten().is_some());
+            !exited
+        })
+    }
+
     pub fn stop_sessions(
         &self,
         agent: &str,

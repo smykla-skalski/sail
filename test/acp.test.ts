@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   acp,
   acpDisconnectAffectsSession,
+  acpDisconnectedForIdleness,
   acpSessionOwner,
   acpRestoreMode,
   acpCancelMatchesSession,
@@ -165,6 +166,24 @@ void test('scoped ACP disconnect only affects sessions from the exited connectio
   assert.equal(acpDisconnectAffectsSession(message, 'build-session', 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'review'), true);
+});
+
+void test('an idle agent exit is not reported as a failed thread', () => {
+  const idle: AgentEvent['message'] = {
+    method: 'sail/disconnected',
+    params: { profile: 'build', sessionIds: ['session'], idle: true },
+  };
+  const crashed: AgentEvent['message'] = {
+    method: 'sail/disconnected',
+    params: { profile: 'build', sessionIds: ['session'], idle: false },
+  };
+
+  assert.equal(acpDisconnectedForIdleness(idle), true);
+  assert.equal(acpDisconnectedForIdleness(crashed), false);
+  assert.equal(
+    acpDisconnectedForIdleness({ method: 'session/update', params: { idle: true } }),
+    false,
+  );
 });
 
 void test('a reopened owned thread reconnects to its run', () => {

@@ -356,6 +356,11 @@ export function acpDisconnectedSessionIds(message: AgentEvent['message']): strin
   return sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string');
 }
 
+/** The backend stopped an idle agent; attached sessions resume on their next use. */
+export function acpDisconnectedForIdleness(message: AgentEvent['message']): boolean {
+  return message.method === 'sail/disconnected' && message.params?.idle === true;
+}
+
 export function acpSessionOwner(sessionId: string | null): string | null {
   if (!sessionId) return null;
   const match = /^sail-owned:([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}):/.exec(

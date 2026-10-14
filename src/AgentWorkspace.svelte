@@ -85,6 +85,7 @@
     acp,
     acpCanResume,
     acpDisconnectAffectsSession,
+    acpDisconnectedForIdleness,
     acpFinishedPromptStatus,
     acpPromptInterrupted,
     acpSessionOwner,
@@ -1726,6 +1727,8 @@
             ]
           : undefined;
       if (payload.directory !== directory && disconnectedDirectory !== directory) return;
+      // An idle exit is not a failure: the next prompt resumes the session on a fresh agent.
+      if (acpDisconnectedForIdleness(message)) return;
       if (
         message.method === 'sail/disconnected' &&
         acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
