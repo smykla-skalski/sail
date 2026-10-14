@@ -123,12 +123,99 @@ fn read(path: &Path) -> Result<String, String> {
     }
 }
 
-fn binary() -> Result<String, String> {
-    std::env::current_exe()
-        .map_err(|error| format!("Cannot locate Sail executable: {error}"))?
-        .to_str()
+fn current_binary() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|error| format!("Cannot locate Sail executable: {error}"))
+}
+
+fn path_text(path: &Path) -> Result<String, String> {
+    path.to_str()
         .map(str::to_owned)
-        .ok_or("Sail executable path is not UTF-8.".into())
+        .ok_or_else(|| format!("Path is not UTF-8: {}", path.display()))
+}
+
+/// A Cargo output directory or a Git checkout changes under running agents.
+fn is_unstable(path: &Path) -> bool {
+    path.ancestors().skip(1).any(|dir| {
+        dir.file_name().is_some_and(|name| name == "target") || dir.join(".git").exists()
+    })
+}
+
+fn stable_path(directory: &Path) -> PathBuf {
+    let name = format!(
+        "sail-memory-mcp-{}{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::EXE_SUFFIX
+    );
+    directory.join(name)
+}
+
+/// Command agents should run: the executable itself when it is stable,
+/// otherwise a versioned copy beside the memory data.
+fn expected_binary(source: &Path, directory: &Path) -> Result<String, String> {
+    if is_unstable(source) {
+        path_text(&stable_path(directory))
+    } else {
+        path_text(source)
+    }
+}
+
+/// Like `expected_binary`, but creates or refreshes the copy. The rename keeps
+/// a running or starting agent from seeing a half-written file.
+fn install_binary(source: &Path, directory: &Path) -> Result<String, String> {
+    if !is_unstable(source) {
+        return path_text(source);
+    }
+    let target = stable_path(directory);
+    let modified = |path: &Path| fs::metadata(path).and_then(|meta| meta.modified()).ok();
+    let current = match (modified(&target), modified(source)) {
+        (Some(copy), Some(origin)) => copy >= origin,
+        _ => false,
+    };
+    if !current {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("Cannot create {}: {error}", directory.display()))?;
+        let temporary = directory.join(format!(".sail-memory-mcp-{}.tmp", uuid::Uuid::new_v4()));
+        let result = fs::copy(source, &temporary)
+            .and_then(|_| fs::rename(&temporary, &target))
+            .map_err(|error| format!("Cannot install {}: {error}", target.display()));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+    }
+    path_text(&target)
+}
+
+fn binary_directory(paths: &(String, String)) -> PathBuf {
+    let root = Path::new(&paths.0);
+    root.parent().unwrap_or(root).join("bin")
+}
+
+fn expected_command(paths: &(String, String)) -> Result<String, String> {
+    expected_binary(&current_binary()?, &binary_directory(paths))
+}
+
+fn install_command(paths: &(String, String)) -> Result<String, String> {
+    install_binary(&current_binary()?, &binary_directory(paths))
+}
+
+/// The command recorded in a managed entry, if any.
+fn installed_command(agent: Agent, text: &str) -> Option<String> {
+    if agent == Agent::Codex {
+        let document: DocumentMut = text.parse().ok()?;
+        return document
+            .get("mcp_servers")?
+            .get(SERVER)?
+            .get("command")?
+            .as_str()
+            .map(str::to_owned);
+    }
+    let entry = json_property(agent, text).ok()??;
+    let command = entry.get("command")?;
+    command
+        .as_str()
+        .or_else(|| command.get(0).and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 fn runtime_paths(app: &AppHandle) -> Result<(String, String), String> {
@@ -424,29 +511,37 @@ fn lock(path: &Path) -> Result<File, String> {
 #[tauri::command]
 pub fn memory_agent_status(app: AppHandle) -> Vec<MemoryAgentStatus> {
     let runtime = runtime_paths(&app);
-    let executable = binary();
+    let executable = runtime
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(expected_command);
     [Agent::Claude, Agent::Codex, Agent::OpenCode]
         .into_iter()
         .map(|agent| {
-            let status = (|| -> Result<(bool, bool), String> {
+            let status = (|| -> Result<(bool, bool, bool), String> {
                 let path = path_for(agent)?;
                 let text = read(&path)?;
                 if !installed(agent, &text)? {
-                    return Ok((false, false));
+                    return Ok((false, false, false));
                 }
                 let runtime = runtime.as_ref().map_err(Clone::clone)?;
                 let executable = executable.as_ref().map_err(Clone::clone)?;
                 let expected = render(agent, &text, executable, (&runtime.0, &runtime.1), true)?;
+                let missing = installed_command(agent, &text)
+                    .is_none_or(|command| !Path::new(&command).exists());
                 Ok((
                     true,
                     preview_entry(agent, &text)? == preview_entry(agent, &expected)?,
+                    missing,
                 ))
             })();
             let (installed, healthy, detail) = match status {
-                Ok((installed, healthy)) => (
+                Ok((installed, healthy, missing)) => (
                     installed,
-                    healthy,
-                    if installed && !healthy {
+                    healthy && !missing,
+                    if installed && missing {
+                        Some("Sail memory server command is missing; reinstall it.".into())
+                    } else if installed && !healthy {
                         Some("Sail memory entry is out of date; reinstall it.".into())
                     } else {
                         None
@@ -490,7 +585,17 @@ fn preview(app: AppHandle, agent: String, install: bool) -> Result<MemoryInstall
     let after = if !install && !installed(agent, &before)? {
         before.clone()
     } else {
-        render(agent, &before, &binary()?, (&paths.0, &paths.1), install)?
+        render(
+            agent,
+            &before,
+            &if install {
+                expected_command(&paths)?
+            } else {
+                String::new()
+            },
+            (&paths.0, &paths.1),
+            install,
+        )?
     };
     Ok(MemoryInstallPreview {
         agent: agent.id(),
@@ -509,7 +614,12 @@ fn change(app: &AppHandle, agent: Agent, install: bool) -> Result<(), String> {
         return Ok(());
     }
     let paths = runtime_paths(app)?;
-    let after = render(agent, &before, &binary()?, (&paths.0, &paths.1), install)?;
+    let command = if install {
+        install_command(&paths)?
+    } else {
+        String::new()
+    };
+    let after = render(agent, &before, &command, (&paths.0, &paths.1), install)?;
     if before != after {
         write_atomic(&path, &after, &before)?;
     }
@@ -537,8 +647,8 @@ pub fn install_memory_agents(app: AppHandle, agents: Vec<String>) -> Result<(), 
     for path in &paths {
         guards.push(lock(path)?);
     }
-    let executable = binary()?;
     let runtime = runtime_paths(&app)?;
+    let executable = install_command(&runtime)?;
     let mut changes = Vec::with_capacity(paths.len());
     for (agent, path) in selected.iter().zip(&paths) {
         let before = read(path)?;
@@ -690,5 +800,89 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "updated by agent");
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    fn scratch() -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("sail-memory-install-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn copies_a_cargo_build_to_a_stable_versioned_path() {
+        let root = scratch();
+        let debug = root.join("checkout/src-tauri/target/debug");
+        fs::create_dir_all(&debug).unwrap();
+        let source = debug.join("sail");
+        fs::write(&source, "build one").unwrap();
+        let data = root.join("data/bin");
+
+        let command = install_binary(&source, &data).unwrap();
+        assert!(!command.contains("target"));
+        assert!(command.contains(env!("CARGO_PKG_VERSION")));
+        assert_eq!(command, expected_binary(&source, &data).unwrap());
+        assert_eq!(fs::read_to_string(&command).unwrap(), "build one");
+
+        // A relink or deleting the checkout leaves the installed command usable.
+        fs::write(&source, "build two").unwrap();
+        fs::remove_dir_all(root.join("checkout")).unwrap();
+        assert_eq!(fs::read_to_string(&command).unwrap(), "build one");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refreshes_the_copy_when_the_build_is_newer() {
+        let root = scratch();
+        let debug = root.join("target/debug");
+        fs::create_dir_all(&debug).unwrap();
+        let source = debug.join("sail");
+        fs::write(&source, "old").unwrap();
+        let data = root.join("bin");
+        let command = install_binary(&source, &data).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(&source, "new").unwrap();
+        assert_eq!(install_binary(&source, &data).unwrap(), command);
+        assert_eq!(fs::read_to_string(&command).unwrap(), "new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keeps_a_release_executable_in_place() {
+        let root = scratch();
+        let source = root.join("Sail.app/Contents/MacOS/sail");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "release").unwrap();
+        let data = root.join("data/bin");
+        let command = install_binary(&source, &data).unwrap();
+        assert_eq!(command, source.to_str().unwrap());
+        assert!(!data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn treats_a_git_checkout_as_unstable() {
+        let root = scratch();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        assert!(is_unstable(&root.join("build/sail")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_the_installed_command_for_each_agent() {
+        for agent in [Agent::Claude, Agent::Codex, Agent::OpenCode] {
+            let after = render(
+                agent,
+                "",
+                "/opt/sail",
+                ("/data/memory", "/config/settings.json"),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                installed_command(agent, &after).as_deref(),
+                Some("/opt/sail")
+            );
+        }
     }
 }
