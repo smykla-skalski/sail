@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -21,6 +21,11 @@ const terminalRequests = new Map();
 let terminalSupport = false;
 let nextTerminalRequest = 3000;
 const agent = process.argv[2];
+if (process.env.SAIL_E2E_ACP_START_LOG)
+  appendFileSync(
+    process.env.SAIL_E2E_ACP_START_LOG,
+    `${JSON.stringify({ agent, directory: process.cwd(), pid: process.pid })}\n`,
+  );
 let authenticated = agent !== 'codex';
 let nextSession = 0;
 // A provider can run under several capability profiles in separate processes.
@@ -143,6 +148,143 @@ function callWorktreeList(server, callback) {
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
   request(1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} });
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
+}
+
+function callContextProvider(server, callback) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let stderr = '';
+  let settled = false;
+  let initialized = false;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    child.kill();
+    callback(result);
+  };
+  let timer = setTimeout(
+    () => finish({ error: 'Context provider initialization timed out' }),
+    30_000,
+  );
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+    let index;
+    while ((index = output.indexOf('\n')) >= 0) {
+      const line = output.slice(0, index);
+      output = output.slice(index + 1);
+      try {
+        const response = JSON.parse(line);
+        if (response.id === 1 && !initialized) {
+          if (response.error || !response.result?.protocolVersion) {
+            finish({ error: 'Context provider initialization failed' });
+            continue;
+          }
+          initialized = true;
+          clearTimeout(timer);
+          timer = setTimeout(
+            () => finish({ error: 'Context provider tool discovery timed out' }),
+            30_000,
+          );
+          child.stdin.write(
+            `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`,
+          );
+          child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
+        }
+        if (response.id === 2) finish(response);
+      } catch {
+        continue;
+      }
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr = (stderr + chunk).slice(-512);
+  });
+  child.on('error', (error) => finish({ error: error.message }));
+  child.on('exit', (code) => finish({ error: stderr.trim() || `Context bridge exited ${code}` }));
+  child.stdin.on('error', (error) => finish({ error: error.message }));
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'sail-acp-fixture', version: '1.0' },
+      },
+    })}\n`,
+  );
+}
+
+function reportSessionTasks(server, callback, focusDuration = 1500, onFocus = () => {}) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  const lines = createInterface({ input: child.stdout });
+  const request = (id, name, args) =>
+    child.stdin.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } })}\n`,
+    );
+  let snapshot;
+  let finished = false;
+  const finish = (result) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeout);
+    lines.close();
+    child.kill();
+    callback(result);
+  };
+  const timeout = setTimeout(() => finish('Task reporting timed out'), 20_000);
+  lines.on('line', (line) => {
+    try {
+      const response = JSON.parse(line);
+      if (response.result?.isError || response.error) {
+        finish(`Task reporting failed: ${line}`);
+        return;
+      }
+      if (response.id === 2) {
+        snapshot = JSON.parse(response.result.content[0].text);
+        request(3, 'sail_tasks_report', {
+          turnId: snapshot.turnId,
+          expectedRevision: snapshot.revision,
+          tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'in_progress' }],
+          focus: 'smoke',
+        });
+      } else if (response.id === 3) {
+        onFocus();
+        snapshot = JSON.parse(response.result.content[0].text);
+        setTimeout(
+          () =>
+            request(4, 'sail_tasks_report', {
+              turnId: snapshot.turnId,
+              expectedRevision: snapshot.revision,
+              tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'done' }],
+              focus: null,
+            }),
+          focusDuration,
+        );
+      } else if (response.id === 4) finish('Task reporting passed');
+    } catch (error) {
+      finish(`Task reporting failed: ${String(error)}`);
+    }
+  });
+  child.on('error', (error) => finish(`Task reporting failed: ${String(error)}`));
+  child.stdin.write(
+    `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {} } })}\n`,
+  );
+  setTimeout(() => request(2, 'sail_tasks_read', {}), 1500);
 }
 
 function terminalRequest(method, params, callback) {
@@ -479,6 +621,91 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    const reportingFixture = sessions.get(sessionId);
+    if (text.startsWith('Task reporting fixture:')) {
+      reportingFixture.reportingMode = text.split(': ')[1];
+      const guidance = message.params.prompt.some((part) =>
+        part.text?.startsWith('Sail Tasks: For this turn'),
+      );
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: guidance ? 'Task guidance received.' : 'Task guidance missing.',
+        },
+      });
+      if (reportingFixture.reportingMode === 'interrupted') {
+        send({ id: message.id, result: { stopReason: 'cancelled' } });
+      } else if (reportingFixture.reportingMode === 'failed') {
+        send({ id: message.id, error: { code: -1, message: 'Reporting fixture failed' } });
+      } else {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }
+      continue;
+    }
+    if (text.startsWith('Sail did not receive a successful task report')) {
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'One task correction received.' },
+      });
+      if (reportingFixture.reportingMode === 'recover') {
+        const server = reportingFixture.mcpServers.find((item) => item.name === 'sail-browser');
+        reportSessionTasks(server, (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        });
+      } else send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (
+      text === 'Report session tasks' ||
+      text === 'Report session focus' ||
+      text === 'Report focus then ask'
+    ) {
+      const server = sessions
+        .get(sessionId)
+        .mcpServers.find((item) => item.name === 'sail-browser');
+      reportSessionTasks(
+        server,
+        (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        text === 'Report session tasks' ? 1500 : 12_000,
+        () => {
+          if (text !== 'Report focus then ask') return;
+          const id = ++nextPermission;
+          elicitations.set(id, { sessionId, promptId: message.id });
+          setTimeout(
+            () =>
+              send({
+                id,
+                method: 'elicitation/create',
+                params: {
+                  sessionId,
+                  mode: 'form',
+                  message: 'Choose the delivery approach',
+                  requestedSchema: {
+                    type: 'object',
+                    properties: {
+                      approach: { type: 'string', enum: ['safe', 'fast'], default: 'safe' },
+                    },
+                    required: ['approach'],
+                  },
+                },
+              }),
+            1000,
+          );
+        },
+      );
+      continue;
+    }
     if (text === 'Long owned history') {
       for (let index = 0; index < 80; index++)
         recordUpdate(sessionId, sessionId, {
@@ -1095,6 +1322,28 @@ for await (const line of createInterface({ input: process.stdin })) {
         clearTimeout(timer);
         clearInterval(stream);
       });
+      continue;
+    }
+    if (text === 'Check context provider') {
+      const servers = sessions.get(sessionId).mcpServers;
+      const context = servers.filter((server) => server.args?.[0] === '--context-mcp');
+      const report = (response) => {
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: JSON.stringify({
+              agent,
+              context: context.map(({ name, command, args }) => ({ name, command, args })),
+              browserCount: servers.filter((server) => server.name === 'sail-browser').length,
+              response,
+            }),
+          },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      };
+      if (context.length === 1) callContextProvider(context[0], report);
+      else report({ error: `Expected one context server; received ${context.length}` });
       continue;
     }
     if (text === 'Check tools') {

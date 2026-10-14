@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import process from 'node:process';
@@ -35,14 +37,94 @@ function openCodeBinary() {
   return located.status === 0 && located.stdout.trim() ? located.stdout.trim() : undefined;
 }
 
-function runProbe(binary: string) {
+function runProbe(binary: string, environment: Record<string, string> = {}) {
   const stdout = execFileSync(process.execPath, [probeScript, '--bin', binary, '--json'], {
     encoding: 'utf8',
     timeout: 600_000,
     maxBuffer: 16 * 1024 * 1024,
+    env: {
+      ...process.env,
+      ...environment,
+      PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ''}`,
+    },
   });
   return probeResultSchema.parse(JSON.parse(stdout));
 }
+
+await test(
+  'the probe serves HTTP requests while its client command is running',
+  {
+    skip: process.platform === 'win32' ? 'the fixture requires POSIX executable scripts' : false,
+  },
+  () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'sail-660-probe-test-'));
+    try {
+      const binary = join(scratch, 'fixture-client.mjs');
+      writeFileSync(
+        binary,
+        `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+if (!existsSync(process.env.HOME)) process.exit(1);
+if (process.env.OPENCODE_CONFIG_DIR === ${JSON.stringify(join(scratch, 'inherited-config'))}) process.exit(1);
+if (process.env.OPENCODE_CONFIG || process.env.OPENCODE_CONFIG_CONTENT) process.exit(1);
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('2.0.24');
+} else if (args[0] === 'service') {
+  process.exit(0);
+} else {
+  const config = JSON.parse(readFileSync('opencode.json', 'utf8'));
+  config.mcp ??= { servers: {} };
+  if (args[1] === 'add') {
+    const url = args[args.indexOf('--url') + 1];
+    const headerIndex = args.indexOf('--header');
+    const headers = headerIndex < 0 ? {} : {
+      Authorization: args[headerIndex + 1].slice('Authorization='.length),
+    };
+    const response = await fetch(url, {
+      method: 'POST', headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize' }),
+      signal: AbortSignal.timeout(2000),
+    });
+    if (response.status !== (headers.Authorization ? 200 : 401)) process.exit(1);
+    config.mcp.servers[args[2]] = { type: 'remote', url, headers };
+    writeFileSync('opencode.json', JSON.stringify(config));
+  } else if (args[1] === 'list') {
+    for (const [name, server] of Object.entries(config.mcp.servers)) {
+      const response = await fetch(server.url, {
+        method: 'POST', headers: server.headers,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+        signal: AbortSignal.timeout(2000),
+      });
+      if (response.status === 401) {
+        await fetch(new URL('/.well-known/oauth-authorization-server', server.url), {
+          signal: AbortSignal.timeout(2000),
+        });
+      }
+      console.log(name + (response.status === 200 ? ' connected' : ' needs authentication'));
+    }
+  } else if (args[1] !== 'logout') {
+    process.exit(1);
+  }
+}
+`,
+        { mode: 0o700 },
+      );
+      const result = runProbe(binary, {
+        OPENCODE_CONFIG_DIR: join(scratch, 'inherited-config'),
+        OPENCODE_CONFIG: join(scratch, 'inherited-config.json'),
+        OPENCODE_CONFIG_CONTENT: '{"mcp":{"servers":{"inherited":{}}}}',
+      });
+      assert.equal(result.status, 'complete');
+      assert.deepEqual(
+        result.findings.filter((finding) => !finding.pass).map((finding) => finding.id),
+        [],
+      );
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  },
+);
 
 await test('the pinned OpenCode client registers, replaces, removes, and authenticates remote MCP servers', async (t) => {
   const binary = openCodeBinary();
@@ -73,6 +155,7 @@ await test('the pinned OpenCode client registers, replaces, removes, and authent
     'remove-via-config',
     'authenticate-header',
     'unauthenticated-rejected',
+    'unauthenticated-oauth-discovery',
   ]) {
     assert.ok(byId.has(id), `the probe must report the ${id} finding`);
     assert.equal(byId.get(id)?.pass, true, `the ${id} contract must hold`);

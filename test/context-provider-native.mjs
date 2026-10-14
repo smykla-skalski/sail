@@ -1,20 +1,43 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:net';
-import { join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import process from 'node:process';
 
 const app = process.env.SAIL_E2E_APP;
 const config = process.env.SAIL_E2E_CONFIG_DIR;
 const scratch = process.env.SAIL_TEST_SCRATCH;
+const temporary = process.env.TMPDIR;
 assert.ok(
-  app && config && scratch && process.env.APPLE_SIGNING_IDENTITY,
-  'Set private SAIL_E2E_APP, SAIL_E2E_CONFIG_DIR, SAIL_TEST_SCRATCH, and APPLE_SIGNING_IDENTITY',
+  app && config && scratch && temporary && isAbsolute(temporary),
+  'Set private SAIL_E2E_APP, SAIL_E2E_CONFIG_DIR, SAIL_TEST_SCRATCH, and TMPDIR',
 );
 const binary = join(app, 'Contents', 'MacOS', 'sail');
 const env = { ...process.env, SAIL_E2E_CONFIG_DIR: config };
+for (const key of [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_COMMON_DIR',
+  'OPENCODE_CONFIG_DIR',
+  'OPENCODE_CONFIG',
+  'OPENCODE_CONFIG_CONTENT',
+  'CLAUDE_CONFIG_DIR',
+  'CODEX_HOME',
+])
+  delete env[key];
 const run = (command, args) =>
   execFileSync(command, args, {
     encoding: 'utf8',
@@ -22,12 +45,47 @@ const run = (command, args) =>
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
+for (const directory of [run('getconf', ['DARWIN_USER_TEMP_DIR']), '/tmp']) {
+  const path = relative(realpathSync(directory), realpathSync(app));
+  assert.ok(
+    path === '..' || path.startsWith('../') || isAbsolute(path),
+    'Install SAIL_E2E_APP outside macOS temporary directories; see docs/context-auth-native.md',
+  );
+}
 const signature = spawnSync('codesign', ['-dv', '--verbose=4', app], {
   encoding: 'utf8',
 });
 assert.equal(signature.status, 0, signature.stderr);
 assert.doesNotMatch(signature.stderr, /^Signature=adhoc$/m);
+const signing = (bundle) => {
+  const result = spawnSync('codesign', ['-dv', '--verbose=4', bundle], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  return {
+    team: result.stderr.match(/^TeamIdentifier=(.+)$/m)?.[1],
+    hash: result.stderr.match(/^CDHash=(.+)$/m)?.[1],
+  };
+};
 run('codesign', ['--verify', '--deep', '--strict', app]);
+run('codesign', ['--verify', '-v', '-R', '=anchor apple generic', app]);
+const bundleId = run('plutil', [
+  '-extract',
+  'CFBundleIdentifier',
+  'raw',
+  '-o',
+  '-',
+  join(app, 'Contents/Info.plist'),
+]);
+assert.match(bundleId, /^dev\.smykla\.sail\.e2e\.[a-f0-9]{32}$/);
+const label = `${bundleId}.context-supervisor`;
+const plist = join(app, 'Contents/Library/LaunchAgents', `${label}.plist`);
+for (const [key, value] of [
+  ['SAIL_E2E_CONFIG_DIR', config],
+  ['TMPDIR', temporary],
+])
+  assert.equal(
+    run('plutil', ['-extract', `EnvironmentVariables.${key}`, 'raw', '-o', '-', plist]),
+    value,
+  );
 
 const port = await new Promise((resolve, reject) => {
   const server = createServer();
@@ -41,13 +99,76 @@ const root = mkdtempSync(join(scratch, 'sail-553-native-'));
 const project = join(root, 'project');
 const broken = join(root, 'broken');
 const revoked = join(root, 'revoked');
+const blocked = join(root, 'blocked-input');
 const empty = join(root, 'empty');
+const upgrade = join(root, 'upgrade');
 const provider = join(root, 'provider');
+const upgradeProvider = join(root, 'upgrade-provider');
+const upgradeBundle = join(root, 'upgrade.app');
 const clients = [];
 let appPid;
 
-function makeProject(directory, command) {
+function prepareUpgrade() {
+  const exported = process.env.SAIL_CONTEXT_AUTH_UPGRADE_APP;
+  run('ditto', [exported || app, upgradeBundle]);
+  if (!exported) {
+    assert.ok(
+      process.env.APPLE_SIGNING_IDENTITY,
+      'Signed upgrade requires a signing identity or pre-signed upgrade',
+    );
+    run('plutil', [
+      '-replace',
+      'CFBundleVersion',
+      '-string',
+      '553.2',
+      join(upgradeBundle, 'Contents', 'Info.plist'),
+    ]);
+    run('codesign', [
+      '--force',
+      '--deep',
+      '--options',
+      'runtime',
+      '--sign',
+      process.env.APPLE_SIGNING_IDENTITY,
+      upgradeBundle,
+    ]);
+  }
+  run('codesign', ['--verify', '--deep', '--strict', upgradeBundle]);
+  run('codesign', ['--verify', '-v', '-R', '=anchor apple generic', upgradeBundle]);
+  assert.equal(
+    run('plutil', [
+      '-extract',
+      'CFBundleIdentifier',
+      'raw',
+      '-o',
+      '-',
+      join(upgradeBundle, 'Contents/Info.plist'),
+    ]),
+    bundleId,
+  );
+  const before = signing(app);
+  const after = signing(upgradeBundle);
+  assert.ok(before.team && before.team !== 'not set');
+  assert.equal(after.team, before.team);
+  assert.ok(before.hash && after.hash);
+  assert.notEqual(after.hash, before.hash);
+}
+
+function installUpgrade() {
+  const previous = join(root, 'previous.app');
+  renameSync(app, previous);
+  try {
+    renameSync(upgradeBundle, app);
+  } catch (error) {
+    renameSync(previous, app);
+    throw error;
+  }
+}
+
+function makeProject(directory, command, blockInput = false) {
   mkdirSync(join(directory, '.sail'), { recursive: true });
+  writeFileSync(join(directory, '.sail/strict-provider-lifecycle'), 'require MCP handshake');
+  writeFileSync(join(directory, '.sail/strict-provider-ids'), 'require unique upstream IDs');
   writeFileSync(
     join(directory, '.sail', 'worktree.json'),
     '{"context":{"manifest":".sail/context.json"}}',
@@ -66,7 +187,13 @@ function makeProject(directory, command) {
       ],
     }),
   );
+  if (blockInput)
+    writeFileSync(join(directory, '.sail/block-provider-stdin'), 'block after initialize');
   run('git', ['init', '-q', directory]);
+  assert.equal(
+    run('git', ['-C', directory, 'rev-parse', '--show-toplevel']),
+    realpathSync(directory),
+  );
   run('git', ['-C', directory, 'add', '.sail']);
   run('git', [
     '-C',
@@ -114,19 +241,44 @@ function startClient(directory) {
   return {
     child,
     stderr: () => stderr,
-    request: async (id, method = 'tools/list') => {
-      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method }) + '\n');
-      const line = await Promise.race([
-        new Promise((resolve, reject) => {
-          if (lines.length) resolve(lines.shift());
-          else if (exited) reject(new Error(stderr.trim()));
-          else waiters.push({ resolve, reject });
-        }),
-        delay(30_000).then(() => {
-          throw new Error('Provider response timed out');
-        }),
-      ]);
-      return JSON.parse(line);
+    request: async (id, method = 'tools/list', params, onNotification) => {
+      if (method === 'initialize')
+        params = {
+          protocolVersion: '2025-06-18',
+          capabilities: { roots: { listChanged: true }, sampling: {}, elicitation: {} },
+          clientInfo: { name: 'sail-native-fixture', version: '1.0' },
+        };
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+      const controller = new AbortController();
+      const timeout = delay(30_000, undefined, { signal: controller.signal }).then(() => {
+        throw new Error('Provider response timed out');
+      });
+      const readResponse = () =>
+        Promise.race([
+          new Promise((resolve, reject) => {
+            if (lines.length) resolve(lines.shift());
+            else if (exited) reject(new Error(stderr.trim()));
+            else waiters.push({ resolve, reject });
+          }),
+          timeout,
+        ]).then((line) => {
+          const response = JSON.parse(line);
+          if (response.method && response.id === undefined) {
+            onNotification?.(response);
+            return readResponse();
+          }
+          assert.equal(response.id, id);
+          return response;
+        });
+      return readResponse()
+        .then((response) => {
+          if (method === 'initialize' && response.result)
+            child.stdin.write(
+              JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n',
+            );
+          return response;
+        })
+        .finally(() => controller.abort());
     },
     waitForExit: () =>
       Promise.race([
@@ -165,10 +317,50 @@ async function waitForProcessExit(pid, attempt = 0) {
   return waitForProcessExit(pid, attempt + 1);
 }
 
+async function rejectFailedInitialization(client) {
+  await assert.rejects(client.request(1, 'initialize'), /invalid response/i);
+  await client.waitForExit();
+  assert.match(client.stderr(), /invalid response/i);
+}
+
+async function verifyFailedInitialization(mode) {
+  const malformed = join(root, `initialize-${mode}`);
+  const command = `initialize-${mode}-provider`;
+  console.log(`CHECK: malformed ${mode} initialization and recovery`);
+  makeProject(malformed, command);
+  const marker = join(malformed, '.sail/initialize-response');
+  writeFileSync(marker, mode);
+  assert.equal(
+    run(binary, ['--context-auth-approve-probe', malformed, command, provider]),
+    'approved',
+  );
+  const owner = startClient(malformed);
+  const peer = startClient(malformed);
+  await rejectFailedInitialization(owner);
+  await rejectFailedInitialization(peer);
+  rmSync(marker);
+  const recoveredOwner = startClient(malformed);
+  const recoveredPeer = startClient(malformed);
+  const recovered = await recoveredOwner.request(2, 'initialize');
+  const shared = await recoveredPeer.request(3, 'initialize');
+  assert.ok(recovered.result.pid > 0);
+  assert.equal(shared.result.pid, recovered.result.pid);
+  assert.equal(recovered.result.initializeCount, 1);
+  assert.equal(shared.result.initializeCount, 1);
+  assert.equal((await recoveredPeer.request(4)).result.pid, recovered.result.pid);
+  recoveredOwner.child.stdin.end();
+  recoveredPeer.child.stdin.end();
+  await Promise.all([recoveredOwner.waitForExit(), recoveredPeer.waitForExit()]);
+  await waitForProcessExit(recovered.result.pid);
+}
+
 try {
+  mkdirSync(join(root, 'home'), { recursive: true });
   makeProject(project, 'fixture-provider');
   makeProject(broken, 'broken-provider');
-  makeProject(revoked, 'fixture-provider');
+  makeProject(revoked, 'revoked-provider');
+  makeProject(blocked, 'blocked-provider', true);
+  makeProject(upgrade, 'upgrade-provider');
   mkdirSync(empty);
   run('git', ['init', '-q', empty]);
   run('cc', [
@@ -180,15 +372,28 @@ try {
     join(process.cwd(), 'test', 'fixtures', 'context-provider.c'),
   ]);
   run('codesign', ['--force', '--sign', '-', provider]);
+  copyFileSync(provider, upgradeProvider);
+  run('codesign', ['--force', '--sign', '-', upgradeProvider]);
+  prepareUpgrade();
   run('open', [
     '-n',
     '-g',
     '--env',
+    `HOME=${join(root, 'home')}`,
+    '--env',
     `SAIL_E2E_CONFIG_DIR=${config}`,
+    '--env',
+    `TMPDIR=${temporary}`,
     '--env',
     `TAURI_WEBDRIVER_PORT=${port}`,
     '--env',
     `SAIL_WORKTREE_ROOT=${join(root, 'worktrees')}`,
+    '--env',
+    `SAIL_E2E_BINARY=${binary}`,
+    '--env',
+    `SAIL_ACP_TEST_AGENT=${join(process.cwd(), 'test', 'e2e', 'acp-agent.mjs')}`,
+    '--env',
+    `OPENCODE_CONFIG_DIR=${join(root, 'opencode-config')}`,
     '--env',
     `XDG_CONFIG_HOME=${join(root, 'xdg-config')}`,
     '--env',
@@ -201,24 +406,310 @@ try {
   ]);
   await waitForReady();
   appPid = run('lsof', ['-nP', `-tiTCP:${port}`, '-sTCP:LISTEN']);
+  assert.equal(
+    run('osascript', [
+      '-l',
+      'JavaScript',
+      '-e',
+      'ObjC.import("AppKit"); function run(args) { const url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(args[0]); return ObjC.unwrap(url.path) || ""; }',
+      bundleId,
+    ]),
+    realpathSync(app),
+    'LaunchServices must resolve the installed private bundle before service registration',
+  );
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
     'approved',
   );
+  await verifyFailedInitialization('both');
+  await verifyFailedInitialization('neither');
+  console.log('CHECK: main project forwarding after independent project approvals');
   const first = startClient(project);
   const second = startClient(project);
-  const a = await first.request(1, 'initialize');
-  const b = await second.request(2, 'initialize');
+  const peer = startClient(project);
+  const [a, b, c] = await Promise.all([
+    first.request(1, 'initialize'),
+    second.request(2, 'initialize'),
+    peer.request(11, 'initialize'),
+  ]);
   assert.equal(a.id, 1);
   assert.equal(b.id, 2);
   assert.ok(a.result.pid > 0);
+  assert.equal(a.result.protocolVersion, '2025-06-18');
+  assert.equal(a.result.serverInfo.name, 'sail-fixture');
+  assert.equal(a.result.clientCapabilitiesEmpty, true, 'relay advertises its supported callbacks');
   assert.equal(a.result.pid, b.result.pid, 'one provider process serves both agents');
+  assert.equal(a.result.pid, c.result.pid, 'one provider process serves all three clients');
   assert.equal(a.result.initializeCount, 1);
   assert.equal(b.result.initializeCount, 1, 'second agent reuses the provider handshake');
+  assert.equal(c.result.initializeCount, 1);
+  assert.equal(run(binary, ['--context-auth-replay-probe', project]), 'replay-rejected');
+  assert.equal(
+    (await second.request(30)).result.pid,
+    a.result.pid,
+    'invalid capability preserves the healthy provider',
+  );
+  const forwarded = await Promise.all([first.request(12), second.request(13), peer.request(14)]);
+  for (const response of forwarded) {
+    assert.equal(response.result.pid, a.result.pid);
+    assert.equal(response.result.tools[0].name, 'fixture_ping');
+  }
+  const repeated = await Promise.all([first.request(1), second.request(1), peer.request(1)]);
+  for (const response of repeated) {
+    assert.equal(response.id, 1);
+    assert.equal(response.result.pid, a.result.pid);
+    assert.ok(response.result.tools.length > 0, 'agent request IDs are translated per provider');
+  }
+  const called = await first.request(16, 'tools/call', { name: 'fixture_ping', arguments: {} });
+  assert.equal(called.result.content[0].text, 'fixture reply');
+  assert.equal(called.result.pid, a.result.pid);
+  const changes = [0, 0, 0];
+  const countChange = (index) => (notification) => {
+    if (notification.method === 'notifications/tools/list_changed') changes[index]++;
+  };
+  const changed = await first.request(
+    34,
+    'tools/call',
+    { name: 'fixture_tools_changed', arguments: {} },
+    countChange(0),
+  );
+  assert.equal(changed.result.pid, a.result.pid);
+  await second.request(35, 'tools/list', undefined, countChange(1));
+  await peer.request(36, 'tools/list', undefined, countChange(2));
+  assert.deepEqual(changes, [1, 1, 1], 'active-request tool changes reach all project clients');
+  const pinged = await first.request(17, 'tools/call', {
+    name: 'fixture_server_ping',
+    arguments: {},
+  });
+  assert.equal(pinged.result.pid, a.result.pid);
+  assert.equal(pinged.result.content[0].text, 'fixture reply');
+  const idlePinged = await first.request(31, 'tools/call', {
+    name: 'fixture_idle_ping',
+    arguments: {},
+  });
+  assert.equal(idlePinged.result.pid, a.result.pid);
+  const idleReply = (marker = 'idle-ping-replied') =>
+    readdirSync(config, { withFileTypes: true }).some(
+      (entry) => entry.isDirectory() && existsSync(join(config, entry.name, marker)),
+    );
+  const waitForIdleReply = async (marker, deadline = Date.now() + 5_000) => {
+    if (idleReply(marker)) return;
+    assert.ok(Date.now() < deadline, `Provider idle marker ${marker} did not appear`);
+    await delay(10);
+    return waitForIdleReply(marker, deadline);
+  };
+  await waitForIdleReply('idle-ping-replied');
+  assert.ok(idleReply(), 'provider ping receives a reply while all clients are idle');
+  let progressCount = 0;
+  const progressed = await first.request(
+    32,
+    'tools/call',
+    { name: 'fixture_many_progress', arguments: {}, _meta: { progressToken: 'fixture' } },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/progress');
+      assert.equal(notification.params.progressToken, 'fixture');
+      assert.equal(notification.params.progress, progressCount++);
+    },
+  );
+  assert.equal(progressCount, 160);
+  assert.equal(progressed.result.pid, a.result.pid);
+  let peerProgress = 0;
+  const countPeerProgress = (notification) => {
+    if (notification.method === 'notifications/progress') peerProgress++;
+  };
+  await second.request(37, 'tools/list', undefined, countPeerProgress);
+  await peer.request(38, 'tools/list', undefined, countPeerProgress);
+  assert.equal(peerProgress, 0, 'request progress stays with its requesting client');
+  let idleCount = 0;
+  const idleNotification = (notification) => {
+    assert.equal(notification.method, 'notifications/message');
+    assert.equal(notification.params.data, idleCount++);
+  };
+  const idleProgressed = await first.request(
+    33,
+    'tools/call',
+    { name: 'fixture_idle_progress', arguments: {} },
+    idleNotification,
+  );
+  assert.equal(idleProgressed.result.pid, a.result.pid);
+  await waitForIdleReply('idle-progress-ping-replied');
+  assert.ok(
+    idleReply('idle-progress-ping-replied'),
+    'idle notification bursts drain before the following provider ping',
+  );
+  const afterIdle = await first.request(34, 'tools/list', undefined, idleNotification);
+  assert.equal(idleCount, 160);
+  assert.equal(afterIdle.result.pid, a.result.pid);
+  const cancellationStart = Date.now();
+  let notificationReceived;
+  const notified = new Promise((resolve) => {
+    notificationReceived = resolve;
+  });
+  const waiting = first.request(
+    18,
+    'tools/call',
+    {
+      name: 'fixture_wait_cancel',
+      arguments: {},
+    },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/message');
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      notificationReceived();
+      first.child.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/cancelled',
+          params: { requestId: 18, reason: 'owner' },
+        }) + '\n',
+      );
+    },
+  );
+  await Promise.race([notified, waiting]);
+  const [cancelled, adjacent] = await Promise.all([waiting, second.request(19)]);
+  assert.equal(cancelled.error.code, -32800);
+  assert.equal(adjacent.result.pid, a.result.pid);
+  assert.ok(Date.now() - cancellationStart < 10_000, 'cancellation bypasses the stalled call');
+  const silentStart = Date.now();
+  const silent = await first.request(
+    'silent-cancellation',
+    'tools/call',
+    { name: 'fixture_wait_cancel_no_response', arguments: {} },
+    (notification) => {
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      first.child.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/cancelled',
+          params: { requestId: 'silent-cancellation', reason: 'owner' },
+        }) + '\n',
+      );
+    },
+  );
+  assert.equal(silent.id, 'silent-cancellation');
+  assert.equal(silent.error.code, -32800);
+  assert.equal((await second.request(39)).result.pid, a.result.pid);
+  assert.ok(Date.now() - silentStart < 10_000, 'no-response cancellation preserves the provider');
+  const lateCancelled = await first.request(
+    'late-progress-cancellation',
+    'tools/call',
+    {
+      name: 'fixture_wait_cancel_late_progress',
+      arguments: {},
+      _meta: { progressToken: 'shared-progress' },
+    },
+    (notification) => {
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      first.child.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/cancelled',
+          params: { requestId: 'late-progress-cancellation', reason: 'owner' },
+        }) + '\n',
+      );
+    },
+  );
+  assert.equal(lateCancelled.error.code, -32800);
+  let peerProgressCount = 0;
+  const afterCancellation = await second.request(
+    'progress-after-cancellation',
+    'tools/call',
+    {
+      name: 'fixture_many_progress',
+      arguments: {},
+      _meta: { progressToken: 'shared-progress' },
+    },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/progress');
+      assert.equal(notification.params.progressToken, 'shared-progress');
+      assert.equal(notification.params.progress, peerProgressCount++);
+    },
+  );
+  assert.equal(peerProgressCount, 160, 'the next client receives only its own progress');
+  assert.equal(afterCancellation.result.pid, a.result.pid);
+  const resourceParams = { uri: 'fixture://shared' };
+  await first.request(40, 'resources/subscribe', resourceParams);
+  const updates = [0, 0, 0];
+  const countUpdate = (index) => (notification) => {
+    if (notification.method === 'notifications/resources/updated') {
+      assert.equal(notification.params.uri, resourceParams.uri);
+      updates[index]++;
+    }
+  };
+  await second.request(
+    41,
+    'tools/call',
+    { name: 'fixture_resource_updated', arguments: {} },
+    countUpdate(1),
+  );
+  await first.request(42, 'tools/list', undefined, countUpdate(0));
+  await peer.request(43, 'tools/list', undefined, countUpdate(2));
+  assert.deepEqual(
+    updates,
+    [1, 0, 0],
+    'resource updates reach their subscriber during another call',
+  );
+  await second.request(
+    51,
+    'tools/call',
+    { name: 'fixture_idle_resource_updated', arguments: {} },
+    countUpdate(1),
+  );
+  await delay(100);
+  await first.request(52, 'tools/list', undefined, countUpdate(0));
+  await second.request(53, 'tools/list', undefined, countUpdate(1));
+  await peer.request(54, 'tools/list', undefined, countUpdate(2));
+  assert.deepEqual(updates, [2, 0, 0], 'idle resource updates reach subscribed sessions only');
+  await second.request(44, 'resources/subscribe', resourceParams);
+  await first.request(45, 'resources/unsubscribe', resourceParams);
+  const subscribedPeer = await peer.request(
+    46,
+    'tools/call',
+    { name: 'fixture_resource_updated', arguments: {} },
+    countUpdate(2),
+  );
+  assert.equal(subscribedPeer.result.subscriptions, 1);
+  assert.equal(subscribedPeer.result.unsubscriptions, 0);
+  await first.request(47, 'tools/list', undefined, countUpdate(0));
+  await second.request(48, 'tools/list', undefined, countUpdate(1));
+  assert.deepEqual(updates, [2, 1, 0], 'one subscriber cannot unsubscribe another');
+  await second.request(49, 'resources/unsubscribe', resourceParams);
+  const unsubscribed = await peer.request(50);
+  assert.equal(unsubscribed.result.unsubscriptions, 1);
+  assert.equal(unsubscribed.result.subscribed, false);
+  assert.equal(
+    run(binary, ['--context-auth-approve-probe', blocked, 'blocked-provider', provider]),
+    'approved',
+  );
+  const blockedClient = startClient(blocked);
+  const blockedPeer = startClient(blocked);
+  const blockedPid = (await blockedClient.request(20, 'initialize')).result.pid;
+  assert.equal((await blockedPeer.request(21, 'initialize')).result.pid, blockedPid);
+  const blockedStart = Date.now();
+  const blockedRequest = blockedClient.request(22, 'tools/call', {
+    name: 'fixture_ping',
+    arguments: { payload: 'x'.repeat(900_000) },
+  });
+  blockedClient.child.stdin.write(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId: 22 },
+    }) + '\n',
+  );
+  await assert.rejects(blockedRequest, /cancelled while writing stdin/);
+  await blockedClient.waitForExit();
+  assert.ok(Date.now() - blockedStart < 10_000, 'cancellation interrupts a blocked stdin write');
+  await waitForProcessExit(blockedPid);
+  rmSync(join(blocked, '.sail/block-provider-stdin'));
+  const recoveredPid = (await blockedPeer.request(24)).result.pid;
+  assert.notEqual(recoveredPid, blockedPid);
+  const recovered = startClient(blocked);
+  assert.equal((await recovered.request(23, 'initialize')).result.pid, recoveredPid);
 
   assert.equal(
-    run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),
+    run(binary, ['--context-auth-approve-probe', revoked, 'revoked-provider', provider]),
     'approved',
   );
   const idle = startClient(revoked);
@@ -263,8 +754,7 @@ try {
   ]);
   await assert.rejects(first.request(4));
   await first.waitForExit();
-  await assert.rejects(second.request(5));
-  await second.waitForExit();
+  await waitForProcessExit(a.result.pid);
   assert.match(first.stderr(), /revoked|approval changed/i);
 
   assert.equal(
@@ -272,12 +762,25 @@ try {
     'approved',
   );
   const third = startClient(project);
-  assert.equal((await third.request(6)).id, 6);
+  await third.request(31, 'initialize');
+  const replacementSession = await third.request(6);
+  assert.equal(replacementSession.id, 6);
+  await assert.rejects(second.request(5));
+  await second.waitForExit();
+  assert.equal(
+    (await third.request(32)).result.pid,
+    replacementSession.result.pid,
+    'stale session preserves the reapproved provider',
+  );
+  await assert.rejects(peer.request(15));
+  await peer.waitForExit();
+  assert.equal((await third.request(33)).result.pid, replacementSession.result.pid);
   copyFileSync('/usr/bin/false', join(root, 'replacement'));
   renameSync(join(root, 'replacement'), provider);
   await assert.rejects(third.request(7));
   await third.waitForExit();
   assert.match(third.stderr(), /revoked|approval changed/i);
+  await waitForProcessExit(replacementSession.result.pid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', broken, 'broken-provider', '/usr/bin/false']),
@@ -290,6 +793,65 @@ try {
   const noContext = startClient(empty);
   await noContext.waitForExit();
   assert.match(noContext.stderr(), /approval unavailable/i);
+
+  assert.equal(
+    run(binary, ['--context-auth-approve-probe', upgrade, 'upgrade-provider', upgradeProvider]),
+    'approved',
+  );
+  const upgradeRequest = startClient(upgrade);
+  const upgradeCancellation = startClient(upgrade);
+  const requestInitialization = await upgradeRequest.request('upgrade-request-init', 'initialize');
+  const cancellationInitialization = await upgradeCancellation.request(
+    'upgrade-cancellation-init',
+    'initialize',
+  );
+  assert.equal(cancellationInitialization.result.pid, requestInitialization.result.pid);
+  let waitingForCancellation;
+  const cancellationReady = new Promise((resolve) => {
+    waitingForCancellation = resolve;
+  });
+  const pendingCancellation = upgradeCancellation.request(
+    'upgrade-cancellation',
+    'tools/call',
+    { name: 'fixture_wait_cancel', arguments: {} },
+    (notification) => {
+      assert.equal(notification.method, 'notifications/message');
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      waitingForCancellation();
+    },
+  );
+  await Promise.race([
+    cancellationReady,
+    pendingCancellation.then(() => {
+      throw new Error('Provider cancellation request completed before the upgrade');
+    }),
+  ]);
+  const cancellationRejected = assert.rejects(
+    pendingCancellation,
+    /stale after upgrade|cancellation delivery failed/i,
+  );
+  for (const client of [upgradeRequest, upgradeCancellation])
+    client.child.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') throw error;
+    });
+  installUpgrade();
+  const requestRejected = assert.rejects(
+    upgradeRequest.request('upgrade-request'),
+    /stale after upgrade|signature or path rejected/i,
+  );
+  upgradeCancellation.child.stdin.write(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId: 'upgrade-cancellation', reason: 'signed upgrade' },
+    }) + '\n',
+  );
+  await Promise.all([requestRejected, cancellationRejected]);
+  await Promise.all([upgradeRequest.waitForExit(), upgradeCancellation.waitForExit()]);
+  assert.match(upgradeRequest.stderr(), /stale after upgrade|signature or path rejected/i);
+  assert.match(upgradeCancellation.stderr(), /stale after upgrade|cancellation delivery failed/i);
+  await waitForProcessExit(requestInitialization.result.pid);
+  console.log('PASS: signed upgrade rejects established request and cancellation sessions');
   console.log(
     'PASS: native MCP forwarding, one provider across agents, idle revocation cleanup, failure isolation, no-context',
   );
@@ -298,7 +860,16 @@ try {
   try {
     run(binary, ['--context-auth-unregister-probe']);
   } catch {
-    /* Fixture may not have registered. */
+    console.error('Private provider service unregister failed');
+    process.exitCode = 1;
+  }
+  try {
+    const status = JSON.parse(run(binary, ['--context-auth-service-status-probe']));
+    assert.equal(status.status, 0);
+    assert.equal(status.label, label);
+  } catch {
+    console.error('Private provider service did not confirm unregistered cleanup');
+    process.exitCode = 1;
   }
   if (appPid)
     for (const pid of appPid.split(/\s+/)) {

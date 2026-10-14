@@ -17,6 +17,18 @@ and disabled tools are rejected even if called from stale schema context. Do not
 work around a missing tool. Permission prompts include Sail's risk classification,
 reason, and policy revision; unknown and high-risk actions require a person.
 
+## Session tasks
+
+- Each turn starts with a Sail starting task. Read `sail_tasks_read` at the start
+  of work, then call `sail_tasks_report` to describe routine tasks and progress.
+- Use stable task IDs within the turn and statuses `pending`, `in_progress`,
+  `done`, `blocked`, or `skipped`. Report updates as work changes.
+- Pass the current `turnId` and `expectedRevision` from the latest snapshot.
+  After a stale error, read again before retrying. Task scope comes from your
+  session; never send another session's work.
+- Set `focus` to the ID of your current `in_progress` task, or `null` when no
+  task is active. Tasks track routine work alongside formal plan review.
+
 ## Workflow references
 
 - Bundled workflow prompts contain the core contract only. When that contract

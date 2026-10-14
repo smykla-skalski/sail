@@ -386,6 +386,7 @@ describe('visual layout audit', () => {
     await capture('desktop-agent-conversation');
     writeFileSync(join(worktree, 'visual-change.txt'), 'Changed during audit\n');
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
     await expect($('.diff-files')).toHaveText(expect.stringContaining('visual-change.txt'));
     await capture('desktop-agent-changes');
     await openSettings();

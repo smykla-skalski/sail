@@ -31,6 +31,7 @@ impl ToolError {
     }
 }
 
+#[derive(Clone)]
 pub struct BrokerMcp {
     provider: String,
     scope: OutputScope,

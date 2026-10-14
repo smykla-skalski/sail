@@ -1,0 +1,192 @@
+[
+  {
+    "path": "main-tasks-light-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "main-tasks-light-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "main-tasks-dark-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "main-tasks-dark-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "main-agents-light-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "main-agents-light-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "main-agents-dark-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "main-agents-dark-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "overview-light-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "overview-light-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "overview-dark-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "overview-dark-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "split-tasks-light-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "split-tasks-light-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "split-tasks-dark-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "split-tasks-dark-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "split-agents-light-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "split-agents-light-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  },
+  {
+    "path": "split-agents-dark-2560x1098.png",
+    "pixels": {
+      "width": 5120,
+      "height": 2260
+    },
+    "runtime": {
+      "dpr": 2,
+      "innerHeight": 1098,
+      "innerWidth": 2560,
+      "screenHeight": 1169,
+      "screenWidth": 1800,
+      "scrollWidth": 2560,
+      "zoom": "1"
+    },
+    "measurement": "browser.execute(() => ({innerWidth, innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, scrollWidth: document.documentElement.scrollWidth, zoom: getComputedStyle(document.documentElement).zoom}))",
+    "sourceFile": "split-agents-dark-requested-2560.png",
+    "capturedRevision": "02ba67b887395d00becdeba099975f1c808076a6"
+  }
+]

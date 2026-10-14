@@ -525,6 +525,18 @@ button:disabled {
   color: var(--sui-primary);
   font-size: var(--type-12);
 }
+.project-worktree-cleanup-pending {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 8px 8px 45px;
+  overflow-wrap: anywhere;
+  color: var(--sui-muted);
+  font-size: var(--type-12);
+}
+.project-worktree-cleanup-pending .project-worktree-retry {
+  align-self: flex-start;
+}
 .project-worktree-spinner {
   width: 12px;
   height: 12px;
@@ -1632,9 +1644,16 @@ time {
 }
 .native-details > .diff-panel,
 .native-details > .history-panel,
-.native-details > .plan-panel {
+.native-details > .plan-panel,
+.native-details > .tasks-view {
   flex: 1;
   min-height: 0;
+}
+.tasks-view {
+  overflow: auto;
+}
+.tasks-view:focus-visible {
+  box-shadow: inset 3px 0 var(--sui-muted);
 }
 .side-tabs-list {
   display: contents;
@@ -2919,6 +2938,10 @@ time {
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.confirmation-dialog p.multi {
+  max-height: 50vh;
+  overflow-y: auto;
 }
 .confirmation-actions,
 .path-picker-actions,

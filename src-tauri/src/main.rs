@@ -6,6 +6,17 @@ fn main() {
         sail_lib::exec_with_scratch_owner();
     }
     #[cfg(all(target_os = "macos", feature = "e2e"))]
+    if std::env::args().nth(1).as_deref() == Some("--context-auth-service-status-probe") {
+        match sail_lib::context::probe_e2e_service_status() {
+            Ok(status) => println!("{status}"),
+            Err(error) => {
+                eprintln!("status: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    #[cfg(all(target_os = "macos", feature = "e2e"))]
     if std::env::args().nth(1).as_deref() == Some("--context-auth-replay-probe") {
         let Some(directory) = std::env::args().nth(2) else {
             std::process::exit(64);

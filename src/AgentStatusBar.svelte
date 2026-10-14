@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import ActivityStatus from './ActivityStatus.svelte';
+  import AgentFocus from './AgentFocus.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
   import { agentStatusCounts, resetLabel, type AgentStatusItem } from './lib/agent-status';
 
@@ -107,7 +108,8 @@
               ><HarnessIcon agent={item.agent} /><strong>{item.agentName}</strong></span
             >
             <span class="agent-status-task"
-              ><strong>{item.title}</strong><small>{item.location}</small></span
+              ><strong>{item.title}</strong><small>{item.location}</small>
+              {#if item.focus}<AgentFocus focus={item.focus} />{/if}</span
             >
             <span class="agent-status-metrics">
               <ActivityStatus status={item.status} compact />

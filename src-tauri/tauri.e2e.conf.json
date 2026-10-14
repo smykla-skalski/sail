@@ -4,6 +4,11 @@
   "build": {
     "beforeBuildCommand": "npm run build -- --mode e2e"
   },
+  "bundle": {
+    "macOS": {
+      "entitlements": "./Entitlements.e2e.plist"
+    }
+  },
   "app": {
     "withGlobalTauri": true,
     "security": {
@@ -30,6 +35,8 @@
             "wdio:default",
             "wdio-webdriver:default",
             "core:window:allow-set-theme",
+            "core:window:allow-is-visible",
+            "core:path:allow-resolve-directory",
             "allow-acp-reset-test-runtimes",
             "allow-reset-test-settings"
           ]
