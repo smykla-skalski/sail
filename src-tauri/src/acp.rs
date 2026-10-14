@@ -382,10 +382,10 @@ impl AgentWorktreeFence {
         {
             return Err("An agent session is starting in this worktree.".into());
         }
-        let active = agents.active_sessions_in(directory)?;
+        let active = agents.sessions_blocking_cleanup_in(directory)?;
         if !stop_agents && !active.is_empty() {
             return Err(format!(
-                "Worktree has active agent sessions: {}.",
+                "Worktree has connected agent sessions: {}.",
                 active
                     .iter()
                     .map(|(agent, _, session)| format!("{agent}:{session}"))
@@ -1948,7 +1948,7 @@ impl AgentManager {
         result
     }
 
-    fn active_sessions_in(
+    pub(crate) fn active_sessions_in(
         &self,
         directory: &Path,
     ) -> Result<Vec<(String, PathBuf, String)>, String> {
@@ -1993,6 +1993,29 @@ impl AgentManager {
         active.sort();
         active.dedup();
         Ok(active)
+    }
+
+    pub(crate) fn sessions_blocking_cleanup_in(
+        &self,
+        directory: &Path,
+    ) -> Result<Vec<(String, PathBuf, String)>, String> {
+        let mut sessions = self.active_sessions_in(directory)?;
+        let agents = self.0.lock().map_err(|error| error.to_string())?;
+        for (key, runtime) in agents.iter() {
+            let directories = runtime
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?;
+            sessions.extend(
+                directories
+                    .iter()
+                    .filter(|(_, path)| crate::acp_terminal::worktree_contains(directory, path))
+                    .map(|(session, _)| (key.agent.clone(), key.worktree.clone(), session.clone())),
+            );
+        }
+        sessions.sort();
+        sessions.dedup();
+        Ok(sessions)
     }
 
     fn native_subagent_snapshots(
@@ -7114,7 +7137,10 @@ mod session_config_tests {
 
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 2 & wait; exec sleep 10"])
+            .args([
+                "-c",
+                "sleep 30 & worker=$!; read signal; kill \"$worker\"; wait \"$worker\" 2>/dev/null; exec sleep 10",
+            ])
             .stdin(Stdio::piped());
         unsafe {
             command.pre_exec(|| {
@@ -7145,6 +7171,7 @@ mod session_config_tests {
         start_temp_cleanup_watcher(&runtime).unwrap();
         runtime.clear_idle_temp(true).unwrap();
         assert!(artifact.exists());
+        runtime.input.lock().unwrap().write_all(b"\n").unwrap();
 
         for _ in 0..100 {
             if !artifact.exists() {
@@ -7491,7 +7518,7 @@ time.sleep(10)
     }
 
     #[cfg(unix)]
-    fn test_runtime(
+    pub(super) fn test_runtime(
         agent: &str,
         profile: CapabilityProfile,
         worktree: &Path,
@@ -8833,6 +8860,13 @@ mod native_subagent_fence_tests {
     #[cfg(unix)]
     #[test]
     fn active_opencode_turn_blocks_worktree_cleanup() {
+        use std::fs;
+
+        let directory =
+            std::env::temp_dir().join(format!("sail-active-turn-cleanup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).expect("create worktree fixture");
+        let marker = directory.join("keep.txt");
+        fs::write(&marker, b"active session data").expect("write worktree marker");
         let mut child = spawn_test_session_process();
         let input = child.stdin.take().expect("placeholder agent stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
@@ -8840,7 +8874,7 @@ mod native_subagent_fence_tests {
         let runtime = Arc::new(Connection {
             agent: "opencode".into(),
             profile: CapabilityProfile::Build,
-            worktree: PathBuf::from("/worktree"),
+            worktree: directory.clone(),
             owner: None,
             #[cfg(unix)]
             shared_build_directory: None,
@@ -8877,7 +8911,6 @@ mod native_subagent_fence_tests {
             ready: Condvar::new(),
             _owned_temp: None,
         });
-        let directory = PathBuf::from("/worktree");
         runtime
             .session_directories
             .lock()
@@ -8897,7 +8930,7 @@ mod native_subagent_fence_tests {
         );
         let agents = AgentManager::default();
         agents.0.lock().unwrap().insert(
-            connection_key("opencode", CapabilityProfile::Build, Path::new("/worktree")),
+            connection_key("opencode", CapabilityProfile::Build, &directory),
             runtime,
         );
         let mut cleaned = false;
@@ -8905,15 +8938,69 @@ mod native_subagent_fence_tests {
         let error = AgentWorktreeFence::default()
             .cleanup(&agents, &directory, None, false, || {
                 cleaned = true;
+                fs::remove_dir_all(&directory).expect("remove selected worktree");
                 Ok(())
             })
             .expect_err("an active OpenCode turn must block worktree removal");
 
         assert_eq!(
             error,
-            "Worktree has active agent sessions: opencode:ses_open."
+            "Worktree has connected agent sessions: opencode:ses_open."
         );
         assert!(!cleaned);
+        assert_eq!(
+            fs::read(&marker).expect("active worktree must remain"),
+            b"active session data"
+        );
+        fs::remove_dir_all(directory).expect("remove worktree fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_idle_session_blocks_worktree_cleanup() {
+        let directory = std::env::temp_dir().join(format!(
+            "sail-idle-session-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).expect("create worktree fixture");
+        let marker = directory.join("keep.txt");
+        std::fs::write(&marker, b"idle session data").expect("write worktree marker");
+        let runtime = super::session_config_tests::test_runtime(
+            "opencode",
+            CapabilityProfile::Build,
+            &directory,
+            "ses_idle",
+            None,
+        );
+        let agents = AgentManager::default();
+        agents.0.lock().unwrap().insert(
+            connection_key("opencode", CapabilityProfile::Build, &directory),
+            runtime,
+        );
+        assert!(agents.active_sessions_in(&directory).unwrap().is_empty());
+        assert_eq!(
+            agents
+                .sessions_blocking_cleanup_in(&directory)
+                .unwrap()
+                .len(),
+            1
+        );
+        let error = AgentWorktreeFence::default()
+            .cleanup(&agents, &directory, None, false, || {
+                std::fs::remove_dir_all(&directory).expect("remove selected worktree");
+                Ok(())
+            })
+            .expect_err("connected idle session must block cleanup");
+        assert_eq!(
+            error,
+            "Worktree has connected agent sessions: opencode:ses_idle."
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("idle worktree must remain"),
+            b"idle session data"
+        );
+        agents.stop_worktree(&directory).unwrap();
+        std::fs::remove_dir_all(directory).expect("remove worktree fixture");
     }
 
     #[test]

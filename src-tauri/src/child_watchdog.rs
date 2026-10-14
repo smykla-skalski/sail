@@ -84,6 +84,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         watchdog.stop();
+        let group_deadline = Instant::now() + Duration::from_secs(3);
+        while !matches!(
+            nix::sys::signal::killpg(group, None),
+            Err(nix::errno::Errno::ESRCH)
+        ) && Instant::now() < group_deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(matches!(
             nix::sys::signal::killpg(group, None),
             Err(nix::errno::Errno::ESRCH)

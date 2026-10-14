@@ -573,27 +573,6 @@ export function shipGatesSettled(issue: ShipIssue): boolean {
   return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
 }
 
-export function shipCleanupRequest(
-  repository: string,
-  issue: ShipIssue,
-  currentRevision: string | undefined,
-) {
-  if (!issue.path) throw new Error('Ship cleanup requires a worktree.');
-  if (!shipEvidenceReadiness(issue).ready)
-    throw new Error('Ship cleanup requires complete revision-bound evidence.');
-  const expectedRevision =
-    issue.validationPolicy?.revision ?? issue.checkpoint?.revision ?? currentRevision;
-  if (!expectedRevision) throw new Error('Ship cleanup requires a verified worktree revision.');
-  return {
-    repository,
-    worktree: issue.path,
-    force: false,
-    archiveIgnored: true,
-    expectedRevision,
-    expectedBranch: issue.branch,
-  };
-}
-
 export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
   if (!issue.checkpoint)
     return {
