@@ -4874,17 +4874,16 @@ impl AgentManager {
     }
 }
 
-/// Sweeps for idle sessions for the life of the app.
+/// Sweeps for idle sessions for the life of the app. A tick only scans in-memory state.
 pub fn start_idle_session_sweeper(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("sail-idle-session-sweep".into())
         .spawn(move || loop {
-            let idle = crate::acp_idle::idle_timeout();
-            let pause = idle.map_or(Duration::from_secs(30), |idle| {
-                (idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(30))
-            });
-            std::thread::sleep(pause);
-            let (Some(idle), Some(manager)) = (idle, app.try_state::<AgentManager>()) else {
+            std::thread::sleep(Duration::from_secs(1));
+            let (Some(idle), Some(manager)) = (
+                crate::acp_idle::idle_timeout(),
+                app.try_state::<AgentManager>(),
+            ) else {
                 continue;
             };
             manager.close_idle_sessions(&app, idle);
