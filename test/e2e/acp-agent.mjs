@@ -164,7 +164,10 @@ function callContextProvider(server, callback) {
     child.kill();
     callback(result);
   };
-  const timer = setTimeout(() => finish({ error: 'Context provider timed out' }), 15_000);
+  let timer = setTimeout(
+    () => finish({ error: 'Context provider initialization timed out' }),
+    30_000,
+  );
   child.stdout.on('data', (chunk) => {
     output += chunk;
     let index;
@@ -179,6 +182,11 @@ function callContextProvider(server, callback) {
             continue;
           }
           initialized = true;
+          clearTimeout(timer);
+          timer = setTimeout(
+            () => finish({ error: 'Context provider tool discovery timed out' }),
+            30_000,
+          );
           child.stdin.write(
             `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`,
           );

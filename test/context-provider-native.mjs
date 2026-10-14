@@ -257,11 +257,13 @@ async function rejectFailedInitialization(client) {
 
 async function verifyFailedInitialization(mode) {
   const malformed = join(root, `initialize-${mode}`);
-  makeProject(malformed, 'fixture-provider');
+  const command = `initialize-${mode}-provider`;
+  console.log(`CHECK: malformed ${mode} initialization and recovery`);
+  makeProject(malformed, command);
   const marker = join(malformed, '.sail/initialize-response');
   writeFileSync(marker, mode);
   assert.equal(
-    run(binary, ['--context-auth-approve-probe', malformed, 'fixture-provider', provider]),
+    run(binary, ['--context-auth-approve-probe', malformed, command, provider]),
     'approved',
   );
   const owner = startClient(malformed);
@@ -288,8 +290,8 @@ try {
   mkdirSync(join(root, 'home'), { recursive: true });
   makeProject(project, 'fixture-provider');
   makeProject(broken, 'broken-provider');
-  makeProject(revoked, 'fixture-provider');
-  makeProject(blocked, 'fixture-provider', true);
+  makeProject(revoked, 'revoked-provider');
+  makeProject(blocked, 'blocked-provider', true);
   mkdirSync(empty);
   run('git', ['init', '-q', empty]);
   run('cc', [
@@ -350,6 +352,7 @@ try {
   );
   await verifyFailedInitialization('both');
   await verifyFailedInitialization('neither');
+  console.log('CHECK: main project forwarding after independent project approvals');
   const first = startClient(project);
   const second = startClient(project);
   const peer = startClient(project);
@@ -602,7 +605,7 @@ try {
   assert.equal(unsubscribed.result.unsubscriptions, 1);
   assert.equal(unsubscribed.result.subscribed, false);
   assert.equal(
-    run(binary, ['--context-auth-approve-probe', blocked, 'fixture-provider', provider]),
+    run(binary, ['--context-auth-approve-probe', blocked, 'blocked-provider', provider]),
     'approved',
   );
   const blockedClient = startClient(blocked);
@@ -632,7 +635,7 @@ try {
   assert.equal((await recovered.request(23, 'initialize')).result.pid, recoveredPid);
 
   assert.equal(
-    run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),
+    run(binary, ['--context-auth-approve-probe', revoked, 'revoked-provider', provider]),
     'approved',
   );
   const idle = startClient(revoked);
