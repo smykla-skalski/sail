@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -187,6 +187,12 @@ struct GuardedSession {
 #[derive(Clone, Default)]
 pub struct AgentWorktreeFence(Arc<Mutex<WorktreeFenceState>>);
 
+#[derive(Clone, Copy)]
+enum WorktreeFenceOperation {
+    Cleanup { stop_agents: bool },
+    Promotion,
+}
+
 impl AgentWorktreeFence {
     #[cfg(test)]
     fn record_native_update(&self, directory: &Path) -> Result<(), String> {
@@ -363,6 +369,42 @@ impl AgentWorktreeFence {
         stop_agents: bool,
         cleanup: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
+        self.with_operation(
+            agents,
+            directory,
+            expected_generation,
+            WorktreeFenceOperation::Cleanup { stop_agents },
+            cleanup,
+        )
+    }
+
+    fn promote<T>(
+        &self,
+        agents: &AgentManager,
+        directory: &Path,
+        promote: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_operation(
+            agents,
+            directory,
+            None,
+            WorktreeFenceOperation::Promotion,
+            promote,
+        )
+    }
+
+    fn with_operation<T>(
+        &self,
+        agents: &AgentManager,
+        directory: &Path,
+        expected_generation: Option<u64>,
+        operation: WorktreeFenceOperation,
+        cleanup: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let stop_agents = matches!(
+            operation,
+            WorktreeFenceOperation::Cleanup { stop_agents: true }
+        );
         let mut state = self.0.lock().map_err(|error| error.to_string())?;
         let generation = state
             .generations
@@ -382,10 +424,15 @@ impl AgentWorktreeFence {
         {
             return Err("An agent session is starting in this worktree.".into());
         }
-        let active = agents.sessions_blocking_cleanup_in(directory)?;
+        let (active, session_kind) = match operation {
+            WorktreeFenceOperation::Cleanup { .. } => {
+                (agents.sessions_blocking_cleanup_in(directory)?, "connected")
+            }
+            WorktreeFenceOperation::Promotion => (agents.active_sessions_in(directory)?, "active"),
+        };
         if !stop_agents && !active.is_empty() {
             return Err(format!(
-                "Worktree has connected agent sessions: {}.",
+                "Worktree has {session_kind} agent sessions: {}.",
                 active
                     .iter()
                     .map(|(agent, _, session)| format!("{agent}:{session}"))
@@ -437,7 +484,7 @@ pub(crate) fn promote_idle_worktree(app: &AppHandle, worktree: &Path) -> Result<
             }
             let fence = app.state::<AgentWorktreeFence>();
             let agents = app.state::<AgentManager>();
-            fence.cleanup(&agents, worktree, None, false, || {
+            fence.promote(&agents, worktree, || {
                 let cache = app
                     .path()
                     .app_cache_dir()
@@ -464,6 +511,7 @@ struct Connection {
     owner: Option<String>,
     #[cfg(unix)]
     shared_build_directory: Option<PathBuf>,
+    codex_workspace_access: Option<CodexWorkspaceAccess>,
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
@@ -501,19 +549,23 @@ struct Connection {
     _owned_temp: Option<OwnedTempDir>,
 }
 
-struct OwnedTempDir(PathBuf);
+struct OwnedTempDir(PathBuf, crate::WorktreeDirectoryIdentity);
 
 impl OwnedTempDir {
     fn create() -> Result<Self, String> {
         let path = std::env::temp_dir().join(format!("sail-codex-{}", Uuid::new_v4()));
         std::fs::create_dir(&path).map_err(|error| error.to_string())?;
-        Ok(Self(path))
+        let identity =
+            crate::worktree_directory_identity(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path, identity))
     }
 }
 
 impl Drop for OwnedTempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if crate::worktree_directory_identity(&self.0).is_ok_and(|identity| identity == self.1) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -560,6 +612,21 @@ struct SessionUiState {
 }
 
 impl Connection {
+    fn validate_codex_workspace(&self, cwd: Option<&str>) -> Result<(), String> {
+        let Some(access) = &self.codex_workspace_access else {
+            return Ok(());
+        };
+        if let Err(error) = access.validate(cwd) {
+            if let Err(stop_error) = self.terminate() {
+                return Err(format!(
+                    "{error} Agent shutdown requires recovery: {stop_error}"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn remember_session_ui(&self, session_id: &str, source: &Value) -> Result<(), String> {
         let config_options = source.get("configOptions").filter(|value| value.is_array());
         let available_commands = source
@@ -712,40 +779,227 @@ fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]
     params
 }
 
-fn codex_overlay_profile_config(
-    scope: &Path,
-    overlay: &crate::git_overlay::GitOverlay,
-    temp: &Path,
-    extra_writable: &[PathBuf],
-) -> Result<String, String> {
-    let mut writable = vec![
-        scope.to_path_buf(),
-        overlay.git_dir.clone(),
-        temp.to_path_buf(),
-    ];
-    writable.extend_from_slice(extra_writable);
-    let mut rules = vec![
-        "\":tmpdir\"=\"read\"".to_string(),
-        "\":slash_tmp\"=\"read\"".to_string(),
-    ];
-    for path in writable {
-        let key =
-            serde_json::to_string(&path.to_string_lossy()).map_err(|error| error.to_string())?;
-        rules.push(format!("{key}=\"write\""));
-    }
-    serde_json::to_string(&json!({
-        "configOverrides": [
-            "default_permissions=\"sail-agent\"",
-            "permissions.sail-read-only={extends=\":read-only\"}",
-            format!("permissions.sail-agent={{extends=\":workspace\",filesystem={{{}}}}}", rules.join(","))
-        ],
-        "modeProfiles": {
-            "read-only": "sail-read-only",
-            "agent": "sail-agent",
-            "agent-full-access": "sail-agent"
+#[cfg(windows)]
+fn windows_directory_owned_by_current_user(path: &Path) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        READ_CONTROL,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct SecurityDescriptor(HLOCAL);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
         }
-    }))
-    .map_err(|error| error.to_string())
+    }
+
+    fn token_information(
+        token: HANDLE,
+        class: TOKEN_INFORMATION_CLASS,
+    ) -> Result<Vec<usize>, String> {
+        let mut length = 0;
+        unsafe {
+            GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut length);
+        }
+        if length == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut buffer = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(buffer)
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(crate::extended_windows_path(path))
+        .map_err(|error| error.to_string())?;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32).to_string());
+    }
+    let _descriptor = SecurityDescriptor(descriptor);
+    if owner.is_null() {
+        return Err("Assigned directory has no verifiable owner SID.".into());
+    }
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let user_info = token_information(token.as_raw_handle(), TokenUser)?;
+    let user = unsafe { &*user_info.as_ptr().cast::<TOKEN_USER>() };
+    if unsafe { EqualSid(owner, user.User.Sid) } != 0 {
+        return Ok(true);
+    }
+    // Elevated processes create directories with their token's default owner SID.
+    let owner_info = token_information(token.as_raw_handle(), TokenOwner)?;
+    let default_owner = unsafe { &*owner_info.as_ptr().cast::<TOKEN_OWNER>() };
+    Ok(unsafe { EqualSid(owner, default_owner.Owner) } != 0)
+}
+
+#[derive(Debug)]
+struct WritableDirectory {
+    path: PathBuf,
+    identity: crate::WorktreeDirectoryIdentity,
+}
+
+impl WritableDirectory {
+    fn capture(path: &Path) -> Result<Self, String> {
+        let canonical = dunce::canonicalize(path).map_err(|error| {
+            format!(
+                "Assigned workspace access unavailable at {}: {error}",
+                path.display()
+            )
+        })?;
+        let metadata = std::fs::metadata(&canonical).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "Assigned workspace access requires a directory: {}",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { nix::libc::geteuid() } {
+                return Err(format!(
+                    "Assigned workspace directory is not owned by this user: {}",
+                    path.display()
+                ));
+            }
+        }
+        #[cfg(windows)]
+        if !windows_directory_owned_by_current_user(&canonical).map_err(|error| {
+            format!(
+                "Cannot verify assigned workspace owner at {}: {error}",
+                path.display()
+            )
+        })? {
+            return Err(format!(
+                "Assigned workspace directory is not owned by this user: {}",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            identity: crate::worktree_directory_identity(&canonical)
+                .map_err(|error| format!("Cannot inspect assigned workspace identity: {error}"))?,
+            path: canonical,
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let current = Self::capture(&self.path)?;
+        if current.path != self.path || current.identity != self.identity {
+            return Err(format!("Assigned workspace directory was replaced: {}. Reopen the thread after restoring its assigned location.", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CodexWorkspaceAccess {
+    directories: Vec<WritableDirectory>,
+}
+
+impl CodexWorkspaceAccess {
+    fn capture(scope: &Path, extra_writable: &[PathBuf]) -> Result<Self, String> {
+        let mut directories = vec![WritableDirectory::capture(scope)?];
+        for path in extra_writable {
+            if std::fs::symlink_metadata(path)
+                .map_err(|error| format!("Cannot inspect owned writable directory: {error}"))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(format!(
+                    "Owned writable directory was replaced by a symlink: {}",
+                    path.display()
+                ));
+            }
+            let directory = WritableDirectory::capture(path)?;
+            if !directories
+                .iter()
+                .any(|current| current.path == directory.path)
+            {
+                directories.push(directory);
+            }
+        }
+        Ok(Self { directories })
+    }
+
+    fn validate(&self, cwd: Option<&str>) -> Result<(), String> {
+        for directory in &self.directories {
+            directory.validate()?;
+        }
+        if let Some(cwd) = cwd {
+            let cwd = dunce::canonicalize(cwd)
+                .map_err(|error| format!("Assigned session directory is unavailable: {error}"))?;
+            if !cwd.starts_with(&self.directories[0].path) {
+                return Err("Session directory is outside its assigned workspace. Start a new agent in that location.".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn profile_config(&self) -> Result<String, String> {
+        self.validate(None)?;
+        let mut rules = Vec::new();
+        for directory in &self.directories {
+            let path = directory
+                .path
+                .to_str()
+                .ok_or("Assigned workspace path is not valid UTF-8.")?;
+            let key = serde_json::to_string(path).map_err(|error| error.to_string())?;
+            rules.push(format!("{key}=\"write\""));
+        }
+        serde_json::to_string(&json!({
+            "configOverrides": [
+                "default_permissions=\"sail-agent\"",
+                "permissions.sail-read-only={extends=\":read-only\"}",
+                format!("permissions.sail-agent={{extends=\":read-only\",filesystem={{{}}}}}", rules.join(","))
+            ],
+            "modeProfiles": {
+                "read-only": "sail-read-only",
+                "agent": "sail-agent",
+                "agent-full-access": "sail-agent"
+            }
+        })).map_err(|error| error.to_string())
+    }
 }
 
 fn session_servers(browser: Value) -> Vec<Value> {
@@ -1493,6 +1747,10 @@ impl Connection {
         write_message: impl FnOnce(&Value) -> Result<(), String>,
         after_write: impl FnOnce(),
     ) -> Result<PendingResponse, String> {
+        if method.starts_with("session/") || method.starts_with("_session/") {
+            self.validate_codex_workspace(params.get("cwd").and_then(Value::as_str))?;
+        }
+
         if !self.alive.load(Ordering::Acquire) {
             return Err("Agent process stopped. Reopen the thread to reconnect.".into());
         }
@@ -1844,9 +2102,22 @@ fn retryable_process_cleanup_sessions(
 pub struct AgentManager(
     Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>,
     Arc<Mutex<ForgetGenerations>>,
+    Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
+    Arc<AtomicU64>,
 );
 
 impl AgentManager {
+    fn worktree_startup(&self, worktree: &Path) -> Result<Arc<Mutex<()>>, String> {
+        let mut startups = self.2.lock().map_err(|error| error.to_string())?;
+        startups.retain(|_, startup| startup.strong_count() > 0);
+        if let Some(startup) = startups.get(worktree).and_then(Weak::upgrade) {
+            return Ok(startup);
+        }
+        let startup = Arc::new(Mutex::new(()));
+        startups.insert(worktree.to_path_buf(), Arc::downgrade(&startup));
+        Ok(startup)
+    }
+
     pub fn retry_turn_temp_cleanup(&self, app: &AppHandle) {
         let connections = self
             .0
@@ -2031,15 +2302,21 @@ impl AgentManager {
         &self,
         directory: &Path,
     ) -> Result<Vec<NativeSubagentSnapshot>, String> {
-        let agents = self.0.lock().map_err(|error| error.to_string())?;
+        let agents = self
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut snapshots = Vec::new();
-        for (key, runtime) in agents.iter() {
+        for runtime in &agents {
             snapshots.extend(
                 runtime
                     .native_subagents
                     .lock()
                     .map_err(|error| error.to_string())?
-                    .snapshots(&key.agent, key.profile, directory),
+                    .snapshots(&runtime.agent, runtime.profile, directory),
             );
         }
         snapshots.sort_by(|left, right| {
@@ -2083,6 +2360,7 @@ impl AgentManager {
             .lock()
             .ok()
             .map(|mut agents| {
+                self.3.fetch_add(1, Ordering::AcqRel);
                 agents
                     .drain()
                     .map(|(_, runtime)| runtime)
@@ -2096,6 +2374,8 @@ impl AgentManager {
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
         let worktree = worktree_identity(worktree);
+        let startup = self.worktree_startup(&worktree)?;
+        let _startup = startup.lock().map_err(|error| error.to_string())?;
         let keys = self
             .0
             .lock()
@@ -2127,6 +2407,8 @@ impl AgentManager {
     fn stop_owner(&self, worktree: &Path, owner: &str) -> Result<(), String> {
         Uuid::parse_str(owner).map_err(|_| "Invalid agent run owner ID.")?;
         let worktree = worktree_identity(worktree);
+        let startup = self.worktree_startup(&worktree)?;
+        let _startup = startup.lock().map_err(|error| error.to_string())?;
         let runtimes = self
             .0
             .lock()
@@ -3493,12 +3775,15 @@ pub async fn acp_activity(
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let worktree = worktree_identity(Path::new(&directory));
-        let agents = manager.0.lock().map_err(|error| error.to_string())?;
-        let mut activity = HashMap::<String, AgentActivity>::new();
-        for runtime in agents
+        let agents = manager
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
             .values()
-            .filter(|runtime| runtime.worktree == worktree)
-        {
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut activity = HashMap::<String, AgentActivity>::new();
+        for runtime in agents.iter().filter(|runtime| runtime.worktree == worktree) {
             let prompts = runtime
                 .prompt_state
                 .lock()
@@ -3527,93 +3812,110 @@ pub async fn acp_activity(
 }
 
 #[tauri::command]
-pub fn acp_native_subagents(
+pub async fn acp_native_subagents(
     manager: State<'_, AgentManager>,
     fence: State<'_, AgentWorktreeFence>,
     directory: String,
 ) -> Result<NativeSubagentSnapshotSet, String> {
-    let directory = PathBuf::from(directory);
-    let state = fence.0.lock().map_err(|error| error.to_string())?;
-    let generation = state
-        .generations
-        .get(&directory)
-        .copied()
-        .unwrap_or_default();
-    let subagents = manager.native_subagent_snapshots(&directory)?;
-    Ok(NativeSubagentSnapshotSet {
-        generation,
-        subagents,
+    let manager = manager.inner().clone();
+    let fence = fence.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = PathBuf::from(directory);
+        let state = fence.0.lock().map_err(|error| error.to_string())?;
+        let generation = state
+            .generations
+            .get(&directory)
+            .copied()
+            .unwrap_or_default();
+        let subagents = manager.native_subagent_snapshots(&directory)?;
+        Ok(NativeSubagentSnapshotSet {
+            generation,
+            subagents,
+        })
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn acp_pending_inbox(
+pub async fn acp_pending_inbox(
     manager: State<'_, AgentManager>,
 ) -> Result<Vec<PendingPermissionInfo>, String> {
-    let agents = manager.0.lock().map_err(|error| error.to_string())?;
-    let mut pending = Vec::new();
-    for runtime in agents.values() {
-        if !runtime.alive.load(Ordering::Acquire) {
-            continue;
-        }
-        for permission in runtime
-            .permission_state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .pending
-            .values()
-        {
-            pending.push(PendingPermissionInfo {
-                agent: runtime.agent.clone(),
-                profile: runtime.profile.as_str().to_string(),
-                directory: runtime
-                    .session_directories
-                    .lock()
-                    .ok()
-                    .and_then(|directories| {
-                        permission
-                            .message
-                            .pointer("/params/sessionId")
-                            .and_then(Value::as_str)
-                            .and_then(|id| directories.get(id).cloned())
-                    })
-                    .unwrap_or_else(|| runtime.worktree.clone())
-                    .to_string_lossy()
-                    .into_owned(),
-                message: permission.message.clone(),
-                received_at: permission.received_at,
-            });
-        }
-        for elicitation in runtime
-            .elicitation_state
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let agents = manager
+            .0
             .lock()
             .map_err(|error| error.to_string())?
             .values()
-        {
-            pending.push(PendingPermissionInfo {
-                agent: runtime.agent.clone(),
-                profile: runtime.profile.as_str().to_string(),
-                directory: runtime
-                    .session_directories
-                    .lock()
-                    .ok()
-                    .and_then(|directories| {
-                        elicitation
-                            .message
-                            .pointer("/params/sessionId")
-                            .and_then(Value::as_str)
-                            .and_then(|id| directories.get(id).cloned())
-                    })
-                    .unwrap_or_else(|| runtime.worktree.clone())
-                    .to_string_lossy()
-                    .into_owned(),
-                message: elicitation.message.clone(),
-                received_at: elicitation.received_at,
-            });
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for runtime in &agents {
+            if !runtime.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            for permission in runtime
+                .permission_state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .pending
+                .values()
+            {
+                pending.push(PendingPermissionInfo {
+                    agent: runtime.agent.clone(),
+                    profile: runtime.profile.as_str().to_string(),
+                    directory: runtime
+                        .session_directories
+                        .lock()
+                        .ok()
+                        .and_then(|directories| {
+                            permission
+                                .message
+                                .pointer("/params/sessionId")
+                                .and_then(Value::as_str)
+                                .and_then(|id| directories.get(id).cloned())
+                        })
+                        .unwrap_or_else(|| runtime.worktree.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    message: permission.message.clone(),
+                    received_at: permission.received_at,
+                });
+            }
+            for elicitation in runtime
+                .elicitation_state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .values()
+            {
+                pending.push(PendingPermissionInfo {
+                    agent: runtime.agent.clone(),
+                    profile: runtime.profile.as_str().to_string(),
+                    directory: runtime
+                        .session_directories
+                        .lock()
+                        .ok()
+                        .and_then(|directories| {
+                            elicitation
+                                .message
+                                .pointer("/params/sessionId")
+                                .and_then(Value::as_str)
+                                .and_then(|id| directories.get(id).cloned())
+                        })
+                        .unwrap_or_else(|| runtime.worktree.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    message: elicitation.message.clone(),
+                    received_at: elicitation.received_at,
+                });
+            }
         }
-    }
-    pending.sort_by_key(|item| item.received_at);
-    Ok(pending)
+        pending.sort_by_key(|item| item.received_at);
+        Ok(pending)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 impl Drop for AgentManager {
@@ -3886,9 +4188,10 @@ fn connection_for_owner(
     directory: &Path,
     owner: Option<&str>,
 ) -> Result<Arc<Connection>, String> {
+    let key = connection_key_for_owner(id, profile, directory, owner);
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     agents
-        .get(&connection_key_for_owner(id, profile, directory, owner))
+        .get(&key)
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".into())
@@ -3957,8 +4260,8 @@ fn connection_for_session(
     session_id: &str,
     directory: &Path,
 ) -> Result<Arc<Connection>, String> {
-    let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let key = connection_key(id, CapabilityProfile::Build, directory);
+    let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let owner = session_owner(session_id);
     let matches = agents
         .values()
@@ -4294,7 +4597,13 @@ fn connect_blocking_inner(
     #[cfg(not(unix))]
     let _ = build_lease;
     let definition = definition(&agent)?;
+    let startup_generation = manager.3.load(Ordering::Acquire);
     let key = connection_key_for_owner(&agent, profile, worktree, owner);
+    let startup = manager.worktree_startup(worktree)?;
+    let _startup = startup.lock().map_err(|error| error.to_string())?;
+    if manager.3.load(Ordering::Acquire) != startup_generation {
+        return Err("Agent startup was cancelled.".into());
+    }
     let live = manager
         .0
         .lock()
@@ -4307,11 +4616,16 @@ fn connect_blocking_inner(
     } else {
         Some(agent_availability_for(&app, &agent)?)
     };
-    let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
-    if let Some(existing) = agents.get(&key) {
+    let existing = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(&key)
+        .cloned();
+    if let Some(existing) = existing {
         if existing.alive.load(Ordering::Acquire) {
-            let existing = Arc::clone(existing);
-            drop(agents);
+            existing.validate_codex_workspace(None)?;
+            drop(_startup);
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut capabilities = existing
                 .capabilities
@@ -4356,11 +4670,17 @@ fn connect_blocking_inner(
     }
     #[cfg(unix)]
     let shared_build_directory = build_lease.and_then(|(build_owner, revision)| {
-        let parent = agents.values().find(|runtime| {
-            runtime.worktree == worktree
-                && runtime.owner.as_deref() == Some(build_owner)
-                && runtime.alive.load(Ordering::Acquire)
-        })?;
+        let parent = manager
+            .0
+            .lock()
+            .ok()?
+            .values()
+            .find(|runtime| {
+                runtime.worktree == worktree
+                    && runtime.owner.as_deref() == Some(build_owner)
+                    && runtime.alive.load(Ordering::Acquire)
+            })
+            .cloned()?;
         let root = parent
             .runtime_scratch
             .lock()
@@ -4369,7 +4689,7 @@ fn connect_blocking_inner(
             .path()
             .to_path_buf();
         let base = gate_build_directory(&root, revision, owner.unwrap_or_default(), false);
-        let busy = agents.values().any(|runtime| {
+        let busy = manager.0.lock().ok()?.values().any(|runtime| {
             runtime.alive.load(Ordering::Acquire)
                 && runtime.shared_build_directory.as_deref() == Some(base.as_path())
         });
@@ -4464,29 +4784,37 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
-    if let Some(temp) = owned_temp.as_ref() {
-        if let Some(overlay) = overlay.as_ref() {
-            let shared_cache = data_directory
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(&data_directory)
-                .join("terminal-package-downloads");
-            std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
-            command.env(
-                "CODEX_ACP_PERMISSION_PROFILE_CONFIG",
-                codex_overlay_profile_config(
-                    worktree,
-                    overlay,
-                    &temp.0,
-                    &[data_directory.clone(), shared_cache],
-                )?,
-            );
-        }
-    }
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
     #[cfg(not(unix))]
-    let scratch_path = None;
+    let scratch_path: Option<&Path> = None;
+    let codex_workspace_access = if let Some(temp) = owned_temp.as_ref() {
+        let shared_cache = data_directory
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&data_directory)
+            .join("terminal-package-downloads");
+        std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
+        let mut writable = vec![temp.0.clone(), data_directory.clone(), shared_cache];
+        if let Some(overlay) = overlay.as_ref() {
+            writable.push(overlay.git_dir.clone());
+        }
+        if let Some(scratch) = scratch_path {
+            writable.push(scratch.to_path_buf());
+        }
+        if let Some(build) = shared_build_directory.as_ref() {
+            std::fs::create_dir_all(build).map_err(|error| error.to_string())?;
+            writable.push(build.clone());
+        }
+        let access = CodexWorkspaceAccess::capture(worktree, &writable)?;
+        command.env(
+            "CODEX_ACP_PERMISSION_PROFILE_CONFIG",
+            access.profile_config()?,
+        );
+        Some(access)
+    } else {
+        None
+    };
     for (name, value) in runtime_environment(
         &data_directory,
         storage_lease.temp_directory(),
@@ -4592,6 +4920,7 @@ fn connect_blocking_inner(
         owner: owner.map(str::to_string),
         #[cfg(unix)]
         shared_build_directory,
+        codex_workspace_access,
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
@@ -5032,8 +5361,16 @@ fn connect_blocking_inner(
             },
         );
     });
+    let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
+    if manager.3.load(Ordering::Acquire) != startup_generation {
+        drop(agents);
+        drop(_startup);
+        runtime.terminate()?;
+        return Err("Agent startup was cancelled.".into());
+    }
     agents.insert(key, Arc::clone(&runtime));
     drop(agents);
+    drop(_startup);
     let result = runtime
         .request(
             "initialize",
@@ -5096,62 +5433,72 @@ fn provider_supports_restore_method(capabilities: &Value, method: &str) -> bool 
 }
 
 #[tauri::command]
-pub fn acp_pending_permissions(
+pub async fn acp_pending_permissions(
     manager: State<'_, AgentManager>,
     agent: String,
     directory: String,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    let permissions = runtime
-        .permission_state
-        .lock()
-        .map_err(|error| error.to_string())?;
-    Ok(permissions
-        .pending
-        .values()
-        .filter(|pending| {
-            pending
-                .message
-                .pointer("/params/sessionId")
-                .and_then(Value::as_str)
-                == Some(session_id.as_str())
-        })
-        .map(|pending| pending.message.clone())
-        .collect())
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+        let permissions = runtime
+            .permission_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        Ok(permissions
+            .pending
+            .values()
+            .filter(|pending| {
+                pending
+                    .message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    == Some(session_id.as_str())
+            })
+            .map(|pending| pending.message.clone())
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn acp_pending_elicitations(
+pub async fn acp_pending_elicitations(
     manager: State<'_, AgentManager>,
     agent: String,
     directory: String,
     session_id: String,
     profile: String,
 ) -> Result<Vec<Value>, String> {
-    let profile = parse_profile(Some(&profile))?;
-    let runtime = connection_for_elicitation(
-        &manager,
-        &agent,
-        profile,
-        Path::new(&directory),
-        &session_id,
-    )?;
-    let pending = runtime
-        .elicitation_state
-        .lock()
-        .map_err(|error| error.to_string())?;
-    Ok(pending
-        .values()
-        .filter(|request| {
-            request
-                .message
-                .pointer("/params/sessionId")
-                .and_then(Value::as_str)
-                == Some(session_id.as_str())
-        })
-        .map(|request| request.message.clone())
-        .collect())
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile = parse_profile(Some(&profile))?;
+        let runtime = connection_for_elicitation(
+            &manager,
+            &agent,
+            profile,
+            Path::new(&directory),
+            &session_id,
+        )?;
+        let pending = runtime
+            .elicitation_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        Ok(pending
+            .values()
+            .filter(|request| {
+                request
+                    .message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    == Some(session_id.as_str())
+            })
+            .map(|request| request.message.clone())
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -5167,47 +5514,53 @@ pub struct AcpElicitationParams {
 }
 
 #[tauri::command]
-pub fn acp_elicitation(
+pub async fn acp_elicitation(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
-    let profile = parse_profile(Some(&params.profile))?;
-    let runtime = connection_for_elicitation(
-        &manager,
-        &params.agent,
-        profile,
-        Path::new(&params.directory),
-        &params.session_id,
-    )?;
-    let key = params.request_id.to_string();
-    let pending = claim_pending_elicitation(&runtime.elicitation_state, &key, &params.session_id)?;
-    let mut result = json!({"action":params.action});
-    if let Some(content) = params.content {
-        result["content"] = content;
-    }
-    if let Err(error) =
-        runtime.write(&json!({"jsonrpc":"2.0","id":params.request_id,"result":result}))
-    {
-        runtime
-            .elicitation_state
-            .lock()
-            .map_err(|cause| cause.to_string())?
-            .insert(key, pending);
-        return Err(error);
-    }
-    let _ = app.emit(
-        "acp-event",
-        AgentEvent {
-            agent: params.agent,
-            directory: Some(params.directory),
-            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-            message: json!({"method":"sail/elicitation_resolved","params":{
-                "sessionId":params.session_id,"requestId":params.request_id
-            }}),
-        },
-    );
-    Ok(())
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile = parse_profile(Some(&params.profile))?;
+        let runtime = connection_for_elicitation(
+            &manager,
+            &params.agent,
+            profile,
+            Path::new(&params.directory),
+            &params.session_id,
+        )?;
+        let key = params.request_id.to_string();
+        let pending =
+            claim_pending_elicitation(&runtime.elicitation_state, &key, &params.session_id)?;
+        let mut result = json!({"action":params.action});
+        if let Some(content) = params.content {
+            result["content"] = content;
+        }
+        if let Err(error) =
+            runtime.write(&json!({"jsonrpc":"2.0","id":params.request_id,"result":result}))
+        {
+            runtime
+                .elicitation_state
+                .lock()
+                .map_err(|cause| cause.to_string())?
+                .insert(key, pending);
+            return Err(error);
+        }
+        let _ = app.emit(
+            "acp-event",
+            AgentEvent {
+                agent: params.agent,
+                directory: Some(params.directory),
+                worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+                message: json!({"method":"sail/elicitation_resolved","params":{
+                    "sessionId":params.session_id,"requestId":params.request_id
+                }}),
+            },
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -5475,17 +5828,22 @@ fn complete_restore_if_current(
 /// E2E specs share one app process; release their fixture runtimes between specs.
 /// The command is only permitted by the E2E capability and has no production effect.
 #[tauri::command]
-pub fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
-    #[cfg(feature = "e2e")]
-    {
-        manager.shutdown();
-        Ok(())
-    }
-    #[cfg(not(feature = "e2e"))]
-    {
-        let _ = manager;
-        Err("ACP test runtime reset requires the E2E build".into())
-    }
+pub async fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(feature = "e2e")]
+        {
+            manager.shutdown();
+            Ok(())
+        }
+        #[cfg(not(feature = "e2e"))]
+        {
+            let _ = manager;
+            Err("ACP test runtime reset requires the E2E build".into())
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Cancels a deleted thread's active turn before releasing its browser token.
@@ -5652,20 +6010,25 @@ pub async fn acp_begin_session_restore(
 }
 
 #[tauri::command]
-pub fn acp_end_session_restore(
+pub async fn acp_end_session_restore(
     manager: State<'_, AgentManager>,
     agent: String,
     directory: String,
     session_id: String,
     restore_token: String,
 ) -> Result<(), String> {
-    release_session_restore(
-        &manager,
-        &agent,
-        Path::new(&directory),
-        &session_id,
-        &restore_token,
-    )
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        release_session_restore(
+            &manager,
+            &agent,
+            Path::new(&directory),
+            &session_id,
+            &restore_token,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn release_session_restore(
@@ -6827,7 +7190,7 @@ fn cleanup_session_processes(
 }
 
 #[tauri::command]
-pub fn acp_cancel(
+pub async fn acp_cancel(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     agent: String,
@@ -6835,8 +7198,13 @@ pub fn acp_cancel(
     session_id: String,
     turn_id: Option<String>,
 ) -> Result<(), String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    cancel_session(&app, &runtime, &agent, &session_id, turn_id)
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+        cancel_session(&app, &runtime, &agent, &session_id, turn_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn cancel_session(
@@ -6957,55 +7325,60 @@ pub struct AcpPermissionParams {
 }
 
 #[tauri::command]
-pub fn acp_permission(
+pub async fn acp_permission(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     params: AcpPermissionParams,
 ) -> Result<(), String> {
-    let AcpPermissionParams {
-        agent,
-        directory,
-        request_id,
-        option_id,
-        session_id,
-        request_generation,
-        request_fingerprint,
-    } = params;
-    let resolution = if option_id.is_some() {
-        "selected"
-    } else {
-        "cancelled"
-    };
-    let outcome = option_id
-        .map(|id| json!({"outcome":"selected","optionId":id}))
-        .unwrap_or_else(|| json!({"outcome":"cancelled"}));
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    let pending = runtime.respond(
-        request_id.clone(),
-        &session_id,
-        request_generation,
-        &request_fingerprint,
-        json!({"outcome":outcome}),
-    )?;
-    let Some(pending) = pending else {
-        return Ok(());
-    };
-    let _ = app.emit(
-        "acp-event",
-        AgentEvent {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let AcpPermissionParams {
             agent,
-            directory: Some(directory),
-            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-            message: json!({"method":"sail/permission_resolved","params":{
-                "sessionId":session_id,"requestId":request_id,
-                "sailPermissionGeneration":pending.generation,
-                "sailPermissionFingerprint":pending.fingerprint,
-                "sailCapabilityProfile":runtime.profile.as_str(),
-                "sailPermissionOutcome":resolution
-            }}),
-        },
-    );
-    Ok(())
+            directory,
+            request_id,
+            option_id,
+            session_id,
+            request_generation,
+            request_fingerprint,
+        } = params;
+        let resolution = if option_id.is_some() {
+            "selected"
+        } else {
+            "cancelled"
+        };
+        let outcome = option_id
+            .map(|id| json!({"outcome":"selected","optionId":id}))
+            .unwrap_or_else(|| json!({"outcome":"cancelled"}));
+        let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+        let pending = runtime.respond(
+            request_id.clone(),
+            &session_id,
+            request_generation,
+            &request_fingerprint,
+            json!({"outcome":outcome}),
+        )?;
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let _ = app.emit(
+            "acp-event",
+            AgentEvent {
+                agent,
+                directory: Some(directory),
+                worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+                message: json!({"method":"sail/permission_resolved","params":{
+                    "sessionId":session_id,"requestId":request_id,
+                    "sailPermissionGeneration":pending.generation,
+                    "sailPermissionFingerprint":pending.fingerprint,
+                    "sailCapabilityProfile":runtime.profile.as_str(),
+                    "sailPermissionOutcome":resolution
+                }}),
+            },
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -7171,7 +7544,8 @@ mod session_config_tests {
         let scratch =
             std::env::temp_dir().join(format!("sail-turn-temp-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&scratch).unwrap();
-        let _scratch = OwnedTempDir(scratch.clone());
+        let identity = crate::worktree_directory_identity(&scratch).unwrap();
+        let _scratch = OwnedTempDir(scratch.clone(), identity);
         let worktree = scratch.join("plain-folder");
         std::fs::create_dir(&worktree).unwrap();
         let cache = scratch.join("cache");
@@ -7640,6 +8014,7 @@ time.sleep(10)
             owner: owner.map(str::to_string),
             #[cfg(unix)]
             shared_build_directory: build_directory,
+            codex_workspace_access: None,
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
@@ -8020,6 +8395,7 @@ time.sleep(10)
                 owner: None,
                 #[cfg(unix)]
                 shared_build_directory: None,
+                codex_workspace_access: None,
                 _storage_lease: None,
                 child: Mutex::new(child),
                 scratch_owner: None,
@@ -8403,6 +8779,177 @@ time.sleep(10)
         assert_eq!(request["mcpServers"][0]["name"], "sail-browser");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn codex_workspace_access_checks_windows_directory_ownership() {
+        let assigned = std::env::current_dir().unwrap();
+        CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"));
+        let error = CodexWorkspaceAccess::capture(&system, &[]).unwrap_err();
+        assert!(error.contains("not owned by this user"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_workspace_access_rejects_steering_and_stops_invalid_runtime() {
+        let assigned = std::env::current_dir().unwrap();
+        let previous = assigned.parent().unwrap();
+        let runtime = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &assigned,
+            "session",
+            None,
+        );
+        let mut runtime = Arc::try_unwrap(runtime).ok().unwrap();
+        let mut access = CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        access.directories[0].identity = crate::worktree_directory_identity(previous).unwrap();
+        runtime.codex_workspace_access = Some(access);
+        let error = runtime
+            .request(
+                "_session/steering",
+                json!({"sessionId":"session"}),
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(error.contains("replaced"), "{error}");
+        assert!(!runtime.alive.load(Ordering::Acquire));
+        assert!(runtime.pending.lock().unwrap().is_empty());
+        assert!(runtime.child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn codex_workspace_access_is_canonical_and_survives_restore_checks() {
+        let root = scratch("codex-access");
+        let assigned = root.join("assigned");
+        let owned = root.join("owned");
+        let sibling = root.join("sibling");
+        for path in [&assigned, &owned, &sibling] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&owned)).unwrap();
+        access.validate(Some(assigned.to_str().unwrap())).unwrap();
+        access.validate(Some(assigned.to_str().unwrap())).unwrap();
+        assert!(access
+            .validate(Some(sibling.to_str().unwrap()))
+            .unwrap_err()
+            .contains("outside"));
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let rules = config["configOverrides"][2].as_str().unwrap();
+        assert!(rules.contains("extends=\":read-only\""));
+        assert!(!rules.contains(":workspace"));
+        assert!(!rules.contains(sibling.to_str().unwrap()));
+        assert!(!rules.contains(":tmpdir"));
+        #[cfg(unix)]
+        {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&assigned, &alias).unwrap();
+            let aliased =
+                CodexWorkspaceAccess::capture(&alias, std::slice::from_ref(&owned)).unwrap();
+            assert_eq!(
+                access.profile_config().unwrap(),
+                aliased.profile_config().unwrap()
+            );
+            access.validate(Some(alias.to_str().unwrap())).unwrap();
+            assert!(CodexWorkspaceAccess::capture(&assigned, &[alias])
+                .unwrap_err()
+                .contains("symlink"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_workspace_access_rejects_missing_files_and_replaced_roots() {
+        let root = scratch("codex-invalid-access");
+        assert!(CodexWorkspaceAccess::capture(&root.join("missing"), &[]).is_err());
+        let file = root.join("file");
+        std::fs::write(&file, "data").unwrap();
+        assert!(CodexWorkspaceAccess::capture(&file, &[]).is_err());
+        let assigned = root.join("assigned");
+        std::fs::create_dir(&assigned).unwrap();
+        let access = CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        std::fs::rename(&assigned, root.join("previous")).unwrap();
+        std::fs::create_dir(&assigned).unwrap();
+        assert!(access.validate(None).unwrap_err().contains("replaced"));
+        #[cfg(unix)]
+        {
+            let unowned = Path::new("/");
+            use std::os::unix::fs::MetadataExt;
+            if std::fs::metadata(unowned).unwrap().uid() != unsafe { nix::libc::geteuid() } {
+                assert!(CodexWorkspaceAccess::capture(unowned, &[])
+                    .unwrap_err()
+                    .contains("not owned"));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_workspace_access_runs_format_and_build_inside_the_sandbox() {
+        let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") else {
+            return;
+        };
+        let root = scratch("codex-sandbox-access");
+        let assigned = root.join("assigned");
+        let owned = root.join("owned");
+        let sibling = root.join("sibling");
+        for path in [&assigned, &owned, &sibling] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let source = assigned.join("main.rs");
+        std::fs::write(&source, "fn main(){println!(\"assigned workspace\");}").unwrap();
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&owned)).unwrap();
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let run = |cwd: &Path, arguments: &[&str]| {
+            let mut command = Command::new(&codex);
+            command
+                .arg("sandbox")
+                .args(["-P", "sail-agent", "-C"])
+                .arg(cwd);
+            for value in config["configOverrides"].as_array().unwrap() {
+                command.arg("-c").arg(value.as_str().unwrap());
+            }
+            command.arg("--").args(arguments).output().unwrap()
+        };
+        let formatted = run(&assigned, &["rustfmt", source.to_str().unwrap()]);
+        assert!(
+            formatted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&formatted.stderr)
+        );
+        let binary = owned.join("program");
+        let built = run(
+            &assigned,
+            &[
+                "rustc",
+                source.to_str().unwrap(),
+                "-o",
+                binary.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        assert!(binary.is_file());
+        let forbidden = sibling.join("denied");
+        for cwd in [&assigned, &sibling] {
+            let denied = run(cwd, &["/usr/bin/touch", forbidden.to_str().unwrap()]);
+            assert!(!denied.status.success());
+            assert!(!forbidden.exists());
+        }
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&assigned, &alias).unwrap();
+        assert!(run(&alias, &["rustfmt", source.to_str().unwrap()])
+            .status
+            .success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn linked_worktree_session_grants_only_its_private_git_overlay() {
         let root = scratch("linked-git");
@@ -8462,13 +9009,16 @@ time.sleep(10)
             crate::acp_terminal::stable_worktree_identity(&linked.canonicalize().unwrap())
         );
         let build_cache = root.join("task-build-cache");
+        let task_temp = root.join("task-tmp");
+        std::fs::create_dir(&build_cache).unwrap();
+        std::fs::create_dir(&task_temp).unwrap();
         let profile: Value = serde_json::from_str(
-            &codex_overlay_profile_config(
+            &CodexWorkspaceAccess::capture(
                 &linked,
-                &overlay,
-                &root.join("task-tmp"),
-                std::slice::from_ref(&build_cache),
+                &[overlay.git_dir.clone(), task_temp, build_cache.clone()],
             )
+            .unwrap()
+            .profile_config()
             .unwrap(),
         )
         .unwrap();
@@ -8483,14 +9033,23 @@ time.sleep(10)
             value.as_str().is_some_and(|value| {
                 value.contains("filesystem")
                     && value.contains(
-                        &serde_json::to_string(&overlay.git_dir.to_string_lossy()).unwrap(),
+                        &serde_json::to_string(
+                            &dunce::canonicalize(&overlay.git_dir)
+                                .unwrap()
+                                .to_string_lossy(),
+                        )
+                        .unwrap(),
                     )
             })
         }));
         assert!(overrides
             .iter()
-            .any(|value| value.as_str().is_some_and(|value| value
-                .contains(&serde_json::to_string(&build_cache.to_string_lossy()).unwrap()))));
+            .any(|value| value.as_str().is_some_and(|value| value.contains(
+                &serde_json::to_string(
+                    &dunce::canonicalize(&build_cache).unwrap().to_string_lossy()
+                )
+                .unwrap()
+            ))));
         let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
         assert_eq!(
             restored["additionalDirectories"],
@@ -8937,6 +9496,7 @@ mod native_subagent_fence_tests {
             owner: None,
             #[cfg(unix)]
             shared_build_directory: None,
+            codex_workspace_access: None,
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
@@ -9006,6 +9566,18 @@ mod native_subagent_fence_tests {
             error,
             "Worktree has connected agent sessions: opencode:ses_open."
         );
+        let mut promoted = false;
+        let error = AgentWorktreeFence::default()
+            .promote(&agents, &directory, || {
+                promoted = true;
+                Ok(())
+            })
+            .expect_err("an active turn must also block promotion");
+        assert_eq!(
+            error,
+            "Worktree has active agent sessions: opencode:ses_open."
+        );
+        assert!(!promoted);
         assert!(!cleaned);
         assert_eq!(
             fs::read(&marker).expect("active worktree must remain"),
@@ -9044,6 +9616,14 @@ mod native_subagent_fence_tests {
                 .len(),
             1
         );
+        let mut promoted = false;
+        AgentWorktreeFence::default()
+            .promote(&agents, &directory, || {
+                promoted = true;
+                Ok(())
+            })
+            .expect("idle connected session must allow promotion");
+        assert!(promoted);
         let error = AgentWorktreeFence::default()
             .cleanup(&agents, &directory, None, false, || {
                 std::fs::remove_dir_all(&directory).expect("remove selected worktree");
@@ -9144,6 +9724,16 @@ mod native_subagent_fence_tests {
             cleanup_error,
             "An agent session is starting in this worktree."
         );
+        let mut promoted = false;
+        let error = fence
+            .promote(&AgentManager::default(), &directory, || {
+                promoted = true;
+                Ok(())
+            })
+            .expect_err("a starting session must also block promotion");
+        assert_eq!(error, "An agent session is starting in this worktree.");
+        assert!(!promoted);
+
         fence
             .record_native_update(&directory)
             .expect("late retired-parent spawn should advance the generation");

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -481,7 +482,7 @@ fn require_shared_current_in_cache(cache: &Path, worktree: &Path) -> Result<(), 
         return Err("Private Git promotion is pending; shared Git operation refused.".into());
     }
     let branch = output(
-        git_command()
+        git_ref_command()
             .arg("--git-dir")
             .arg(git_config_path(&overlay.git_dir))
             .args(["symbolic-ref", "-q", "HEAD"]),
@@ -562,6 +563,14 @@ fn git_command() -> Command {
     command
 }
 
+fn git_ref_command() -> Command {
+    let mut command = git_command();
+    // Ref spellings belong to Git, including packed NFC/NFD aliases. Keep file
+    // and index commands on the inherited filesystem normalization setting.
+    command.args(["-c", "core.precomposeUnicode=false"]);
+    command
+}
+
 struct OverlayBuild(PathBuf);
 
 impl Drop for OverlayBuild {
@@ -629,7 +638,7 @@ fn source(worktree: &Path) -> Result<Option<Source>, String> {
     if dunce::canonicalize(&backlink).map_err(|error| error.to_string())? != pointer {
         return Err("Linked Git directory belongs to another worktree.".into());
     }
-    let branch = git_command()
+    let branch = git_ref_command()
         .arg("-C")
         .arg(&worktree)
         .args(["symbolic-ref", "-q", "HEAD"])
@@ -935,25 +944,86 @@ fn read_manifest(path: &Path) -> Result<Option<Manifest>, String> {
 
 fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
     let refs = output(
-        git_command()
+        git_ref_command()
             .arg("-C")
             .arg(&source.worktree)
             .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
     )?;
-    let mut updates = String::new();
-    for line in String::from_utf8(refs.stdout)
+    let mut remaining = Vec::new();
+    for line in String::from_utf8(refs.stdout.clone())
         .map_err(|error| error.to_string())?
         .lines()
     {
         let (reference, oid) = line
             .split_once(' ')
             .ok_or("Invalid source Git reference output.")?;
-        updates.push_str(&format!("update {reference} {oid}\n"));
+        remaining.push((reference.to_string(), oid.to_string()));
     }
-    if updates.is_empty() {
-        return Ok(());
+    while !remaining.is_empty() {
+        let mut names = HashMap::new();
+        let mut updates = String::new();
+        let mut next = Vec::new();
+        let mut isolated = false;
+        for (reference, oid) in remaining {
+            // Filesystems use Unicode folding and normalization rules that differ
+            // from Rust lowercasing. Isolate non-ASCII names from every other ref.
+            if !reference.is_ascii() {
+                if updates.is_empty() {
+                    updates.push_str(&format!("update {reference} {oid}\n"));
+                    isolated = true;
+                } else {
+                    next.push((reference, oid));
+                }
+                continue;
+            }
+            if isolated {
+                next.push((reference, oid));
+                continue;
+            }
+            let prefixes = reference
+                .match_indices('/')
+                .map(|(end, _)| &reference[..end])
+                .chain(std::iter::once(reference.as_str()))
+                .collect::<Vec<_>>();
+            if prefixes.iter().any(|prefix| {
+                names
+                    .get(&prefix.to_ascii_lowercase())
+                    .is_some_and(|existing| existing != prefix)
+            }) {
+                next.push((reference, oid));
+            } else {
+                for prefix in prefixes {
+                    names.insert(prefix.to_ascii_lowercase(), prefix.to_string());
+                }
+                updates.push_str(&format!("update {reference} {oid}\n"));
+            }
+        }
+        seed_ref_batch(git_dir, &updates)?;
+        // Case-distinct refs cannot share loose files or transaction locks on macOS.
+        // Pack hidden refs too, without changing the inherited configuration or
+        // requiring newer Git versions' --include option.
+        output(
+            git_ref_command()
+                .arg("--git-dir")
+                .arg(git_config_path(git_dir))
+                .args(["-c", "transfer.hideRefs=!", "pack-refs", "--all"]),
+        )?;
+        remaining = next;
     }
-    let mut child = git_command()
+    let seeded = output(
+        git_ref_command()
+            .arg("--git-dir")
+            .arg(git_config_path(git_dir))
+            .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
+    )?;
+    if seeded.stdout != refs.stdout {
+        return Err("Private Git reference names or targets changed during initialization.".into());
+    }
+    Ok(())
+}
+
+fn seed_ref_batch(git_dir: &Path, updates: &str) -> Result<(), String> {
+    let mut child = git_ref_command()
         .arg("--git-dir")
         .arg(git_config_path(git_dir))
         .args(["update-ref", "--stdin"])
@@ -1253,7 +1323,7 @@ fn recover_unregistered_overlay(
             return Err("Unregistered overlay has unfinished Git writes.".into());
         }
         let branch = output(
-            git_command()
+            git_ref_command()
                 .arg("--git-dir")
                 .arg(git_config_path(git_dir))
                 .args(["symbolic-ref", "-q", "HEAD"]),
@@ -1486,7 +1556,7 @@ impl GitOverlay {
         }
         seed_refs(&current, &git_dir)?;
         output(
-            git_command()
+            git_ref_command()
                 .args(["--git-dir"])
                 .arg(git_config_path(&git_dir))
                 .args(["symbolic-ref", "HEAD", &current.branch]),
@@ -1592,7 +1662,7 @@ impl GitOverlay {
             return Err("Git overlay owner changed; promotion refused.".into());
         }
         let branch = output(
-            git_command()
+            git_ref_command()
                 .arg("--git-dir")
                 .arg(git_config_path(&self.git_dir))
                 .args(["symbolic-ref", "-q", "HEAD"]),
@@ -1668,7 +1738,7 @@ impl GitOverlay {
                     .arg(&promotion.new_oid),
             )?;
             output(
-                git_command()
+                git_ref_command()
                     .arg("--git-dir")
                     .arg(git_config_path(&manifest.common_dir))
                     .args([
@@ -1682,6 +1752,17 @@ impl GitOverlay {
             return Err(
                 "Assigned branch changed during promotion; recovery requires a decision.".into(),
             );
+        }
+        if promotion.new_oid != promotion.expected_oid {
+            // A new loose ref can shadow another packed spelling on an
+            // insensitive filesystem. Repack exact names before publication
+            // completes, including when recovering an interrupted promotion.
+            output(
+                git_ref_command()
+                    .arg("--git-dir")
+                    .arg(git_config_path(&manifest.common_dir))
+                    .args(["-c", "transfer.hideRefs=!", "pack-refs", "--all"]),
+            )?;
         }
         replace_index(
             &source_index,
@@ -1751,6 +1832,173 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    #[test]
+    fn overlay_seeds_case_distinct_refs_without_losing_their_targets() {
+        let fixture = OverlayFixture::new();
+        let initial = git(&fixture.main, &["rev-parse", "HEAD"]);
+        git(&fixture.main, &["update-ref", "refs/heads/Hooks", &initial]);
+        git(&fixture.main, &["pack-refs", "--all"]);
+        git(
+            &fixture.main,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "next",
+            ],
+        );
+        let next = git(&fixture.main, &["rev-parse", "HEAD"]);
+        git(&fixture.main, &["update-ref", "refs/heads/hooks", &next]);
+        git(&fixture.main, &["pack-refs", "--all"]);
+        git(&fixture.main, &["update-ref", "refs/heads/HOOKS", &initial]);
+        git(&fixture.main, &["pack-refs", "--all"]);
+        for reference in [
+            "refs/heads/Topic/one",
+            "refs/heads/topic/two",
+            "refs/heads/Σ",
+            "refs/heads/ς",
+            "refs/heads/café",
+            "refs/heads/cafe\u{301}",
+            "refs/heads/K",
+            "refs/heads/K",
+        ] {
+            let oid = if reference == "refs/heads/café" {
+                &initial
+            } else {
+                &next
+            };
+            git(
+                &fixture.main,
+                &[
+                    "-c",
+                    "core.precomposeUnicode=false",
+                    "update-ref",
+                    reference,
+                    oid,
+                ],
+            );
+            git(
+                &fixture.main,
+                &["-c", "core.precomposeUnicode=false", "pack-refs", "--all"],
+            );
+        }
+        git(&fixture.main, &["config", "core.precomposeUnicode", "true"]);
+        git(
+            &fixture.task,
+            &[
+                "-c",
+                "core.precomposeUnicode=false",
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/cafe\u{301}",
+            ],
+        );
+        git(
+            &fixture.main,
+            &["config", "transfer.hideRefs", "refs/heads/Hooks"],
+        );
+        let before = git(
+            &fixture.main,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+
+        let mut overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let after = overlay_git(
+            &overlay,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        assert_eq!(after, before);
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/Hooks"]),
+            initial
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/hooks"]),
+            next
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/HOOKS"]),
+            initial
+        );
+        assert_eq!(overlay_git(&overlay, &["rev-parse", "HEAD"]), next);
+        assert_eq!(
+            overlay_git(&overlay, &["symbolic-ref", "HEAD"]),
+            "refs/heads/cafe\u{301}"
+        );
+        assert!(before
+            .lines()
+            .any(|line| line == format!("refs/heads/café {initial}")));
+        assert!(before
+            .lines()
+            .any(|line| line == format!("refs/heads/cafe\u{301} {next}")));
+        assert_eq!(
+            git(
+                &fixture.main,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            before
+        );
+        assert!(private_lock_files(&overlay.git_dir).unwrap().is_empty());
+        assert_eq!(
+            overlay_git(&overlay, &["config", "--get", "transfer.hideRefs"]),
+            "refs/heads/Hooks"
+        );
+        assert_eq!(
+            GitOverlay::ensure(&fixture.cache, &fixture.task)
+                .unwrap()
+                .unwrap()
+                .git_dir,
+            overlay.git_dir,
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["config", "--get", "core.precomposeUnicode"]),
+            "true"
+        );
+        overlay_git(
+            &overlay,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "private",
+            ],
+        );
+        let promoted = overlay_git(&overlay, &["rev-parse", "HEAD"]);
+        overlay.promote_quiescent(|| Ok(())).unwrap();
+        assert_eq!(git(&fixture.task, &["rev-parse", "HEAD"]), promoted);
+        assert_eq!(
+            git(&fixture.main, &["rev-parse", "refs/heads/café"]),
+            initial
+        );
+        assert_eq!(
+            git(&fixture.task, &["symbolic-ref", "HEAD"]),
+            "refs/heads/cafe\u{301}"
+        );
+        let source_refs = git(
+            &fixture.main,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        assert!(source_refs
+            .lines()
+            .any(|line| line == format!("refs/heads/café {initial}")));
+        assert!(source_refs
+            .lines()
+            .any(|line| line == format!("refs/heads/cafe\u{301} {promoted}")));
+        assert_eq!(
+            git(
+                &fixture.main,
+                &["config", "--get", "core.precomposeUnicode"]
+            ),
+            "true"
+        );
     }
 
     #[test]

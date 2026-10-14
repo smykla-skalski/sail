@@ -90,6 +90,7 @@ pub(crate) fn owner_identity_for_pid(pid: u32) -> Option<String> {
 
 pub(crate) struct OwnedRuntimeScratch {
     path: PathBuf,
+    identity: crate::WorktreeDirectoryIdentity,
     owner: Option<String>,
     cleaned: bool,
 }
@@ -107,6 +108,7 @@ impl OwnedRuntimeScratch {
             return Err(error);
         }
         Ok(Self {
+            identity: crate::worktree_directory_identity(&path)?,
             path,
             owner: None,
             cleaned: false,
@@ -127,6 +129,9 @@ impl OwnedRuntimeScratch {
     pub(crate) fn cleanup_now(&mut self) -> std::io::Result<()> {
         if self.cleaned {
             return Ok(());
+        }
+        if crate::worktree_directory_identity(&self.path)? != self.identity {
+            return Err(std::io::ErrorKind::InvalidData.into());
         }
         if let Some(owner) = self.owner.as_deref() {
             remove_owned_runtime_root(&self.path, owner)?;
@@ -713,6 +718,7 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         let scratch = OwnedRuntimeScratch {
+            identity: crate::worktree_directory_identity(&path).unwrap(),
             path: path.clone(),
             owner: Some(fs::read_to_string(path.join(MARKER)).unwrap()),
             cleaned: false,

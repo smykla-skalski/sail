@@ -248,6 +248,7 @@
   } from './lib/task-economics.ts';
   import DiffPanel from './DiffPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
+  import { createSidebarThreadLoader } from './lib/sidebar-inventory';
   import {
     clampSidebarWidth,
     parseSidebarWidth,
@@ -835,12 +836,11 @@
   let memoryRecallEnabled = $state(false);
   let memoryRecallProjectKey = $state('');
   let memoryRecallBusy = $state(false);
-  let memoryRecallRefresh = 0;
+  let memoryStatusRefresh = 0;
   let memoryCaptureAvailable = $state(false);
   let memoryCaptureEnabled = $state(false);
   let memoryCaptureProjectKey = $state('');
   let memoryCaptureBusy = $state(false);
-  let memoryCaptureRefresh = 0;
   type BrowserAccessRequest = { id: string; sessionId: string; directory: string; origin?: string };
   type CoordinationRequest = {
     id: string;
@@ -2543,12 +2543,12 @@
       });
       if (directory) {
         const initialDirectory = directory;
-        void canonicalizeProject(initialDirectory).then(() =>
-          Promise.all([
-            refreshAutomaticMemoryRecall(initialDirectory),
-            refreshAutomaticMemoryCapture(initialDirectory),
-          ]),
-        );
+        const initialSelection = selection;
+        void canonicalizeProject(initialDirectory).then(() => {
+          if (initialSelection === selection && directory)
+            return refreshAutomaticMemoryControls(directory);
+          return undefined;
+        });
       }
     }
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
@@ -2607,26 +2607,39 @@
     }).catch((cause) => (error = describe(cause)));
   }
 
-  async function refreshAutomaticMemoryRecall(path: string) {
-    const refresh = ++memoryRecallRefresh;
+  function resetAutomaticMemoryControls() {
+    ++memoryStatusRefresh;
     memoryRecallAvailable = false;
     memoryRecallEnabled = false;
     memoryRecallProjectKey = '';
+    memoryCaptureAvailable = false;
+    memoryCaptureEnabled = false;
+    memoryCaptureProjectKey = '';
+  }
+
+  async function refreshAutomaticMemoryControls(path: string) {
+    resetAutomaticMemoryControls();
+    const refresh = memoryStatusRefresh;
     try {
-      const status = await invoke<{ enabled: boolean; projectKey: string }>('memory_status', {
-        directory: path,
-      });
-      if (refresh !== memoryRecallRefresh || directory !== path) return;
-      const control = automaticRecallControl(
+      const status = await invoke<MemoryStatus>('memory_status', { directory: path });
+      if (refresh !== memoryStatusRefresh || directory !== path) return;
+      const recall = automaticRecallControl(
         status,
         getSetting(`sai-memory-auto-recall:${status.projectKey}`),
       );
-      memoryRecallAvailable = control.available;
-      memoryRecallEnabled = control.enabled;
-      memoryRecallProjectKey = control.projectKey;
+      const capture = automaticCaptureControl(
+        status,
+        getSetting(`sai-memory-auto-capture:${status.projectKey}`),
+      );
+      memoryRecallAvailable = recall.available;
+      memoryRecallEnabled = recall.enabled;
+      memoryRecallProjectKey = recall.projectKey;
+      memoryCaptureAvailable = capture.available;
+      memoryCaptureEnabled = capture.enabled;
+      memoryCaptureProjectKey = status.projectKey;
     } catch (cause) {
-      if (refresh === memoryRecallRefresh && directory === path)
-        error = `Could not load automatic memory recall: ${describe(cause)}`;
+      if (refresh === memoryStatusRefresh && directory === path)
+        error = `Could not load automatic memory controls: ${describe(cause)}`;
     }
   }
 
@@ -2642,27 +2655,6 @@
       error = `Could not update automatic memory recall: ${describe(cause)}`;
     } finally {
       if (memoryRecallProjectKey === projectKey) memoryRecallBusy = false;
-    }
-  }
-
-  async function refreshAutomaticMemoryCapture(path: string) {
-    const refresh = ++memoryCaptureRefresh;
-    memoryCaptureAvailable = false;
-    memoryCaptureEnabled = false;
-    memoryCaptureProjectKey = '';
-    try {
-      const status = await invoke<MemoryStatus>('memory_status', { directory: path });
-      if (refresh !== memoryCaptureRefresh || directory !== path) return;
-      const control = automaticCaptureControl(
-        status,
-        getSetting(`sai-memory-auto-capture:${status.projectKey}`),
-      );
-      memoryCaptureAvailable = control.available;
-      memoryCaptureEnabled = control.enabled;
-      memoryCaptureProjectKey = status.projectKey;
-    } catch (cause) {
-      if (refresh === memoryCaptureRefresh && directory === path)
-        error = `Could not load automatic memory capture: ${describe(cause)}`;
     }
   }
 
@@ -10528,7 +10520,8 @@
     }
     ++projectLoadGeneration;
     error = '';
-    ++selection;
+    const currentSelection = ++selection;
+    resetAutomaticMemoryControls();
     directory = path;
     mainPickerDirectory = getSetting(`sai-main-pane-empty:${path}`) === 'true' ? path : null;
     browserAccessDisabled = getSetting(`sai-browser-disabled:${path}`) === 'true';
@@ -10555,8 +10548,8 @@
     ++diffRefresh;
     diffLoading = false;
     await canonicalizeProject(path);
-    if (directory) await refreshAutomaticMemoryRecall(directory);
-    if (directory) await refreshAutomaticMemoryCapture(directory);
+    if (currentSelection !== selection || !directory) return;
+    await refreshAutomaticMemoryControls(directory);
   }
 
   async function selectDefaultWorktree(path: string) {
@@ -10697,18 +10690,21 @@
     return unique.find((_, index) => available[index]) ?? null;
   }
 
-  async function listOpenCodeRootThreads(path: string): Promise<AgentThread[]> {
-    const threads = await listSidebarAcpThreads(
-      'opencode',
-      (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
-      path,
-    );
-    // OpenCode's session/list has no parent marker, so only children Sail has seen are hidden.
-    return threads.filter(
-      (thread) =>
-        !nativeSubagents[nativeSubagentId('opencode', thread.directory, thread.sessionId)],
-    );
-  }
+  const listOpenCodeRootThreads = createSidebarThreadLoader(
+    (path) => invoke<boolean>('repository_path_available', { path }),
+    async (path) => {
+      const threads = await listSidebarAcpThreads(
+        'opencode',
+        (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
+        path,
+      );
+      // OpenCode's session/list has no parent marker, so only children Sail has seen are hidden.
+      return threads.filter(
+        (thread) =>
+          !nativeSubagents[nativeSubagentId('opencode', thread.directory, thread.sessionId)],
+      );
+    },
+  );
 
   async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;

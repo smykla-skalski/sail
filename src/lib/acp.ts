@@ -482,7 +482,7 @@ export function saveRecentTranscriptAfterPaint(thread: AgentThread, entries: Age
   cancelPendingTranscript(id);
   const pending: PendingTranscript = {
     thread,
-    entries: entries.slice(-transcriptLimit),
+    entries: acpSessionOwner(thread.sessionId) ? entries.slice() : entries.slice(-transcriptLimit),
     timer: setTimeout(() => persist(), 100),
   };
   const persist = () => {
