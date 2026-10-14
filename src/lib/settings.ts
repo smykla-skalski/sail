@@ -31,6 +31,7 @@ const pendingMutations = new Set<Promise<unknown>>();
 let e2eQuiesced = false;
 
 export async function quiesceSettingsWrites(): Promise<void> {
+  flushTranscriptWrite();
   e2eQuiesced = true;
   ready = false;
   e2eSettingsDisabled = true;
@@ -88,7 +89,69 @@ export async function initializeSettings(): Promise<void> {
   }
 }
 
+const transcriptWriteIntervalMs = 10_000;
+let transcriptLastWrite = Number.NEGATIVE_INFINITY;
+let transcriptTimer: ReturnType<typeof setTimeout> | null = null;
+let transcriptQueued: string | null = null;
+let transcriptWaiters: Array<() => void> = [];
+
 function persist(key: string, value: string | null): void {
+  if (key !== transcriptKey) {
+    persistNow(key, value);
+    return;
+  }
+  if (value === null) {
+    dropQueuedTranscript();
+    persistNow(key, value);
+    return;
+  }
+  if (!ready) return;
+  transcriptQueued = value;
+  if (transcriptTimer !== null) return;
+  const wait = transcriptLastWrite + transcriptWriteIntervalMs - Date.now();
+  if (wait <= 0) flushTranscriptWrite();
+  else transcriptTimer = setTimeout(flushTranscriptWrite, wait);
+}
+
+function dropQueuedTranscript(): void {
+  if (transcriptTimer !== null) clearTimeout(transcriptTimer);
+  transcriptTimer = null;
+  transcriptQueued = null;
+  releaseTranscriptWaiters();
+}
+
+function releaseTranscriptWaiters(): void {
+  const waiters = transcriptWaiters;
+  transcriptWaiters = [];
+  for (const release of waiters) release();
+}
+
+/** Sends the queued transcript now; the localStorage mirror and pending token cover a write that never starts. */
+export function flushTranscriptWrite(): void {
+  if (transcriptTimer !== null) clearTimeout(transcriptTimer);
+  transcriptTimer = null;
+  const value = transcriptQueued;
+  transcriptQueued = null;
+  if (value !== null) {
+    transcriptLastWrite = Date.now();
+    persistNow(transcriptKey, value);
+  }
+  releaseTranscriptWaiters();
+}
+
+function afterTranscriptWrite(): Promise<unknown> {
+  if (transcriptQueued === null) return writes;
+  return new Promise<void>((resolve) => transcriptWaiters.push(resolve)).then(() => writes);
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('pagehide', flushTranscriptWrite);
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushTranscriptWrite();
+  });
+}
+
+function persistNow(key: string, value: string | null): void {
   if (!ready) return;
   writes = writes.catch(() => undefined).then(() => invoke<void>('save_setting', { key, value }));
   void writes.catch((cause: unknown) =>
@@ -97,8 +160,7 @@ function persist(key: string, value: string | null): void {
 }
 
 function clearTranscriptPendingAfterWrite(token: string): void {
-  const write = writes;
-  void write
+  void afterTranscriptWrite()
     .then(() => {
       if (localStorage.getItem(transcriptPendingKey) === token)
         localStorage.removeItem(transcriptPendingKey);

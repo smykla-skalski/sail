@@ -11,10 +11,14 @@ use std::time::{Duration, Instant};
 #[cfg(not(feature = "e2e"))]
 use tauri::Manager;
 
+use crate::settings_records::{self as records, is_record_key};
+use std::sync::Mutex as StdMutex;
+
 type Settings = BTreeMap<String, String>;
 type Deletions = BTreeMap<String, BTreeSet<String>>;
 const DELETIONS_KEY: &str = "sai-settings-deletions";
 const MODIFIED_KEY: &str = "sai-settings-modified";
+const SPAWN_RECEIPTS_KEY: &str = "sai-agent-spawn-receipts";
 const INTERRUPTED_TURNS_KEY: &str = "sai-interrupted-agent-turns";
 const ACP_TURN_EVIDENCE_KEY: &str = "sai-acp-turn-evidence";
 const ACP_TURN_EVIDENCE_LIMIT: usize = 500;
@@ -170,7 +174,7 @@ fn protected_acp_turns(settings: &Settings) -> HashSet<(String, String, String, 
         .map(|turn| (turn.agent, turn.directory, turn.session_id, turn.turn_id))
         .collect::<HashSet<_>>();
     let receipts = settings
-        .get("sai-agent-spawn-receipts")
+        .get(SPAWN_RECEIPTS_KEY)
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
@@ -315,9 +319,10 @@ pub fn record_acp_turn_evidence(
     let _writer = begin_e2e_settings_write()?;
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
+    let before = settings.clone();
     merge_acp_turn_evidence(&mut settings, evidence)?;
-    write_settings(&path, &settings)
+    write_settings(&path, &before, &settings)
 }
 
 #[tauri::command]
@@ -330,7 +335,7 @@ pub fn get_acp_turn_evidence(
 ) -> Result<Option<AcpTurnEvidence>, String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
-    Ok(acp_turn_evidence(&read_settings(&path)?)
+    Ok(acp_turn_evidence(&read_scoped(&path, ACP_KEYS)?)
         .into_iter()
         .find(|item| {
             item.agent == agent
@@ -346,7 +351,7 @@ pub fn list_pending_acp_post_turn_checks(
 ) -> Result<Vec<AcpTurnEvidence>, String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
-    Ok(acp_turn_evidence(&read_settings(&path)?)
+    Ok(acp_turn_evidence(&read_scoped(&path, ACP_KEYS)?)
         .into_iter()
         .filter(|item| item.post_turn_pending && item.status == "done")
         .collect())
@@ -362,7 +367,8 @@ pub fn finish_acp_post_turn_checks(
 ) -> Result<(), String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
+    let before = settings.clone();
     let mut evidence = acp_turn_evidence(&settings);
     let Some(item) = evidence.iter_mut().find(|item| {
         item.agent == agent
@@ -375,7 +381,7 @@ pub fn finish_acp_post_turn_checks(
     };
     item.post_turn_pending = false;
     write_acp_turn_evidence(&mut settings, &evidence)?;
-    write_settings(&path, &settings)
+    write_settings(&path, &before, &settings)
 }
 
 fn interrupted_turns(settings: &Settings) -> Vec<InterruptedAgentTurn> {
@@ -444,9 +450,10 @@ pub fn record_interrupted_turns(
     }
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
+    let before = settings.clone();
     merge_interrupted_turns(&mut settings, interrupted)?;
-    write_settings(&path, &settings)
+    write_settings(&path, &before, &settings)
 }
 
 pub fn clear_interrupted_turn(
@@ -460,12 +467,13 @@ pub fn clear_interrupted_turn(
     let _writer = begin_e2e_settings_write()?;
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    let mut settings = read_settings(&path)?;
+    let mut settings = read_scoped(&path, ACP_KEYS)?;
     if !settings.contains_key(INTERRUPTED_TURNS_KEY) {
         return Ok(());
     }
+    let before = settings.clone();
     remove_interrupted_turn(&mut settings, agent, directory, session_id, turn_id)?;
-    write_settings(&path, &settings)
+    write_settings(&path, &before, &settings)
 }
 
 #[tauri::command]
@@ -474,7 +482,7 @@ pub fn list_interrupted_agent_turns(
 ) -> Result<Vec<InterruptedAgentTurn>, String> {
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
-    Ok(interrupted_turns(&read_settings(&path)?))
+    Ok(interrupted_turns(&read_scoped(&path, ACP_KEYS)?))
 }
 
 #[tauri::command]
@@ -520,7 +528,13 @@ fn lock_settings(path: &Path) -> Result<File, String> {
     Ok(lock)
 }
 
-fn read_settings(path: &Path) -> Result<Settings, String> {
+const ACP_KEYS: &[&str] = &[
+    ACP_TURN_EVIDENCE_KEY,
+    INTERRUPTED_TURNS_KEY,
+    SPAWN_RECEIPTS_KEY,
+];
+
+fn read_settings_file(path: &Path) -> Result<Settings, String> {
     let backup = path.with_extension("json.bak");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -538,7 +552,92 @@ fn read_settings(path: &Path) -> Result<Settings, String> {
     serde_json::from_str(&contents).map_err(|error| format!("Cannot parse settings: {error}"))
 }
 
-fn write_settings(path: &Path, settings: &Settings) -> Result<(), String> {
+static MIGRATED: StdMutex<BTreeSet<PathBuf>> = StdMutex::new(BTreeSet::new());
+
+/// Moves record keys out of `settings.json` once per process. Records are written
+/// first, so a crash leaves each key in the file, the store, or both; the record
+/// wins and the file copy is dropped on the next pass.
+fn migrate_records(path: &Path) -> Result<(), String> {
+    if MIGRATED
+        .lock()
+        .map_err(|error| error.to_string())?
+        .contains(path)
+    {
+        return Ok(());
+    }
+    let mut file = read_settings_file(path)?;
+    if file.keys().any(|key| is_record_key(key)) {
+        for (key, value) in &file {
+            if is_record_key(key) {
+                records::write(path, key, value)?;
+            }
+        }
+        file.retain(|key, _| !is_record_key(key));
+        write_settings_file(path, &file)?;
+    }
+    MIGRATED
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(path.to_path_buf());
+    Ok(())
+}
+
+fn read_file_settings(path: &Path) -> Result<Settings, String> {
+    migrate_records(path)?;
+    read_settings_file(path)
+}
+
+fn read_settings(path: &Path) -> Result<Settings, String> {
+    let mut settings = read_file_settings(path)?;
+    settings.extend(records::read_all(path)?);
+    Ok(settings)
+}
+
+/// Non-record keys come from `settings.json`; do not write back a scoped read of them.
+fn read_scoped(path: &Path, keys: &[&str]) -> Result<Settings, String> {
+    migrate_records(path)?;
+    let mut settings = Settings::new();
+    for key in keys.iter().filter(|key| is_record_key(key)) {
+        if let Some(value) = records::read(path, key)? {
+            settings.insert((*key).to_string(), value);
+        }
+    }
+    if keys.iter().any(|key| !is_record_key(key)) {
+        let mut file = read_settings_file(path)?;
+        file.retain(|key, _| keys.contains(&key.as_str()));
+        settings.extend(file);
+    }
+    Ok(settings)
+}
+
+/// Persists the difference between `before` and `after`: one record per changed
+/// record key, and `settings.json` only when its own content changed.
+fn write_settings(path: &Path, before: &Settings, after: &Settings) -> Result<(), String> {
+    for (key, value) in after {
+        if is_record_key(key) && before.get(key) != Some(value) {
+            records::write(path, key, value)?;
+        }
+    }
+    for key in before.keys() {
+        if is_record_key(key) && !after.contains_key(key) {
+            records::remove(path, key)?;
+        }
+    }
+    let file_part = |settings: &Settings| -> Settings {
+        settings
+            .iter()
+            .filter(|(key, _)| !is_record_key(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    };
+    let next = file_part(after);
+    if file_part(before) == next {
+        return Ok(());
+    }
+    write_settings_file(path, &next)
+}
+
+fn write_settings_file(path: &Path, settings: &Settings) -> Result<(), String> {
     let temporary = path.with_extension("json.tmp");
     let contents = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("Cannot encode settings: {error}"))?;
@@ -580,6 +679,9 @@ fn write_settings(path: &Path, settings: &Settings) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     fs::rename(&temporary, path).map_err(|error| format!("Cannot save settings: {error}"))?;
+    if let Some(parent) = path.parent() {
+        records::sync_directory(parent);
+    }
     Ok(())
 }
 
@@ -859,7 +961,7 @@ fn filter_legacy(key: &str, raw: &str, deleted: &Deletions) -> String {
 pub fn string_setting(app: &tauri::AppHandle, key: &str) -> Result<Option<String>, String> {
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
-    Ok(read_settings(&path)?.remove(key))
+    Ok(read_scoped(&path, &[key])?.remove(key))
 }
 
 /// Clear disk-backed fixture settings between E2E specs under the normal settings lock.
@@ -872,7 +974,8 @@ pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
         let result = (|| {
             quiesce_e2e_settings_writes()?;
             let _lock = lock_settings(&path)?;
-            write_settings(&path, &Settings::new())?;
+            write_settings_file(&path, &Settings::new())?;
+            records::clear(&path)?;
             crate::local_claims::reset_test_store(&app)
         })();
         let writers = resume_e2e_settings_writes();
@@ -927,10 +1030,7 @@ fn migrate_settings_sync(
         .get(DELETIONS_KEY)
         .and_then(|raw| serde_json::from_str(raw).ok())
         .unwrap_or_default();
-    let modified: BTreeSet<String> = saved
-        .get(MODIFIED_KEY)
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
+    let modified = modified_keys(&saved);
     for (key, value) in legacy {
         if (!key.starts_with("sai-") && key != "sail-agent-threads")
             || key == DELETIONS_KEY
@@ -966,9 +1066,7 @@ fn migrate_settings_sync(
             Some(_) => {}
         }
     }
-    if saved != before {
-        write_settings(&path, &saved)?;
-    }
+    write_settings(&path, &before, &saved)?;
     Ok(saved)
 }
 
@@ -993,12 +1091,23 @@ pub(crate) fn save_setting_sync(
     if !key.starts_with("sai-") && key != "sail-agent-threads" {
         return Err("Unknown settings key.".to_string());
     }
-    let path = settings_path(&app)?;
-    let _lock = lock_settings(&path)?;
-    let mut saved = read_settings(&path)?;
     if key == DELETIONS_KEY || key == MODIFIED_KEY {
         return Err("Unknown settings key.".to_string());
     }
+    save_setting_at(&settings_path(&app)?, key, value)
+}
+
+fn save_setting_at(path: &Path, key: String, value: Option<String>) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let _lock = lock_settings(&path)?;
+    let mut saved = if is_record_key(&key) {
+        read_scoped(&path, &[&key, MODIFIED_KEY, DELETIONS_KEY])?
+    } else {
+        let mut saved = read_file_settings(&path)?;
+        saved.extend(read_scoped(&path, &[MODIFIED_KEY, DELETIONS_KEY])?);
+        saved
+    };
+    let before = saved.clone();
     let mut modified: BTreeSet<String> = saved
         .get(MODIFIED_KEY)
         .and_then(|raw| serde_json::from_str(raw).ok())
@@ -1020,18 +1129,26 @@ pub(crate) fn save_setting_sync(
             saved.remove(&key);
         }
     }
-    write_settings(&path, &saved)
+    write_settings(&path, &before, &saved)
+}
+
+fn modified_keys(settings: &Settings) -> BTreeSet<String> {
+    settings
+        .get(MODIFIED_KEY)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        acp_turn_evidence, filter_legacy, interrupted_turns, lock_settings,
+        acp_turn_evidence, filter_legacy, interrupted_turns, is_record_key, lock_settings,
         merge_acp_turn_evidence, merge_acp_turn_evidence_at, merge_catalog,
-        merge_interrupted_turns, merge_threads, read_settings, remove_interrupted_turn,
+        merge_interrupted_turns, merge_threads, modified_keys, read_file_settings, read_scoped,
+        read_settings, read_settings_file, records, remove_interrupted_turn, save_setting_at,
         update_deletions, write_acp_turn_evidence, write_settings, AcpTurnEvidence, Deletions,
-        InterruptedAgentTurn, Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS,
-        DELETIONS_KEY,
+        InterruptedAgentTurn, Settings, ACP_KEYS, ACP_TURN_EVIDENCE_LIMIT,
+        ACP_UNSETTLED_RETENTION_MS, DELETIONS_KEY, MODIFIED_KEY, SPAWN_RECEIPTS_KEY,
     };
     #[cfg(feature = "e2e")]
     use super::{E2eWriterGate, E2eWriterState};
@@ -1514,8 +1631,9 @@ mod tests {
                 std::thread::spawn(move || {
                     let _lock = lock_settings(&path).unwrap();
                     let mut saved = read_settings(&path).unwrap();
+                    let before = saved.clone();
                     saved.insert(format!("sai-key-{index}"), index.to_string());
-                    write_settings(&path, &saved).unwrap();
+                    write_settings(&path, &before, &saved).unwrap();
                 })
             })
             .collect();
@@ -1524,6 +1642,151 @@ mod tests {
         }
         assert_eq!(read_settings(&path).unwrap().len(), 8);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn scratch_settings(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "sail-settings-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory.join("settings.json")
+    }
+
+    #[test]
+    fn upgrade_moves_state_keys_out_of_settings_and_keeps_every_value() {
+        let path = scratch_settings("upgrade");
+        let legacy = Settings::from([
+            ("sai-theme".to_string(), "dark".to_string()),
+            ("sai-agent-transcript-cache".to_string(), "[1]".to_string()),
+            ("sai-agent-spawn-receipts".to_string(), "[2]".to_string()),
+            ("sai-issue-graph:/repo:ses:1".to_string(), "{}".to_string()),
+            (
+                MODIFIED_KEY.to_string(),
+                "[\"sai-theme\",\"sai-agent-spawn-receipts\"]".to_string(),
+            ),
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-agent-transcript-cache"], "[1]");
+        assert_eq!(loaded["sai-agent-spawn-receipts"], "[2]");
+        assert_eq!(loaded["sai-issue-graph:/repo:ses:1"], "{}");
+        assert_eq!(loaded["sai-theme"], "dark");
+        assert_eq!(
+            modified_keys(&loaded),
+            ["sai-agent-spawn-receipts", "sai-theme"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+
+        let on_disk = read_settings_file(&path).unwrap();
+        assert!(on_disk.keys().all(|key| !is_record_key(key)), "{on_disk:?}");
+        assert_eq!(on_disk["sai-theme"], "dark");
+        assert!(!on_disk.contains_key(MODIFIED_KEY));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn settings_file_copy_wins_so_a_downgrade_write_is_not_lost() {
+        let path = scratch_settings("crash");
+        let legacy = Settings::from([
+            ("sai-theme".to_string(), "dark".to_string()),
+            ("sai-ship-runs".to_string(), "[\"old\"]".to_string()),
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        records::write(&path, "sai-ship-runs", "[\"stale\"]").unwrap();
+
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-ship-runs"], "[\"old\"]");
+        assert_eq!(loaded["sai-theme"], "dark");
+        assert!(!read_settings_file(&path)
+            .unwrap()
+            .contains_key("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn saving_a_record_key_leaves_settings_json_untouched() {
+        let path = scratch_settings("isolated");
+        let original = b"{ \"sai-theme\": \"dark\" }";
+        std::fs::write(&path, original).unwrap();
+        let before = read_scoped(&path, ACP_KEYS).unwrap();
+        let mut after = before.clone();
+        after.insert(SPAWN_RECEIPTS_KEY.to_string(), "[3]".to_string());
+        write_settings(&path, &before, &after).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            read_scoped(&path, ACP_KEYS).unwrap()[SPAWN_RECEIPTS_KEY],
+            "[3]"
+        );
+
+        let before = after.clone();
+        after.remove(SPAWN_RECEIPTS_KEY);
+        write_settings(&path, &before, &after).unwrap();
+        assert!(read_scoped(&path, ACP_KEYS).unwrap().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn saving_a_user_setting_does_not_rewrite_records() {
+        let path = scratch_settings("user");
+        let mut saved = Settings::new();
+        saved.insert("sai-ship-runs".to_string(), "[1]".to_string());
+        write_settings(&path, &Settings::new(), &saved).unwrap();
+        let record = path.with_file_name("records");
+        let stamp = |directory: &std::path::Path| -> Vec<std::time::SystemTime> {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().modified().unwrap())
+                .collect()
+        };
+        let first = stamp(&record);
+        let before = read_file_settings(&path).unwrap();
+        let mut after = before.clone();
+        after.insert("sai-theme".to_string(), "light".to_string());
+        write_settings(&path, &before, &after).unwrap();
+        assert_eq!(stamp(&record), first);
+        assert_eq!(read_settings(&path).unwrap()["sai-theme"], "light");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn save_setting_writes_only_the_store_that_owns_the_key() {
+        let path = scratch_settings("owner");
+        std::fs::write(&path, b"{ \"sai-theme\": \"dark\" }").unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        save_setting_at(&path, SPAWN_RECEIPTS_KEY.into(), Some("[1]".into())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        save_setting_at(&path, SPAWN_RECEIPTS_KEY.into(), Some("[2]".into())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        save_setting_at(&path, "sai-theme".into(), Some("light".into())).unwrap();
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-theme"], "light");
+        assert_eq!(loaded[SPAWN_RECEIPTS_KEY], "[2]");
+        assert_eq!(
+            modified_keys(&loaded),
+            ["sai-theme", SPAWN_RECEIPTS_KEY]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+        let on_disk = read_settings_file(&path).unwrap();
+        assert_eq!(on_disk.len(), 1, "{on_disk:?}");
+
+        save_setting_at(&path, SPAWN_RECEIPTS_KEY.into(), None).unwrap();
+        assert!(!read_settings(&path)
+            .unwrap()
+            .contains_key(SPAWN_RECEIPTS_KEY));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[cfg(feature = "e2e")]

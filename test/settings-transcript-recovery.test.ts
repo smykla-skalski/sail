@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import {
+  flushTranscriptWrite,
   getSetting,
   initializeSettings,
   quiesceSettingsWrites,
@@ -65,6 +66,7 @@ void test('unfinished transcript writes survive restart and overlapping native a
     },
   });
 
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   try {
     await initializeSettings();
     assert.equal(getSetting(transcriptKey), 'newer local transcript');
@@ -83,28 +85,33 @@ void test('unfinished transcript writes survive restart and overlapping native a
     const latestToken = storage.getItem(pendingKey);
     assert.ok(latestToken);
     await new Promise(setImmediate);
+    assert.equal(saves.length, 1, 'a second transcript write inside the interval is deferred');
+    assert.equal(getSetting(transcriptKey), 'repeated transcript');
+    mock.timers.tick(10_000);
+    await new Promise(setImmediate);
+    assert.equal(saves.length, 2, 'queued writes collapse into the newest transcript');
     assert.equal(saves[1]?.value, 'repeated transcript');
+    assert.equal(storage.getItem(pendingKey), latestToken);
     saves[1].resolve();
-    await new Promise(setImmediate);
-    assert.equal(storage.getItem(pendingKey), latestToken);
-    assert.equal(saves[2]?.value, 'intermediate transcript');
-    saves[2].resolve();
-    await new Promise(setImmediate);
-    assert.equal(storage.getItem(pendingKey), latestToken);
-    assert.equal(saves[3]?.value, 'repeated transcript');
-    saves[3].resolve();
     await new Promise(setImmediate);
     assert.equal(storage.getItem(pendingKey), null);
 
     setTranscriptSetting('other window is active');
     storage.setItem(pendingKey, 'newer-window-token');
+    mock.timers.tick(10_000);
     await new Promise(setImmediate);
-    assert.equal(saves[4]?.value, 'other window is active');
-    saves[4].resolve();
+    assert.equal(saves[2]?.value, 'other window is active');
+    saves[2].resolve();
     await new Promise(setImmediate);
     assert.equal(storage.getItem(pendingKey), 'newer-window-token');
+    setTranscriptSetting('flushed on demand');
+    flushTranscriptWrite();
+    await new Promise(setImmediate);
+    assert.equal(saves[3]?.value, 'flushed on demand');
+    saves[3].resolve();
     await quiesceSettingsWrites();
   } finally {
+    mock.timers.reset();
     for (const save of saves) save.resolve();
     globals.forEach((key, index) => {
       const descriptor = original[index];

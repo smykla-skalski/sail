@@ -85,6 +85,7 @@
     acp,
     acpCanResume,
     acpDisconnectAffectsSession,
+    acpDisconnectedForIdleness,
     acpFinishedPromptStatus,
     acpPromptInterrupted,
     acpSessionOwner,
@@ -1735,6 +1736,8 @@
             ]
           : undefined;
       if (payload.directory !== directory && disconnectedDirectory !== directory) return;
+      // An idle exit is not a failure: the next prompt resumes the session on a fresh agent.
+      if (acpDisconnectedForIdleness(message)) return;
       if (
         message.method === 'sail/disconnected' &&
         acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
@@ -2081,7 +2084,11 @@
       if (planRequested || forcePlan) {
         if (!id || !planModeOption)
           throw new Error(`${name} does not expose a planning mode for this session.`);
-        const result = await acp.setConfig(turnAgent, directory, id, planModeOption.id, 'plan');
+        const planModeId = planModeOption.id;
+        const result = await recoverMissingSession(
+          () => acp.setConfig(turnAgent, directory, id, planModeId, 'plan'),
+          () => reattachSession(id, current),
+        );
         configOptions = result.configOptions ?? configOptions;
       }
       if (shipIssue && id && !ephemeral) {
@@ -2691,7 +2698,10 @@
     const task = (async () => {
       if (previous) await previous;
       try {
-        const result = await acp.setConfig(agent, directory, sessionId, configId, value);
+        const result = await recoverMissingSession(
+          () => acp.setConfig(agent, directory, sessionId, configId, value),
+          () => reattachSession(sessionId, generation),
+        );
         if (activeSessionId !== sessionId) return;
         configFailure = '';
         error = '';

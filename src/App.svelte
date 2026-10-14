@@ -256,7 +256,14 @@
   } from './lib/task-economics.ts';
   import DiffPanel from './DiffPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
-  import { createSidebarThreadLoader } from './lib/sidebar-inventory';
+  import {
+    createSidebarThreadLoader,
+    mergeSidebarRefreshPaths,
+    SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS,
+    sidebarFocusRefreshDue,
+    unlistedSidebarPaths,
+    type SidebarRefreshPaths,
+  } from './lib/sidebar-inventory';
   import {
     clampSidebarWidth,
     parseSidebarWidth,
@@ -1733,6 +1740,13 @@
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
+  let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
+  let sidebarInventoryLastFullListing = 0;
+  let sidebarInventoryDeferred = false;
+  let sidebarFocusPending = false;
+  let sidebarFocusTimer: ReturnType<typeof setTimeout> | undefined;
+  // Directories already listed; only new ones are listed again without a focus change.
+  let sidebarListedDirectories: Record<string, true> = {};
   const sidebarInventoryDelay = import.meta.env.MODE === 'e2e' ? 250 : 5_000;
   const foregroundAgentLoading = $derived.by(() =>
     leaves(paneLayout).some((pane) => pane.agent && agentEntrySnapshots[pane.id]?.ready !== true),
@@ -2606,7 +2620,8 @@
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
-    const sidebarRefreshTimer = setInterval(scheduleSidebarInventoryRefresh, 30_000);
+    window.addEventListener('focus', refreshSidebarOnFocus);
+    document.addEventListener('visibilitychange', refreshSidebarOnFocus);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
       if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading)
@@ -2629,8 +2644,10 @@
       clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
-      clearInterval(sidebarRefreshTimer);
+      window.removeEventListener('focus', refreshSidebarOnFocus);
+      document.removeEventListener('visibilitychange', refreshSidebarOnFocus);
       clearTimeout(sidebarInventoryTimer);
+      clearTimeout(sidebarFocusTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
       if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
@@ -10932,6 +10949,7 @@
     const results = await request.finally(() => sidebarInventoryRequests.delete(request));
     if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
+    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories[path] = true;
     const listed = new Set(paths);
     const retained = sidebarOpenCodeThreads.filter(
       (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
@@ -10957,19 +10975,28 @@
   let sidebarInventoryFailure = '';
 
   function reportSidebarInventoryFailure(failure: string | null) {
-    // The 30 s refresh must not re-raise the same failure over the user's current error.
+    // A repeated refresh must not re-raise the same failure over the user's current error.
     if (failure && failure !== sidebarInventoryFailure) error = failure;
     sidebarInventoryFailure = failure ?? '';
   }
 
-  function scheduleSidebarInventoryRefresh(delay = sidebarInventoryDelay) {
+  function scheduleSidebarInventoryRefresh(
+    delay = sidebarInventoryDelay,
+    paths?: string[] | 'all',
+  ) {
+    sidebarInventoryWaiting = mergeSidebarRefreshPaths(sidebarInventoryWaiting, paths);
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryReadyKey = '';
     const key = sidebarDirectoryKey;
     const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
       sidebarInventoryTimer = undefined;
-      void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
+      const directories: string[] = JSON.parse(sidebarDirectoryKey);
+      const wanted = sidebarInventoryWaiting;
+      sidebarInventoryWaiting = undefined;
+      if (!wanted) sidebarInventoryLastFullListing = Date.now();
+      const selected = wanted ? directories.filter((path) => wanted.has(path)) : directories;
+      void refreshSidebarOpenCodeThreads(selected.length > 0 ? selected : directories).then(
         (failure) => {
           reportSidebarInventoryFailure(failure);
           if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
@@ -10979,6 +11006,32 @@
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
     }, delay);
+  }
+
+  // OpenCode sessions made outside Sail appear when the window regains focus, not by polling.
+  function refreshSidebarOnFocus() {
+    clearTimeout(sidebarFocusTimer);
+    sidebarFocusTimer = undefined;
+    if (
+      document.visibilityState === 'hidden' ||
+      !agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)
+    )
+      return;
+    if (foregroundAgentLoading) {
+      sidebarFocusPending = true;
+      return;
+    }
+    const now = Date.now();
+    if (!sidebarFocusRefreshDue(sidebarInventoryLastFullListing, now)) {
+      // Focus stays put after this event, so check again once the last listing is old enough.
+      sidebarFocusTimer = setTimeout(
+        refreshSidebarOnFocus,
+        SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - sidebarInventoryLastFullListing),
+      );
+      return;
+    }
+    if (sidebarInventoryTimer === undefined)
+      scheduleSidebarInventoryRefresh(sidebarInventoryDelay, 'all');
   }
 
   if (import.meta.env.MODE === 'e2e') {
@@ -10995,14 +11048,37 @@
     const tracked = sidebarDirectoryKey;
     const available = agentAvailability.some((agent) => agent.id === 'opencode' && agent.available);
     const loading = foregroundAgentLoading;
-    if (!tracked || !available) return;
+    if (!tracked) return;
+    if (!available) {
+      // Re-detection must list every directory again.
+      sidebarListedDirectories = {};
+      return;
+    }
     if (loading) {
+      // A queued request waits for the pane instead of being dropped.
+      if (sidebarInventoryTimer !== undefined) sidebarInventoryDeferred = true;
       clearTimeout(sidebarInventoryTimer);
       sidebarInventoryTimer = undefined;
       sidebarInventoryReadyKey = '';
       return;
     }
-    scheduleSidebarInventoryRefresh();
+    const directories: string[] = JSON.parse(tracked);
+    // A directory that left the catalog is listed again if it returns.
+    sidebarListedDirectories = Object.fromEntries(
+      directories.filter((path) => sidebarListedDirectories[path]).map((path) => [path, true]),
+    );
+    const fresh = unlistedSidebarPaths(directories, sidebarListedDirectories);
+    const deferred = sidebarInventoryDeferred;
+    sidebarInventoryDeferred = false;
+    if (sidebarFocusPending) {
+      sidebarFocusPending = false;
+      refreshSidebarOnFocus();
+    }
+    if (fresh.length === 0 && !deferred) {
+      if (sidebarInventoryTimer === undefined) sidebarInventoryReadyKey = tracked;
+      return;
+    }
+    scheduleSidebarInventoryRefresh(sidebarInventoryDelay, fresh);
   });
 
   function openAgent(agent: AgentId, thread: AgentThread | null = null, preserveCycle = false) {
@@ -12408,7 +12484,7 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
-      scheduleSidebarInventoryRefresh(250);
+      scheduleSidebarInventoryRefresh(250, [thread.directory]);
       return;
     }
     saveAgentThread(thread);

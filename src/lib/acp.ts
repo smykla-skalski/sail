@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { getSetting, setSetting, setTranscriptSetting } from './settings.ts';
+import { flushTranscriptWrite, getSetting, setSetting, setTranscriptSetting } from './settings.ts';
 import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
 import { sessionTasks } from './session-tasks.ts';
@@ -359,6 +359,11 @@ export function acpDisconnectedSessionIds(message: AgentEvent['message']): strin
   return sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string');
 }
 
+/** The backend stopped an idle agent; attached sessions resume on their next use. */
+export function acpDisconnectedForIdleness(message: AgentEvent['message']): boolean {
+  return message.method === 'sail/disconnected' && message.params?.idle === true;
+}
+
 export function acpSessionOwner(sessionId: string | null): string | null {
   if (!sessionId) return null;
   const match = /^sail-owned:([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}):/.exec(
@@ -446,6 +451,7 @@ if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', () => {
     for (const pending of pendingTranscripts.values())
       saveRecentTranscript(pending.thread, pending.entries);
+    flushTranscriptWrite();
   });
 }
 
