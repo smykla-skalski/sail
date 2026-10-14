@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -48,8 +48,9 @@ await test('artifact reuse rejects source, toolchain, signature, identity and bi
   assert.equal(artifactMatches(manifest, requirements, 'binary', 'dev.smykla.sail', true), false);
 });
 
-await test('sequential runs canonicalize aliases and isolate every fixture path', () => {
+await test('sequential runs canonicalize aliases and isolate every fixture path', (context) => {
   const root = mkdtempSync(join(tmpdir(), 'sail-native-policy-'));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
   const alias = join(root, 'alias');
   symlinkSync(realpathSync(root), alias, 'dir');
   const inherited = {

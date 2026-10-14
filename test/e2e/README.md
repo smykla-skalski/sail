@@ -6,6 +6,10 @@ The E2E build accepts `SAIL_E2E_MACHINE_READING=healthy` to supply fixed healthy
 
 Attached app and runner processes must share `SAIL_E2E_OPEN_URL_LOG` for `conversation-links.spec.ts`: leaving it unset in the runner failed with “Conversation link did not invoke the external browser command”; passing the app’s log path to both made the same spec pass. Set `SAIL_E2E_FAKE_GH_DIR` and `SAIL_E2E_FAKE_GH_BIN` to the private fake-gh fixture paths in both processes. A missing fake-gh fixture directory with no real `gh` on `PATH` returned exit 127 and `gh is not installed`; the fake shim can fall through to a real `gh` if one is available, so do not run attached ship specs with a missing fixture path.
 
+## Per-run app data
+
+Each native run launches the app with a fresh bundle identifier, and macOS and WebKit create a folder for it in `~/Library/Logs`, `~/Library/Caches`, `~/Library/WebKit`, `~/Library/Application Support`, and the per-user temporary and cache folders. `npm run test:native` removes the run's folders when its app stops, whether the run passed, failed or was cancelled, and a failed removal is reported in `result.json` under `leftovers`. At the start of each run it also removes folders of earlier `dev.smykla.sail.e2e.<32 hex>` runs whose `Sail E2E <8 hex>.app` process is gone, and WebdriverIO state folders in the temporary directory whose owning process exited. A run that is still in progress keeps its folders. Folders with other identifiers, such as ones an agent names for a manual test bundle, are never touched.
+
 ## Signed pre-quiescence run on 2026-10-10
 
 The full private app run on `0e1a6109` completed all 53 spec files in 32m23s: 31 passed and 22 failed. The original `activity-history → agent-questions` and `task-overview-scale → task-overview` fixture transitions passed. `agent-status-bar` failed both in the full run and alone on the same missing permission assertion; `inbox` failed both ways on the same unread-attention timeout. `conversation-links` failed only when the attached app and runner used different URL log paths, as described above.

@@ -18,6 +18,13 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { e2eContextService, e2eIdentity } from './e2e-identity.mjs';
+import { sweepStateRoots } from './e2e-state.mjs';
+import {
+  listProcessCommands,
+  removeRunData,
+  sweepRunData,
+  systemRunDataRoots,
+} from './native-app-data.mjs';
 import { runOwnedCommand } from './native-test-process.mjs';
 import {
   artifactKey,
@@ -316,6 +323,13 @@ async function main() {
     process.exitCode = 1;
     return;
   }
+  const dataRoots = systemRunDataRoots();
+  try {
+    const removed = [...sweepRunData(dataRoots, listProcessCommands), ...sweepStateRoots(tmpdir())];
+    process.stdout.write(`Removed ${removed.length} folders left by earlier native runs\n`);
+  } catch (error) {
+    process.stderr.write(`Could not remove folders left by earlier runs: ${error.message}\n`);
+  }
   let result = { verdict: 'SETUP_FAILED' };
   const runAttempt = async (index) => {
     if (cancelled || index > limit) return;
@@ -323,10 +337,12 @@ async function main() {
     mkdirSync(attempt);
     const env = nativeEnvironment(attempt, checkout, process.env, await availablePort());
     let phase = 'artifact';
+    let runIdentifier;
     try {
       const built = await artifact(canonical, requirements, attempt);
       phase = 'signing and identity';
       const { app, identity } = prepareApp(built.app, attempt, env);
+      runIdentifier = identity.identifier;
       const fixtureNames = [
         'TMPDIR',
         'SAIL_E2E_CONFIG_DIR',
@@ -389,6 +405,12 @@ async function main() {
       writeFileSync(join(attempt, 'failure.json'), JSON.stringify(result, null, 2));
     } finally {
       if (env.SAIL_E2E_BINARY) await stopApp(env.SAIL_E2E_BINARY);
+      if (runIdentifier) {
+        const leftovers = await removeRunData(runIdentifier, dataRoots);
+        result.leftovers = leftovers;
+        if (leftovers.length > 0)
+          process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
+      }
     }
     if (result.verdict === 'SETUP_FAILED') return runAttempt(index + 1);
   };

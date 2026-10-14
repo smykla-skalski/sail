@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -9,8 +9,9 @@ import test from 'node:test';
 await test(
   'native toolchain precondition failures retain a diagnostic result before building',
   { skip: process.platform !== 'darwin' },
-  () => {
+  (context) => {
     const root = mkdtempSync(join(tmpdir(), 'sail-native-preflight-'));
+    context.after(() => rmSync(root, { recursive: true, force: true }));
     const result = spawnSync(process.execPath, ['scripts/run-native-tests.mjs'], {
       encoding: 'utf8',
       timeout: 45_000,

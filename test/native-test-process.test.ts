@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -13,6 +13,7 @@ await test(
   { skip: process.platform === 'win32' },
   async (context) => {
     const root = mkdtempSync(join(tmpdir(), 'sail-owned-command-'));
+    context.after(() => rmSync(root, { recursive: true, force: true }));
     const pidFile = join(root, 'descendant.pid');
     const unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore',

@@ -1,5 +1,5 @@
 import { browser } from '@wdio/globals';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import {
@@ -8,6 +8,7 @@ import {
   privatePort,
   PrivateEndpointGuard,
 } from './test/e2e-isolation.ts';
+import { createStateRoot, removeStateRoot, sweepStateRoots } from './scripts/e2e-state.mjs';
 import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
 import { assertNativeWebviews } from './test/e2e/native-preconditions.ts';
 
@@ -24,10 +25,11 @@ const port = privatePort(process.env.TAURI_WEBDRIVER_PORT);
 process.env.TAURI_WEBDRIVER_PORT = String(port);
 const serviceModule = '@wdio/tauri-service';
 const { default: TauriService } = await import(serviceModule);
-const state = mkdtempSync(join(tmpdir(), 'sail-e2e-'));
+sweepStateRoots(tmpdir());
+const state = createStateRoot(tmpdir());
 process.once('exit', () => {
   jobs.release();
-  rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  removeStateRoot(state);
 });
 const attach = process.env.SAIL_E2E_ATTACH === '1';
 if (!attach) process.env.SAIL_HOOK_CONNECTION_FILE = join(state, 'hook-connection.json');
@@ -226,6 +228,6 @@ export const config = {
   }),
   onComplete() {
     jobs.release();
-    rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removeStateRoot(state);
   },
 };
