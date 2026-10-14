@@ -2150,8 +2150,24 @@ fn runtime_environment(
         ("NPM_CONFIG_CACHE", shared_download_cache.join("npm")),
         ("YARN_CACHE_FOLDER", shared_download_cache.join("yarn")),
         ("COREPACK_HOME", shared_download_cache.join("corepack")),
+        ("MISE_STATE_DIR", data_directory.join("mise-state")),
+        ("UV_TOOL_DIR", data_directory.join("uv-tools")),
     ]);
     environment
+}
+
+fn configured_tool_paths(home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    [
+        home.join(".local/share/mise/shims"),
+        home.join(".local/bin"),
+        home.join(".cargo/bin"),
+    ]
+    .into_iter()
+    .filter(|path| path.is_dir())
+    .collect()
 }
 
 #[cfg(unix)]
@@ -2179,6 +2195,8 @@ fn prepare_runtime_directories(data_directory: &Path, temp_directory: &Path) -> 
         temp_directory.to_path_buf(),
         data_directory.join("cache"),
         data_directory.join("build"),
+        data_directory.join("mise-state"),
+        data_directory.join("uv-tools"),
         temp_directory.join("go-tmp"),
     ] {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
@@ -5018,11 +5036,13 @@ fn connect_blocking_inner(
     #[cfg(not(unix))]
     let shared_build_directory: Option<PathBuf> = None;
     let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     #[cfg(feature = "e2e")]
     let test_agent = std::env::var_os("SAIL_ACP_TEST_AGENT");
     #[cfg(not(feature = "e2e"))]
     let test_agent: Option<std::ffi::OsString> = None;
-    let mut paths = Vec::new();
+    let mut paths = configured_tool_paths(home.as_deref());
     let is_test_agent = test_agent.is_some();
     let mut owned_temp = None;
     let background = crate::background_priority::enabled(&app);
@@ -8949,6 +8969,8 @@ time.sleep(10)
             "CARGO_TARGET_DIR",
             "GOCACHE",
             "GOTMPDIR",
+            "MISE_STATE_DIR",
+            "UV_TOOL_DIR",
         ] {
             assert_ne!(
                 path(&first_environment, name),
@@ -8963,9 +8985,13 @@ time.sleep(10)
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
+            first_data.join("mise-state"),
+            first_data.join("uv-tools"),
             first_temp.join("go-tmp"),
             second_temp.clone(),
             second_data.join("cache"),
+            second_data.join("mise-state"),
+            second_data.join("uv-tools"),
             second_temp.join("go-tmp"),
         ] {
             assert!(
@@ -8988,6 +9014,24 @@ time.sleep(10)
             );
         }
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn configured_tool_paths_prefer_repository_tool_shims() {
+        let root = scratch("configured-tool-paths");
+        let shims = root.join(".local/share/mise/shims");
+        let local = root.join(".local/bin");
+        let cargo = root.join(".cargo/bin");
+        for directory in [&shims, &local, &cargo] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        assert_eq!(
+            configured_tool_paths(Some(&root)),
+            vec![shims, local, cargo]
+        );
+        assert!(configured_tool_paths(None).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
