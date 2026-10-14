@@ -4035,7 +4035,7 @@ fn make_worktree_files_removable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct WorktreeDirectoryIdentity {
     #[cfg(unix)]
     device: u64,
