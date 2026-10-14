@@ -84,7 +84,9 @@ await test(
     const leftover = launch(binary);
     const unrelated = launch('/bin/sleep');
     assert.doesNotThrow(() => process.kill(leftover, 0));
-    assert.equal(await stopProcessesUnder(join(root, 'run/Sail Native Fixture.app')), true);
+    // The /private form of a /var path names the same bundle that `ps` lists as /var.
+    const bundle = join(root, 'run/Sail Native Fixture.app');
+    assert.equal(await stopProcessesUnder(bundle.replace(/^\/var\//, '/private/var/')), true);
     assert.throws(() => process.kill(leftover, 0), { code: 'ESRCH' });
     assert.doesNotThrow(() => process.kill(unrelated, 0));
   },

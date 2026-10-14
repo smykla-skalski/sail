@@ -59,6 +59,13 @@ export async function stopProcessesUnder(directory, { timeout = 5000 } = {}) {
   }
 }
 
+// `ps` reports the launch path, which may be the /private alias of a symlinked
+// system directory (or the reverse) relative to the path we were given.
+function alias(root) {
+  if (root.startsWith('/private/')) return [root, root.slice('/private'.length)];
+  return /^\/(var|tmp|etc)(\/|$)/.test(root) ? [root, `/private${root}`] : [root];
+}
+
 async function stopMatching(directory, timeout) {
   const roots = new Set([directory]);
   try {
@@ -66,7 +73,9 @@ async function stopMatching(directory, timeout) {
   } catch {
     /* The bundle is already gone; its launch path still identifies the process. */
   }
-  const prefixes = [...roots].map((root) => (root.endsWith('/') ? root : `${root}/`));
+  const prefixes = [...roots]
+    .flatMap(alias)
+    .map((root) => (root.endsWith('/') ? root : `${root}/`));
   const running = () =>
     execFileSync('ps', ['-axo', 'pid=,comm='], { encoding: 'utf8' })
       .split('\n')
