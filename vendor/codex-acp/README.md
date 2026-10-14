@@ -27,4 +27,4 @@ cp dist/index.js /path/to/sail/vendor/codex-acp/dist/index.js.txt
 ```
 
 The committed bundle's SHA-256 is
-`140132a5830969e7de951763d2e18cdf6841db61a78017cca5f944d4b81b977d`.
+`a9750334c121173e93d85966cded27bb1974ec8e8635a73082851704f5e55cbe`.

@@ -962,6 +962,8 @@ struct CodexWorkspaceAccess {
     directories: Vec<WritableDirectory>,
 }
 
+const CODEX_PROCESS_INSPECTION_INSTRUCTIONS: &str = "When the active permission profile is sail-agent on macOS, the Seatbelt sandbox blocks read-only process inspection and background-job priority setup. For an already approved exact command, request command-scoped host execution by setting sandbox_permissions to require_escalated only for: ps -ef; pgrep -fl followed by one literal task-owned pattern; or starting a bounded task-owned background job. Keep the command within its approved prefix and use a concise justification. Never request escalation for other ps or pgrep forms, kill, pkill, renice, signals, process mutation, unrelated commands, filesystem access, or network access. Keep the sail-agent session profile unchanged. If every condition does not match, run sandboxed or ask the user.";
+
 impl CodexWorkspaceAccess {
     fn capture(scope: &Path, extra_writable: &[PathBuf]) -> Result<Self, String> {
         let mut directories = vec![WritableDirectory::capture(scope)?];
@@ -1018,6 +1020,7 @@ impl CodexWorkspaceAccess {
                 "permissions.sail-read-only={extends=\":read-only\"}",
                 format!("permissions.sail-agent={{extends=\":read-only\",filesystem={{{}}}}}", rules.join(","))
             ],
+            "developerInstructions": CODEX_PROCESS_INSPECTION_INSTRUCTIONS,
             "modeProfiles": {
                 "read-only": "sail-read-only",
                 "agent": "sail-agent",
@@ -10140,6 +10143,39 @@ time.sleep(10)
         assert!(rules.contains(&owned_key));
         assert!(!rules.contains(&sibling_key));
         assert!(!rules.contains(":tmpdir"));
+        let process_instructions = config["developerInstructions"].as_str().unwrap();
+        assert!(config["configOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .all(|value| !value.starts_with("developer_instructions=")));
+        for allowed in [
+            "active permission profile is sail-agent on macOS",
+            "ps -ef",
+            "pgrep -fl followed by one literal task-owned pattern",
+            "bounded task-owned background job",
+            "sandbox_permissions to require_escalated",
+            "Keep the sail-agent session profile unchanged",
+        ] {
+            assert!(process_instructions.contains(allowed), "{allowed}");
+        }
+        for forbidden in [
+            "other ps or pgrep forms",
+            "kill",
+            "pkill",
+            "renice",
+            "signals",
+            "process mutation",
+            "unrelated commands",
+            "filesystem access",
+            "network access",
+        ] {
+            assert!(process_instructions.contains(forbidden), "{forbidden}");
+        }
+        assert_eq!(config["modeProfiles"]["agent"], "sail-agent");
+        assert_eq!(config["modeProfiles"]["agent-full-access"], "sail-agent");
+        assert!(!config.to_string().contains(":danger-full-access"));
         #[cfg(unix)]
         {
             let alias = root.join("alias");

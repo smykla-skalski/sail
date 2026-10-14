@@ -6,16 +6,18 @@ index cfd9581..109bfad 100644
 +  minify: true,
 +  supported: {'template-literal': false},
 diff --git a/readme-dev.md b/readme-dev.md
-index 58dd0e8..e34d876 100644
+index 58dd0e8..f8e40a5 100644
 --- a/readme-dev.md
 +++ b/readme-dev.md
-@@ -15,0 +16,14 @@ Set `CODEX_PATH` to run a different Codex binary; versions other than the one sp
+@@ -15,0 +16,16 @@ Set `CODEX_PATH` to run a different Codex binary; versions other than the one sp
 +### External permission profiles
 +
 +A trusted runtime launcher may set `CODEX_ACP_PERMISSION_PROFILE_CONFIG` to a JSON
 +object containing `configOverrides` for the long-lived Codex app-server and a
 +`modeProfiles` mapping for the `read-only`, `agent`, and `agent-full-access` ACP
-+modes. The adapter treats profile definitions as opaque operator policy.
++modes. An optional `developerInstructions` string is appended to Codex's
++configured developer instructions and applied to new, resumed, loaded, and
++forked threads. The adapter treats profile definitions as opaque operator policy.
 +
 +When configured, codex-acp selects the matching profile on thread start, resume,
 +and mode changes, preserves ACP additional workspace roots, and omits the legacy
@@ -25,7 +27,7 @@ index 58dd0e8..e34d876 100644
 +sandbox behavior.
 +
 diff --git a/src/CodexAcpClient.ts b/src/CodexAcpClient.ts
-index 3b3aca4..8614dd8 100644
+index 3b3aca4..4e18f91 100644
 --- a/src/CodexAcpClient.ts
 +++ b/src/CodexAcpClient.ts
 @@ -49 +48,0 @@ import type {
@@ -35,33 +37,53 @@ index 3b3aca4..8614dd8 100644
 +import type {ExperimentalThreadResumeParams} from "./CodexAppServerClient";
 @@ -123,0 +125 @@ export class CodexAcpClient {
 +    private readonly permissionProfileConfig: PermissionProfileConfig | undefined;
-@@ -139 +141,2 @@ export class CodexAcpClient {
+@@ -136,0 +139 @@ export class CodexAcpClient {
++    private permissionProfileDeveloperInstructions: string | undefined;
+@@ -139 +142,2 @@ export class CodexAcpClient {
 -    constructor(codexClient: CodexAppServerClient, codexConfig?: JsonObject, modelProvider?: string) {
 +    constructor(codexClient: CodexAppServerClient, codexConfig?: JsonObject, modelProvider?: string,
 +                permissionProfileConfig?: PermissionProfileConfig) {
-@@ -142,0 +146 @@ export class CodexAcpClient {
+@@ -142,0 +147 @@ export class CodexAcpClient {
 +        this.permissionProfileConfig = permissionProfileConfig;
-@@ -550 +554 @@ export class CodexAcpClient {
+@@ -168,0 +174,13 @@ export class CodexAcpClient {
++        const profileInstructions = this.permissionProfileConfig?.developerInstructions;
++        if (profileInstructions) {
++            const sessionConfigured = this.config["developer_instructions"];
++            const configured = typeof sessionConfigured === "string"
++                ? sessionConfigured.trim()
++                : sessionConfigured === null
++                    ? undefined
++                    : (await this.codexClient.configRead({includeLayers: false}))
++                        .config.developer_instructions?.trim();
++            this.permissionProfileDeveloperInstructions = configured
++                ? `${configured}\n\n${profileInstructions}`
++                : profileInstructions;
++        }
+@@ -550 +568 @@ export class CodexAcpClient {
 -    private async resumeThread(params: ThreadResumeParams): Promise<ResumedThread> {
 +    private async resumeThread(params: ExperimentalThreadResumeParams): Promise<ResumedThread> {
-@@ -590 +594,2 @@ export class CodexAcpClient {
+@@ -590 +608,2 @@ export class CodexAcpClient {
 -    async resumeSession(request: acp.ResumeSessionRequest, onSubscribed?: () => void): Promise<SessionMetadata> {
 +    async resumeSession(request: acp.ResumeSessionRequest, onSubscribed?: () => void,
 +                        agentMode = AgentMode.getInitialAgentMode()): Promise<SessionMetadata> {
-@@ -599,0 +605 @@ export class CodexAcpClient {
+@@ -599,0 +619,2 @@ export class CodexAcpClient {
++            ...this.permissionProfileInstructionSelection(),
 +            ...this.permissionProfileSelection(agentMode, request.cwd, additionalDirectories),
-@@ -627,0 +634,2 @@ export class CodexAcpClient {
+@@ -627,0 +649,3 @@ export class CodexAcpClient {
 +            permissionProfileSelection: (cwd, directories) =>
 +                this.permissionProfileSelection(AgentMode.getInitialAgentMode(), cwd, directories),
-@@ -632,0 +641 @@ export class CodexAcpClient {
++            developerInstructionSelection: () => this.permissionProfileInstructionSelection(),
+@@ -632,0 +657 @@ export class CodexAcpClient {
 +        const initialAgentMode = AgentMode.getInitialAgentMode();
-@@ -640,0 +650 @@ export class CodexAcpClient {
+@@ -640,0 +666,2 @@ export class CodexAcpClient {
++            ...this.permissionProfileInstructionSelection(),
 +            ...this.permissionProfileSelection(initialAgentMode, request.cwd, additionalDirectories),
-@@ -700,0 +711 @@ export class CodexAcpClient {
+@@ -700,0 +728 @@ export class CodexAcpClient {
 +        const initialAgentMode = AgentMode.getInitialAgentMode();
-@@ -706,0 +718 @@ export class CodexAcpClient {
+@@ -706,0 +735,2 @@ export class CodexAcpClient {
++            ...this.permissionProfileInstructionSelection(),
 +            ...this.permissionProfileSelection(initialAgentMode, request.cwd, additionalDirectories),
-@@ -724,0 +737,10 @@ export class CodexAcpClient {
+@@ -724,0 +755,15 @@ export class CodexAcpClient {
 +    private permissionProfileSelection(agentMode: AgentMode, cwd: string, additionalDirectories: string[]) {
 +        const config = this.permissionProfileConfig;
 +        if (!config) return {};
@@ -72,16 +94,21 @@ index 3b3aca4..8614dd8 100644
 +        };
 +    }
 +
-@@ -1056,0 +1079,5 @@ export class CodexAcpClient {
++    private permissionProfileInstructionSelection() {
++        const developerInstructions = this.permissionProfileDeveloperInstructions;
++        return developerInstructions ? {developerInstructions} : {};
++    }
++
+@@ -1056,0 +1102,5 @@ export class CodexAcpClient {
 +        const sandboxSelection = this.permissionProfileConfig ? {
 +            runtimeWorkspaceRoots: sessionRoots(cwd, additionalDirectories),
 +        } : {
 +            sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
 +        };
-@@ -1062 +1089 @@ export class CodexAcpClient {
+@@ -1062 +1112 @@ export class CodexAcpClient {
 -            sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
 +            ...sandboxSelection,
-@@ -1069,0 +1097,13 @@ export class CodexAcpClient {
+@@ -1069,0 +1120,13 @@ export class CodexAcpClient {
 +    async setAgentMode(
 +        sessionId: string,
 +        agentMode: AgentMode,
@@ -95,7 +122,7 @@ index 3b3aca4..8614dd8 100644
 +        });
 +    }
 +
-@@ -1410,0 +1451,4 @@ function uniqueStrings(values: string[]): string[] {
+@@ -1410,0 +1474,4 @@ function uniqueStrings(values: string[]): string[] {
 +function sessionRoots(cwd: string, additionalDirectories: string[]): string[] {
 +    return uniqueStrings([cwd, ...additionalDirectories]);
 +}
@@ -206,16 +233,17 @@ index 0f79117..4d84b06 100644
 +        codex = spawn(process.execPath, [bundledCodexPath, ...args], {env: spawnEnv});
 diff --git a/src/PermissionProfileConfig.ts b/src/PermissionProfileConfig.ts
 new file mode 100644
-index 0000000..24559bb
+index 0000000..8756edd
 --- /dev/null
 +++ b/src/PermissionProfileConfig.ts
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,42 @@
 +import {z} from "zod";
 +
 +export const PERMISSION_PROFILE_CONFIG_ENV = "CODEX_ACP_PERMISSION_PROFILE_CONFIG";
 +
 +const permissionProfileConfigSchema = z.object({
 +    configOverrides: z.array(z.string().min(1)).min(1),
++    developerInstructions: z.string().min(1).optional(),
 +    modeProfiles: z.object({
 +        "read-only": z.string().min(1),
 +        agent: z.string().min(1),
@@ -252,30 +280,37 @@ index 0000000..24559bb
 +    return profile;
 +}
 diff --git a/src/SessionFork.ts b/src/SessionFork.ts
-index 1a533df..8ab5893 100644
+index 1a533df..a3c6e1a 100644
 --- a/src/SessionFork.ts
 +++ b/src/SessionFork.ts
 @@ -4 +4 @@ import {RequestError} from "@agentclientprotocol/sdk";
 -import type {CodexAppServerClient} from "./CodexAppServerClient";
 +import type {CodexAppServerClient, ExperimentalThreadForkParams} from "./CodexAppServerClient";
-@@ -21,0 +22,3 @@ export type SessionForkDependencies = {
+@@ -21,0 +22,5 @@ export type SessionForkDependencies = {
 +    permissionProfileSelection(cwd: string, additionalDirectories: string[]): Pick<
 +        ExperimentalThreadForkParams, "approvalPolicy" | "permissions" | "runtimeWorkspaceRoots"
 +    > | Record<string, never>;
-@@ -41,0 +45 @@ export async function forkSession(
++    developerInstructionSelection(): Pick<ExperimentalThreadForkParams, "developerInstructions">
++        | Record<string, never>;
+@@ -41,0 +47,2 @@ export async function forkSession(
++        ...dependencies.developerInstructionSelection(),
 +        ...dependencies.permissionProfileSelection(request.cwd, additionalDirectories),
 diff --git a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
-index fc673fa..735adfa 100644
+index fc673fa..a57f7f1 100644
 --- a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
 +++ b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
 @@ -11,0 +12 @@ import {
 +    TEST_PERMISSION_PROFILE_CONFIG,
-@@ -530,0 +532,32 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+@@ -530,0 +532,55 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 +    it('selects external permission profiles without losing workspace roots', async () => {
 +        const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
 +        const codexAcpClient = mockFixture.getCodexAcpClient();
 +        const codexAppServerClient = mockFixture.getCodexAppServerClient();
 +
++        vi.spyOn(codexAppServerClient, "configRead").mockResolvedValue({
++            config: {developer_instructions: "configured policy"},
++        } as any);
++        await codexAcpClient.initialize({} as any);
 +        vi.spyOn(codexAppServerClient, "skillsExtraRootsSet").mockResolvedValue(undefined);
 +        vi.spyOn(codexAppServerClient, "listSkills").mockResolvedValue({data: []});
 +        const threadStartSpy = vi.spyOn(codexAppServerClient, "threadStart").mockResolvedValue({
@@ -300,10 +335,29 @@ index fc673fa..735adfa 100644
 +            approvalPolicy: "on-request",
 +            permissions: "external-agent",
 +            runtimeWorkspaceRoots: ["/workspace", "/workspace/extra"],
++            developerInstructions: "configured policy\n\nexternal process policy",
 +        });
 +    });
 +
-@@ -532 +565 @@ describe('ACP server test', { timeout: 40_000 }, () => {
++    it('preserves per-thread developer instructions before appending external policy', async () => {
++        const mockFixture = createCodexMockTestFixture(
++            undefined,
++            undefined,
++            TEST_PERMISSION_PROFILE_CONFIG,
++            {developer_instructions: "per-thread policy"},
++        );
++        const codexAcpClient = mockFixture.getCodexAcpClient();
++        const codexAppServerClient = mockFixture.getCodexAppServerClient();
++
++        const configRead = vi.spyOn(codexAppServerClient, "configRead");
++        await codexAcpClient.initialize({} as any);
++
++        expect(configRead).not.toHaveBeenCalled();
++        expect((codexAcpClient as any).permissionProfileDeveloperInstructions)
++            .toBe("per-thread policy\n\nexternal process policy");
++    });
++
+@@ -532 +588 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 -        const mockFixture = createCodexMockTestFixture();
 +        const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
 diff --git a/src/__tests__/CodexACPAgent/session-config-options.test.ts b/src/__tests__/CodexACPAgent/session-config-options.test.ts
@@ -315,31 +369,38 @@ index eea8183..ffc904b 100644
 +        const {codexAcpAgent, codexAcpClient} = await createSession("fast-model[medium]", [fast]);
 +        const update = vi.spyOn((codexAcpClient as any).codexClient, "threadSettingsUpdate").mockResolvedValue(undefined);
 diff --git a/src/__tests__/acp-test-utils.ts b/src/__tests__/acp-test-utils.ts
-index ca4901d..12ad4ed 100644
+index ca4901d..5b684b0 100644
 --- a/src/__tests__/acp-test-utils.ts
 +++ b/src/__tests__/acp-test-utils.ts
-@@ -24,0 +25,10 @@ import {ClientCapabilities} from "../tool-calls/ClientCapabilities";
+@@ -3 +3 @@ import type {CreateElicitationResponse, McpServerStdio, RequestPermissionRespons
+-import {CodexAcpClient} from '../CodexAcpClient';
++import {CodexAcpClient, type JsonObject} from '../CodexAcpClient';
+@@ -24,0 +25,11 @@ import {ClientCapabilities} from "../tool-calls/ClientCapabilities";
 +import type {PermissionProfileConfig} from "../PermissionProfileConfig";
 +
 +export const TEST_PERMISSION_PROFILE_CONFIG: PermissionProfileConfig = {
 +    configOverrides: ["permissions.external-agent.extends=\":workspace\""],
++    developerInstructions: "external process policy",
 +    modeProfiles: {
 +        "read-only": "external-read-only",
 +        agent: "external-agent",
 +        "agent-full-access": "external-full-access",
 +    },
 +};
-@@ -97,0 +108 @@ export interface ConnectionConfig {
+@@ -97,0 +109,2 @@ export interface ConnectionConfig {
 +    permissionProfileConfig?: PermissionProfileConfig;
-@@ -110 +121,3 @@ export function createBaseTestFixture(config: ConnectionConfig): TestFixture {
++    codexConfig?: JsonObject;
+@@ -110 +123,3 @@ export function createBaseTestFixture(config: ConnectionConfig): TestFixture {
 -    const codexAcpClient = new CodexAcpClient(codexAppServerClient);
 +    const codexAcpClient = new CodexAcpClient(
-+        codexAppServerClient, undefined, undefined, config.permissionProfileConfig,
++        codexAppServerClient, config.codexConfig, undefined, config.permissionProfileConfig,
 +    );
-@@ -280,0 +294 @@ export function createCodexMockTestFixture(
+@@ -280,0 +296,2 @@ export function createCodexMockTestFixture(
 +    permissionProfileConfig?: PermissionProfileConfig,
-@@ -328,0 +343 @@ export function createCodexMockTestFixture(
++    codexConfig?: JsonObject,
+@@ -328,0 +346,2 @@ export function createCodexMockTestFixture(
 +        ...(permissionProfileConfig ? {permissionProfileConfig} : {}),
++        ...(codexConfig ? {codexConfig} : {}),
 diff --git a/src/index.ts b/src/index.ts
 index 1975930..90b1ad0 100644
 --- a/src/index.ts
