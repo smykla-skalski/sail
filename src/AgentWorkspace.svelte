@@ -741,6 +741,7 @@
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
   let recoveringPromptTurnId: string | null = null;
+  let dispatchingPromptTurnId: string | null = null;
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
   // What the user sees: a turn the app already marked finished no longer reads busy, so the
   // header, the working row and the pickers settle together.
@@ -2120,8 +2121,9 @@
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
           recoverMissingCodexSession(
             turnAgent,
-            () =>
-              acp.prompt(
+            () => {
+              dispatchingPromptTurnId = turnId;
+              return acp.prompt(
                 turnAgent,
                 directory,
                 id!,
@@ -2130,7 +2132,8 @@
                 promptImagePaths(sentImages, sentClipboard),
                 undefined,
                 true,
-              ),
+              );
+            },
             async () => {
               recoveringPromptTurnId = turnId;
               if (current === generation) turnEnded = false;
@@ -2251,6 +2254,7 @@
       if (external && !queuedMessage && !delivered) throw cause;
     } finally {
       if (recoveringPromptTurnId === turnId) recoveringPromptTurnId = null;
+      if (dispatchingPromptTurnId === turnId) dispatchingPromptTurnId = null;
       releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
         inFlightSteer.finish();
@@ -2529,11 +2533,14 @@
     const current = generation;
     const sessionId = activeSessionId;
     const pending = permissions;
-    let cancelSent = false;
+    const cancelAgent = liveTurn || dispatchingPromptTurnId === activeTurnId;
+    let cancelSent = !cancelAgent;
     try {
-      await acp.cancel(agent, directory, sessionId, activeTurnId);
-      cancelSent = true;
-      // Cancelling the session already settles its pending requests in the backend.
+      if (cancelAgent) {
+        await acp.cancel(agent, directory, sessionId, activeTurnId);
+        cancelSent = true;
+      }
+      // Local cancellation can precede backend prompt dispatch, so settle any visible requests too.
       await Promise.all(
         pending.map((permission) =>
           acp
