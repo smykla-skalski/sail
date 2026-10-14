@@ -1970,8 +1970,27 @@ fn translate_session_ids(value: &mut Value, owner: &str, to_wire: bool) {
     }
 }
 
+/// Git roots by requested directory. Each ACP command resolves its worktree, and a `git`
+/// spawn per call made every thread open pay for ten or more of them.
+static WORKTREE_ROOTS: std::sync::LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
 fn worktree_identity(directory: &Path) -> PathBuf {
-    crate::acp_terminal::stable_worktree_identity(&crate::terminal::git_worktree_root(directory))
+    let cached = WORKTREE_ROOTS
+        .lock()
+        .ok()
+        .and_then(|roots| roots.get(directory).cloned())
+        .filter(|root| root.join(".git").exists());
+    let root = cached.unwrap_or_else(|| {
+        let root = crate::terminal::git_worktree_root(directory);
+        if root.join(".git").exists() {
+            if let Ok(mut roots) = WORKTREE_ROOTS.lock() {
+                roots.insert(directory.to_path_buf(), root.clone());
+            }
+        }
+        root
+    });
+    crate::acp_terminal::stable_worktree_identity(&root)
 }
 
 fn connection_key(agent: &str, profile: CapabilityProfile, directory: &Path) -> ConnectionKey {
@@ -4740,6 +4759,34 @@ fn isolate_agent_process(command: &mut Command) {
     }
 }
 
+/// Capabilities of a live, initialized connection. Checked before the worktree startup lock so
+/// reopening a thread never waits behind another agent spawning in the same worktree.
+fn initialized_capabilities(
+    manager: &AgentManager,
+    key: &ConnectionKey,
+) -> Result<Option<Value>, String> {
+    let existing = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(key)
+        .filter(|existing| existing.alive.load(Ordering::Acquire))
+        .cloned();
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let capabilities = existing
+        .capabilities
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    if capabilities.is_null() {
+        return Ok(None);
+    }
+    existing.validate_codex_workspace(None)?;
+    Ok(Some(capabilities))
+}
+
 fn connect_blocking_inner(
     app: AppHandle,
     manager: &AgentManager,
@@ -4754,6 +4801,9 @@ fn connect_blocking_inner(
     let definition = definition(&agent)?;
     let startup_generation = manager.3.load(Ordering::Acquire);
     let key = connection_key_for_owner(&agent, profile, worktree, owner);
+    if let Some(capabilities) = initialized_capabilities(manager, &key)? {
+        return Ok(capabilities);
+    }
     let startup = manager.worktree_startup(worktree)?;
     let _startup = startup.lock().map_err(|error| error.to_string())?;
     if manager.3.load(Ordering::Acquire) != startup_generation {

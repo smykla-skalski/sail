@@ -440,6 +440,7 @@
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     acpSessionOwner,
+    forgetAcpConnections,
     archiveOwnedTranscriptUpdate,
     applyLiveTranscriptUpdate,
     forgetRecentTranscript,
@@ -13181,6 +13182,7 @@
   }
 
   function handleAgentEvent(event: AgentEvent) {
+    if (event.message.method === 'sail/disconnected') forgetAcpConnections(event.agent);
     if (event.message.method === 'sail/disconnected' && !event.directory) {
       const sessionDirectories = event.message.params?.sessionDirectories;
       if (sessionDirectories && typeof sessionDirectories === 'object') {

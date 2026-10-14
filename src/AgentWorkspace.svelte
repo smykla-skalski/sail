@@ -83,6 +83,7 @@
   import {
     acpCancelMatchesSession,
     acp,
+    acpCanResume,
     acpDisconnectAffectsSession,
     acpFinishedPromptStatus,
     acpPromptInterrupted,
@@ -92,7 +93,7 @@
     liveSessionView,
     markLiveMessageBoundary,
     restoredLiveTurnIsCurrent,
-    recoverMissingCodexSession,
+    recoverMissingSession,
     loadRecentTranscript,
     restoreEntryTimes,
     restoreOwnedEntries,
@@ -527,6 +528,7 @@
   let visibleCount = $state(50);
   let historyLoaded = $state(true);
   let attachedCodexSession = $state(false);
+  let sessionCanResume = false;
   let historyLoading = $state(false);
   let historyAttempted = $state(false);
   let historicalToolIds = $state.raw<ReadonlySet<string>>(new Set());
@@ -1100,6 +1102,24 @@
       void showEarlier();
   }
 
+  /** Restores a session the adapter dropped; a load-only agent's replay duplicates the shown transcript. */
+  async function reattachSession(id: string, current: number) {
+    if (sessionCanResume) {
+      await acp.resume(agent, directory, id, activeCapabilityProfile);
+      return;
+    }
+    const visible = current === generation;
+    if (visible) setReplaying(true);
+    try {
+      await acp.load(agent, directory, id, activeCapabilityProfile);
+    } finally {
+      if (visible && current === generation) {
+        setReplaying(false);
+        replayEntries = [];
+      }
+    }
+  }
+
   async function loadHistory(requested = false) {
     const id = activeSessionId;
     if (
@@ -1365,6 +1385,7 @@
     visibleCount = 50;
     historyLoaded = !id;
     attachedCodexSession = false;
+    sessionCanResume = false;
     historyLoading = false;
     historyAttempted = false;
     configOptions = [];
@@ -1441,6 +1462,7 @@
       });
       if (current !== generation) return;
       authMethods = (info.authMethods as AgentAuthMethod[] | undefined) ?? [];
+      sessionCanResume = acpCanResume(info.agentCapabilities);
       if (id) {
         const capabilities = info.agentCapabilities;
         const restoreMode = acpRestoreMode(capabilities);
@@ -1481,11 +1503,11 @@
             await acp.endRestore(agent, directory, id, reservation.restoreToken);
           return;
         }
-        attachedCodexSession =
-          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
+        const attached = runtime?.alive === true && runtime.sessions.includes(id);
+        attachedCodexSession = agent === 'codex' && attached;
         if (reservation.liveTurn) {
           await showLiveTurn(reservation.liveTurn, reservation);
-        } else if (liveView && attachedCodexSession) {
+        } else if (liveView && attached) {
           if (reservation.restoreToken)
             await acp.endRestore(agent, directory, id, reservation.restoreToken);
           await showLiveTurn(null, reservation);
@@ -2121,8 +2143,7 @@
       let result;
       try {
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
-          recoverMissingCodexSession(
-            turnAgent,
+          recoverMissingSession(
             () => {
               dispatchingPromptTurnId = turnId;
               return acp.prompt(
@@ -2139,7 +2160,7 @@
             async () => {
               recoveringPromptTurnId = turnId;
               if (current === generation) turnEnded = false;
-              await acp.resume(turnAgent, directory, id!, activeCapabilityProfile);
+              await reattachSession(id!, current);
             },
           ),
         );

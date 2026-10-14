@@ -18,7 +18,7 @@ import {
   liveTranscriptLimit,
   loadRecentTranscript,
   rememberSessionState,
-  recoverMissingCodexSession,
+  recoverMissingSession,
   restoreEntryTimes,
   restoreOwnedEntries,
   saveRecentTranscript,
@@ -67,28 +67,32 @@ void test('owned thread restore chooses the advertised provider mode', () => {
   assert.equal(acpRestoreMode({ loadSession: false, sessionCapabilities: {} }), null);
 });
 
-void test('a stale Codex session resumes before retrying its prompt', async () => {
-  const calls: string[] = [];
-  const response = await recoverMissingCodexSession(
-    'codex',
-    async () => {
-      calls.push('prompt');
-      if (calls.length === 1) throw new Error('Session not found: codex-test');
-      return 'recovered';
-    },
-    async () => {
-      calls.push('resume');
-    },
+void test('a stale session resumes before retrying its prompt', async () => {
+  await Promise.all(
+    ['Session not found: codex-test', 'Session not found: claude-test', 'Thread missing'].map(
+      async (message) => {
+        const calls: string[] = [];
+        const response = await recoverMissingSession(
+          async () => {
+            calls.push('prompt');
+            if (calls.length === 1) throw new Error(message);
+            return 'recovered';
+          },
+          async () => {
+            calls.push('resume');
+          },
+        );
+        assert.equal(response, 'recovered');
+        assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
+      },
+    ),
   );
-  assert.equal(response, 'recovered');
-  assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
 });
 
-void test('a failed history load can restore Codex backend registration on send', async () => {
+void test('a failed history load can restore backend registration on send', async () => {
   const calls: string[] = [];
   let registered = false;
-  const response = await recoverMissingCodexSession(
-    'codex',
+  const response = await recoverMissingSession(
     async () => {
       calls.push('prompt');
       if (!registered) throw new Error('Agent session is not connected in this worktree.');
@@ -103,41 +107,36 @@ void test('a failed history load can restore Codex backend registration on send'
   assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
 });
 
-void test('prompt recovery leaves other errors and agents untouched', async () => {
+void test('prompt recovery leaves other errors untouched', async () => {
   await Promise.all(
-    [
-      ['codex', 'Permission denied'],
-      ['codex', 'Agent session is not connected in another worktree.'],
-      ['claude', 'Session not found: claude-test'],
-      ['claude', 'Agent session is not connected in this worktree.'],
-    ].map(async ([agent, message]) => {
-      let resumes = 0;
-      await assert.rejects(
-        recoverMissingCodexSession(
-          agent,
-          async () => {
-            throw new Error(message);
-          },
-          async () => {
-            resumes += 1;
-          },
-        ),
-        { message },
-      );
-      assert.equal(resumes, 0);
-    }),
+    ['Permission denied', 'Agent session is not connected in another worktree.'].map(
+      async (message) => {
+        let resumes = 0;
+        await assert.rejects(
+          recoverMissingSession(
+            async () => {
+              throw new Error(message);
+            },
+            async () => {
+              resumes += 1;
+            },
+          ),
+          { message },
+        );
+        assert.equal(resumes, 0);
+      },
+    ),
   );
 });
 
-void test('a missing Codex session is retried only once', async () => {
+void test('a missing session is retried only once', async () => {
   await Promise.all(
     ['Session not found: codex-test', 'Agent session is not connected in this worktree.'].map(
       async (message) => {
         let prompts = 0;
         let resumes = 0;
         await assert.rejects(
-          recoverMissingCodexSession(
-            'codex',
+          recoverMissingSession(
             async () => {
               prompts += 1;
               throw new Error(message);

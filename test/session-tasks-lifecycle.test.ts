@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { initializeSettings } from '../src/lib/settings.ts';
-import { acp, recoverMissingCodexSession } from '../src/lib/acp.ts';
+import { acp, recoverMissingSession } from '../src/lib/acp.ts';
 import { sessionTasks } from '../src/lib/session-tasks.ts';
 
 const local = new Map<string, string>([['sail-settings-migrated-v1', '1']]);
@@ -90,9 +90,8 @@ await test('activity refresh during backend preflight preserves reportable task 
   await prompt;
   assert.equal(sessionTasks().snapshot(scope).focus, null);
 });
-await test('Codex recovery retries its prompt without duplicating starting task identities', async () => {
-  await recoverMissingCodexSession(
-    'codex',
+await test('session recovery retries its prompt without duplicating starting task identities', async () => {
+  await recoverMissingSession(
     () => acp.prompt('codex', '/repo', 'retry', 'Report tasks', 'retry-turn', [], undefined, true),
     async () => {
       resumed = true;
