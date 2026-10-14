@@ -292,7 +292,7 @@ void test(
             },
           ],
           concurrency: 32,
-          timeoutMs: 1_000,
+          timeoutMs: 10_000,
         }),
       );
 
@@ -309,39 +309,34 @@ void test(
               '--output',
               outputPath,
             ],
-            { cwd: root, timeout: 15_000 },
+            { cwd: root, timeout: 30_000 },
           ),
-        /timed out after 1000 ms/,
+        /timed out after 10000 ms/,
       );
       const runDirectories = await readdir(join(outputPath, 'runs'));
-      const spawned = (
-        await Promise.all(
-          runDirectories.map(async (directory) => {
-            try {
-              const pid = Number(
-                await readFile(
-                  join(outputPath, 'runs', directory, 'observation.json.child-pid'),
-                  'utf8',
-                ),
-              );
-              return { directory, pid };
-            } catch (error) {
-              if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
-                return null;
+      const childFiles = await Promise.all(
+        runDirectories.map(async (directory) => {
+          try {
+            return await readFile(
+              join(outputPath, 'runs', directory, 'observation.json.child-pid'),
+              'utf8',
+            );
+          } catch (error) {
+            if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT'))
               throw error;
-            }
-          }),
-        )
-      ).filter((child) => child !== null);
-      assert.ok(spawned.length > 0, 'at least one timed-out runner spawned a descendant');
-      childPids.push(...spawned.map((child) => child.pid));
-      const heartbeats = spawned.map((child) =>
-        join(outputPath, 'runs', child.directory, 'observation.json.heartbeat'),
+            return assert.fail(
+              `Fixture descendant was not ready before the runner timeout: ${directory}`,
+            );
+          }
+        }),
       );
-      const before = await Promise.all(heartbeats.map((heartbeat) => readFile(heartbeat, 'utf8')));
+      childPids.push(...childFiles.map(Number));
+      const heartbeats = runDirectories.map((directory) =>
+        join(outputPath, 'runs', directory, 'observation.json.heartbeat'),
+      );
+      const before = await Promise.all(heartbeats.map((path) => readFile(path, 'utf8')));
       await new Promise((settled) => setTimeout(settled, 200));
-      const after = await Promise.all(heartbeats.map((heartbeat) => readFile(heartbeat, 'utf8')));
-      assert.deepEqual(after, before);
+      assert.deepEqual(await Promise.all(heartbeats.map((path) => readFile(path, 'utf8'))), before);
     } finally {
       childPids.forEach(stopFixtureChild);
       await rm(temporary, { recursive: true, force: true });

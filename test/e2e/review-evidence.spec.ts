@@ -36,6 +36,7 @@ describe('review evidence', () => {
 
     writeFileSync(join(repository, 'review-me.txt'), 'Review this evidence\n');
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('#session-details button[role="tab"]*=Changes').click();
 
     await expect($('.review-evidence')).toBeDisplayed();
     await expect($('.review-evidence')).toHaveText(expect.stringContaining('Review evidence'));
