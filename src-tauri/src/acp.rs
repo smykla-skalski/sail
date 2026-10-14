@@ -732,6 +732,100 @@ fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]
     params
 }
 
+#[cfg(windows)]
+fn windows_directory_owned_by_current_user(path: &Path) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        READ_CONTROL,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct SecurityDescriptor(HLOCAL);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+
+    fn token_information(
+        token: HANDLE,
+        class: TOKEN_INFORMATION_CLASS,
+    ) -> Result<Vec<usize>, String> {
+        let mut length = 0;
+        unsafe {
+            GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut length);
+        }
+        if length == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut buffer = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(buffer)
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(crate::extended_windows_path(path))
+        .map_err(|error| error.to_string())?;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32).to_string());
+    }
+    let _descriptor = SecurityDescriptor(descriptor);
+    if owner.is_null() {
+        return Err("Assigned directory has no verifiable owner SID.".into());
+    }
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let user_info = token_information(token.as_raw_handle(), TokenUser)?;
+    let user = unsafe { &*user_info.as_ptr().cast::<TOKEN_USER>() };
+    if unsafe { EqualSid(owner, user.User.Sid) } != 0 {
+        return Ok(true);
+    }
+    // Elevated processes create directories with their token's default owner SID.
+    let owner_info = token_information(token.as_raw_handle(), TokenOwner)?;
+    let default_owner = unsafe { &*owner_info.as_ptr().cast::<TOKEN_OWNER>() };
+    Ok(unsafe { EqualSid(owner, default_owner.Owner) } != 0)
+}
+
 #[derive(Debug)]
 struct WritableDirectory {
     path: PathBuf,
@@ -762,6 +856,18 @@ impl WritableDirectory {
                     path.display()
                 ));
             }
+        }
+        #[cfg(windows)]
+        if !windows_directory_owned_by_current_user(&canonical).map_err(|error| {
+            format!(
+                "Cannot verify assigned workspace owner at {}: {error}",
+                path.display()
+            )
+        })? {
+            return Err(format!(
+                "Assigned workspace directory is not owned by this user: {}",
+                path.display()
+            ));
         }
         Ok(Self {
             identity: crate::worktree_directory_identity(&canonical)
@@ -8564,6 +8670,16 @@ time.sleep(10)
         let request = session_request_params("/work/repo", None, &servers);
         assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
         assert_eq!(request["mcpServers"][0]["name"], "sail-browser");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_workspace_access_checks_windows_directory_ownership() {
+        let assigned = std::env::current_dir().unwrap();
+        CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"));
+        let error = CodexWorkspaceAccess::capture(&system, &[]).unwrap_err();
+        assert!(error.contains("not owned by this user"), "{error}");
     }
 
     #[cfg(unix)]
