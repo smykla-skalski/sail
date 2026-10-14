@@ -148,7 +148,7 @@ fn sweep_runtime_roots_in(
         let Some(id) = name.strip_prefix(RUNTIME_PREFIX) else {
             continue;
         };
-        if uuid::Uuid::parse_str(id).is_err() {
+        if !uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id) {
             continue;
         }
         let path = entry.path();
@@ -223,7 +223,7 @@ fn sweep_runtime_roots_in(
             &open_files,
         ) {
             Ok(()) => report(name, RuntimeRootEvent::Removed { bytes }),
-            Err("gone") => {}
+            Err(_) if !path.exists() => {}
             Err(reason) => report(name, RuntimeRootEvent::Kept { reason }),
         }
     }
@@ -292,6 +292,32 @@ pub(crate) fn owner_identity() -> Option<String> {
 pub(crate) fn owner_identity_for_pid(pid: u32) -> Option<String> {
     let started = process_start_time(pid)?;
     Some(format!("{pid} {started}"))
+}
+
+// An agent that died but was not reaped still answers `kill(pid, 0)`. It has
+// exited and holds nothing, so its root is reclaimable.
+#[cfg(target_os = "macos")]
+fn unreaped_zombie(pid: u32) -> bool {
+    // sysinfo drops a macOS zombie and proc_pidinfo reports it as running, so
+    // read the kernel's process table entry through `ps`.
+    Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .is_ok_and(|output| output.stdout.trim_ascii().starts_with(b"Z"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unreaped_zombie(pid: u32) -> bool {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(Pid::from_u32(pid))
+        .is_some_and(|process| process.status() == ProcessStatus::Zombie)
 }
 
 fn process_start_time(pid: u32) -> Option<u64> {
@@ -877,12 +903,17 @@ fn owner_status(marker: &Path) -> Option<bool> {
         return None;
     }
     let result = unsafe { nix::libc::kill(pid, 0) };
-    if result == -1 {
-        return Some(std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH));
+    if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH) {
+        return Some(true);
     }
-    // Read the start time now: a snapshot taken before a long pass can predate
-    // a pid that was reused meanwhile.
-    Some(process_start_time(pid as u32).is_some_and(|current| current != started))
+    // A pid that answers but belongs to another user (EPERM) still has to
+    // match the recorded start time. Read it now: a snapshot taken before a
+    // long pass can predate a pid that was reused meanwhile. An unreaped
+    // child answers `kill` too, but it has exited and holds nothing.
+    Some(
+        unreaped_zombie(pid as u32)
+            || process_start_time(pid as u32).is_some_and(|current| current != started),
+    )
 }
 
 fn inspect(path: &Path, device: u64, now: SystemTime) -> std::io::Result<Option<u64>> {
@@ -1465,6 +1496,46 @@ mod tests {
         )
         .unwrap();
         assert!(!events.contains(&name));
+    }
+
+    #[test]
+    fn runtime_sweep_removes_a_root_whose_agent_exited_but_was_not_reaped() {
+        let temp = fixture();
+        let mut child = Command::new("/bin/sleep").arg("1").spawn().unwrap();
+        let owner = owner_identity_for_pid(child.id()).unwrap();
+        let root = runtime_root(&temp, Some(&owner));
+        std::thread::sleep(Duration::from_millis(1600));
+        assert!(unsafe { nix::libc::kill(child.id() as i32, 0) } == 0);
+        let events = runtime_sweep(&temp, |_| Some(false));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, "removed");
+        assert!(!root.exists());
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn runtime_sweep_removes_a_root_whose_pid_now_belongs_to_another_user() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some("1 12345"));
+        runtime_sweep(&temp, |_| Some(false));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_ignores_non_canonical_uuid_spellings() {
+        let temp = fixture();
+        let compact = temp.join(format!("sail-runtime-{}", uuid::Uuid::new_v4().simple()));
+        let upper = temp.join(format!(
+            "sail-runtime-{}",
+            uuid::Uuid::new_v4().to_string().to_uppercase()
+        ));
+        for root in [&compact, &upper] {
+            fs::create_dir(root).unwrap();
+            fs::write(root.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        }
+        let events = runtime_sweep(&temp, |_| Some(false));
+        assert!(events.is_empty());
+        assert!(compact.exists() && upper.exists());
     }
 
     #[test]
