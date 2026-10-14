@@ -23,6 +23,8 @@ const coreCapabilityTools = new Set([
   'task_checkpoint_read',
   'task_checkpoint_update',
   'ship_progress',
+  'sail_tasks_read',
+  'sail_tasks_report',
   'sail_plan_propose',
   'sail_plan_ask',
   'sail_plan_step',

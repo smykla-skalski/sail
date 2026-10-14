@@ -11,6 +11,7 @@ import {
   recordSidebarOpenCodeOutcome,
   sidebarThreadRows,
   sidebarThreadStatus,
+  waitForSidebarInventory,
 } from '../src/lib/sidebar-agents.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 
@@ -39,6 +40,22 @@ function nativeReceipt(
     error: null,
   };
 }
+
+await test('unfinished agent inventory blocks cleanup after the deadline', async () => {
+  const unresolved = new Promise<void>(() => {});
+
+  const settled = await waitForSidebarInventory([unresolved], 10);
+
+  assert.equal(settled, false);
+});
+
+await test('failed agent inventory requests count as settled', async () => {
+  const requests = [Promise.resolve(), Promise.reject(new Error('offline'))];
+
+  const settled = await waitForSidebarInventory(requests, 100);
+
+  assert.equal(settled, true);
+});
 
 await test('sidebar groups every thread by checkout and keeps distinct sessions', () => {
   const grouped = groupSidebarThreads([

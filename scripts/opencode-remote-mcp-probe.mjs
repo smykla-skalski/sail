@@ -155,8 +155,13 @@ function delay(milliseconds) {
 
 async function settleList(binary, project, environment, expectedNames, attempts = 10) {
   const result = await run(binary, ['mcp', 'list'], { cwd: project, environment, timeout: 20_000 });
-  if (expectedNames.every((name) => result.stdout.includes(name))) return result;
-  if (attempts <= 1) return undefined;
+  if (
+    expectedNames.every((name) => result.stdout.includes(name)) &&
+    /authed\s+connected/.test(result.stdout) &&
+    /anonymous\s+needs authentication/.test(result.stdout)
+  )
+    return result;
+  if (attempts <= 1) return result;
   await delay(1000);
   return settleList(binary, project, environment, expectedNames, attempts - 1);
 }

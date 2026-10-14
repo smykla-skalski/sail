@@ -8,6 +8,8 @@
   import ActivityStatus from './ActivityStatus.svelte';
   import ElicitationForm, { type Elicitation } from './ElicitationForm.svelte';
   import TaskLocation from './TaskLocation.svelte';
+  import TasksPanel from './TasksPanel.svelte';
+  import { sessionTasks } from './lib/session-tasks';
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
   import {
@@ -579,6 +581,13 @@
   let authNeeded = $state(false);
   let authenticating = $state(false);
   let activeSessionId = $state<string | null>(null);
+  let tasksTick = $state(0);
+  let taskSnapshot = $derived.by(() => {
+    void tasksTick;
+    return activeSessionId
+      ? sessionTasks().snapshot({ agent, directory, sessionId: activeSessionId })
+      : null;
+  });
   const visibleHookActivities = $derived(activityForSession(hookActivities, activeSessionId));
   $effect(() => {
     const sessionId = activeSessionId;
@@ -1658,6 +1667,9 @@
   }
 
   onMount(() => {
+    const unsubscribeTasks = sessionTasks().subscribe(() => {
+      tasksTick += 1;
+    });
     if (!ephemeral) shellRuns = takeShellRuns(`${directory}\0${agent}`);
     let unlistenHookActivity: (() => void) | undefined;
     void listen<unknown>('sail:hook-activity', ({ payload }) => {
@@ -1859,6 +1871,7 @@
         if (!disposed) error = `Could not subscribe to agent events: ${describe(cause)}`;
       });
     return () => {
+      unsubscribeTasks();
       unlistenHookActivity?.();
       rememberDraft();
       disposed = true;
@@ -2864,6 +2877,11 @@
             >{/if}
         {/snippet}
         {#snippet tail()}
+          {#if taskSnapshot?.tasks.length}<details class="session-tasks">
+              <summary>Tasks ({taskSnapshot.tasks.length})</summary><TasksPanel
+                snapshot={taskSnapshot}
+              />
+            </details>{/if}
           {#if nativePlan}<section class="native-plan" aria-label="Native plan">
               <h3>Plan</h3>
               <Markdown source={nativePlan.markdown} />

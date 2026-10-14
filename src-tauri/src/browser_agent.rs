@@ -565,6 +565,8 @@ impl BrowserManager {
             | "task_checkpoint_update"
             | "task_evidence_record"
             | "validation_policy"
+            | "sail_tasks_read"
+            | "sail_tasks_report"
             | "sail_plan_propose"
             | "sail_plan_ask"
             | "sail_plan_step"
@@ -629,10 +631,14 @@ impl BrowserManager {
             .ok_or("Unknown browser tool connection.")?;
         if matches!(
             request.name.as_str(),
-            "terminal_create" | "terminal_write" | "terminal_stop"
+            "terminal_create"
+                | "terminal_write"
+                | "terminal_stop"
+                | "sail_tasks_read"
+                | "sail_tasks_report"
         ) && (client.session.is_none() || client.agent.is_none())
         {
-            return Err("Terminal control requires a session-bound agent connection.".into());
+            return Err("This tool requires a session-bound agent connection.".into());
         }
         let directory = client.directory.clone();
         let source_agent = client.agent.clone();
@@ -685,6 +691,8 @@ impl BrowserManager {
                 | "task_checkpoint_read"
                 | "task_checkpoint_update"
                 | "task_evidence_record"
+                | "sail_tasks_read"
+                | "sail_tasks_report"
                 | "sail_plan_propose"
                 | "sail_plan_ask"
                 | "sail_plan_step"
@@ -1576,6 +1584,8 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "Report your assigned Ship issue stage, an inline gate verdict, or your own validation verdict. Structured reports appear in the native Ship view. Blocked or failing reports require a reason.",
         "",
     ),
+    ("sail_tasks_read", "Read this session's Tasks snapshot, including current turnId and revision. Read before reporting task progress.", ""),
+    ("sail_tasks_report", "Report routine work live in Sail Tasks. Upsert stable task IDs with pending/in_progress/done/blocked/skipped status. Pass turnId and expectedRevision from sail_tasks_read; read again after stale errors. Set focus to an in_progress task ID or null. Never report another session's work. Successful writes are durable.", ""),
     (
         "sail_plan_propose",
         "Submit a structured implementation plan for the user to review step by step in Sail. Use it for risky, ambiguous or multi-file work; small, obvious changes need no plan. Always include an overview flowchart and a sequenceDiagram, as lists of lines. Replaces any previous version; approved and finished steps keep their status if you keep their id, title, detail and files unchanged. Mark only the steps that need a human decision with needsYou. After calling this, end your turn and wait for a <plan-review> message.",
@@ -1733,6 +1743,28 @@ fn plan_step_schema() -> Value {
         },
         "required":["id","title","detail"]
     })
+}
+
+fn task_tool_schema(name: &str) -> Option<Value> {
+    match name {
+        "sail_tasks_read" => {
+            Some(json!({"type":"object","properties":{},"additionalProperties":false}))
+        }
+        "sail_tasks_report" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "turnId":{"type":"string","minLength":1},
+                "expectedRevision":{"type":"integer","minimum":0},
+                "tasks":{"type":"array","maxItems":100,"items":{"type":"object","additionalProperties":false,"properties":{
+                    "id":{"type":"string","minLength":1,"maxLength":100},
+                    "title":{"type":"string","minLength":1,"maxLength":300},
+                    "status":{"type":"string","enum":["pending","in_progress","done","blocked","skipped"]}
+                },"required":["id","title","status"]}},
+                "focus":{"type":["string","null"]}
+            },"required":["turnId","expectedRevision","tasks","focus"]
+        })),
+        _ => None,
+    }
 }
 
 fn plan_tool_schema(name: &str) -> Option<Value> {
@@ -1947,6 +1979,8 @@ impl CapabilityProfile {
             "task_checkpoint_read",
             "task_checkpoint_update",
             "ship_progress",
+            "sail_tasks_read",
+            "sail_tasks_report",
             "sail_plan_propose",
             "sail_plan_ask",
             "sail_plan_step",
@@ -2020,6 +2054,9 @@ pub fn run_mcp_stdio() {
             "tools/list" => {
                 json!({"tools": TOOLS.iter().filter(|(name, _, _)| tool_listed(profile, name, plan_tools)).map(|(name, description, fields)| {
                 if let Some(schema) = memory_tool_schema(name) {
+                    return json!({"name":name,"description":description,"inputSchema":schema});
+                }
+                if let Some(schema) = task_tool_schema(name) {
                     return json!({"name":name,"description":description,"inputSchema":schema});
                 }
                 if let Some(schema) = plan_tool_schema(name) {
@@ -2256,9 +2293,30 @@ mod picker_tests {
 mod skill_tests {
     use super::{
         call_bridge, economics_input_schema, mcp_initialize, memory_tool_schema, plan_tool_schema,
-        requires_phase_lease, skill_text, thread_keywords_schema, tool_listed, BrowserManager,
-        CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
+        requires_phase_lease, skill_text, task_tool_schema, thread_keywords_schema, tool_listed,
+        BrowserManager, CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
     };
+
+    #[test]
+    fn task_tools_reach_all_profiles_and_providers() {
+        for name in ["sail_tasks_read", "sail_tasks_report"] {
+            assert!(task_tool_schema(name).is_some());
+            assert!(TOOLS.iter().any(|(tool, _, _)| *tool == name));
+            for profile in [
+                CapabilityProfile::Explore,
+                CapabilityProfile::Review,
+                CapabilityProfile::Build,
+                CapabilityProfile::Release,
+            ] {
+                assert!(tool_listed(profile, name, true));
+                assert!(tool_listed(profile, name, false));
+            }
+        }
+        assert_eq!(
+            task_tool_schema("sail_tasks_report").unwrap()["additionalProperties"],
+            false
+        );
+    }
 
     #[test]
     fn capability_profiles_expose_only_role_tools() {

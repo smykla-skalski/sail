@@ -12,7 +12,6 @@ import {
   reserveInlineValidation,
   shipGatesSettled,
   gateVerdictPassed,
-  shipCleanupRequest,
   shipEvidenceReadiness,
   shipTaskThreadsSettled,
   shipTaskReceiptIdsToProtect,
@@ -357,32 +356,6 @@ void test('legacy persisted work cannot opt out of validation by omitting the po
   assert.equal(restored[0].issues[0].validationPolicyRequired, true);
   assert.equal(restored[0].issues[1].validationPolicyRequired, true);
   assert.equal(shipEvidenceReadiness(restored[0].issues[0]).ready, false);
-});
-
-void test('Ship cleanup binds deletion to the selected validation revision', () => {
-  const issue = withMergeEvidence(fixture().issues[0]);
-  issue.path = '/worktree';
-  issue.branch = 'validated-branch';
-
-  assert.deepEqual(shipCleanupRequest('a/b', issue, 'newer-unchecked-revision'), {
-    repository: 'a/b',
-    worktree: '/worktree',
-    force: false,
-    archiveIgnored: true,
-    expectedRevision: 'revision-one',
-    expectedBranch: 'validated-branch',
-  });
-});
-
-void test('Ship cleanup rejects a merged task before evidence recovery', () => {
-  const issue = fixture().issues[0];
-  issue.path = '/worktree';
-  issue.branch = 'validated-branch';
-
-  assert.throws(
-    () => shipCleanupRequest('a/b', issue, 'revision-one'),
-    /complete revision-bound evidence/,
-  );
 });
 
 void test('durable gate receipts recover manifest evidence after restart', () => {
