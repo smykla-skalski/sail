@@ -2,8 +2,9 @@ use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use jsonc_parser::ParseOptions;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
@@ -133,11 +134,34 @@ fn path_text(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("Path is not UTF-8: {}", path.display()))
 }
 
-/// A Cargo output directory or a Git checkout changes under running agents.
+/// A Cargo output directory (any name, for example a private
+/// `CARGO_TARGET_DIR`) or a Git checkout changes under running agents.
 fn is_unstable(path: &Path) -> bool {
     path.ancestors().skip(1).any(|dir| {
-        dir.file_name().is_some_and(|name| name == "target") || dir.join(".git").exists()
+        dir.file_name().is_some_and(|name| name == "target")
+            || dir.join(".git").exists()
+            || (dir.join(".fingerprint").is_dir() && dir.join("deps").is_dir())
     })
+}
+
+fn same_content(left: &Path, right: &Path) -> bool {
+    fn digest(path: &Path) -> Option<Vec<u8>> {
+        let mut file = File::open(path).ok()?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1 << 20];
+        loop {
+            let read = file.read(&mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Some(hasher.finalize().to_vec())
+    }
+    match (digest(left), digest(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn stable_path(directory: &Path) -> PathBuf {
@@ -166,12 +190,7 @@ fn install_binary(source: &Path, directory: &Path) -> Result<String, String> {
         return path_text(source);
     }
     let target = stable_path(directory);
-    let modified = |path: &Path| fs::metadata(path).and_then(|meta| meta.modified()).ok();
-    let current = match (modified(&target), modified(source)) {
-        (Some(copy), Some(origin)) => copy >= origin,
-        _ => false,
-    };
-    if !current {
+    if !same_content(source, &target) {
         fs::create_dir_all(directory)
             .map_err(|error| format!("Cannot create {}: {error}", directory.display()))?;
         let temporary = directory.join(format!(".sail-memory-mcp-{}.tmp", uuid::Uuid::new_v4()));
@@ -832,18 +851,33 @@ mod tests {
     }
 
     #[test]
-    fn refreshes_the_copy_when_the_build_is_newer() {
+    fn replaces_the_copy_when_the_build_differs() {
         let root = scratch();
-        let debug = root.join("target/debug");
-        fs::create_dir_all(&debug).unwrap();
-        let source = debug.join("sail");
-        fs::write(&source, "old").unwrap();
+        let data = root.join("bin");
+        let first = root.join("a/target/debug/sail");
+        let second = root.join("b/target/debug/sail");
+        for (path, text) in [(&first, "new build"), (&second, "old build")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let command = install_binary(&first, &data).unwrap();
+        // A worktree with an older build still gets its own binary.
+        assert_eq!(install_binary(&second, &data).unwrap(), command);
+        assert_eq!(fs::read_to_string(&command).unwrap(), "old build");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn treats_a_renamed_cargo_target_dir_as_unstable() {
+        let root = scratch();
+        let profile = root.join("scratch-cache/debug");
+        fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        let source = profile.join("sail");
+        fs::write(&source, "build").unwrap();
         let data = root.join("bin");
         let command = install_binary(&source, &data).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        fs::write(&source, "new").unwrap();
-        assert_eq!(install_binary(&source, &data).unwrap(), command);
-        assert_eq!(fs::read_to_string(&command).unwrap(), "new");
+        assert!(command.starts_with(data.to_str().unwrap()));
         fs::remove_dir_all(root).unwrap();
     }
 
