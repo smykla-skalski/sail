@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const OWNER_FILE: &str = "worktree-owner-v2";
 const OWNER_HEADER: &str = "sail-terminal-worktree-owner-v2";
@@ -1194,6 +1194,7 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
 }
 
 pub(crate) fn retry_cleanup(cache_directory: &Path) -> Vec<CleanupPending> {
+    forget_reported_pending();
     reconcile(cache_directory);
     cleanup_status(cache_directory)
 }
@@ -3775,8 +3776,39 @@ fn remove_quarantine_with_identity(
     }
 }
 
+static REPORTED_PENDING: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+
+// Pollers re-enter the pending paths every second; log a key again only
+// when its reason changes or a retry clears the record.
+fn first_report(key: &str, reason: &str) -> bool {
+    let mut reported = REPORTED_PENDING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    note_report(&mut reported, key, reason)
+}
+
+fn note_report(reported: &mut BTreeMap<String, String>, key: &str, reason: &str) -> bool {
+    if reported.get(key).is_some_and(|last| last == reason) {
+        return false;
+    }
+    reported.insert(key.to_string(), reason.to_string());
+    true
+}
+
+fn forget_reported_pending() {
+    REPORTED_PENDING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
 fn report_pending(path: &Path, reason: &str) {
     let key = cache_key(path).unwrap_or_else(|_| "unknown".into());
+    if !first_report(&key, reason) {
+        return;
+    }
     crate::diagnostics::record(
         "worktree_storage_cleanup_pending",
         json!({"cacheKey":key,"reason":reason}),
@@ -3785,6 +3817,9 @@ fn report_pending(path: &Path, reason: &str) {
 
 fn report_selected(path: &Path, reason: &str) {
     let key = cache_key(path).unwrap_or_else(|_| "unknown".into());
+    if !first_report(&key, reason) {
+        return;
+    }
     crate::diagnostics::record(
         "worktree_storage_cleanup_pending",
         json!({
@@ -4041,6 +4076,20 @@ fn lock_file(_file: &File, _exclusive: bool, _nonblocking: bool) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_report_repeats_only_on_reason_change() {
+        let mut reported = BTreeMap::new();
+        assert!(note_report(&mut reported, "k", "turn-temp-cleanup-failed"));
+        for _ in 0..5 {
+            assert!(!note_report(&mut reported, "k", "turn-temp-cleanup-failed"));
+        }
+        assert!(note_report(&mut reported, "k", "active-use"));
+        assert!(!note_report(&mut reported, "k", "active-use"));
+        assert!(note_report(&mut reported, "other", "active-use"));
+        reported.clear();
+        assert!(note_report(&mut reported, "k", "active-use"));
+    }
 
     #[cfg(unix)]
     #[test]
