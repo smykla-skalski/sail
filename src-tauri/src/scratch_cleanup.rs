@@ -29,7 +29,7 @@ pub(crate) fn sweep_on_startup(cache_directory: Option<&Path>) {
             }
         })
         .and_then(|bytes| {
-            let Some(home) = dirs::home_dir() else {
+            let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
                 return Ok(bytes);
             };
             sweep_native_roots(&home, now, has_open_files).map(|native| bytes + native)
@@ -432,15 +432,31 @@ fn stop_root_processes(root: &Path) {
     let Ok(canonical) = fs::canonicalize(root) else {
         return;
     };
+    // A Sail build that runs from the dead run's root keeps its own helpers.
+    if std::env::current_exe().is_ok_and(|exe| exe.starts_with(&canonical) || exe.starts_with(root))
+    {
+        return;
+    }
     let own = Pid::from_u32(std::process::id());
     let kind = ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet);
     let mut system = System::new();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    let is_own_descendant = |process: &sysinfo::Process| {
+        let mut parent = process.parent();
+        while let Some(pid) = parent {
+            if pid == own {
+                return true;
+            }
+            parent = system.process(pid).and_then(sysinfo::Process::parent);
+        }
+        false
+    };
     let mut running = system
         .processes()
         .values()
         .filter(|process| {
             process.pid() != own
+                && !is_own_descendant(process)
                 && process
                     .exe()
                     .is_some_and(|exe| exe.starts_with(&canonical) || exe.starts_with(root))
@@ -871,31 +887,37 @@ mod tests {
     fn fixture_binary(root: &Path) -> PathBuf {
         let binary = root.join("run/Sail Native Fixture.app/Contents/MacOS/sail");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        fs::copy("/bin/sleep", &binary).unwrap();
-        // A copied system binary fails macOS signature validation at exec.
-        #[cfg(target_os = "macos")]
-        assert!(Command::new("codesign")
-            .args(["-f", "-s", "-"])
-            .arg(&binary)
-            .output()
-            .unwrap()
-            .status
-            .success());
+        // A copy of this test binary runs anywhere; a copied system binary
+        // fails macOS signature validation.
+        fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
         binary
+    }
+
+    // Started only by `spawn_orphan`, as a stand-in for a fixture app.
+    #[test]
+    #[ignore = "helper process for the native root tests"]
+    fn fixture_sleeper() {
+        std::thread::sleep(Duration::from_secs(300));
     }
 
     // Matches a fixture app that `open` leaves running with PPID 1.
     fn spawn_orphan(binary: &Path) -> i32 {
         let output = Command::new("/bin/sh")
-            .args(["-c", "\"$0\" 300 >/dev/null 2>&1 & echo $!"])
+            .args([
+                "-c",
+                "\"$0\" scratch_cleanup::tests::fixture_sleeper --ignored --exact >/dev/null 2>&1 & echo $!",
+            ])
             .arg(binary)
             .output()
             .unwrap();
-        String::from_utf8(output.stdout)
+        let pid = String::from_utf8(output.stdout)
             .unwrap()
             .trim()
             .parse()
-            .unwrap()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(alive(pid), "fixture helper did not start");
+        pid
     }
 
     fn alive(pid: i32) -> bool {
@@ -974,6 +996,28 @@ mod tests {
             nix::libc::kill(pid, nix::libc::SIGKILL);
             nix::libc::kill(unmarked_pid, nix::libc::SIGKILL);
         }
+    }
+
+    #[test]
+    fn a_sibling_root_sharing_a_name_prefix_keeps_its_fixture() {
+        let home = fixture();
+        let applications = home.join("Applications");
+        let dead = applications.join("sail-681-native.a");
+        let sibling = applications.join("sail-681-native.ab");
+        for path in [&dead, &sibling] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(dead.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        fs::write(sibling.join(MARKER), owner_identity().unwrap()).unwrap();
+        let stopped = spawn_orphan(&fixture_binary(&dead));
+        let kept = spawn_orphan(&fixture_binary(&sibling));
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep_native_roots(&home, future, |_| Some(false)).unwrap();
+        assert!(wait_until_gone(stopped));
+        assert!(!dead.exists());
+        assert!(sibling.exists());
+        assert!(alive(kept));
+        unsafe { nix::libc::kill(kept, nix::libc::SIGKILL) };
     }
 
     #[test]

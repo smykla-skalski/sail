@@ -14,7 +14,7 @@ import { createServer } from 'node:net';
 import { isAbsolute, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import process from 'node:process';
-import { stopProcessesUnder } from '../scripts/native-test-process.mjs';
+import { stopProcessesUnder, stopProcessesUnderOnSignal } from '../scripts/native-test-process.mjs';
 
 const app = process.env.SAIL_E2E_APP;
 const config = process.env.SAIL_E2E_CONFIG_DIR;
@@ -32,6 +32,7 @@ if (
   throw new Error('Set TMPDIR to an existing absolute private directory');
 }
 const binary = join(app, 'Contents', 'MacOS', 'sail');
+stopProcessesUnderOnSignal(app);
 const env = { ...process.env, SAIL_E2E_CONFIG_DIR: config };
 for (const key of [
   'GIT_DIR',

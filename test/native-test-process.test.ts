@@ -89,3 +89,36 @@ await test(
     assert.doesNotThrow(() => process.kill(unrelated, 0));
   },
 );
+
+await test(
+  'a sibling bundle sharing a name prefix keeps its processes',
+  { skip: process.platform !== 'darwin' },
+  async (context) => {
+    const root = mkdtempSync(join(tmpdir(), 'sail-fixture-sibling-'));
+    context.after(() => rmSync(root, { recursive: true, force: true }));
+    const launch = (app: string) => {
+      const binary = join(root, app, 'Contents/MacOS/sail');
+      mkdirSync(join(root, app, 'Contents/MacOS'), { recursive: true });
+      copyFileSync('/bin/sleep', binary);
+      execFileSync('codesign', ['-f', '-s', '-', binary]);
+      const pid = Number(
+        execFileSync('/bin/sh', ['-c', '"$0" 300 >/dev/null 2>&1 & echo $!', binary], {
+          encoding: 'utf8',
+        }),
+      );
+      context.after(() => {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* Already stopped. */
+        }
+      });
+      return pid;
+    };
+    const target = launch('fixture.app');
+    const sibling = launch('fixture.app.old');
+    assert.equal(await stopProcessesUnder(join(root, 'fixture.app')), true);
+    assert.throws(() => process.kill(target, 0), { code: 'ESRCH' });
+    assert.doesNotThrow(() => process.kill(sibling, 0));
+  },
+);

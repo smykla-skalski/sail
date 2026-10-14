@@ -50,6 +50,16 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal }) 
 // `open -n` leaves the fixture app running with PPID 1 when a run fails before
 // it learns the listening pid, so match processes by their executable path.
 export async function stopProcessesUnder(directory, { timeout = 5000 } = {}) {
+  try {
+    return await stopMatching(directory, timeout);
+  } catch (error) {
+    // Cleanup must reach the caller's scratch removal even when `ps` is denied.
+    console.error('Fixture process cleanup failed:', error);
+    return false;
+  }
+}
+
+async function stopMatching(directory, timeout) {
   const roots = new Set([directory]);
   try {
     roots.add(realpathSync(directory));
@@ -87,4 +97,16 @@ export async function stopProcessesUnder(directory, { timeout = 5000 } = {}) {
     return (await waitUntilGone(Date.now() + timeout)) || stop(signals.slice(1));
   };
   return stop(['SIGTERM', 'SIGKILL']);
+}
+
+// A cancelled run skips its `finally`, so stop the fixture before exiting.
+export function stopProcessesUnderOnSignal(directory) {
+  for (const [signal, code] of [
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ]) {
+    process.once(signal, () => {
+      void stopProcessesUnder(directory).finally(() => process.exit(code));
+    });
+  }
 }
