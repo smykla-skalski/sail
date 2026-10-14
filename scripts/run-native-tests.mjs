@@ -325,8 +325,13 @@ async function main() {
   }
   const dataRoots = systemRunDataRoots();
   try {
-    const removed = [...sweepRunData(dataRoots, listProcessCommands), ...sweepStateRoots(tmpdir())];
+    const data = sweepRunData(dataRoots, listProcessCommands);
+    const state = sweepStateRoots(tmpdir());
+    const removed = [...data.removed, ...state.removed];
     process.stdout.write(`Removed ${removed.length} folders left by earlier native runs\n`);
+    const failed = [...data.failed, ...state.failed];
+    if (failed.length > 0)
+      process.stderr.write(`Could not remove folders left by earlier runs: ${failed.join(', ')}\n`);
   } catch (error) {
     process.stderr.write(`Could not remove folders left by earlier runs: ${error.message}\n`);
   }

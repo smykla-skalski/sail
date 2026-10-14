@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -80,7 +80,7 @@ await test('a sweep removes dead runs, keeps live runs and ignores other folders
   const unrelated = ['dev.smykla.sail.e2e.fiximages9e79940', 'com.apple.WebKit', 'sail-keep'];
   for (const name of [dead, live, current, ...unrelated]) populate(name);
 
-  const removed = sweepRunData(roots, () => appPath(live), [current]);
+  const { removed } = sweepRunData(roots, () => appPath(live), [current]);
 
   assert.equal(removed.length, roots.length);
   assert.deepEqual(remaining(dead), []);
@@ -93,7 +93,7 @@ await test('a sweep reads the process table after listing folders', (context) =>
   const { roots, populate } = fixture(context);
   const events: string[] = [];
   populate(identifier('a2'));
-  const removed = sweepRunData(roots, () => {
+  const { removed } = sweepRunData(roots, () => {
     events.push('processes');
     return '';
   });
@@ -101,7 +101,10 @@ await test('a sweep reads the process table after listing folders', (context) =>
   assert.equal(removed.length, roots.length);
   assert.deepEqual(
     sweepRunData(roots, () => assert.fail('nothing to check')),
-    [],
+    {
+      removed: [],
+      failed: [],
+    },
   );
 });
 
@@ -115,13 +118,13 @@ await test('a sweep follows a real process until it exits', async (context) => {
   context.after(() => holder.kill('SIGKILL'));
   await delay(200);
 
-  assert.deepEqual(sweepRunData(roots, listProcessCommands), []);
+  assert.deepEqual(sweepRunData(roots, listProcessCommands).removed, []);
   assert.deepEqual(remaining(run), roots);
 
   const exited = new Promise((resolve) => holder.once('exit', resolve));
   holder.kill('SIGKILL');
   await exited;
-  assert.equal(sweepRunData(roots, listProcessCommands).length, roots.length);
+  assert.equal(sweepRunData(roots, listProcessCommands).removed.length, roots.length);
   assert.deepEqual(remaining(run), []);
 });
 
@@ -138,3 +141,30 @@ await test('finishing a run removes only its own folders', async (context) => {
   assert.deepEqual(remaining(sibling), roots);
   await assert.rejects(() => removeRunData('dev.smykla.sail', roots, 0), /Not a native run/);
 });
+
+await test(
+  'a folder that cannot be removed does not stop the other removals',
+  { skip: process.platform === 'win32' },
+  async (context) => {
+    const { roots, populate, remaining } = fixture(context);
+    const run = identifier('a4');
+    const other = identifier('b4');
+    populate(run);
+    populate(other);
+    const locked = join(roots[0], run, 'nested');
+    writeFileSync(join(locked, 'file'), '');
+    chmodSync(locked, 0o500);
+    try {
+      const swept = sweepRunData(roots, () => '');
+      assert.deepEqual(swept.failed, [join(roots[0], run)]);
+      assert.equal(swept.removed.length, roots.length * 2 - 1);
+      assert.deepEqual(remaining(other), []);
+
+      const leftovers = await removeRunData(run, roots, 0);
+      assert.deepEqual(leftovers, [join(roots[0], run)]);
+      assert.deepEqual(remaining(run), [roots[0]]);
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+  },
+);

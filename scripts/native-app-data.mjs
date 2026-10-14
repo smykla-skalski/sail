@@ -69,7 +69,12 @@ function listNames(root) {
 }
 
 function removeFolder(path) {
-  rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  try {
+    rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Folders under the given roots that belong to the identifier and still exist. */
@@ -80,7 +85,8 @@ export function runFolders(identifier, roots) {
 
 /**
  * Removes one run's folders. WebKit helper processes can recreate data while the app exits, so a
- * second pass follows a short pause. Returns the folders that could not be removed.
+ * second pass follows a short pause. Returns the folders that could not be removed; a failure never
+ * stops the removal of the other folders.
  */
 export async function removeRunData(identifier, roots, pause = 500) {
   for (const path of runFolders(identifier, roots)) removeFolder(path);
@@ -92,7 +98,8 @@ export async function removeRunData(identifier, roots, pause = 500) {
 
 /**
  * Removes folders of every run whose app process no longer exists. Candidates are listed before the
- * process table is read, so a run that starts during the sweep is seen as live.
+ * process table is read, so a run that starts during the sweep is seen as live. A folder that cannot
+ * be removed is reported in `failed` without stopping the sweep.
  */
 export function sweepRunData(roots, readProcessCommands, keep = []) {
   const kept = new Set(keep);
@@ -101,9 +108,11 @@ export function sweepRunData(roots, readProcessCommands, keep = []) {
       .filter((name) => isRunIdentifier(name) && !kept.has(name))
       .map((name) => ({ name, path: join(root, name) })),
   );
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) return { removed: [], failed: [] };
   const live = liveRunTokens(readProcessCommands());
   const stale = candidates.filter(({ name }) => !isRunLive(name, live));
-  for (const { path } of stale) removeFolder(path);
-  return stale.map(({ path }) => path);
+  const removed = [];
+  const failed = [];
+  for (const { path } of stale) (removeFolder(path) ? removed : failed).push(path);
+  return { removed, failed };
 }
