@@ -66,3 +66,10 @@ export function nativeFailurePhase(setup) {
     return setup.precondition;
   return null;
 }
+
+export function nativePreconditionFailure(precondition, detail, preserveProductFailure = false) {
+  const failure = { precondition, detail };
+  return preserveProductFailure
+    ? { status: 'ready', cleanupFailure: failure }
+    : { status: 'failed', ...failure };
+}

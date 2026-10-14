@@ -9,6 +9,7 @@ import {
   PrivateEndpointGuard,
 } from './test/e2e-isolation.ts';
 import { createStateRoot, removeStateRoot, sweepStateRoots } from './scripts/e2e-state.mjs';
+import { nativePreconditionFailure } from './scripts/native-test-policy.mjs';
 import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
 import { resetAgentFixture } from './test/e2e/fixture-lifecycle.ts';
 import { assertNativeWebviews } from './test/e2e/native-preconditions.ts';
@@ -64,6 +65,21 @@ if (!attach && process.platform !== 'win32' && !process.env.SAIL_E2E_FAKE_GH_DIR
 
 const e2eAppearance = process.env.SAIL_E2E_APPEARANCE === 'dark' ? 'dark' : 'light';
 
+function stopForPrecondition(
+  precondition: string,
+  error: unknown,
+  preserveProductFailure = false,
+): never {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  if (process.env.SAIL_E2E_SETUP_REPORT)
+    writeFileSync(
+      process.env.SAIL_E2E_SETUP_REPORT,
+      JSON.stringify(nativePreconditionFailure(precondition, detail, preserveProductFailure)),
+    );
+  writeSync(2, `Fatal E2E fixture reset: ${detail}\n`);
+  process.exit(1);
+}
+
 /** WDIO logs ordinary config-hook errors and continues, so fixture failures must stop the worker. */
 function failClosedPrecondition(
   precondition: string,
@@ -73,14 +89,7 @@ function failClosedPrecondition(
     try {
       await setup();
     } catch (error) {
-      const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
-      if (process.env.SAIL_E2E_SETUP_REPORT)
-        writeFileSync(
-          process.env.SAIL_E2E_SETUP_REPORT,
-          JSON.stringify({ status: 'failed', precondition, detail }),
-        );
-      writeSync(2, `Fatal E2E fixture reset: ${detail}\n`);
-      process.exit(1);
+      stopForPrecondition(precondition, error);
     }
   };
 }
@@ -197,9 +206,13 @@ export const config = {
   beforeTest: failClosedPrecondition('pre-test agent request cleanup', async () => {
     await resetNativeAgentFixture();
   }),
-  afterTest: failClosedPrecondition('post-test agent request cleanup', async () => {
-    await resetNativeAgentFixture();
-  }),
+  async afterTest(_test: unknown, _context: unknown, result: { passed: boolean }) {
+    try {
+      await resetNativeAgentFixture();
+    } catch (error) {
+      stopForPrecondition('post-test agent request cleanup', error, !result.passed);
+    }
+  },
   onComplete() {
     jobs.release();
     removeStateRoot(state);
