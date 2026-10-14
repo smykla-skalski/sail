@@ -2249,6 +2249,22 @@ pub struct AgentManager(
     Arc<Mutex<()>>,
 );
 
+/// True while a live connection builds inside `root`, as a gate does under the
+/// runtime scratch of the agent that started it.
+#[cfg(unix)]
+pub(crate) fn runtime_root_in_use(manager: &AgentManager, root: &Path) -> bool {
+    let Ok(connections) = manager.0.lock() else {
+        return true;
+    };
+    connections.values().any(|runtime| {
+        runtime.alive.load(Ordering::Acquire)
+            && runtime
+                .shared_build_directory
+                .as_deref()
+                .is_some_and(|directory| directory.starts_with(root))
+    })
+}
+
 impl AgentManager {
     fn worktree_startup(&self, worktree: &Path) -> Result<Arc<Mutex<()>>, String> {
         let mut startups = self.2.lock().map_err(|error| error.to_string())?;
