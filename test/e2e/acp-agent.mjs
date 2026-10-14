@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -21,6 +21,11 @@ const terminalRequests = new Map();
 let terminalSupport = false;
 let nextTerminalRequest = 3000;
 const agent = process.argv[2];
+if (process.env.SAIL_E2E_ACP_START_LOG)
+  appendFileSync(
+    process.env.SAIL_E2E_ACP_START_LOG,
+    `${JSON.stringify({ agent, directory: process.cwd(), pid: process.pid })}\n`,
+  );
 let authenticated = agent !== 'codex';
 let nextSession = 0;
 // A provider can run under several capability profiles in separate processes.
@@ -543,6 +548,45 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    const reportingFixture = sessions.get(sessionId);
+    if (text.startsWith('Task reporting fixture:')) {
+      reportingFixture.reportingMode = text.split(': ')[1];
+      const guidance = message.params.prompt.some((part) =>
+        part.text?.startsWith('Sail Tasks: For this turn'),
+      );
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: guidance ? 'Task guidance received.' : 'Task guidance missing.',
+        },
+      });
+      if (reportingFixture.reportingMode === 'interrupted') {
+        send({ id: message.id, result: { stopReason: 'cancelled' } });
+      } else if (reportingFixture.reportingMode === 'failed') {
+        send({ id: message.id, error: { code: -1, message: 'Reporting fixture failed' } });
+      } else {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }
+      continue;
+    }
+    if (text.startsWith('Sail did not receive a successful task report')) {
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'One task correction received.' },
+      });
+      if (reportingFixture.reportingMode === 'recover') {
+        const server = reportingFixture.mcpServers.find((item) => item.name === 'sail-browser');
+        reportSessionTasks(server, (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        });
+      } else send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (
       text === 'Report session tasks' ||
       text === 'Report session focus' ||

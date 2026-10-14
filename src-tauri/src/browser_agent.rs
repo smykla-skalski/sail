@@ -535,6 +535,25 @@ impl BrowserManager {
         Ok(())
     }
 
+    pub(crate) fn check_task_report(
+        &self,
+        app: &AppHandle,
+        agent: &str,
+        directory: &Path,
+        session: &str,
+        turn: &str,
+    ) -> Result<bool, String> {
+        self.coordinate(
+            app,
+            session,
+            Some(agent),
+            directory,
+            "sail_task_report_check",
+            json!({"turnId":turn}),
+        )
+        .map(|value| value.get("needsCorrection").and_then(Value::as_bool) == Some(true))
+    }
+
     fn coordinate(
         &self,
         app: &AppHandle,
@@ -567,6 +586,7 @@ impl BrowserManager {
             | "validation_policy"
             | "sail_tasks_read"
             | "sail_tasks_report"
+            | "sail_task_report_check"
             | "sail_plan_propose"
             | "sail_plan_ask"
             | "sail_plan_step"
@@ -590,6 +610,11 @@ impl BrowserManager {
             .lock()
             .map_err(|error| error.to_string())?
             .insert(id.clone(), sender);
+        let timeout = if name == "sail_task_report_check" {
+            15
+        } else {
+            300
+        };
         let event = CoordinationRequest {
             id: id.clone(),
             session_id: session.to_string(),
@@ -601,7 +626,11 @@ impl BrowserManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|error| error.to_string())?
                 .as_millis() as u64
-                + 110_000,
+                + if name == "sail_task_report_check" {
+                    10_000
+                } else {
+                    110_000
+                },
         };
         if let Err(error) = app.emit_to("main", "agent:coordination-request", event) {
             self.0
@@ -611,7 +640,7 @@ impl BrowserManager {
                 .and_then(|mut map| map.remove(&id));
             return Err(error.to_string());
         }
-        let response = receiver.recv_timeout(Duration::from_secs(300));
+        let response = receiver.recv_timeout(Duration::from_secs(timeout));
         self.0
             .coordination
             .lock()

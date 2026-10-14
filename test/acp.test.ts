@@ -39,6 +39,24 @@ import { toolCommand } from '../src/lib/tool-display.ts';
 const normalizeEntries = (entries: AgentEntry[]) =>
   entries.map((entry) => (entry.type === 'tool' ? entry : { ...entry, id: entry.type }));
 
+void test('MCP reporting failures stay failed when the provider marks the call completed', () => {
+  const entries = updateEntries([], {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'report',
+    title: 'sail_tasks_report',
+    status: 'completed',
+    rawOutput: { isError: true, content: [{ type: 'text', text: 'Stale task revision' }] },
+  });
+  assert.equal(entries[0]?.type, 'tool');
+  assert.equal(entries[0]?.type === 'tool' && entries[0].status, 'failed');
+  const updated = updateEntries(entries, {
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'report',
+    status: 'completed',
+  });
+  assert.equal(updated[0]?.type === 'tool' && updated[0].status, 'failed');
+});
+
 void test('owned thread restore chooses the advertised provider mode', () => {
   assert.equal(acpRestoreMode({ sessionCapabilities: { resume: {} } }), 'resume');
   assert.equal(acpRestoreMode({ loadSession: true }), 'load');
@@ -655,6 +673,45 @@ void test('switching threads shows recent entries immediately and persists them 
     forgetRecentTranscript(thread);
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.deepEqual(loadRecentTranscript(thread), []);
+  } finally {
+    forgetRecentTranscript(thread);
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
+void test('deferred owned transcripts retain the complete conversation during a switch', async () => {
+  const values = new Map<string, string>();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => void values.set(key, value),
+    },
+  });
+  const thread: AgentThread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'sail-owned:12345678-1234-1234-1234-123456789abc:deferred-full',
+    title: 'Owned conversation',
+    updated: 0,
+  };
+  const entries: AgentEntry[] = Array.from({ length: 120 }, (_, index) => ({
+    id: `message-${index}`,
+    type: 'assistant',
+    text: `Message ${index}`,
+  }));
+  try {
+    saveRecentTranscriptAfterPaint(thread, entries);
+    entries.push({ id: 'later', type: 'assistant', text: 'Later update' });
+    assert.equal(values.has('sai-agent-transcript-cache'), false);
+    assert.equal(loadRecentTranscript(thread).length, 120);
+    assert.equal(loadRecentTranscript(thread)[0].id, 'message-0');
+    assert.equal(loadRecentTranscript(thread).at(-1)?.id, 'message-119');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(loadRecentTranscript(thread).length, 50);
+    assert.equal(loadRecentTranscript(thread).at(-1)?.id, 'message-119');
   } finally {
     forgetRecentTranscript(thread);
     if (previous) Object.defineProperty(globalThis, 'localStorage', previous);

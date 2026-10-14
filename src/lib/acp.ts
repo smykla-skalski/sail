@@ -482,7 +482,7 @@ export function saveRecentTranscriptAfterPaint(thread: AgentThread, entries: Age
   cancelPendingTranscript(id);
   const pending: PendingTranscript = {
     thread,
-    entries: entries.slice(-transcriptLimit),
+    entries: acpSessionOwner(thread.sessionId) ? entries.slice() : entries.slice(-transcriptLimit),
     timer: setTimeout(() => persist(), 100),
   };
   const persist = () => {
@@ -750,7 +750,12 @@ function applyEntryUpdate(
       id,
       type: 'tool',
       title: typeof update.title === 'string' ? update.title : (existing?.title ?? 'Tool call'),
-      status: typeof update.status === 'string' ? update.status : (existing?.status ?? 'pending'),
+      status:
+        output && typeof output === 'object' && 'isError' in output && output.isError === true
+          ? 'failed'
+          : typeof update.status === 'string'
+            ? update.status
+            : (existing?.status ?? 'pending'),
       content,
       ...(input !== undefined ? { input } : {}),
       ...(output !== undefined ? { output } : {}),
@@ -1168,15 +1173,28 @@ async function taskPrompt(
   const prior = sessionTasks().snapshot(scope);
   if (prior.turnId && prior.turnId !== turnId) {
     const runtime = (await acp.activity(directory))[agent];
-    await sessionTasks().reconcile(scope, runtime?.activeTurns[sessionId] ?? null, prior.revision);
+    await sessionTasks().reconcile(
+      scope,
+      runtime?.activeTurns[sessionId] ?? null,
+      prior.revision,
+      runtime?.finished[sessionId],
+    );
   }
   await sessionTasks().start(scope, turnId);
+  let completion: 'done' | 'interrupted' | 'failed' = 'failed';
   try {
-    return await invoke<AcpPromptOutcome>('acp_prompt', {
+    const outcome = await invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
+    completion = acpPromptInterrupted(outcome) ? 'interrupted' : 'done';
+    return outcome;
+  } catch (cause) {
+    completion =
+      (await acpFinishedPromptStatus(agent, directory, sessionId, turnId).catch(() => null)) ??
+      'failed';
+    throw cause;
   } finally {
-    await sessionTasks().finish(scope, turnId);
+    await sessionTasks().finish(scope, turnId, completion);
   }
 }
 
