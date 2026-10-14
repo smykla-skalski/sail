@@ -3737,10 +3737,29 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stopping_a_busy_provider_does_not_wait_on_its_project_lock() {
+        struct StopAndWait(String);
+
+        impl Drop for StopAndWait {
+            fn drop(&mut self) {
+                let key = std::ffi::CString::new(self.0.clone()).unwrap();
+                unsafe { sail_context_provider_stop(key.as_ptr()) };
+                if let Some(providers) = PROVIDERS.get() {
+                    let registry = providers.lock().unwrap();
+                    drop(
+                        PROVIDER_STOPPED
+                            .wait_while(registry, |registry| {
+                                registry.get(&self.0).is_some_and(Option::is_none)
+                            })
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+
         let repository = Repository::new("runtime-stop-busy");
         repository.configure();
         let key = project_key(&repository.0).unwrap();
-        let _stop = StopProvider(key.clone());
+        let _stop = StopAndWait(key.clone());
         let executable = repository.provider_fixture();
         let store_path = repository.0.join("approvals.json");
         let fingerprint = locked_store(&store_path, |store| {
@@ -3769,27 +3788,39 @@ mod tests {
             .get(key.to_str().unwrap())
             .is_some_and(Option::is_none));
         std::thread::scope(|scope| {
+            let guard = guard;
+            let project = repository.0.clone();
             let (send, receive) = std::sync::mpsc::channel();
             scope.spawn(move || {
                 let result = provider_request_at(
-                    &repository.0,
+                    &project,
                     &fingerprint,
                     None,
                     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
                     &store_path,
-                    &repository.0.join("data"),
+                    &project.join("data"),
                 );
                 send.send(result).unwrap();
             });
-            assert!(receive
-                .recv_timeout(std::time::Duration::from_millis(30))
-                .is_err());
+            assert_eq!(
+                receive.recv_timeout(std::time::Duration::from_millis(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            );
             drop(guard);
-            let response = receive
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
-                .unwrap()
+            let registry = PROVIDERS.get().unwrap().lock().unwrap();
+            let (registry, _) = PROVIDER_STOPPED
+                .wait_timeout_while(registry, std::time::Duration::from_secs(2), |registry| {
+                    registry
+                        .get(key.to_str().unwrap())
+                        .is_some_and(Option::is_none)
+                })
                 .unwrap();
+            let stopping = registry
+                .get(key.to_str().unwrap())
+                .is_some_and(Option::is_none);
+            drop(registry);
+            assert!(!stopping);
+            let response = receive.recv().unwrap().unwrap().unwrap();
             let value: serde_json::Value = serde_json::from_str(&response).unwrap();
             assert_eq!(value["id"], 1);
         });
