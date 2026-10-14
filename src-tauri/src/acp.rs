@@ -1814,7 +1814,40 @@ impl Connection {
         )
     }
 
+    /// An idle exit sent nothing the agent could have acted on, so callers may safely reattach
+    /// and retry on this error.
     fn request_response_around_write(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        write_message: impl FnOnce(&Value) -> Result<(), String>,
+        after_write: impl FnOnce(),
+    ) -> Result<PendingResponse, String> {
+        let result = self.dispatch_request(method, params, timeout, write_message, after_write);
+        if !self.idle_exit.load(Ordering::Acquire) {
+            return result;
+        }
+        match result {
+            Err(_) => Err(IDLE_EXIT_ERROR.into()),
+            Ok(mut response) => {
+                if let Some(error) = response
+                    .message
+                    .get_mut("error")
+                    .and_then(Value::as_object_mut)
+                    .filter(|error| {
+                        error.get("message").and_then(Value::as_str)
+                            == Some("Agent process exited.")
+                    })
+                {
+                    error.insert("message".into(), IDLE_EXIT_ERROR.into());
+                }
+                Ok(response)
+            }
+        }
+    }
+
+    fn dispatch_request(
         &self,
         method: &str,
         params: Value,
@@ -6386,6 +6419,7 @@ fn listing_connection(
                     && runtime.profile == profile
                     && runtime.owner.is_none()
                     && runtime.alive.load(Ordering::Acquire)
+                    && !runtime.stopped.load(Ordering::Acquire)
                     && runtime
                         .capabilities
                         .lock()
@@ -6436,12 +6470,9 @@ pub async fn acp_list_sessions(
                 params["cursor"] = json!(cursor);
             }
             let result = runtime.request("session/list", params, Duration::from_secs(30));
-            // The agent may exit for idleness between lookup and request; the next lookup respawns it.
-            if result.is_err()
-                && attempts < 2
-                && runtime.idle_exit.load(Ordering::Acquire)
-                && !runtime.alive.load(Ordering::Acquire)
-            {
+            // The shared agent may exit (idle, worktree removal) between lookup and request;
+            // the next lookup respawns it.
+            if result.is_err() && attempts < 2 && !runtime.alive.load(Ordering::Acquire) {
                 continue;
             }
             return result;
@@ -7381,6 +7412,9 @@ fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
         false
     })
 }
+
+/// The text `recoverMissingSession` retries on after reattaching the session.
+const IDLE_EXIT_ERROR: &str = "Agent session is not connected in this worktree.";
 
 const OPENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -8673,6 +8707,13 @@ time.sleep(10)
         assert!(runtime.exit_if_idle(Duration::from_secs(30), || false));
         assert!(!runtime.alive.load(Ordering::Acquire));
         assert!(runtime.idle_exit.load(Ordering::Acquire));
+        assert_eq!(
+            runtime
+                .request("session/prompt", json!({}), Duration::from_secs(1))
+                .unwrap_err(),
+            IDLE_EXIT_ERROR,
+            "a request racing the idle exit must be recoverable by reattaching"
+        );
     }
 
     #[cfg(unix)]
