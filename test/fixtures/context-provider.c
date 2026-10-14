@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +237,17 @@ int main(void) {
         }
         if (initialization_count && access(".sail/block-provider-stdin", F_OK) == 0) {
             if (!write_marker("blocked-input")) return 1;
+            if (access(".sail/observe-provider-write", F_OK) == 0) {
+                char prefix[4096];
+                size_t received = 0;
+                while (received < sizeof(prefix)) {
+                    ssize_t count = read(STDIN_FILENO, prefix + received, sizeof(prefix) - received);
+                    if (count < 0 && errno == EINTR) continue;
+                    if (count <= 0) return 1;
+                    received += (size_t)count;
+                }
+                if (!write_marker("partial-input")) return 1;
+            }
             for (;;) pause();
         }
     }

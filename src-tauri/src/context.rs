@@ -932,7 +932,7 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
                 &mut stdout,
                 &message,
                 std::time::Duration::from_secs(30),
-                || Ok(()),
+                |_| Ok(()),
             ) {
                 let _ = output_errors.send(Event::OutputError(error));
                 break;
@@ -1338,19 +1338,24 @@ fn write_provider_request_checked(
     stdin: &mut impl std::io::Write,
     message: &str,
     timeout: std::time::Duration,
-    mut check: impl FnMut() -> Result<(), String>,
+    mut check: impl FnMut(bool) -> Result<(), String>,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
     let message = message.trim_end_matches(['\r', '\n']);
+    let mut written = false;
     for bytes in [message.as_bytes(), b"\n".as_slice()] {
         let mut remaining = bytes;
         while !remaining.is_empty() {
+            check(written)?;
             match stdin.write(remaining) {
                 Ok(0) => return Err("Provider stdin closed before request completed.".into()),
-                Ok(count) => remaining = &remaining[count..],
+                Ok(count) => {
+                    written = true;
+                    remaining = &remaining[count..];
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    check()?;
+                    check(written)?;
                     let remaining_time =
                         deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining_time.is_zero() {
@@ -1661,6 +1666,15 @@ fn provider_request_with_notifications_at(
         }
         return Err("Context approval changed or was revoked.".into());
     }
+    if let Some(id) = request.get("id") {
+        if !take_cancellations(&key, capability, id).is_empty() {
+            if provider.is_none() {
+                drop(provider);
+                forget_provider(&key, &slot);
+            }
+            return Ok(Some(cancelled_provider_response(id)));
+        }
+    }
     let stale = provider.as_mut().is_some_and(|current| {
         current.fingerprint != expected || current.child.try_wait().ok().flatten().is_some()
     });
@@ -1889,6 +1903,13 @@ fn successful_provider_response(response: Option<&str>) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn cancelled_provider_response(id: &serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc":"2.0","id":id,
+        "error":{"code":-32800,"message":"Provider request cancelled."}})
+    .to_string()
+}
+
+#[cfg(target_os = "macos")]
 enum ProviderEvent {
     Notification(String),
     Response(String),
@@ -1906,11 +1927,11 @@ fn write_shared_provider_request(
     stdin: &std::sync::Mutex<std::process::ChildStdin>,
     message: &str,
     timeout: std::time::Duration,
-    mut check: impl FnMut() -> Result<(), String>,
+    mut check: impl FnMut(bool) -> Result<(), String>,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        check()?;
+        check(false)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err("Provider stdin write timed out.".into());
@@ -2112,7 +2133,7 @@ fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
                                 &stdin,
                                 &reply,
                                 std::time::Duration::from_secs(1),
-                                || Ok(()),
+                                |_| Ok(()),
                             )?;
                             continue;
                         }
@@ -2246,7 +2267,8 @@ fn exchange_provider_request(
     let write_timeout = deadline.map_or(Duration::from_secs(30), |deadline| {
         deadline.saturating_duration_since(std::time::Instant::now())
     });
-    write_shared_provider_request(&process.stdin, message, write_timeout, || {
+    let mut cancelled_before_write = false;
+    let write = write_shared_provider_request(&process.stdin, message, write_timeout, |written| {
         if !session_active()? {
             return Err("Context session revoked during provider stdin write.".into());
         }
@@ -2254,10 +2276,15 @@ fn exchange_provider_request(
             .get("id")
             .is_some_and(|id| !take_cancellations(key, capability, id).is_empty())
         {
+            cancelled_before_write = !written;
             return Err("Provider request cancelled while writing stdin.".into());
         }
         Ok(())
-    })?;
+    });
+    if cancelled_before_write {
+        return Ok(request_id.map(cancelled_provider_response));
+    }
+    write?;
     let Some(request_id) = request_id else {
         if method == "notifications/initialized" {
             process.initialized_notification_sent = true;
@@ -2285,7 +2312,7 @@ fn exchange_provider_request(
                 &process.stdin,
                 &notification.to_string(),
                 Duration::from_secs(1),
-                || {
+                |_| {
                     if session_active()? {
                         Ok(())
                     } else {
@@ -2295,9 +2322,7 @@ fn exchange_provider_request(
             )?;
         }
         if !cancellations.is_empty() {
-            let cancelled = serde_json::json!({"jsonrpc":"2.0","id":request_id,
-                "error":{"code":-32800,"message":"Provider request cancelled."}})
-            .to_string();
+            let cancelled = cancelled_provider_response(request_id);
             if buffered.len() + cancelled.len() > 1024 * 1024 {
                 return Err("Buffered provider output exceeds 1 MiB.".into());
             }
@@ -2671,7 +2696,7 @@ mod tests {
             &provider.stdin,
             request,
             std::time::Duration::from_secs(1),
-            || Ok(()),
+            |_| Ok(()),
         )
         .unwrap();
         let response = read_bounded_line(provider.stdout.as_mut().unwrap(), 1024)
@@ -3079,7 +3104,7 @@ mod tests {
                 &mut output,
                 &format!("{first}\n{second}{suffix}"),
                 std::time::Duration::from_secs(1),
-                || Ok(()),
+                |_| Ok(()),
             )
             .unwrap();
             let output = String::from_utf8(output).unwrap();
@@ -3768,6 +3793,83 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn cancelling_a_queued_request_preserves_the_shared_provider() {
+        for (name, request_id) in [("integer-id", json!(11)), ("string-id", json!("queued"))] {
+            let repository = Repository::new(name);
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopProvider(key);
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let peer = ActiveSession::new();
+            let call = |message: &str, capability: &str| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    message,
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            let before = call(
+                r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#,
+                &owner.0,
+            )
+            .unwrap()
+            .unwrap();
+            let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+            let queued_request =
+                json!({"jsonrpc":"2.0","id":request_id,"method":"tools/list"}).to_string();
+            let queued_cancellation = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id}}).to_string();
+            let (ready, received) = std::sync::mpsc::sync_channel(1);
+
+            let cancelled = std::thread::scope(|scope| {
+                let active = scope.spawn(|| {
+                    let mut notify = |_: &str| ready.send(()).map_err(|error| error.to_string());
+                    provider_request_with_notifications_at(
+                        &repository.0,
+                        &fingerprint,
+                        Some(&owner.0),
+                        r#"{"jsonrpc":"2.0","id":10,"method":"wait-for-cancel-no-response"}"#,
+                        &store_path,
+                        &repository.0.join("data"),
+                        Some(&mut notify),
+                    )
+                });
+                received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let queued = scope.spawn(|| call(&queued_request, &owner.0));
+                call(&queued_cancellation, &owner.0).unwrap();
+                call(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":10}}"#, &owner.0).unwrap();
+                active.join().unwrap().unwrap();
+                queued.join().unwrap()
+            });
+
+            let cancelled = cancelled.unwrap().unwrap();
+            let cancelled: serde_json::Value = serde_json::from_str(&cancelled).unwrap();
+            assert_eq!(cancelled["id"], request_id);
+            assert_eq!(cancelled["error"]["code"], -32800);
+            let reused = call(&queued_request, &owner.0).unwrap().unwrap();
+            let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+            let adjacent = call(&queued_request, &peer.0).unwrap().unwrap();
+            let adjacent: serde_json::Value = serde_json::from_str(&adjacent).unwrap();
+            assert_eq!(reused["result"]["pid"], before["result"]["pid"]);
+            assert_eq!(adjacent["result"]["pid"], before["result"]["pid"]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn cancellation_reaches_a_waiting_provider_without_ending_other_calls() {
         for method in ["wait-for-cancel", "wait-for-cancel-no-response"] {
             let repository = Repository::new("runtime-cancellation");
@@ -4008,6 +4110,7 @@ mod tests {
         let repository = Repository::new("runtime-blocked-input");
         repository.configure();
         repository.write(".sail/block-provider-stdin", "block after initialize");
+        repository.write(".sail/observe-provider-write", "signal a partial request");
         repository.commit();
         let key = project_key(&repository.0).unwrap();
         let _stop = StopProvider(key.clone());
@@ -4040,7 +4143,8 @@ mod tests {
         )
         .unwrap();
         let first: serde_json::Value = serde_json::from_str(&first).unwrap();
-        let marker = repository.0.join("data").join(key).join("blocked-input");
+        let data_root = repository.0.join("data").join(key);
+        let marker = data_root.join("blocked-input");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !marker.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -4052,6 +4156,15 @@ mod tests {
 
         std::thread::scope(|scope| {
             let pending = scope.spawn(|| call(&request, &owner.0));
+            let partial = data_root.join("partial-input");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !partial.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                partial.exists(),
+                "Provider did not receive a partial request"
+            );
             let start = std::time::Instant::now();
             assert_eq!(call(cancellation, &owner.0).unwrap(), None);
             let result = pending.join().unwrap();
@@ -4373,7 +4486,7 @@ mod tests {
             &mut stdin,
             &"x".repeat(900_000),
             std::time::Duration::from_millis(50),
-            || Ok(()),
+            |_| Ok(()),
         )
         .unwrap_err();
         child.kill().unwrap();
