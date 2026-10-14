@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -219,6 +220,106 @@ pub(crate) fn require_no_private_state_at_missing(worktree: &Path) -> Result<(),
     Ok(())
 }
 
+pub(crate) fn removed_worktree_overlay_absent(worktree: &Path) -> Result<bool, String> {
+    let root = crate::acp_terminal::stable_worktree_identity(worktree);
+    let cache = CACHE
+        .get()
+        .ok_or("Private Git cache is unavailable for cleanup verification.")?;
+    if let Some(entries) = ACTIVE.get() {
+        if entries
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|(owner, _, _)| owner == &root)
+        {
+            return Ok(false);
+        }
+    }
+    let (private, manifest, _) = paths(cache, &root);
+    for path in [private, manifest.clone(), manifest.with_extension("bak")] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot verify private Git state: {error}")),
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn removed_worktree_overlay_pending_path(
+    worktree: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let root = crate::acp_terminal::stable_worktree_identity(worktree);
+    let cache = CACHE
+        .get()
+        .ok_or("Private Git cache is unavailable for cleanup verification.")?;
+    let (private, manifest, _) = paths(cache, &root);
+    for path in [private, manifest.clone(), manifest.with_extension("bak")] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
+}
+
+/// A staged checkout can still own a synchronized overlay keyed to its old path.
+/// Keep that overlay in place so it becomes usable again after the Git move.
+pub(crate) fn require_recoverable_private_state_at_missing(
+    original: &Path,
+    recovery: &Path,
+) -> Result<(), String> {
+    let root = crate::acp_terminal::stable_worktree_identity(original);
+    let Some(cache) = CACHE.get() else {
+        return require_no_private_state_at_missing(&root);
+    };
+    require_recoverable_private_state_at_missing_in_cache(cache, &root, recovery)
+}
+
+fn require_recoverable_private_state_at_missing_in_cache(
+    cache: &Path,
+    original: &Path,
+    recovery: &Path,
+) -> Result<(), String> {
+    let root = crate::acp_terminal::stable_worktree_identity(original);
+    let (private, manifest_path, _) = paths(cache, &root);
+    let present = |path: &Path| fs::symlink_metadata(path).is_ok();
+    if !present(&private)
+        && !present(&manifest_path)
+        && !present(&manifest_path.with_extension("bak"))
+    {
+        return require_no_private_state_at_missing(&root);
+    }
+    let manifest = read_manifest(&manifest_path)?
+        .ok_or("Missing worktree has incomplete private Git state; recovery refused.")?;
+    if manifest.version != VERSION || manifest.worktree != root || manifest.promotion.is_some() {
+        return Err("Missing worktree has private Git state that requires recovery.".into());
+    }
+    let current = source(recovery)?.ok_or("Recovery checkout is not a linked Git worktree.")?;
+    if manifest.source_git_dir != current.git_dir
+        || manifest.common_dir != current.common_dir
+        || manifest.branch != current.branch
+        || manifest.promoted_oid != current.head
+        || index_hash(&current.git_dir.join("index"))? != manifest.source_index_hash
+    {
+        return Err("Recovery checkout does not match the original private Git state.".into());
+    }
+    validate_overlay(&private, &current.common_dir)?;
+    let head = output(
+        git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(&private))
+            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+    )?;
+    if String::from_utf8_lossy(&head.stdout).trim() != manifest.promoted_oid
+        || index_hash(&private.join("index"))? != manifest.source_index_hash
+    {
+        return Err("Recovery checkout has unpromoted private Git changes.".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn forget_removed_worktree(worktree: &Path) -> Result<(), String> {
     let root = crate::acp_terminal::stable_worktree_identity(worktree);
     let Some(cache) = CACHE.get() else {
@@ -230,7 +331,39 @@ pub(crate) fn forget_removed_worktree(worktree: &Path) -> Result<(), String> {
     forget_removed_worktree_in_cache(cache, &root)
 }
 
+pub(crate) fn forget_removed_worktree_for_repository(
+    worktree: &Path,
+    repository: &Path,
+) -> Result<(), String> {
+    let result = output(
+        git_command()
+            .arg("-C")
+            .arg(repository)
+            .args(["rev-parse", "--git-common-dir"]),
+    )?;
+    let common = String::from_utf8(result.stdout).map_err(|error| error.to_string())?;
+    let common = Path::new(common.trim());
+    let common = dunce::canonicalize(if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        repository.join(common)
+    })
+    .map_err(|error| error.to_string())?;
+    let cache = CACHE
+        .get()
+        .ok_or("Private Git cache is unavailable for selected cleanup.")?;
+    forget_removed_worktree_in_cache_checked(cache, worktree, Some(&common))
+}
+
 fn forget_removed_worktree_in_cache(cache: &Path, worktree: &Path) -> Result<(), String> {
+    forget_removed_worktree_in_cache_checked(cache, worktree, None)
+}
+
+fn forget_removed_worktree_in_cache_checked(
+    cache: &Path,
+    worktree: &Path,
+    expected_common: Option<&Path>,
+) -> Result<(), String> {
     let root = crate::acp_terminal::stable_worktree_identity(worktree);
     if root.exists() {
         return Err("Removed worktree path was recreated before private Git cleanup.".into());
@@ -265,7 +398,31 @@ fn forget_removed_worktree_in_cache(cache: &Path, worktree: &Path) -> Result<(),
     if manifest.version != VERSION || manifest.worktree != root || manifest.promotion.is_some() {
         return Err("Removed worktree private Git state requires recovery.".into());
     }
-    if !manifest.removing {
+    if expected_common.is_some_and(|common| manifest.common_dir.as_path() != common) {
+        return Err("Removed worktree private Git state belongs to another repository.".into());
+    }
+    let backup = manifest_path.with_extension("bak");
+    if present(&backup) {
+        let previous: Manifest =
+            serde_json::from_slice(&fs::read(&backup).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("Cannot verify previous overlay manifest: {error}"))?;
+        if previous.version != manifest.version
+            || previous.worktree != manifest.worktree
+            || previous.source_git_dir != manifest.source_git_dir
+            || previous.common_dir != manifest.common_dir
+        {
+            return Err("Overlay manifest backup belongs to another worktree.".into());
+        }
+    }
+    // A prior removal may have deleted only part of this directory. Its
+    // remaining contents cannot be distinguished from a replacement on retry.
+    if manifest.removing && present(&private) {
+        return Err(format!(
+            "Interrupted private Git cleanup retained unverifiable data at {}. Leave it pending for separate recovery.",
+            private.display()
+        ));
+    }
+    if !manifest.removing && present(&private) {
         validate_overlay(&private, &manifest.common_dir)?;
         let head = output(
             git_command()
@@ -286,12 +443,10 @@ fn forget_removed_worktree_in_cache(cache: &Path, worktree: &Path) -> Result<(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    match fs::remove_file(manifest_path.with_extension("bak")) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
-    }
     fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
+    if present(&backup) {
+        fs::remove_file(&backup).map_err(|error| error.to_string())?;
+    }
     if let Some(entries) = ACTIVE.get() {
         entries
             .lock()
@@ -327,7 +482,7 @@ fn require_shared_current_in_cache(cache: &Path, worktree: &Path) -> Result<(), 
         return Err("Private Git promotion is pending; shared Git operation refused.".into());
     }
     let branch = output(
-        git_command()
+        git_ref_command()
             .arg("--git-dir")
             .arg(git_config_path(&overlay.git_dir))
             .args(["symbolic-ref", "-q", "HEAD"]),
@@ -408,6 +563,14 @@ fn git_command() -> Command {
     command
 }
 
+fn git_ref_command() -> Command {
+    let mut command = git_command();
+    // Ref spellings belong to Git, including packed NFC/NFD aliases. Keep file
+    // and index commands on the inherited filesystem normalization setting.
+    command.args(["-c", "core.precomposeUnicode=false"]);
+    command
+}
+
 struct OverlayBuild(PathBuf);
 
 impl Drop for OverlayBuild {
@@ -475,13 +638,19 @@ fn source(worktree: &Path) -> Result<Option<Source>, String> {
     if dunce::canonicalize(&backlink).map_err(|error| error.to_string())? != pointer {
         return Err("Linked Git directory belongs to another worktree.".into());
     }
-    let branch =
-        output(
-            git_command()
-                .arg("-C")
-                .arg(&worktree)
-                .args(["symbolic-ref", "-q", "HEAD"]),
-        )?;
+    let branch = git_ref_command()
+        .arg("-C")
+        .arg(&worktree)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if branch.status.code() == Some(1) && branch.stderr.is_empty() {
+        // A detached linked worktree has no branch to isolate in a Git overlay.
+        return Ok(None);
+    }
+    if !branch.status.success() {
+        return Err(String::from_utf8_lossy(&branch.stderr).trim().to_string());
+    }
     let branch = String::from_utf8(branch.stdout).map_err(|error| error.to_string())?;
     let branch = branch.trim().to_string();
     if !branch.starts_with("refs/heads/") {
@@ -775,25 +944,86 @@ fn read_manifest(path: &Path) -> Result<Option<Manifest>, String> {
 
 fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
     let refs = output(
-        git_command()
+        git_ref_command()
             .arg("-C")
             .arg(&source.worktree)
             .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
     )?;
-    let mut updates = String::new();
-    for line in String::from_utf8(refs.stdout)
+    let mut remaining = Vec::new();
+    for line in String::from_utf8(refs.stdout.clone())
         .map_err(|error| error.to_string())?
         .lines()
     {
         let (reference, oid) = line
             .split_once(' ')
             .ok_or("Invalid source Git reference output.")?;
-        updates.push_str(&format!("update {reference} {oid}\n"));
+        remaining.push((reference.to_string(), oid.to_string()));
     }
-    if updates.is_empty() {
-        return Ok(());
+    while !remaining.is_empty() {
+        let mut names = HashMap::new();
+        let mut updates = String::new();
+        let mut next = Vec::new();
+        let mut isolated = false;
+        for (reference, oid) in remaining {
+            // Filesystems use Unicode folding and normalization rules that differ
+            // from Rust lowercasing. Isolate non-ASCII names from every other ref.
+            if !reference.is_ascii() {
+                if updates.is_empty() {
+                    updates.push_str(&format!("update {reference} {oid}\n"));
+                    isolated = true;
+                } else {
+                    next.push((reference, oid));
+                }
+                continue;
+            }
+            if isolated {
+                next.push((reference, oid));
+                continue;
+            }
+            let prefixes = reference
+                .match_indices('/')
+                .map(|(end, _)| &reference[..end])
+                .chain(std::iter::once(reference.as_str()))
+                .collect::<Vec<_>>();
+            if prefixes.iter().any(|prefix| {
+                names
+                    .get(&prefix.to_ascii_lowercase())
+                    .is_some_and(|existing| existing != prefix)
+            }) {
+                next.push((reference, oid));
+            } else {
+                for prefix in prefixes {
+                    names.insert(prefix.to_ascii_lowercase(), prefix.to_string());
+                }
+                updates.push_str(&format!("update {reference} {oid}\n"));
+            }
+        }
+        seed_ref_batch(git_dir, &updates)?;
+        // Case-distinct refs cannot share loose files or transaction locks on macOS.
+        // Pack hidden refs too, without changing the inherited configuration or
+        // requiring newer Git versions' --include option.
+        output(
+            git_ref_command()
+                .arg("--git-dir")
+                .arg(git_config_path(git_dir))
+                .args(["-c", "transfer.hideRefs=!", "pack-refs", "--all"]),
+        )?;
+        remaining = next;
     }
-    let mut child = git_command()
+    let seeded = output(
+        git_ref_command()
+            .arg("--git-dir")
+            .arg(git_config_path(git_dir))
+            .args(["for-each-ref", "--format=%(refname) %(objectname)"]),
+    )?;
+    if seeded.stdout != refs.stdout {
+        return Err("Private Git reference names or targets changed during initialization.".into());
+    }
+    Ok(())
+}
+
+fn seed_ref_batch(git_dir: &Path, updates: &str) -> Result<(), String> {
+    let mut child = git_ref_command()
         .arg("--git-dir")
         .arg(git_config_path(git_dir))
         .args(["update-ref", "--stdin"])
@@ -1082,7 +1312,7 @@ fn recover_unregistered_overlay(
             return Err("Unregistered overlay has unfinished Git writes.".into());
         }
         let branch = output(
-            git_command()
+            git_ref_command()
                 .arg("--git-dir")
                 .arg(git_config_path(git_dir))
                 .args(["symbolic-ref", "-q", "HEAD"]),
@@ -1315,7 +1545,7 @@ impl GitOverlay {
         }
         seed_refs(&current, &git_dir)?;
         output(
-            git_command()
+            git_ref_command()
                 .args(["--git-dir"])
                 .arg(git_config_path(&git_dir))
                 .args(["symbolic-ref", "HEAD", &current.branch]),
@@ -1421,7 +1651,7 @@ impl GitOverlay {
             return Err("Git overlay owner changed; promotion refused.".into());
         }
         let branch = output(
-            git_command()
+            git_ref_command()
                 .arg("--git-dir")
                 .arg(git_config_path(&self.git_dir))
                 .args(["symbolic-ref", "-q", "HEAD"]),
@@ -1497,7 +1727,7 @@ impl GitOverlay {
                     .arg(&promotion.new_oid),
             )?;
             output(
-                git_command()
+                git_ref_command()
                     .arg("--git-dir")
                     .arg(git_config_path(&manifest.common_dir))
                     .args([
@@ -1511,6 +1741,17 @@ impl GitOverlay {
             return Err(
                 "Assigned branch changed during promotion; recovery requires a decision.".into(),
             );
+        }
+        if promotion.new_oid != promotion.expected_oid {
+            // A new loose ref can shadow another packed spelling on an
+            // insensitive filesystem. Repack exact names before publication
+            // completes, including when recovering an interrupted promotion.
+            output(
+                git_ref_command()
+                    .arg("--git-dir")
+                    .arg(git_config_path(&manifest.common_dir))
+                    .args(["-c", "transfer.hideRefs=!", "pack-refs", "--all"]),
+            )?;
         }
         replace_index(
             &source_index,
@@ -1580,6 +1821,173 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    #[test]
+    fn overlay_seeds_case_distinct_refs_without_losing_their_targets() {
+        let fixture = OverlayFixture::new();
+        let initial = git(&fixture.main, &["rev-parse", "HEAD"]);
+        git(&fixture.main, &["update-ref", "refs/heads/Hooks", &initial]);
+        git(&fixture.main, &["pack-refs", "--all"]);
+        git(
+            &fixture.main,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "next",
+            ],
+        );
+        let next = git(&fixture.main, &["rev-parse", "HEAD"]);
+        git(&fixture.main, &["update-ref", "refs/heads/hooks", &next]);
+        git(&fixture.main, &["pack-refs", "--all"]);
+        git(&fixture.main, &["update-ref", "refs/heads/HOOKS", &initial]);
+        git(&fixture.main, &["pack-refs", "--all"]);
+        for reference in [
+            "refs/heads/Topic/one",
+            "refs/heads/topic/two",
+            "refs/heads/Σ",
+            "refs/heads/ς",
+            "refs/heads/café",
+            "refs/heads/cafe\u{301}",
+            "refs/heads/K",
+            "refs/heads/K",
+        ] {
+            let oid = if reference == "refs/heads/café" {
+                &initial
+            } else {
+                &next
+            };
+            git(
+                &fixture.main,
+                &[
+                    "-c",
+                    "core.precomposeUnicode=false",
+                    "update-ref",
+                    reference,
+                    oid,
+                ],
+            );
+            git(
+                &fixture.main,
+                &["-c", "core.precomposeUnicode=false", "pack-refs", "--all"],
+            );
+        }
+        git(&fixture.main, &["config", "core.precomposeUnicode", "true"]);
+        git(
+            &fixture.task,
+            &[
+                "-c",
+                "core.precomposeUnicode=false",
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/cafe\u{301}",
+            ],
+        );
+        git(
+            &fixture.main,
+            &["config", "transfer.hideRefs", "refs/heads/Hooks"],
+        );
+        let before = git(
+            &fixture.main,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+
+        let mut overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let after = overlay_git(
+            &overlay,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        assert_eq!(after, before);
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/Hooks"]),
+            initial
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/hooks"]),
+            next
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["rev-parse", "refs/heads/HOOKS"]),
+            initial
+        );
+        assert_eq!(overlay_git(&overlay, &["rev-parse", "HEAD"]), next);
+        assert_eq!(
+            overlay_git(&overlay, &["symbolic-ref", "HEAD"]),
+            "refs/heads/cafe\u{301}"
+        );
+        assert!(before
+            .lines()
+            .any(|line| line == format!("refs/heads/café {initial}")));
+        assert!(before
+            .lines()
+            .any(|line| line == format!("refs/heads/cafe\u{301} {next}")));
+        assert_eq!(
+            git(
+                &fixture.main,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            before
+        );
+        assert!(private_lock_files(&overlay.git_dir).unwrap().is_empty());
+        assert_eq!(
+            overlay_git(&overlay, &["config", "--get", "transfer.hideRefs"]),
+            "refs/heads/Hooks"
+        );
+        assert_eq!(
+            GitOverlay::ensure(&fixture.cache, &fixture.task)
+                .unwrap()
+                .unwrap()
+                .git_dir,
+            overlay.git_dir,
+        );
+        assert_eq!(
+            overlay_git(&overlay, &["config", "--get", "core.precomposeUnicode"]),
+            "true"
+        );
+        overlay_git(
+            &overlay,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "private",
+            ],
+        );
+        let promoted = overlay_git(&overlay, &["rev-parse", "HEAD"]);
+        overlay.promote_quiescent(|| Ok(())).unwrap();
+        assert_eq!(git(&fixture.task, &["rev-parse", "HEAD"]), promoted);
+        assert_eq!(
+            git(&fixture.main, &["rev-parse", "refs/heads/café"]),
+            initial
+        );
+        assert_eq!(
+            git(&fixture.task, &["symbolic-ref", "HEAD"]),
+            "refs/heads/cafe\u{301}"
+        );
+        let source_refs = git(
+            &fixture.main,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        assert!(source_refs
+            .lines()
+            .any(|line| line == format!("refs/heads/café {initial}")));
+        assert!(source_refs
+            .lines()
+            .any(|line| line == format!("refs/heads/cafe\u{301} {promoted}")));
+        assert_eq!(
+            git(
+                &fixture.main,
+                &["config", "--get", "core.precomposeUnicode"]
+            ),
+            "true"
+        );
     }
 
     #[test]
@@ -1710,13 +2118,22 @@ mod tests {
         let snapshot = vec![finished.clone(), stale.clone()];
         fs::remove_file(finished).unwrap();
 
-        recover_stale_private_locks_from_snapshot(
-            &fixture.cache,
-            &fixture.task,
-            &overlay.git_dir,
-            snapshot,
-        )
-        .unwrap();
+        // Recovery leaves locks intact while a Git writer or storage lease is
+        // still active. A concurrent test run can observe that short window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stale.exists() {
+            recover_stale_private_locks_from_snapshot(
+                &fixture.cache,
+                &fixture.task,
+                &overlay.git_dir,
+                snapshot.clone(),
+            )
+            .unwrap();
+            if !stale.exists() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         assert!(!stale.exists());
         overlay_git(&overlay, &["update-ref", "refs/heads/stale", "HEAD"]);
@@ -2012,6 +2429,30 @@ mod tests {
         forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap();
         forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap();
         assert_eq!(known_worktree_in_cache(&fixture.cache, &fixture.task), None);
+    }
+
+    #[test]
+    fn interrupted_private_cleanup_keeps_a_replacement_overlay_directory() {
+        let fixture = OverlayFixture::new();
+        let mut overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.task.to_str().unwrap()],
+        );
+        overlay.manifest.removing = true;
+        write_manifest(&overlay.manifest_path, &overlay.manifest).unwrap();
+        fs::remove_dir_all(&overlay.git_dir).unwrap();
+        fs::create_dir_all(&overlay.git_dir).unwrap();
+        let replacement = overlay.git_dir.join("private-replacement.txt");
+        fs::write(&replacement, "unrelated data").unwrap();
+
+        let error = forget_removed_worktree_in_cache(&fixture.cache, &fixture.task).unwrap_err();
+        assert!(error.contains("retained unverifiable data"), "{error}");
+        assert!(error.contains(&overlay.git_dir.to_string_lossy().to_string()));
+        assert_eq!(fs::read_to_string(&replacement).unwrap(), "unrelated data");
+        assert!(overlay.manifest_path.exists());
     }
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
@@ -2349,6 +2790,147 @@ mod tests {
     }
 
     #[test]
+    fn detached_linked_worktree_does_not_create_a_branch_overlay() {
+        let root =
+            std::env::temp_dir().join(format!("sail-overlay-detached-{}", uuid::Uuid::new_v4()));
+        let main = root.join("main");
+        let detached = root.join("detached");
+        let task = root.join("task");
+        let cache = root.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main", main.to_str().unwrap()]);
+        git(&main, &["config", "user.name", "Sail Test"]);
+        git(&main, &["config", "user.email", "sail@example.test"]);
+        fs::write(main.join("initial.txt"), "base\n").unwrap();
+        git(&main, &["add", "initial.txt"]);
+        git(
+            &main,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "detached",
+                detached.to_str().unwrap(),
+            ],
+        );
+        git(&detached, &["checkout", "--detach", "-q"]);
+
+        assert!(source(&detached).unwrap().is_none());
+        assert!(GitOverlay::ensure(&cache, &detached).unwrap().is_none());
+        let (_, manifest, _) = paths(&cache, &detached.canonicalize().unwrap());
+        assert!(!manifest.exists());
+
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task",
+                task.to_str().unwrap(),
+            ],
+        );
+        assert!(GitOverlay::ensure(&cache, &task).unwrap().is_some());
+        git(&task, &["checkout", "--detach", "-q"]);
+        assert!(GitOverlay::existing(&cache, &task).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_recovery_accepts_only_the_original_synchronized_overlay() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-overlay-staged-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let main = root.join("main");
+        let task = root.join("task");
+        let recovery = root.join("recovery");
+        let cache = root.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main", main.to_str().unwrap()]);
+        git(&main, &["config", "user.name", "Sail Test"]);
+        git(&main, &["config", "user.email", "sail@example.test"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "base",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task",
+                task.to_str().unwrap(),
+            ],
+        );
+        let overlay = GitOverlay::ensure(&cache, &task).unwrap().unwrap();
+        require_shared_current_in_cache(&cache, &task).unwrap();
+
+        git(
+            &main,
+            &[
+                "worktree",
+                "move",
+                task.to_str().unwrap(),
+                recovery.to_str().unwrap(),
+            ],
+        );
+        require_recoverable_private_state_at_missing_in_cache(&cache, &task, &recovery).unwrap();
+        assert!(overlay.manifest_path.exists());
+        git(
+            &main,
+            &[
+                "worktree",
+                "move",
+                recovery.to_str().unwrap(),
+                task.to_str().unwrap(),
+            ],
+        );
+        require_shared_current_in_cache(&cache, &task).unwrap();
+        git(
+            &main,
+            &[
+                "worktree",
+                "move",
+                task.to_str().unwrap(),
+                recovery.to_str().unwrap(),
+            ],
+        );
+        git(
+            &recovery,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "changed",
+            ],
+        );
+        assert!(
+            require_recoverable_private_state_at_missing_in_cache(&cache, &task, &recovery)
+                .is_err()
+        );
+        assert!(overlay.manifest_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn clean_deletion_forgets_overlay_before_path_reuse() {
         let root =
             std::env::temp_dir().join(format!("sail-overlay-delete-{}", uuid::Uuid::new_v4()));
@@ -2381,7 +2963,18 @@ mod tests {
         assert!(overlay.manifest_path.exists());
         require_shared_current_in_cache(&cache, &task).unwrap();
         git(&main, &["worktree", "remove", task.to_str().unwrap()]);
-        forget_removed_worktree_in_cache(&cache, &task).unwrap();
+        fs::remove_dir_all(&overlay.git_dir).unwrap();
+        assert!(overlay.manifest_path.exists());
+        let wrong_common = root.join("unrelated-git");
+        assert!(
+            forget_removed_worktree_in_cache_checked(&cache, &task, Some(&wrong_common)).is_err()
+        );
+        forget_removed_worktree_in_cache_checked(
+            &cache,
+            &task,
+            Some(&main.join(".git").canonicalize().unwrap()),
+        )
+        .unwrap();
         assert!(!overlay.git_dir.exists());
         assert!(!overlay.manifest_path.exists());
         assert_eq!(known_worktree_in_cache(&cache, &task), None);

@@ -592,8 +592,12 @@ fn context(app: &tauri::AppHandle, directory: &str) -> Result<(PathBuf, String),
 }
 
 pub fn mode(app: &tauri::AppHandle, directory: &str) -> Result<String, String> {
+    mode_for_project(app, &project_key_for(Path::new(directory))?)
+}
+
+fn mode_for_project(app: &tauri::AppHandle, project_key: &str) -> Result<String, String> {
     let settings = crate::settings::load_settings_sync(app.clone())?;
-    let key = format!("sai-memory-mode:{}", project_key_for(Path::new(directory))?);
+    let key = format!("sai-memory-mode:{project_key}");
     Ok(match settings.get(&key).map(String::as_str) {
         Some("sail") => "sail",
         Some("system") => "system",
@@ -771,10 +775,17 @@ fn status_at(root: &Path, key: String, mode: String) -> Result<MemoryStatus, Str
 }
 
 #[tauri::command]
-pub fn memory_status(app: tauri::AppHandle, directory: String) -> Result<MemoryStatus, String> {
-    let (root, key) = context(&app, &directory)?;
-    let mode = mode(&app, &directory)?;
-    status_at(&root, key, mode)
+pub async fn memory_status(
+    app: tauri::AppHandle,
+    directory: String,
+) -> Result<MemoryStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, key) = context(&app, &directory)?;
+        let mode = mode_for_project(&app, &key)?;
+        status_at(&root, key, mode)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

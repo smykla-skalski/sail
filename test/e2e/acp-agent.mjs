@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -21,6 +21,11 @@ const terminalRequests = new Map();
 let terminalSupport = false;
 let nextTerminalRequest = 3000;
 const agent = process.argv[2];
+if (process.env.SAIL_E2E_ACP_START_LOG)
+  appendFileSync(
+    process.env.SAIL_E2E_ACP_START_LOG,
+    `${JSON.stringify({ agent, directory: process.cwd(), pid: process.pid })}\n`,
+  );
 let authenticated = agent !== 'codex';
 let nextSession = 0;
 // A provider can run under several capability profiles in separate processes.

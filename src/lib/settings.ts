@@ -135,7 +135,9 @@ export async function setSettingDurable(key: string, value: string): Promise<voi
   if (e2eQuiesced) throw new Error('E2E settings writes are quiesced');
   if (isTauri() && !ready && !e2eSettingsDisabled)
     throw new Error('Sail settings are unavailable.');
+  const unchanged = ready && values[key] === value;
   setSetting(key, value);
+  if (unchanged) persist(key, value);
   await writes;
 }
 

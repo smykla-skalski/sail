@@ -27,8 +27,8 @@
   } from './lib/agent-results';
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
   import {
-    currentCatalogWorktrees,
     externalGitWorktrees,
+    visibleRailWorktrees,
     ungroupedRepositories,
     worktreeAncestry,
   } from './lib/projects';
@@ -96,6 +96,8 @@
       issue: GitHubIssue | null,
     ) => Promise<string>;
     ondeleteworktree: (repository: string, path: string, branch: string) => Promise<void>;
+    oncheckpendingcleanup: (repository: string, path?: string) => Promise<void>;
+    onremovependingcleanup: (repository: string, path: string) => Promise<void>;
     oncreatepullrequest: (
       repository: string,
       worktree: ProjectWorktree,
@@ -151,6 +153,8 @@
     onremoverepository,
     oncreateworktree,
     ondeleteworktree,
+    oncheckpendingcleanup,
+    onremovependingcleanup,
     oncreatepullrequest,
     onsendchecklog,
   }: Props = $props();
@@ -455,14 +459,39 @@
   function railWorktrees(path: string): ProjectWorktree[] {
     return repositoryCollapsed(path)
       ? []
-      : [
-          ...currentCatalogWorktrees(catalog, path, registeredWorktrees[path] ?? []),
-          ...externalWorktrees(path),
-        ];
+      : visibleRailWorktrees(catalog, path, registeredWorktrees[path] ?? []);
   }
 
   function externalWorktrees(repository: string): ProjectWorktree[] {
     return externalGitWorktrees(catalog, repository, registeredWorktrees[repository] ?? []);
+  }
+
+  function pendingIdentityMissing(repository: string, worktree: ProjectWorktree): boolean {
+    return (
+      !!worktree.pendingCleanup &&
+      !!worktree.generation &&
+      !(registeredWorktrees[repository] ?? []).some(
+        (entry) => entry.path === worktree.path && entry.generation === worktree.generation,
+      )
+    );
+  }
+
+  function overlayRetryUnavailable(repository: string, worktree: ProjectWorktree): boolean {
+    const pending = worktree.pendingCleanup;
+    return !!(
+      pending &&
+      pendingIdentityMissing(repository, worktree) &&
+      !pending.storagePaths?.length &&
+      (pending.selectedWorktreeCleanupConfirmed || pending.selectedStorageCleanupConfirmed)
+    );
+  }
+
+  function pendingCleanupSize(bytes: number | null): string {
+    if (bytes === null) return 'Unknown';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+    const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)) - 1, units.length - 1);
+    return `${(bytes / 1024 ** (unit + 1)).toFixed(1)} ${units[unit]}`;
   }
 
   function isExternalWorktree(repository: string, path: string): boolean {
@@ -991,7 +1020,13 @@
         ><span aria-hidden="true">⑂</span><span>{worktree.branch}</span></button
       >
     </div>
-    <p class="project-worktree-origin">External worktree · Open to add to Sail</p>
+    <p class="project-worktree-origin">
+      {catalog.worktrees[repository]?.some(
+        (saved) => saved.path === worktree.path && saved.pendingCleanup,
+      )
+        ? 'External replacement · older checkout cleanup remains pending; resolve it before adding this worktree'
+        : 'External worktree · Open to add to Sail'}
+    </p>
   {/each}
 {/snippet}
 
@@ -1162,6 +1197,13 @@
                 id={repositoryWorktreesID(path)}
                 hidden={repositoryCollapsed(path)}
               >
+                {#if catalog.worktrees[path]?.some((worktree) => worktree.pendingCleanup)}
+                  <button
+                    class="project-worktree-retry"
+                    onclick={() => void oncheckpendingcleanup(path)}
+                    >Recheck all pending worktrees</button
+                  >
+                {/if}
                 <div class:active={path === directory} class="project-worktree-row" role="group">
                   <button
                     class="project-worktree-select project-default-worktree-select"
@@ -1185,7 +1227,10 @@
                     class="project-worktree-row"
                     role="group"
                     oncontextmenu={(event) => {
-                      if (!worktreeDeletions[worktree.path])
+                      if (
+                        !worktreeDeletions[worktree.path] &&
+                        !pendingIdentityMissing(path, worktree)
+                      )
                         openMenu({ kind: 'worktree', repository: path, worktree }, event);
                     }}
                   >
@@ -1200,9 +1245,15 @@
                         ? agentListID(worktree.path)
                         : undefined}
                       title={worktree.path}
-                      disabled={disabled || !!worktreeDeletions[worktree.path]}
+                      disabled={disabled ||
+                        !!worktreeDeletions[worktree.path] ||
+                        pendingIdentityMissing(path, worktree)}
                       onmousedown={(event) => {
-                        if (event.button === 2 && !worktreeDeletions[worktree.path])
+                        if (
+                          event.button === 2 &&
+                          !worktreeDeletions[worktree.path] &&
+                          !pendingIdentityMissing(path, worktree)
+                        )
                           void openMenu({ kind: 'worktree', repository: path, worktree }, event);
                       }}
                       onclick={() =>
@@ -1225,7 +1276,8 @@
                       aria-haspopup="menu"
                       aria-expanded={menu?.kind === 'worktree' &&
                         menu.worktree.path === worktree.path}
-                      disabled={!!worktreeDeletions[worktree.path]}
+                      disabled={!!worktreeDeletions[worktree.path] ||
+                        pendingIdentityMissing(path, worktree)}
                       onclick={(event) =>
                         openMenu(
                           { kind: 'worktree', repository: path, worktree },
@@ -1256,6 +1308,51 @@
                     </p>{:else if worktree.statusComment}<p class="project-worktree-status">
                       {worktree.statusComment}
                     </p>{/if}
+                  {#if worktree.pendingCleanup}
+                    <div
+                      class="project-worktree-cleanup-pending"
+                      data-pending-worktree={worktree.path}
+                      role="status"
+                    >
+                      <strong
+                        >{worktree.pendingCleanup.storagePaths?.length
+                          ? 'Private storage pending; checkout removed'
+                          : 'Pending cleanup'}</strong
+                      >
+                      <span>Original: {worktree.pendingCleanup.originalPath}</span>
+                      {#if worktree.pendingCleanup.storagePaths?.length}
+                        <span
+                          >Retained storage: {worktree.pendingCleanup.storagePaths.join(', ')}</span
+                        >
+                      {:else}
+                        <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                      {/if}
+                      <span
+                        >Retained size: {pendingCleanupSize(
+                          worktree.pendingCleanup.sizeBytes,
+                        )}</span
+                      >
+                      <span>{worktree.pendingCleanup.reason}</span>
+                      <button
+                        class="project-worktree-retry"
+                        onclick={() => void oncheckpendingcleanup(path, worktree.path)}
+                        >{worktree.pendingCleanup.storagePaths?.length
+                          ? 'Recheck storage'
+                          : 'Recheck worktree'}</button
+                      >
+                      <button
+                        class="project-worktree-retry"
+                        disabled={overlayRetryUnavailable(path, worktree)}
+                        title={overlayRetryUnavailable(path, worktree)
+                          ? 'Interrupted private Git state requires separate recovery. Recheck the pending worktree.'
+                          : undefined}
+                        onclick={() => void onremovependingcleanup(path, worktree.path)}
+                        >{worktree.pendingCleanup.storagePaths?.length
+                          ? 'Retry selected storage cleanup…'
+                          : 'Clean up this worktree…'}</button
+                      >
+                    </div>
+                  {/if}
                   {@render checkFailures(path, worktree)}
                 {/each}
                 {@render externalRows(path)}
@@ -1313,6 +1410,13 @@
               id={repositoryWorktreesID(path)}
               hidden={repositoryCollapsed(path)}
             >
+              {#if catalog.worktrees[path]?.some((worktree) => worktree.pendingCleanup)}
+                <button
+                  class="project-worktree-retry"
+                  onclick={() => void oncheckpendingcleanup(path)}
+                  >Recheck all pending worktrees</button
+                >
+              {/if}
               <div class:active={path === directory} class="project-worktree-row" role="group">
                 <button
                   class="project-worktree-select project-default-worktree-select"
@@ -1336,7 +1440,10 @@
                   class="project-worktree-row"
                   role="group"
                   oncontextmenu={(event) => {
-                    if (!worktreeDeletions[worktree.path])
+                    if (
+                      !worktreeDeletions[worktree.path] &&
+                      !pendingIdentityMissing(path, worktree)
+                    )
                       openMenu({ kind: 'worktree', repository: path, worktree }, event);
                   }}
                 >
@@ -1351,9 +1458,15 @@
                       ? agentListID(worktree.path)
                       : undefined}
                     title={worktree.path}
-                    disabled={disabled || !!worktreeDeletions[worktree.path]}
+                    disabled={disabled ||
+                      !!worktreeDeletions[worktree.path] ||
+                      pendingIdentityMissing(path, worktree)}
                     onmousedown={(event) => {
-                      if (event.button === 2 && !worktreeDeletions[worktree.path])
+                      if (
+                        event.button === 2 &&
+                        !worktreeDeletions[worktree.path] &&
+                        !pendingIdentityMissing(path, worktree)
+                      )
                         void openMenu({ kind: 'worktree', repository: path, worktree }, event);
                     }}
                     onclick={() =>
@@ -1376,7 +1489,8 @@
                     aria-haspopup="menu"
                     aria-expanded={menu?.kind === 'worktree' &&
                       menu.worktree.path === worktree.path}
-                    disabled={!!worktreeDeletions[worktree.path]}
+                    disabled={!!worktreeDeletions[worktree.path] ||
+                      pendingIdentityMissing(path, worktree)}
                     onclick={(event) =>
                       openMenu(
                         { kind: 'worktree', repository: path, worktree },
@@ -1407,6 +1521,49 @@
                   </p>{:else if worktree.statusComment}<p class="project-worktree-status">
                     {worktree.statusComment}
                   </p>{/if}
+                {#if worktree.pendingCleanup}
+                  <div
+                    class="project-worktree-cleanup-pending"
+                    data-pending-worktree={worktree.path}
+                    role="status"
+                  >
+                    <strong
+                      >{worktree.pendingCleanup.storagePaths?.length
+                        ? 'Private storage pending; checkout removed'
+                        : 'Pending cleanup'}</strong
+                    >
+                    <span>Original: {worktree.pendingCleanup.originalPath}</span>
+                    {#if worktree.pendingCleanup.storagePaths?.length}
+                      <span
+                        >Retained storage: {worktree.pendingCleanup.storagePaths.join(', ')}</span
+                      >
+                    {:else}
+                      <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                    {/if}
+                    <span
+                      >Retained size: {pendingCleanupSize(worktree.pendingCleanup.sizeBytes)}</span
+                    >
+                    <span>{worktree.pendingCleanup.reason}</span>
+                    <button
+                      class="project-worktree-retry"
+                      onclick={() => void oncheckpendingcleanup(path, worktree.path)}
+                      >{worktree.pendingCleanup.storagePaths?.length
+                        ? 'Recheck storage'
+                        : 'Recheck worktree'}</button
+                    >
+                    <button
+                      class="project-worktree-retry"
+                      disabled={overlayRetryUnavailable(path, worktree)}
+                      title={overlayRetryUnavailable(path, worktree)
+                        ? 'Interrupted private Git state requires separate recovery. Recheck the pending worktree.'
+                        : undefined}
+                      onclick={() => void onremovependingcleanup(path, worktree.path)}
+                      >{worktree.pendingCleanup.storagePaths?.length
+                        ? 'Retry selected storage cleanup…'
+                        : 'Clean up this worktree…'}</button
+                    >
+                  </div>
+                {/if}
                 {@render checkFailures(path, worktree)}
               {/each}
               {@render externalRows(path)}
@@ -1490,11 +1647,15 @@
         role="menuitem"
         class="danger"
         disabled={target.path === directory ||
-          (catalog.worktrees[target.path] ?? []).some((worktree) => worktree.path === directory)}
+          (catalog.worktrees[target.path] ?? []).some(
+            (worktree) => worktree.path === directory || worktree.pendingCleanup,
+          )}
         title={target.path === directory ||
         (catalog.worktrees[target.path] ?? []).some((worktree) => worktree.path === directory)
           ? 'Switch repositories before removing this one'
-          : 'Remove from sidebar'}
+          : (catalog.worktrees[target.path] ?? []).some((worktree) => worktree.pendingCleanup)
+            ? 'Finish pending worktree cleanup before removing this repository'
+            : 'Remove from sidebar'}
         onclick={() => {
           onremoverepository(target.path);
           closeMenu();

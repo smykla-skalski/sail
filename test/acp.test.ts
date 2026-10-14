@@ -662,6 +662,45 @@ void test('switching threads shows recent entries immediately and persists them 
   }
 });
 
+void test('deferred owned transcripts retain the complete conversation during a switch', async () => {
+  const values = new Map<string, string>();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => void values.set(key, value),
+    },
+  });
+  const thread: AgentThread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'sail-owned:12345678-1234-1234-1234-123456789abc:deferred-full',
+    title: 'Owned conversation',
+    updated: 0,
+  };
+  const entries: AgentEntry[] = Array.from({ length: 120 }, (_, index) => ({
+    id: `message-${index}`,
+    type: 'assistant',
+    text: `Message ${index}`,
+  }));
+  try {
+    saveRecentTranscriptAfterPaint(thread, entries);
+    entries.push({ id: 'later', type: 'assistant', text: 'Later update' });
+    assert.equal(values.has('sai-agent-transcript-cache'), false);
+    assert.equal(loadRecentTranscript(thread).length, 120);
+    assert.equal(loadRecentTranscript(thread)[0].id, 'message-0');
+    assert.equal(loadRecentTranscript(thread).at(-1)?.id, 'message-119');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(loadRecentTranscript(thread).length, 50);
+    assert.equal(loadRecentTranscript(thread).at(-1)?.id, 'message-119');
+  } finally {
+    forgetRecentTranscript(thread);
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
 void test('consecutive ACP tools form a stable group between visible messages', () => {
   const entries: AgentEntry[] = [
     { id: 'message-1', type: 'assistant', text: 'Checking files.' },

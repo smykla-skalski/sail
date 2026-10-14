@@ -20,6 +20,61 @@ export type WorktreeOrigin = {
   sessionId: string;
   sessionTitle: string;
 };
+export type PendingWorktreeCleanup = {
+  originalPath: string;
+  recoveryPath: string;
+  sizeBytes: number | null;
+  reason: string;
+  storagePaths?: string[];
+  storageKeys?: string[];
+  selectedWorktreeCleanupConfirmed?: boolean;
+  selectedStorageCleanupConfirmed?: boolean;
+  registeredWorktreesAtMark?: { path: string; generation: string | null }[];
+};
+
+export function movePendingWorktreeCleanup(
+  pending: PendingWorktreeCleanup,
+  previousPath: string,
+  recoveryPath: string,
+  generation: string,
+): PendingWorktreeCleanup {
+  return {
+    ...pending,
+    recoveryPath,
+    selectedWorktreeCleanupConfirmed: undefined,
+    registeredWorktreesAtMark: pending.registeredWorktreesAtMark?.map((entry) =>
+      entry.path === previousPath && entry.generation === generation
+        ? { ...entry, path: recoveryPath }
+        : entry,
+    ),
+  };
+}
+
+export type SelectedRemovedWorktreeStorage = {
+  cacheKey: string;
+  path: string;
+  sizeBytes: number | null;
+};
+
+export async function reconcileSelectedRemovedWorktreeStorage(
+  pending: PendingWorktreeCleanup,
+  storage: SelectedRemovedWorktreeStorage[],
+  pathsAbsent: (paths: string[]) => Promise<boolean>,
+): Promise<PendingWorktreeCleanup | null> {
+  const verifiedPaths = new Set(storage.map((item) => item.path));
+  const omittedPaths = (pending.storagePaths ?? []).filter((path) => !verifiedPaths.has(path));
+  if (omittedPaths.length && !(await pathsAbsent(omittedPaths))) return null;
+  return {
+    ...pending,
+    storagePaths: storage.map((item) => item.path),
+    storageKeys: storage.map((item) => item.cacheKey),
+    sizeBytes: storage.every((item) => item.sizeBytes !== null)
+      ? storage.reduce((total, item) => total + item.sizeBytes!, 0)
+      : null,
+    reason: `The Git checkout was removed; selected private storage remains at ${storage.map((item) => item.path).join(', ')}. Confirm it is unused before retrying.`,
+  };
+}
+
 export type ProjectWorktree = {
   path: string;
   branch: string;
@@ -29,6 +84,7 @@ export type ProjectWorktree = {
   pullRequest?: PullRequestLink;
   statusComment?: string;
   setupStatus?: 'pending' | 'ready' | 'failed';
+  pendingCleanup?: PendingWorktreeCleanup;
 };
 
 export type WorktreeCreation = {
@@ -95,6 +151,68 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
           worktree.setupStatus = entry.setupStatus;
         if (typeof entry.statusComment === 'string')
           worktree.statusComment = entry.statusComment.slice(0, 140);
+        if (isRecord(entry.pendingCleanup)) {
+          const {
+            originalPath,
+            recoveryPath,
+            sizeBytes,
+            reason,
+            storagePaths,
+            storageKeys,
+            selectedWorktreeCleanupConfirmed,
+            selectedStorageCleanupConfirmed,
+            registeredWorktreesAtMark,
+          } = entry.pendingCleanup;
+          if (
+            typeof originalPath === 'string' &&
+            !!originalPath &&
+            recoveryPath === worktree.path &&
+            (sizeBytes === null ||
+              (typeof sizeBytes === 'number' &&
+                Number.isSafeInteger(sizeBytes) &&
+                sizeBytes >= 0)) &&
+            typeof reason === 'string' &&
+            !!reason
+          )
+            worktree.pendingCleanup = {
+              originalPath,
+              recoveryPath,
+              sizeBytes,
+              reason,
+              ...(Array.isArray(storagePaths) &&
+              storagePaths.length > 0 &&
+              storagePaths.every((path): path is string => typeof path === 'string' && !!path)
+                ? { storagePaths }
+                : {}),
+              ...(Array.isArray(storageKeys) &&
+              Array.isArray(storagePaths) &&
+              storageKeys.length === storagePaths.length &&
+              storageKeys.every(
+                (key): key is string => typeof key === 'string' && /^[0-9a-f]{64}$/.test(key),
+              )
+                ? { storageKeys }
+                : {}),
+              ...(selectedStorageCleanupConfirmed === true
+                ? { selectedStorageCleanupConfirmed: true }
+                : {}),
+              ...(selectedWorktreeCleanupConfirmed === true
+                ? { selectedWorktreeCleanupConfirmed: true }
+                : {}),
+              ...(Array.isArray(registeredWorktreesAtMark) &&
+              registeredWorktreesAtMark.length > 0 &&
+              registeredWorktreesAtMark.every(
+                (item) =>
+                  isRecord(item) &&
+                  typeof item.path === 'string' &&
+                  !!item.path &&
+                  (item.generation === null || validGeneration(item.generation)),
+              ) &&
+              new Set(registeredWorktreesAtMark.map((item) => item.path)).size ===
+                registeredWorktreesAtMark.length
+                ? { registeredWorktreesAtMark }
+                : {}),
+            };
+        }
         if (isRecord(entry.pullRequest)) {
           const { number, url } = entry.pullRequest;
           if (typeof number === 'number' && validPullRequestLink(number, url))
@@ -187,6 +305,7 @@ export function assignRepository(
 }
 
 export function removeRepository(catalog: ProjectCatalog, path: string): ProjectCatalog {
+  if ((catalog.worktrees[path] ?? []).some((worktree) => worktree.pendingCleanup)) return catalog;
   const { collapsedRepositories, ...remaining } = catalog;
   const repositories = catalog.repositories.filter((repository) => repository !== path);
   return {
@@ -213,18 +332,136 @@ export function addWorktree(
 ): ProjectCatalog {
   const entries = catalog.worktrees[repository] ?? [];
   const existing = entries.find((entry) => entry.path === worktree.path);
-  if (existing && (!worktree.generation || existing.generation === worktree.generation))
-    return catalog;
+  const incoming = { ...worktree, setupStatus: worktree.setup ? 'pending' : 'ready' } as const;
+  if (existing && !worktree.generation) return catalog;
+  if (
+    entries.some(
+      (entry) =>
+        entry.path === worktree.path &&
+        entry.pendingCleanup &&
+        entry.generation !== worktree.generation,
+    )
+  )
+    throw new Error(
+      `Cannot add worktree at ${worktree.path}: an older generation still has pending cleanup. Recheck and resolve its retained data first.`,
+    );
+  if (existing && existing.generation === worktree.generation) {
+    const merged = mergeSavedWorktrees(existing, incoming);
+    if (sameSavedValue(existing, merged)) return catalog;
+    return {
+      ...catalog,
+      worktrees: {
+        ...catalog.worktrees,
+        [repository]: entries.map((entry) => (entry === existing ? merged : entry)),
+      },
+    };
+  }
   return {
     ...catalog,
     worktrees: {
       ...catalog.worktrees,
-      [repository]: [
-        ...entries.filter((entry) => entry.path !== worktree.path),
-        { ...worktree, setupStatus: worktree.setup ? 'pending' : 'ready' },
-      ],
+      [repository]: [...entries.filter((entry) => entry.path !== worktree.path), incoming],
     },
   };
+}
+
+export function reconcileMovedWorktrees(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null; branch?: string | null }[],
+): ProjectCatalog {
+  const liveByGeneration = new Map<string, (typeof registered)[number]>();
+  for (const worktree of registered) {
+    if (!worktree.generation) continue;
+    const prior = liveByGeneration.get(worktree.generation);
+    if (prior && prior.path !== worktree.path)
+      throw new Error('A Git generation is registered at multiple paths. No worktree was adopted.');
+    liveByGeneration.set(worktree.generation, worktree);
+  }
+  let worktrees = catalog.worktrees;
+  let changed = false;
+  for (const [generation, live] of liveByGeneration) {
+    const stale = Object.entries(worktrees).flatMap(([savedRepository, entries]) =>
+      entries
+        .filter(
+          (entry) =>
+            entry.generation === generation &&
+            (savedRepository !== repository || entry.path !== live.path),
+        )
+        .map((entry) => ({ savedRepository, entry })),
+    );
+    if (!stale.length) continue;
+    if (stale.length !== 1)
+      throw new Error('A moved Git generation has multiple saved owners. No worktree was adopted.');
+    const saved = stale[0].entry;
+    const atDestination = worktrees[repository]?.find((entry) => entry.path === live.path);
+    if (atDestination && atDestination.generation !== generation)
+      throw new Error('A moved Git generation conflicts with saved data at its new path.');
+    if (
+      Object.values(worktrees)
+        .flat()
+        .some(
+          (entry) =>
+            entry !== saved &&
+            entry !== atDestination &&
+            entry.path === live.path &&
+            entry.generation !== generation &&
+            entry.pendingCleanup,
+        )
+    )
+      throw new Error('A moved Git generation conflicts with pending data at its new path.');
+    const moved = {
+      ...saved,
+      path: live.path,
+      branch: live.branch ?? saved.branch,
+      ...(saved.pendingCleanup
+        ? {
+            pendingCleanup: movePendingWorktreeCleanup(
+              saved.pendingCleanup,
+              saved.path,
+              live.path,
+              generation,
+            ),
+          }
+        : {}),
+    };
+    const merged = atDestination
+      ? mergeSavedWorktrees(moved, {
+          ...atDestination,
+          branch: live.branch ?? atDestination.branch,
+        })
+      : moved;
+    worktrees = Object.fromEntries(
+      Object.entries(worktrees).map(([savedRepository, entries]) => [
+        savedRepository,
+        entries.flatMap((entry) => {
+          if (entry === saved || entry === atDestination) return [];
+          if (entry.origin?.sourceGeneration === generation)
+            return [{ ...entry, origin: { ...entry.origin, sourcePath: live.path } }];
+          return [entry];
+        }),
+      ]),
+    );
+    worktrees = {
+      ...worktrees,
+      [repository]: [...(worktrees[repository] ?? []), merged],
+    };
+    changed = true;
+  }
+  worktrees = Object.fromEntries(
+    Object.entries(worktrees).map(([savedRepository, entries]) => [
+      savedRepository,
+      entries.map((entry) => {
+        if (!entry.origin) return entry;
+        const source = liveByGeneration.get(entry.origin.sourceGeneration);
+        if (!source || source.path === entry.origin.sourcePath) return entry;
+        changed = true;
+        return { ...entry, origin: { ...entry.origin, sourcePath: source.path } };
+      }),
+    ]),
+  );
+  if (!changed) return catalog;
+  return { ...catalog, worktrees };
 }
 
 export function currentCatalogWorktrees(
@@ -235,6 +472,7 @@ export function currentCatalogWorktrees(
   const live = new Map(registered.map((item) => [item.path, item.generation]));
   return (catalog.worktrees[repository] ?? []).filter(
     (worktree) =>
+      !!worktree.pendingCleanup ||
       !worktree.generation ||
       !live.has(worktree.path) ||
       live.get(worktree.path) === worktree.generation,
@@ -247,7 +485,15 @@ export function externalGitWorktrees(
   registered: { path: string; branch: string | null; generation: string | null }[],
 ): ProjectWorktree[] {
   const known = new Set(
-    currentCatalogWorktrees(catalog, repository, registered).map((worktree) => worktree.path),
+    currentCatalogWorktrees(catalog, repository, registered)
+      .filter(
+        (worktree) =>
+          !worktree.pendingCleanup ||
+          registered.some(
+            (entry) => entry.path === worktree.path && entry.generation === worktree.generation,
+          ),
+      )
+      .map((worktree) => worktree.path),
   );
   return registered
     .filter((worktree) => worktree.path !== repository && !known.has(worktree.path))
@@ -256,6 +502,21 @@ export function externalGitWorktrees(
       branch: worktree.branch ?? 'detached',
       generation: worktree.generation,
     }));
+}
+
+export function visibleRailWorktrees(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; branch: string | null; generation: string | null }[],
+): ProjectWorktree[] {
+  const byPath = new Map<string, ProjectWorktree>();
+  for (const worktree of currentCatalogWorktrees(catalog, repository, registered))
+    byPath.set(worktree.path, worktree);
+  // A replacement can share the path of a retained pending generation. The
+  // compact rail opens the current Git checkout; the full list retains both rows.
+  for (const worktree of externalGitWorktrees(catalog, repository, registered))
+    byPath.set(worktree.path, worktree);
+  return [...byPath.values()];
 }
 
 export type WorktreeAncestryRow = {
@@ -318,6 +579,59 @@ export function worktreeAncestry(
   return rows;
 }
 
+export function worktreeDescendants(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null }[],
+  root: string,
+): ProjectWorktree[] {
+  const live = new Map(registered.map((item) => [item.path, item.generation]));
+  const entries = currentCatalogWorktrees(catalog, repository, registered);
+  const visited = new Set<string>([root]);
+  const descendants: ProjectWorktree[] = [];
+  function append(sourcePath: string, sourceGeneration: string | null | undefined) {
+    if (!sourceGeneration) return;
+    for (const worktree of entries) {
+      if (
+        visited.has(worktree.path) ||
+        !worktree.generation ||
+        live.get(worktree.path) !== worktree.generation ||
+        worktree.origin?.sourcePath !== sourcePath ||
+        worktree.origin.sourceGeneration !== sourceGeneration
+      )
+        continue;
+      visited.add(worktree.path);
+      append(worktree.path, worktree.generation);
+      descendants.push(worktree);
+    }
+  }
+  append(root, live.get(root));
+  return descendants;
+}
+
+export function unmergedCatalogDescendants(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null }[],
+  root: string,
+): ProjectWorktree[] {
+  const known = new Set(
+    worktreeDescendants(catalog, repository, registered, root).map(
+      (worktree) => `${worktree.path}\0${worktree.generation}`,
+    ),
+  );
+  const combined = {
+    ...catalog,
+    worktrees: {
+      ...catalog.worktrees,
+      [repository]: Object.values(catalog.worktrees).flat(),
+    },
+  };
+  return worktreeDescendants(combined, repository, registered, root).filter(
+    (worktree) => !known.has(`${worktree.path}\0${worktree.generation}`),
+  );
+}
+
 export function setWorktreeSetupStatus(
   catalog: ProjectCatalog,
   repository: string,
@@ -372,6 +686,70 @@ export function removeWorktree(
   };
 }
 
+export function markWorktreeCleanupPending(
+  catalog: ProjectCatalog,
+  repository: string,
+  path: string,
+  pendingCleanup: PendingWorktreeCleanup,
+  generation?: string,
+): ProjectCatalog {
+  const entries = catalog.worktrees[repository] ?? [];
+  const owner = entries.find((item) => item.path === path);
+  if (!owner || entries.some((item) => item.path === pendingCleanup.recoveryPath && item !== owner))
+    return catalog;
+  // A path reused by an external worktree does not transfer ownership of the
+  // saved Sail entry. A legacy entry without a generation remains unverified.
+  if (generation && owner.generation && generation !== owner.generation) return catalog;
+  const updated = entries.slice();
+  for (const [index, item] of entries.entries()) {
+    if (item === owner) {
+      updated[index] = {
+        ...item,
+        path: pendingCleanup.recoveryPath,
+        generation: item.generation,
+        pendingCleanup,
+      };
+    } else if (
+      owner.generation &&
+      item.origin?.sourcePath === path &&
+      item.origin.sourceGeneration === owner.generation
+    ) {
+      updated[index] = {
+        ...item,
+        origin: { ...item.origin, sourcePath: pendingCleanup.recoveryPath },
+      };
+    }
+  }
+  const worktrees = { ...catalog.worktrees, [repository]: updated };
+  if (owner.generation && path !== pendingCleanup.recoveryPath) {
+    for (const [savedRepository, savedEntries] of Object.entries(worktrees)) {
+      if (savedRepository === repository) continue;
+      const updatedSavedEntries = savedEntries.slice();
+      for (const [index, item] of savedEntries.entries()) {
+        if (item.origin?.sourcePath === path && item.origin.sourceGeneration === owner.generation)
+          updatedSavedEntries[index] = {
+            ...item,
+            origin: { ...item.origin, sourcePath: pendingCleanup.recoveryPath },
+          };
+      }
+      worktrees[savedRepository] = updatedSavedEntries;
+    }
+  }
+  return { ...catalog, worktrees };
+}
+
+export function markNewWorktreeCleanupPending(
+  catalog: ProjectCatalog,
+  repository: string,
+  path: string,
+  pendingCleanup: PendingWorktreeCleanup,
+  generation?: string,
+): ProjectCatalog {
+  if (catalog.worktrees[repository]?.some((item) => item.path === path && item.pendingCleanup))
+    return catalog;
+  return markWorktreeCleanupPending(catalog, repository, path, pendingCleanup, generation);
+}
+
 export function worktreeAt(
   catalog: ProjectCatalog,
   directory: string,
@@ -405,6 +783,69 @@ export function setWorktreePullRequest(
   };
 }
 
+function sameSavedValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left))
+    return (
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameSavedValue(value, right[index]))
+    );
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const keys = Object.keys(left);
+  return (
+    keys.length === Object.keys(right).length &&
+    keys.every((key) => Object.hasOwn(right, key) && sameSavedValue(left[key], right[key]))
+  );
+}
+
+function mergePendingCleanup(
+  saved: PendingWorktreeCleanup,
+  incoming: PendingWorktreeCleanup,
+  path: string,
+): PendingWorktreeCleanup {
+  const merged: PendingWorktreeCleanup = { ...saved };
+  for (const key of Object.keys(incoming)) {
+    if (key === 'selectedWorktreeCleanupConfirmed' || key === 'selectedStorageCleanupConfirmed')
+      continue;
+    const value: unknown = Reflect.get(incoming, key);
+    if (value === undefined) continue;
+    const existing: unknown = Reflect.get(saved, key);
+    if (existing !== undefined && !sameSavedValue(existing, value))
+      throw new Error(`Cannot merge conflicting saved worktrees at ${path}`);
+    if (existing === undefined) Object.assign(merged, { [key]: value });
+  }
+  // Any disjoint evidence changes what was attested before these aliases merged.
+  // Require fresh confirmation after combining their recovery inventory.
+  const sameEvidence = sameSavedValue(saved, incoming);
+  merged.selectedWorktreeCleanupConfirmed =
+    sameEvidence && saved.selectedWorktreeCleanupConfirmed === true ? true : undefined;
+  merged.selectedStorageCleanupConfirmed =
+    sameEvidence && saved.selectedStorageCleanupConfirmed === true ? true : undefined;
+  return merged;
+}
+
+function mergeSavedWorktrees(saved: ProjectWorktree, incoming: ProjectWorktree): ProjectWorktree {
+  const merged = { ...saved };
+  for (const key of Object.keys(incoming)) {
+    const value: unknown = Reflect.get(incoming, key);
+    if (value === undefined) continue;
+    const existing: unknown = Reflect.get(saved, key);
+    if (key === 'pendingCleanup' && saved.pendingCleanup && incoming.pendingCleanup) {
+      merged.pendingCleanup = mergePendingCleanup(
+        saved.pendingCleanup,
+        incoming.pendingCleanup,
+        incoming.path,
+      );
+      continue;
+    }
+    if (existing !== undefined && !sameSavedValue(existing, value))
+      throw new Error(`Cannot merge conflicting saved worktrees at ${incoming.path}`);
+    if (existing === undefined) Object.assign(merged, { [key]: value });
+  }
+  return merged;
+}
+
 export function replaceRepositoryPath(
   catalog: ProjectCatalog,
   oldPath: string,
@@ -426,18 +867,35 @@ export function replaceRepositoryPath(
         return true;
       }),
   }));
-  const worktrees = Object.fromEntries(
-    Object.entries(catalog.worktrees).map(([parent, entries]) => [
-      parent === oldPath ? canonicalPath : parent,
-      entries.map((entry) => ({
+  const worktrees: ProjectCatalog['worktrees'] = {};
+  for (const [parent, entries] of Object.entries(catalog.worktrees)) {
+    const destination = parent === oldPath ? canonicalPath : parent;
+    const merged = (worktrees[destination] ??= []);
+    for (const entry of entries) {
+      const renamedPath = entry.path === oldPath ? canonicalPath : entry.path;
+      const renamed = {
         ...entry,
-        path: entry.path === oldPath ? canonicalPath : entry.path,
+        path: renamedPath,
         ...(entry.origin?.sourcePath === oldPath
           ? { origin: { ...entry.origin, sourcePath: canonicalPath } }
           : {}),
-      })),
-    ]),
-  );
+        ...(entry.pendingCleanup && entry.path === oldPath
+          ? {
+              pendingCleanup: {
+                ...entry.pendingCleanup,
+                recoveryPath: canonicalPath,
+              },
+            }
+          : {}),
+      };
+      const index = merged.findIndex((saved) => saved.path === renamed.path);
+      if (index < 0) {
+        merged.push(renamed);
+        continue;
+      }
+      merged[index] = mergeSavedWorktrees(merged[index], renamed);
+    }
+  }
   return {
     ...remaining,
     repositories,
@@ -448,4 +906,20 @@ export function replaceRepositoryPath(
       collapsedRepositories?.map((path) => (path === oldPath ? canonicalPath : path)) ?? [],
     ),
   };
+}
+
+export async function canonicalizeRepositoryAliases(
+  catalog: ProjectCatalog,
+  repository: string,
+  resolveRepository: (path: string) => Promise<string>,
+): Promise<ProjectCatalog> {
+  let canonicalCatalog = catalog;
+  const aliases = catalog.repositories.filter((path) => path !== repository);
+  const resolutions = await Promise.allSettled(aliases.map(resolveRepository));
+  for (const [index, resolution] of resolutions.entries()) {
+    // Keep an unavailable saved repository and its worktrees intact.
+    if (resolution.status !== 'fulfilled' || resolution.value !== repository) continue;
+    canonicalCatalog = replaceRepositoryPath(canonicalCatalog, aliases[index], repository);
+  }
+  return canonicalCatalog;
 }

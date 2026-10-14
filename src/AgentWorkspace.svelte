@@ -1882,7 +1882,7 @@
           setSetting(failedDraftKey(), [pending, draft].filter(Boolean).join('\n\n'));
       }
       setReplaying(false);
-      rememberTranscript();
+      rememberTranscript(true);
       if (activeSessionId && !nativeEntries && !ephemeral)
         trackLiveTranscript(agent, directory, activeSessionId, entries, historyLoaded);
       generation++;

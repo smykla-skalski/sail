@@ -35,6 +35,8 @@
             "wdio:default",
             "wdio-webdriver:default",
             "core:window:allow-set-theme",
+            "core:window:allow-is-visible",
+            "core:path:allow-resolve-directory",
             "allow-acp-reset-test-runtimes",
             "allow-reset-test-settings"
           ]

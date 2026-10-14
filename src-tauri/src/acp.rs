@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -382,10 +382,10 @@ impl AgentWorktreeFence {
         {
             return Err("An agent session is starting in this worktree.".into());
         }
-        let active = agents.active_sessions_in(directory)?;
+        let active = agents.sessions_blocking_cleanup_in(directory)?;
         if !stop_agents && !active.is_empty() {
             return Err(format!(
-                "Worktree has active agent sessions: {}.",
+                "Worktree has connected agent sessions: {}.",
                 active
                     .iter()
                     .map(|(agent, _, session)| format!("{agent}:{session}"))
@@ -1835,9 +1835,22 @@ fn retryable_process_cleanup_sessions(
 pub struct AgentManager(
     Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>,
     Arc<Mutex<ForgetGenerations>>,
+    Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
+    Arc<AtomicU64>,
 );
 
 impl AgentManager {
+    fn worktree_startup(&self, worktree: &Path) -> Result<Arc<Mutex<()>>, String> {
+        let mut startups = self.2.lock().map_err(|error| error.to_string())?;
+        startups.retain(|_, startup| startup.strong_count() > 0);
+        if let Some(startup) = startups.get(worktree).and_then(Weak::upgrade) {
+            return Ok(startup);
+        }
+        let startup = Arc::new(Mutex::new(()));
+        startups.insert(worktree.to_path_buf(), Arc::downgrade(&startup));
+        Ok(startup)
+    }
+
     pub fn retry_turn_temp_cleanup(&self, app: &AppHandle) {
         let connections = self
             .0
@@ -1948,7 +1961,7 @@ impl AgentManager {
         result
     }
 
-    fn active_sessions_in(
+    pub(crate) fn active_sessions_in(
         &self,
         directory: &Path,
     ) -> Result<Vec<(String, PathBuf, String)>, String> {
@@ -1995,19 +2008,48 @@ impl AgentManager {
         Ok(active)
     }
 
+    pub(crate) fn sessions_blocking_cleanup_in(
+        &self,
+        directory: &Path,
+    ) -> Result<Vec<(String, PathBuf, String)>, String> {
+        let mut sessions = self.active_sessions_in(directory)?;
+        let agents = self.0.lock().map_err(|error| error.to_string())?;
+        for (key, runtime) in agents.iter() {
+            let directories = runtime
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?;
+            sessions.extend(
+                directories
+                    .iter()
+                    .filter(|(_, path)| crate::acp_terminal::worktree_contains(directory, path))
+                    .map(|(session, _)| (key.agent.clone(), key.worktree.clone(), session.clone())),
+            );
+        }
+        sessions.sort();
+        sessions.dedup();
+        Ok(sessions)
+    }
+
     fn native_subagent_snapshots(
         &self,
         directory: &Path,
     ) -> Result<Vec<NativeSubagentSnapshot>, String> {
-        let agents = self.0.lock().map_err(|error| error.to_string())?;
+        let agents = self
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut snapshots = Vec::new();
-        for (key, runtime) in agents.iter() {
+        for runtime in &agents {
             snapshots.extend(
                 runtime
                     .native_subagents
                     .lock()
                     .map_err(|error| error.to_string())?
-                    .snapshots(&key.agent, key.profile, directory),
+                    .snapshots(&runtime.agent, runtime.profile, directory),
             );
         }
         snapshots.sort_by(|left, right| {
@@ -2051,6 +2093,7 @@ impl AgentManager {
             .lock()
             .ok()
             .map(|mut agents| {
+                self.3.fetch_add(1, Ordering::AcqRel);
                 agents
                     .drain()
                     .map(|(_, runtime)| runtime)
@@ -2064,6 +2107,8 @@ impl AgentManager {
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
         let worktree = worktree_identity(worktree);
+        let startup = self.worktree_startup(&worktree)?;
+        let _startup = startup.lock().map_err(|error| error.to_string())?;
         let keys = self
             .0
             .lock()
@@ -2095,6 +2140,8 @@ impl AgentManager {
     fn stop_owner(&self, worktree: &Path, owner: &str) -> Result<(), String> {
         Uuid::parse_str(owner).map_err(|_| "Invalid agent run owner ID.")?;
         let worktree = worktree_identity(worktree);
+        let startup = self.worktree_startup(&worktree)?;
+        let _startup = startup.lock().map_err(|error| error.to_string())?;
         let runtimes = self
             .0
             .lock()
@@ -3461,12 +3508,15 @@ pub async fn acp_activity(
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let worktree = worktree_identity(Path::new(&directory));
-        let agents = manager.0.lock().map_err(|error| error.to_string())?;
-        let mut activity = HashMap::<String, AgentActivity>::new();
-        for runtime in agents
+        let agents = manager
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
             .values()
-            .filter(|runtime| runtime.worktree == worktree)
-        {
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut activity = HashMap::<String, AgentActivity>::new();
+        for runtime in agents.iter().filter(|runtime| runtime.worktree == worktree) {
             let prompts = runtime
                 .prompt_state
                 .lock()
@@ -3495,93 +3545,110 @@ pub async fn acp_activity(
 }
 
 #[tauri::command]
-pub fn acp_native_subagents(
+pub async fn acp_native_subagents(
     manager: State<'_, AgentManager>,
     fence: State<'_, AgentWorktreeFence>,
     directory: String,
 ) -> Result<NativeSubagentSnapshotSet, String> {
-    let directory = PathBuf::from(directory);
-    let state = fence.0.lock().map_err(|error| error.to_string())?;
-    let generation = state
-        .generations
-        .get(&directory)
-        .copied()
-        .unwrap_or_default();
-    let subagents = manager.native_subagent_snapshots(&directory)?;
-    Ok(NativeSubagentSnapshotSet {
-        generation,
-        subagents,
+    let manager = manager.inner().clone();
+    let fence = fence.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = PathBuf::from(directory);
+        let state = fence.0.lock().map_err(|error| error.to_string())?;
+        let generation = state
+            .generations
+            .get(&directory)
+            .copied()
+            .unwrap_or_default();
+        let subagents = manager.native_subagent_snapshots(&directory)?;
+        Ok(NativeSubagentSnapshotSet {
+            generation,
+            subagents,
+        })
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn acp_pending_inbox(
+pub async fn acp_pending_inbox(
     manager: State<'_, AgentManager>,
 ) -> Result<Vec<PendingPermissionInfo>, String> {
-    let agents = manager.0.lock().map_err(|error| error.to_string())?;
-    let mut pending = Vec::new();
-    for runtime in agents.values() {
-        if !runtime.alive.load(Ordering::Acquire) {
-            continue;
-        }
-        for permission in runtime
-            .permission_state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .pending
-            .values()
-        {
-            pending.push(PendingPermissionInfo {
-                agent: runtime.agent.clone(),
-                profile: runtime.profile.as_str().to_string(),
-                directory: runtime
-                    .session_directories
-                    .lock()
-                    .ok()
-                    .and_then(|directories| {
-                        permission
-                            .message
-                            .pointer("/params/sessionId")
-                            .and_then(Value::as_str)
-                            .and_then(|id| directories.get(id).cloned())
-                    })
-                    .unwrap_or_else(|| runtime.worktree.clone())
-                    .to_string_lossy()
-                    .into_owned(),
-                message: permission.message.clone(),
-                received_at: permission.received_at,
-            });
-        }
-        for elicitation in runtime
-            .elicitation_state
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let agents = manager
+            .0
             .lock()
             .map_err(|error| error.to_string())?
             .values()
-        {
-            pending.push(PendingPermissionInfo {
-                agent: runtime.agent.clone(),
-                profile: runtime.profile.as_str().to_string(),
-                directory: runtime
-                    .session_directories
-                    .lock()
-                    .ok()
-                    .and_then(|directories| {
-                        elicitation
-                            .message
-                            .pointer("/params/sessionId")
-                            .and_then(Value::as_str)
-                            .and_then(|id| directories.get(id).cloned())
-                    })
-                    .unwrap_or_else(|| runtime.worktree.clone())
-                    .to_string_lossy()
-                    .into_owned(),
-                message: elicitation.message.clone(),
-                received_at: elicitation.received_at,
-            });
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for runtime in &agents {
+            if !runtime.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            for permission in runtime
+                .permission_state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .pending
+                .values()
+            {
+                pending.push(PendingPermissionInfo {
+                    agent: runtime.agent.clone(),
+                    profile: runtime.profile.as_str().to_string(),
+                    directory: runtime
+                        .session_directories
+                        .lock()
+                        .ok()
+                        .and_then(|directories| {
+                            permission
+                                .message
+                                .pointer("/params/sessionId")
+                                .and_then(Value::as_str)
+                                .and_then(|id| directories.get(id).cloned())
+                        })
+                        .unwrap_or_else(|| runtime.worktree.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    message: permission.message.clone(),
+                    received_at: permission.received_at,
+                });
+            }
+            for elicitation in runtime
+                .elicitation_state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .values()
+            {
+                pending.push(PendingPermissionInfo {
+                    agent: runtime.agent.clone(),
+                    profile: runtime.profile.as_str().to_string(),
+                    directory: runtime
+                        .session_directories
+                        .lock()
+                        .ok()
+                        .and_then(|directories| {
+                            elicitation
+                                .message
+                                .pointer("/params/sessionId")
+                                .and_then(Value::as_str)
+                                .and_then(|id| directories.get(id).cloned())
+                        })
+                        .unwrap_or_else(|| runtime.worktree.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    message: elicitation.message.clone(),
+                    received_at: elicitation.received_at,
+                });
+            }
         }
-    }
-    pending.sort_by_key(|item| item.received_at);
-    Ok(pending)
+        pending.sort_by_key(|item| item.received_at);
+        Ok(pending)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 impl Drop for AgentManager {
@@ -3854,9 +3921,10 @@ fn connection_for_owner(
     directory: &Path,
     owner: Option<&str>,
 ) -> Result<Arc<Connection>, String> {
+    let key = connection_key_for_owner(id, profile, directory, owner);
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     agents
-        .get(&connection_key_for_owner(id, profile, directory, owner))
+        .get(&key)
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".into())
@@ -3925,8 +3993,8 @@ fn connection_for_session(
     session_id: &str,
     directory: &Path,
 ) -> Result<Arc<Connection>, String> {
-    let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let key = connection_key(id, CapabilityProfile::Build, directory);
+    let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let owner = session_owner(session_id);
     let matches = agents
         .values()
@@ -4262,7 +4330,13 @@ fn connect_blocking_inner(
     #[cfg(not(unix))]
     let _ = build_lease;
     let definition = definition(&agent)?;
+    let startup_generation = manager.3.load(Ordering::Acquire);
     let key = connection_key_for_owner(&agent, profile, worktree, owner);
+    let startup = manager.worktree_startup(worktree)?;
+    let _startup = startup.lock().map_err(|error| error.to_string())?;
+    if manager.3.load(Ordering::Acquire) != startup_generation {
+        return Err("Agent startup was cancelled.".into());
+    }
     let live = manager
         .0
         .lock()
@@ -4275,11 +4349,15 @@ fn connect_blocking_inner(
     } else {
         Some(agent_availability_for(&app, &agent)?)
     };
-    let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
-    if let Some(existing) = agents.get(&key) {
+    let existing = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(&key)
+        .cloned();
+    if let Some(existing) = existing {
         if existing.alive.load(Ordering::Acquire) {
-            let existing = Arc::clone(existing);
-            drop(agents);
+            drop(_startup);
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut capabilities = existing
                 .capabilities
@@ -4324,11 +4402,17 @@ fn connect_blocking_inner(
     }
     #[cfg(unix)]
     let shared_build_directory = build_lease.and_then(|(build_owner, revision)| {
-        let parent = agents.values().find(|runtime| {
-            runtime.worktree == worktree
-                && runtime.owner.as_deref() == Some(build_owner)
-                && runtime.alive.load(Ordering::Acquire)
-        })?;
+        let parent = manager
+            .0
+            .lock()
+            .ok()?
+            .values()
+            .find(|runtime| {
+                runtime.worktree == worktree
+                    && runtime.owner.as_deref() == Some(build_owner)
+                    && runtime.alive.load(Ordering::Acquire)
+            })
+            .cloned()?;
         let root = parent
             .runtime_scratch
             .lock()
@@ -4337,7 +4421,7 @@ fn connect_blocking_inner(
             .path()
             .to_path_buf();
         let base = gate_build_directory(&root, revision, owner.unwrap_or_default(), false);
-        let busy = agents.values().any(|runtime| {
+        let busy = manager.0.lock().ok()?.values().any(|runtime| {
             runtime.alive.load(Ordering::Acquire)
                 && runtime.shared_build_directory.as_deref() == Some(base.as_path())
         });
@@ -5000,8 +5084,16 @@ fn connect_blocking_inner(
             },
         );
     });
+    let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
+    if manager.3.load(Ordering::Acquire) != startup_generation {
+        drop(agents);
+        drop(_startup);
+        runtime.terminate()?;
+        return Err("Agent startup was cancelled.".into());
+    }
     agents.insert(key, Arc::clone(&runtime));
     drop(agents);
+    drop(_startup);
     let result = runtime
         .request(
             "initialize",
@@ -5064,62 +5156,72 @@ fn provider_supports_restore_method(capabilities: &Value, method: &str) -> bool 
 }
 
 #[tauri::command]
-pub fn acp_pending_permissions(
+pub async fn acp_pending_permissions(
     manager: State<'_, AgentManager>,
     agent: String,
     directory: String,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    let permissions = runtime
-        .permission_state
-        .lock()
-        .map_err(|error| error.to_string())?;
-    Ok(permissions
-        .pending
-        .values()
-        .filter(|pending| {
-            pending
-                .message
-                .pointer("/params/sessionId")
-                .and_then(Value::as_str)
-                == Some(session_id.as_str())
-        })
-        .map(|pending| pending.message.clone())
-        .collect())
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+        let permissions = runtime
+            .permission_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        Ok(permissions
+            .pending
+            .values()
+            .filter(|pending| {
+                pending
+                    .message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    == Some(session_id.as_str())
+            })
+            .map(|pending| pending.message.clone())
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn acp_pending_elicitations(
+pub async fn acp_pending_elicitations(
     manager: State<'_, AgentManager>,
     agent: String,
     directory: String,
     session_id: String,
     profile: String,
 ) -> Result<Vec<Value>, String> {
-    let profile = parse_profile(Some(&profile))?;
-    let runtime = connection_for_elicitation(
-        &manager,
-        &agent,
-        profile,
-        Path::new(&directory),
-        &session_id,
-    )?;
-    let pending = runtime
-        .elicitation_state
-        .lock()
-        .map_err(|error| error.to_string())?;
-    Ok(pending
-        .values()
-        .filter(|request| {
-            request
-                .message
-                .pointer("/params/sessionId")
-                .and_then(Value::as_str)
-                == Some(session_id.as_str())
-        })
-        .map(|request| request.message.clone())
-        .collect())
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile = parse_profile(Some(&profile))?;
+        let runtime = connection_for_elicitation(
+            &manager,
+            &agent,
+            profile,
+            Path::new(&directory),
+            &session_id,
+        )?;
+        let pending = runtime
+            .elicitation_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        Ok(pending
+            .values()
+            .filter(|request| {
+                request
+                    .message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    == Some(session_id.as_str())
+            })
+            .map(|request| request.message.clone())
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -5135,47 +5237,53 @@ pub struct AcpElicitationParams {
 }
 
 #[tauri::command]
-pub fn acp_elicitation(
+pub async fn acp_elicitation(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
-    let profile = parse_profile(Some(&params.profile))?;
-    let runtime = connection_for_elicitation(
-        &manager,
-        &params.agent,
-        profile,
-        Path::new(&params.directory),
-        &params.session_id,
-    )?;
-    let key = params.request_id.to_string();
-    let pending = claim_pending_elicitation(&runtime.elicitation_state, &key, &params.session_id)?;
-    let mut result = json!({"action":params.action});
-    if let Some(content) = params.content {
-        result["content"] = content;
-    }
-    if let Err(error) =
-        runtime.write(&json!({"jsonrpc":"2.0","id":params.request_id,"result":result}))
-    {
-        runtime
-            .elicitation_state
-            .lock()
-            .map_err(|cause| cause.to_string())?
-            .insert(key, pending);
-        return Err(error);
-    }
-    let _ = app.emit(
-        "acp-event",
-        AgentEvent {
-            agent: params.agent,
-            directory: Some(params.directory),
-            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-            message: json!({"method":"sail/elicitation_resolved","params":{
-                "sessionId":params.session_id,"requestId":params.request_id
-            }}),
-        },
-    );
-    Ok(())
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile = parse_profile(Some(&params.profile))?;
+        let runtime = connection_for_elicitation(
+            &manager,
+            &params.agent,
+            profile,
+            Path::new(&params.directory),
+            &params.session_id,
+        )?;
+        let key = params.request_id.to_string();
+        let pending =
+            claim_pending_elicitation(&runtime.elicitation_state, &key, &params.session_id)?;
+        let mut result = json!({"action":params.action});
+        if let Some(content) = params.content {
+            result["content"] = content;
+        }
+        if let Err(error) =
+            runtime.write(&json!({"jsonrpc":"2.0","id":params.request_id,"result":result}))
+        {
+            runtime
+                .elicitation_state
+                .lock()
+                .map_err(|cause| cause.to_string())?
+                .insert(key, pending);
+            return Err(error);
+        }
+        let _ = app.emit(
+            "acp-event",
+            AgentEvent {
+                agent: params.agent,
+                directory: Some(params.directory),
+                worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+                message: json!({"method":"sail/elicitation_resolved","params":{
+                    "sessionId":params.session_id,"requestId":params.request_id
+                }}),
+            },
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -5439,17 +5547,22 @@ fn complete_restore_if_current(
 /// E2E specs share one app process; release their fixture runtimes between specs.
 /// The command is only permitted by the E2E capability and has no production effect.
 #[tauri::command]
-pub fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
-    #[cfg(feature = "e2e")]
-    {
-        manager.shutdown();
-        Ok(())
-    }
-    #[cfg(not(feature = "e2e"))]
-    {
-        let _ = manager;
-        Err("ACP test runtime reset requires the E2E build".into())
-    }
+pub async fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(feature = "e2e")]
+        {
+            manager.shutdown();
+            Ok(())
+        }
+        #[cfg(not(feature = "e2e"))]
+        {
+            let _ = manager;
+            Err("ACP test runtime reset requires the E2E build".into())
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Cancels a deleted thread's active turn before releasing its browser token.
@@ -5616,20 +5729,25 @@ pub async fn acp_begin_session_restore(
 }
 
 #[tauri::command]
-pub fn acp_end_session_restore(
+pub async fn acp_end_session_restore(
     manager: State<'_, AgentManager>,
     agent: String,
     directory: String,
     session_id: String,
     restore_token: String,
 ) -> Result<(), String> {
-    release_session_restore(
-        &manager,
-        &agent,
-        Path::new(&directory),
-        &session_id,
-        &restore_token,
-    )
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        release_session_restore(
+            &manager,
+            &agent,
+            Path::new(&directory),
+            &session_id,
+            &restore_token,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn release_session_restore(
@@ -6780,7 +6898,7 @@ fn cleanup_session_processes(
 }
 
 #[tauri::command]
-pub fn acp_cancel(
+pub async fn acp_cancel(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     agent: String,
@@ -6788,8 +6906,13 @@ pub fn acp_cancel(
     session_id: String,
     turn_id: Option<String>,
 ) -> Result<(), String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    cancel_session(&app, &runtime, &agent, &session_id, turn_id)
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+        cancel_session(&app, &runtime, &agent, &session_id, turn_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn cancel_session(
@@ -6910,55 +7033,60 @@ pub struct AcpPermissionParams {
 }
 
 #[tauri::command]
-pub fn acp_permission(
+pub async fn acp_permission(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     params: AcpPermissionParams,
 ) -> Result<(), String> {
-    let AcpPermissionParams {
-        agent,
-        directory,
-        request_id,
-        option_id,
-        session_id,
-        request_generation,
-        request_fingerprint,
-    } = params;
-    let resolution = if option_id.is_some() {
-        "selected"
-    } else {
-        "cancelled"
-    };
-    let outcome = option_id
-        .map(|id| json!({"outcome":"selected","optionId":id}))
-        .unwrap_or_else(|| json!({"outcome":"cancelled"}));
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    let pending = runtime.respond(
-        request_id.clone(),
-        &session_id,
-        request_generation,
-        &request_fingerprint,
-        json!({"outcome":outcome}),
-    )?;
-    let Some(pending) = pending else {
-        return Ok(());
-    };
-    let _ = app.emit(
-        "acp-event",
-        AgentEvent {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let AcpPermissionParams {
             agent,
-            directory: Some(directory),
-            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-            message: json!({"method":"sail/permission_resolved","params":{
-                "sessionId":session_id,"requestId":request_id,
-                "sailPermissionGeneration":pending.generation,
-                "sailPermissionFingerprint":pending.fingerprint,
-                "sailCapabilityProfile":runtime.profile.as_str(),
-                "sailPermissionOutcome":resolution
-            }}),
-        },
-    );
-    Ok(())
+            directory,
+            request_id,
+            option_id,
+            session_id,
+            request_generation,
+            request_fingerprint,
+        } = params;
+        let resolution = if option_id.is_some() {
+            "selected"
+        } else {
+            "cancelled"
+        };
+        let outcome = option_id
+            .map(|id| json!({"outcome":"selected","optionId":id}))
+            .unwrap_or_else(|| json!({"outcome":"cancelled"}));
+        let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+        let pending = runtime.respond(
+            request_id.clone(),
+            &session_id,
+            request_generation,
+            &request_fingerprint,
+            json!({"outcome":outcome}),
+        )?;
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let _ = app.emit(
+            "acp-event",
+            AgentEvent {
+                agent,
+                directory: Some(directory),
+                worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+                message: json!({"method":"sail/permission_resolved","params":{
+                    "sessionId":session_id,"requestId":request_id,
+                    "sailPermissionGeneration":pending.generation,
+                    "sailPermissionFingerprint":pending.fingerprint,
+                    "sailCapabilityProfile":runtime.profile.as_str(),
+                    "sailPermissionOutcome":resolution
+                }}),
+            },
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -7114,7 +7242,10 @@ mod session_config_tests {
 
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 2 & wait; exec sleep 10"])
+            .args([
+                "-c",
+                "sleep 30 & worker=$!; read signal; kill \"$worker\"; wait \"$worker\" 2>/dev/null; exec sleep 10",
+            ])
             .stdin(Stdio::piped());
         unsafe {
             command.pre_exec(|| {
@@ -7145,6 +7276,7 @@ mod session_config_tests {
         start_temp_cleanup_watcher(&runtime).unwrap();
         runtime.clear_idle_temp(true).unwrap();
         assert!(artifact.exists());
+        runtime.input.lock().unwrap().write_all(b"\n").unwrap();
 
         for _ in 0..100 {
             if !artifact.exists() {
@@ -7491,7 +7623,7 @@ time.sleep(10)
     }
 
     #[cfg(unix)]
-    fn test_runtime(
+    pub(super) fn test_runtime(
         agent: &str,
         profile: CapabilityProfile,
         worktree: &Path,
@@ -8833,6 +8965,13 @@ mod native_subagent_fence_tests {
     #[cfg(unix)]
     #[test]
     fn active_opencode_turn_blocks_worktree_cleanup() {
+        use std::fs;
+
+        let directory =
+            std::env::temp_dir().join(format!("sail-active-turn-cleanup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).expect("create worktree fixture");
+        let marker = directory.join("keep.txt");
+        fs::write(&marker, b"active session data").expect("write worktree marker");
         let mut child = spawn_test_session_process();
         let input = child.stdin.take().expect("placeholder agent stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
@@ -8840,7 +8979,7 @@ mod native_subagent_fence_tests {
         let runtime = Arc::new(Connection {
             agent: "opencode".into(),
             profile: CapabilityProfile::Build,
-            worktree: PathBuf::from("/worktree"),
+            worktree: directory.clone(),
             owner: None,
             #[cfg(unix)]
             shared_build_directory: None,
@@ -8877,7 +9016,6 @@ mod native_subagent_fence_tests {
             ready: Condvar::new(),
             _owned_temp: None,
         });
-        let directory = PathBuf::from("/worktree");
         runtime
             .session_directories
             .lock()
@@ -8897,7 +9035,7 @@ mod native_subagent_fence_tests {
         );
         let agents = AgentManager::default();
         agents.0.lock().unwrap().insert(
-            connection_key("opencode", CapabilityProfile::Build, Path::new("/worktree")),
+            connection_key("opencode", CapabilityProfile::Build, &directory),
             runtime,
         );
         let mut cleaned = false;
@@ -8905,15 +9043,69 @@ mod native_subagent_fence_tests {
         let error = AgentWorktreeFence::default()
             .cleanup(&agents, &directory, None, false, || {
                 cleaned = true;
+                fs::remove_dir_all(&directory).expect("remove selected worktree");
                 Ok(())
             })
             .expect_err("an active OpenCode turn must block worktree removal");
 
         assert_eq!(
             error,
-            "Worktree has active agent sessions: opencode:ses_open."
+            "Worktree has connected agent sessions: opencode:ses_open."
         );
         assert!(!cleaned);
+        assert_eq!(
+            fs::read(&marker).expect("active worktree must remain"),
+            b"active session data"
+        );
+        fs::remove_dir_all(directory).expect("remove worktree fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_idle_session_blocks_worktree_cleanup() {
+        let directory = std::env::temp_dir().join(format!(
+            "sail-idle-session-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).expect("create worktree fixture");
+        let marker = directory.join("keep.txt");
+        std::fs::write(&marker, b"idle session data").expect("write worktree marker");
+        let runtime = super::session_config_tests::test_runtime(
+            "opencode",
+            CapabilityProfile::Build,
+            &directory,
+            "ses_idle",
+            None,
+        );
+        let agents = AgentManager::default();
+        agents.0.lock().unwrap().insert(
+            connection_key("opencode", CapabilityProfile::Build, &directory),
+            runtime,
+        );
+        assert!(agents.active_sessions_in(&directory).unwrap().is_empty());
+        assert_eq!(
+            agents
+                .sessions_blocking_cleanup_in(&directory)
+                .unwrap()
+                .len(),
+            1
+        );
+        let error = AgentWorktreeFence::default()
+            .cleanup(&agents, &directory, None, false, || {
+                std::fs::remove_dir_all(&directory).expect("remove selected worktree");
+                Ok(())
+            })
+            .expect_err("connected idle session must block cleanup");
+        assert_eq!(
+            error,
+            "Worktree has connected agent sessions: opencode:ses_idle."
+        );
+        assert_eq!(
+            std::fs::read(&marker).expect("idle worktree must remain"),
+            b"idle session data"
+        );
+        agents.stop_worktree(&directory).unwrap();
+        std::fs::remove_dir_all(directory).expect("remove worktree fixture");
     }
 
     #[test]
