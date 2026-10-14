@@ -14,6 +14,8 @@ The shared bridge forwards the provider's negotiated MCP wire version. Later cli
 
 The supervisor advertises empty client capabilities upstream because it cannot route provider callbacks to an individual agent. Roots, sampling, elicitation, and experimental client callbacks are unavailable through this bridge. Provider pings remain supported. Tool, resource, and prompt list changes reach every authenticated session with the same project and approval fingerprint, while active-request progress remains with its requesting session.
 
+Agent request IDs are translated to a unique sequence within the shared provider session and restored in responses. Cancellation completes locally with error code `-32800`; providers that omit a cancellation response remain usable, and late responses are discarded. Resource updates reach subscribed sessions only. Shared subscriptions stay active until the last subscriber unsubscribes and are restored after a provider replacement.
+
 Use the signed app's `--context-auth-service-status-probe` to distinguish `NotFound` (3), `NotRegistered` (0), `RequiresApproval` (2), and `Enabled` (1). Approval is required only when macOS reports `RequiresApproval`; preserve existing background items and use normal OS controls for the exact private service. Do not bootstrap a helper manually or change privacy grants.
 
 Unregister only the task-created service through the app's `--context-auth-unregister-probe`, stop only its owned processes, and remove only the root created for this run. The coordinator that creates a shared acceptance root owns its final removal. Published installers retain mandatory notarization; this private signing fixture does not distribute an installer.

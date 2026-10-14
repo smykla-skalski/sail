@@ -100,6 +100,7 @@ let appPid;
 function makeProject(directory, command, blockInput = false) {
   mkdirSync(join(directory, '.sail'), { recursive: true });
   writeFileSync(join(directory, '.sail/strict-provider-lifecycle'), 'require MCP handshake');
+  writeFileSync(join(directory, '.sail/strict-provider-ids'), 'require unique upstream IDs');
   writeFileSync(
     join(directory, '.sail', 'worktree.json'),
     '{"context":{"manifest":".sail/context.json"}}',
@@ -340,6 +341,12 @@ try {
     assert.equal(response.result.pid, a.result.pid);
     assert.equal(response.result.tools[0].name, 'fixture_ping');
   }
+  const repeated = await Promise.all([first.request(1), second.request(1), peer.request(1)]);
+  for (const response of repeated) {
+    assert.equal(response.id, 1);
+    assert.equal(response.result.pid, a.result.pid);
+    assert.ok(response.result.tools.length > 0, 'agent request IDs are translated per provider');
+  }
   const called = await first.request(16, 'tools/call', { name: 'fixture_ping', arguments: {} });
   assert.equal(called.result.content[0].text, 'fixture reply');
   assert.equal(called.result.pid, a.result.pid);
@@ -447,12 +454,79 @@ try {
   );
   await Promise.race([notified, waiting]);
   const [cancelled, adjacent] = await Promise.all([waiting, second.request(19)]);
-  assert.equal(cancelled.result.cancelled, true);
-  assert.equal(cancelled.result.cancelledBy, 'owner');
-  assert.equal(cancelled.result.content[0].text, 'fixture cancelled');
-  assert.equal(cancelled.result.pid, a.result.pid);
+  assert.equal(cancelled.error.code, -32800);
   assert.equal(adjacent.result.pid, a.result.pid);
   assert.ok(Date.now() - cancellationStart < 10_000, 'cancellation bypasses the stalled call');
+  const silentStart = Date.now();
+  const silent = await first.request(
+    'silent-cancellation',
+    'tools/call',
+    { name: 'fixture_wait_cancel_no_response', arguments: {} },
+    (notification) => {
+      assert.equal(notification.params.data, 'waiting for cancellation');
+      first.child.stdin.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/cancelled',
+          params: { requestId: 'silent-cancellation', reason: 'owner' },
+        }) + '\n',
+      );
+    },
+  );
+  assert.equal(silent.id, 'silent-cancellation');
+  assert.equal(silent.error.code, -32800);
+  assert.equal((await second.request(39)).result.pid, a.result.pid);
+  assert.ok(Date.now() - silentStart < 10_000, 'no-response cancellation preserves the provider');
+  const resourceParams = { uri: 'fixture://shared' };
+  await first.request(40, 'resources/subscribe', resourceParams);
+  const updates = [0, 0, 0];
+  const countUpdate = (index) => (notification) => {
+    if (notification.method === 'notifications/resources/updated') {
+      assert.equal(notification.params.uri, resourceParams.uri);
+      updates[index]++;
+    }
+  };
+  await second.request(
+    41,
+    'tools/call',
+    { name: 'fixture_resource_updated', arguments: {} },
+    countUpdate(1),
+  );
+  await first.request(42, 'tools/list', undefined, countUpdate(0));
+  await peer.request(43, 'tools/list', undefined, countUpdate(2));
+  assert.deepEqual(
+    updates,
+    [1, 0, 0],
+    'resource updates reach their subscriber during another call',
+  );
+  await second.request(
+    51,
+    'tools/call',
+    { name: 'fixture_idle_resource_updated', arguments: {} },
+    countUpdate(1),
+  );
+  await delay(100);
+  await first.request(52, 'tools/list', undefined, countUpdate(0));
+  await second.request(53, 'tools/list', undefined, countUpdate(1));
+  await peer.request(54, 'tools/list', undefined, countUpdate(2));
+  assert.deepEqual(updates, [2, 0, 0], 'idle resource updates reach subscribed sessions only');
+  await second.request(44, 'resources/subscribe', resourceParams);
+  await first.request(45, 'resources/unsubscribe', resourceParams);
+  const subscribedPeer = await peer.request(
+    46,
+    'tools/call',
+    { name: 'fixture_resource_updated', arguments: {} },
+    countUpdate(2),
+  );
+  assert.equal(subscribedPeer.result.subscriptions, 1);
+  assert.equal(subscribedPeer.result.unsubscriptions, 0);
+  await first.request(47, 'tools/list', undefined, countUpdate(0));
+  await second.request(48, 'tools/list', undefined, countUpdate(1));
+  assert.deepEqual(updates, [2, 1, 0], 'one subscriber cannot unsubscribe another');
+  await second.request(49, 'resources/unsubscribe', resourceParams);
+  const unsubscribed = await peer.request(50);
+  assert.equal(unsubscribed.result.unsubscriptions, 1);
+  assert.equal(unsubscribed.result.subscribed, false);
   assert.equal(
     run(binary, ['--context-auth-approve-probe', blocked, 'fixture-provider', provider]),
     'approved',

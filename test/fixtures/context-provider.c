@@ -21,6 +21,10 @@ int main(void) {
     int initialized = 0;
     int roots_supported = 0;
     int client_capabilities_empty = 0;
+    long last_request_id = 0;
+    int subscriptions = 0;
+    int unsubscriptions = 0;
+    int subscribed = 0;
     while (getline(&line, &capacity, stdin) != -1) {
         if (strstr(line, "\"method\":\"initialize\"")) {
             initialization_count++;
@@ -42,6 +46,21 @@ int main(void) {
         char *end = NULL;
         long value = strtol(id + 1, &end, 10);
         if (end == id + 1) continue;
+        if (access(".sail/strict-provider-ids", F_OK) == 0 && value <= last_request_id) {
+            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"error\":{\"code\":-32600,"
+                   "\"message\":\"Provider request ID was reused\"}}\n", value);
+            fflush(stdout);
+            continue;
+        }
+        last_request_id = value;
+        if (strstr(line, "\"method\":\"resources/subscribe\"")) {
+            subscriptions++;
+            subscribed = 1;
+        }
+        if (strstr(line, "\"method\":\"resources/unsubscribe\"")) {
+            unsubscriptions++;
+            subscribed = 0;
+        }
         if (strstr(line, "\"method\":\"invalid-slow\"")) {
             if (!write_marker("protocol-fault-ready")) return 1;
             sleep(1);
@@ -73,7 +92,17 @@ int main(void) {
             return 1;
         }
         int cancelled = strstr(line, "\"method\":\"wait-for-cancel\"") != NULL ||
-            (tool_call && strstr(line, "\"name\":\"fixture_wait_cancel\""));
+            strstr(line, "\"method\":\"wait-for-cancel-no-response\"") != NULL ||
+            (tool_call && (strstr(line, "\"name\":\"fixture_wait_cancel\"") ||
+                          strstr(line, "\"name\":\"fixture_wait_cancel_no_response\"")));
+        int no_response_cancel = strstr(line, "wait-for-cancel-no-response") != NULL ||
+            (tool_call && strstr(line, "\"name\":\"fixture_wait_cancel_no_response\""));
+        int idle_resource = subscribed && tool_call && strstr(line, "\"name\":\"fixture_idle_resource_updated\"");
+        if (subscribed && tool_call && strstr(line, "\"name\":\"fixture_resource_updated\"")) {
+            puts("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\","
+                 "\"params\":{\"uri\":\"fixture://shared\"}}");
+            fflush(stdout);
+        }
         if (strstr(line, "\"method\":\"server-ping\"") ||
             strstr(line, "\"method\":\"server-ping-different-id\"") ||
             (tool_call && strstr(line, "\"name\":\"fixture_server_ping\""))) {
@@ -90,6 +119,11 @@ int main(void) {
             fflush(stdout);
             if (getline(&line, &capacity, stdin) == -1 ||
                 !strstr(line, "\"method\":\"notifications/cancelled\"")) return 1;
+            char expected[64];
+            snprintf(expected, sizeof(expected), "\"requestId\":%ld", value);
+            if (!strstr(line, expected)) return 1;
+            if (!write_marker("cancellation-received")) return 1;
+            if (no_response_cancel) continue;
         }
         if (progress) {
             for (int count = 0; count < 160; count++) {
@@ -104,7 +138,7 @@ int main(void) {
                 ? ",\"cancelled\":true,\"cancelledBy\":\"owner\",\"content\":[{\"type\":\"text\",\"text\":\"fixture cancelled\"}],\"isError\":false"
                 : ",\"cancelled\":true,\"cancelledBy\":\"other\",\"content\":[{\"type\":\"text\",\"text\":\"fixture cancelled\"}],\"isError\":false";
         } else if (strstr(line, "\"method\":\"initialize\"")) {
-            result = ",\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},"
+            result = ",\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{},\"resources\":{\"subscribe\":true}},"
                      "\"serverInfo\":{\"name\":\"sail-fixture\",\"version\":\"1.0\"}";
         } else if (strstr(line, "\"method\":\"tools/list\"")) {
             result = ",\"tools\":[{\"name\":\"fixture_ping\",\"description\":\"Reply from the fixture\","
@@ -114,15 +148,25 @@ int main(void) {
                      "{\"name\":\"fixture_idle_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_many_progress\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_tools_changed\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_resource_updated\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_idle_resource_updated\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                     "{\"name\":\"fixture_wait_cancel_no_response\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                      "{\"name\":\"fixture_wait_cancel\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
         } else if (tool_call) {
             result = ",\"content\":[{\"type\":\"text\",\"text\":\"fixture reply\"}],\"isError\":false";
         }
         printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d,"
+               "\"subscriptions\":%d,\"unsubscriptions\":%d,\"subscribed\":%s,"
                "\"clientCapabilitiesEmpty\":%s%s}}\n",
                value, (long)getpid(), initialization_count,
+               subscriptions, unsubscriptions, subscribed ? "true" : "false",
                client_capabilities_empty ? "true" : "false", result);
         fflush(stdout);
+        if (idle_resource) {
+            puts("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\","
+                 "\"params\":{\"uri\":\"fixture://shared\"}}");
+            fflush(stdout);
+        }
         if (idle_progress) {
             for (int count = 0; count < 160; count++) {
                 printf("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\","

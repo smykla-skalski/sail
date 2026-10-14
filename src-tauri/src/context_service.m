@@ -54,16 +54,27 @@ static bool sharedNotification(NSString *text) {
     NSString *method = value[@"method"];
     if (![method isKindOfClass:NSString.class]) return false;
     return [@[@"notifications/tools/list_changed", @"notifications/resources/list_changed",
-              @"notifications/prompts/list_changed"] containsObject:method];
+              @"notifications/prompts/list_changed", @"notifications/resources/updated"] containsObject:method];
 }
 
 static bool enqueueNotification(NSMutableDictionary<NSValue *, NSDictionary *> *sessions,
                                 NSValue *key, NSDictionary *session, NSString *text, bool shared) {
+    NSData *bytes = [text dataUsingEncoding:NSUTF8StringEncoding];
+    id value = [NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil];
+    NSString *resource = nil;
+    if ([value isKindOfClass:NSDictionary.class] &&
+        [value[@"method"] isEqual:@"notifications/resources/updated"]) {
+        id params = value[@"params"];
+        id uri = [params isKindOfClass:NSDictionary.class] ? params[@"uri"] : nil;
+        if (![uri isKindOfClass:NSString.class]) return sessions[key] == session;
+        resource = uri;
+    }
     for (NSValue *otherKey in sessions.allKeys) {
         NSDictionary *other = sessions[otherKey];
         if ((!shared && ![otherKey isEqual:key]) ||
             ![other[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
-            ![other[@"fingerprint"] isEqualToString:session[@"fingerprint"]]) continue;
+            ![other[@"fingerprint"] isEqualToString:session[@"fingerprint"]] ||
+            (resource && ![other[@"subscriptions"] containsObject:resource])) continue;
         NSMutableString *pending = other[@"notifications"];
         if ([pending lengthOfBytesUsingEncoding:NSUTF8StringEncoding] +
             [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] <= 1024 * 1024) {
@@ -211,6 +222,7 @@ int sail_context_service_main(void) {
                                                @"projectKey": binding[@"projectKey"],
                                                @"fingerprint": binding[@"fingerprint"],
                                                @"capability": capability,
+                                               @"subscriptions": [NSMutableSet set],
                                                @"notifications": [NSMutableString string] };
                             xpc_dictionary_set_string(reply, "capability", capability.UTF8String);
                             xpc_dictionary_set_string(reply, "projectKey", [binding[@"projectKey"] UTF8String]);
@@ -255,7 +267,10 @@ int sail_context_service_main(void) {
                                 return;
                             }
                             if (text.length) {
-                                enqueueNotification(sessions, key, session, text, true);
+                                for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+                                    if (line.length) enqueueNotification(sessions, key, session,
+                                        [line stringByAppendingString:@"\n"], true);
+                                }
                             }
                             if (sessions[key] != session) {
                                 xpc_dictionary_set_string(reply, "error", "Context MCP notification queue exceeded 1 MiB.");
@@ -279,6 +294,22 @@ int sail_context_service_main(void) {
                             closeSession(sessions, key);
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         } else {
+                            NSData *requestBytes = [request dataUsingEncoding:NSUTF8StringEncoding];
+                            id parsed = [NSJSONSerialization JSONObjectWithData:requestBytes options:0 error:nil];
+                            NSString *method = [parsed isKindOfClass:NSDictionary.class] ? parsed[@"method"] : nil;
+                            id params = [parsed isKindOfClass:NSDictionary.class] ? parsed[@"params"] : nil;
+                            id uri = [params isKindOfClass:NSDictionary.class] ? params[@"uri"] : nil;
+                            NSString *resource = [uri isKindOfClass:NSString.class] ? uri : nil;
+                            bool subscribing = resource && [method isEqual:@"resources/subscribe"];
+                            bool unsubscribing = resource && [method isEqual:@"resources/unsubscribe"];
+                            NSMutableSet *subscriptions = session[@"subscriptions"];
+                            bool wasSubscribed = resource && [subscriptions containsObject:resource];
+                            if (subscribing && !wasSubscribed && subscriptions.count >= 1024) {
+                                xpc_dictionary_set_string(reply, "error", "Context resource subscriptions exceeded their bounded queue.");
+                                xpc_connection_send_message(peer, reply);
+                                return;
+                            }
+                            if (subscribing) [subscriptions addObject:resource];
                             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                                 SailContextNotification notify = ^bool(NSString *text) {
                                     __block bool accepted = false;
@@ -303,6 +334,15 @@ int sail_context_service_main(void) {
                                     deliverNotification, (__bridge void *)notify,
                                     output, 1024 * 1024 + 1);
                                 dispatch_async(queue, ^{
+                                    NSString *responseText = output ? [NSString stringWithUTF8String:output] : nil;
+                                    NSString *responseLine = [[responseText componentsSeparatedByString:@"\n"] lastObject];
+                                    NSData *responseBytes = [responseLine dataUsingEncoding:NSUTF8StringEncoding];
+                                    id response = responseBytes ? [NSJSONSerialization JSONObjectWithData:responseBytes options:0 error:nil] : nil;
+                                    bool subscribed = success && [response isKindOfClass:NSDictionary.class] &&
+                                        response[@"result"] && !response[@"error"];
+                                    if ((subscribing && !wasSubscribed && !subscribed) || (unsubscribing && subscribed)) {
+                                        [subscriptions removeObject:resource];
+                                    }
                                     NSDictionary *latest = sessions[key] == session
                                         ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
                                     if (![latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {

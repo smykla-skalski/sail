@@ -1032,6 +1032,8 @@ struct ProviderProcess {
     fingerprint: String,
     initialization: Option<serde_json::Value>,
     initialized_notification_sent: bool,
+    request_sequence: u64,
+    subscriptions: HashSet<String>,
     child: std::process::Child,
     stdin: std::sync::Arc<std::sync::Mutex<std::process::ChildStdin>>,
     stdout: Option<std::io::BufReader<std::process::ChildStdout>>,
@@ -1104,6 +1106,7 @@ struct SessionInitialization {
     request: serde_json::Value,
     protocol_version: String,
     initialized: bool,
+    subscriptions: HashSet<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1488,6 +1491,8 @@ fn spawn_provider(
             .ok_or("Provider fingerprint missing.")?,
         initialization: None,
         initialized_notification_sent: false,
+        request_sequence: 0,
+        subscriptions: HashSet::new(),
         child,
         stdin: std::sync::Arc::new(std::sync::Mutex::new(stdin)),
         stdout: Some(std::io::BufReader::new(stdout)),
@@ -1550,7 +1555,7 @@ fn provider_request_with_notifications_at(
     message: &str,
     store_path: &Path,
     data_root: &Path,
-    notify: NotificationSink<'_>,
+    mut notify: NotificationSink<'_>,
 ) -> Result<Option<String>, String> {
     use std::time::Duration;
     if message.len() > 1024 * 1024 {
@@ -1745,7 +1750,116 @@ fn provider_request_with_notifications_at(
         if method == "notifications/initialized" && process.initialized_notification_sent {
             return Ok(None);
         }
-        exchange_provider_request(process, &key, capability, &request, message, notify)
+        if process.initialized_notification_sent {
+            let subscriptions: HashSet<String> = active_sessions()
+                .lock()
+                .map_err(|error| error.to_string())?
+                .values()
+                .filter_map(Option::as_ref)
+                .filter(|session| {
+                    session.project == key && session.fingerprint == expected && session.initialized
+                })
+                .flat_map(|session| session.subscriptions.iter().cloned())
+                .collect();
+            for uri in subscriptions
+                .difference(&process.subscriptions)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                let subscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-subscription",
+                    "method":"resources/subscribe","params":{"uri":uri}});
+                let response = exchange_provider_request(
+                    process,
+                    &key,
+                    None,
+                    &subscribe,
+                    &subscribe.to_string(),
+                    notify
+                        .as_mut()
+                        .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+                )?;
+                if !successful_provider_response(response.as_deref()) {
+                    return Err(
+                        "Replacement provider rejected an active resource subscription.".into(),
+                    );
+                }
+                process.subscriptions.insert(uri);
+            }
+            for uri in process
+                .subscriptions
+                .difference(&subscriptions)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                let unsubscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-unsubscription",
+                    "method":"resources/unsubscribe","params":{"uri":uri}});
+                let response = exchange_provider_request(
+                    process,
+                    &key,
+                    None,
+                    &unsubscribe,
+                    &unsubscribe.to_string(),
+                    notify
+                        .as_mut()
+                        .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+                )?;
+                if !successful_provider_response(response.as_deref()) {
+                    return Err("Provider rejected an expired resource subscription.".into());
+                }
+                process.subscriptions.remove(&uri);
+            }
+        }
+        let uri = request
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(serde_json::Value::as_str);
+        let shared_subscription = if let Some(uri) = uri {
+            if method == "resources/subscribe" {
+                if saved.as_ref().is_some_and(|session| {
+                    session.subscriptions.len() >= 1024 && !session.subscriptions.contains(uri)
+                }) {
+                    return Err(
+                        "Context resource subscriptions exceeded their bounded queue.".into(),
+                    );
+                }
+                process.subscriptions.contains(uri)
+            } else if method == "resources/unsubscribe" {
+                active_sessions()
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .any(|(owner, session)| {
+                        Some(owner.as_str()) != capability
+                            && session.as_ref().is_some_and(|session| {
+                                session.project == key
+                                    && session.fingerprint == expected
+                                    && session.subscriptions.contains(uri)
+                            })
+                    })
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let response = if shared_subscription {
+            let id = request
+                .get("id")
+                .ok_or("MCP resource subscription request has no ID.")?;
+            Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string())
+        } else {
+            exchange_provider_request(process, &key, capability, &request, message, notify)?
+        };
+        if successful_provider_response(response.as_deref()) {
+            if let Some(uri) = uri {
+                if method == "resources/subscribe" {
+                    process.subscriptions.insert(uri.into());
+                } else if method == "resources/unsubscribe" && !shared_subscription {
+                    process.subscriptions.remove(uri);
+                }
+            }
+        }
+        Ok(response)
     })();
     let response = match response {
         Ok(response) => response,
@@ -1775,15 +1889,38 @@ fn provider_request_with_notifications_at(
                         .ok_or("Provider protocol version missing.")?
                         .into(),
                     initialized: false,
+                    subscriptions: HashSet::new(),
                 });
             }
         } else if method == "notifications/initialized" {
             if let Some(initialization) = initialization {
                 initialization.initialized = true;
             }
+        } else if successful_provider_response(response.as_deref()) {
+            if let Some(uri) = request
+                .get("params")
+                .and_then(|params| params.get("uri"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(initialization) = initialization {
+                    if method == "resources/subscribe" {
+                        initialization.subscriptions.insert(uri.into());
+                    } else if method == "resources/unsubscribe" {
+                        initialization.subscriptions.remove(uri);
+                    }
+                }
+            }
         }
     }
     Ok(response)
+}
+
+#[cfg(target_os = "macos")]
+fn successful_provider_response(response: Option<&str>) -> bool {
+    response
+        .and_then(|response| response.lines().last())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .is_some_and(|value| value.get("result").is_some() && value.get("error").is_none())
 }
 
 #[cfg(target_os = "macos")]
@@ -1884,8 +2021,16 @@ fn provider_notifications(
                     }
                     buffered.push_str(&message);
                 }
-                ProviderEvent::Response(_) => {
-                    return Err("Provider sent a response without an active request.".into());
+                ProviderEvent::Response(message) => {
+                    let value: serde_json::Value = serde_json::from_str(message.trim_end())
+                        .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                    if value
+                        .get("id")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none_or(|id| id == 0 || id > process.request_sequence)
+                    {
+                        return Err("Provider sent a response without an active request.".into());
+                    }
                 }
                 ProviderEvent::Failure(error) => return Err(error),
             }
@@ -2034,13 +2179,32 @@ fn exchange_provider_request(
         .get("method")
         .and_then(serde_json::Value::as_str)
         .ok_or("MCP method missing.")?;
-    // A shared provider cannot call back into any individual agent client.
-    let initialize = (method == "initialize").then(|| {
-        let mut initialize = request.clone();
-        initialize["params"]["capabilities"] = serde_json::json!({});
-        initialize.to_string()
-    });
-    let message = initialize.as_deref().unwrap_or(message);
+    let request_id = request.get("id");
+    let mut upstream = request.clone();
+    let upstream_id = if let Some(id) = request_id {
+        if !(id.is_string() || id.is_i64() || id.is_u64()) {
+            return Err("MCP request has no valid ID.".into());
+        }
+        process.request_sequence = process
+            .request_sequence
+            .checked_add(1)
+            .ok_or("Provider request ID sequence exhausted.")?;
+        upstream["id"] = serde_json::json!(process.request_sequence);
+        Some(process.request_sequence)
+    } else {
+        None
+    };
+    if method == "initialize" {
+        // A shared provider cannot call back into any individual agent client.
+        upstream["params"]["capabilities"] = serde_json::json!({});
+    }
+    let encoded;
+    let message = if upstream_id.is_some() || method == "initialize" {
+        encoded = upstream.to_string();
+        encoded.as_str()
+    } else {
+        message
+    };
     write_shared_provider_request(&process.stdin, message, Duration::from_secs(30), || {
         if !session_active()? {
             return Err("Context session revoked during provider stdin write.".into());
@@ -2053,28 +2217,32 @@ fn exchange_provider_request(
         }
         Ok(())
     })?;
-    if request.get("id").is_none() {
+    let Some(request_id) = request_id else {
         if method == "notifications/initialized" {
             process.initialized_notification_sent = true;
         }
         return Ok(None);
-    }
+    };
     start_provider_output(process)?;
     let output = process
         .output
         .as_mut()
         .ok_or("Provider output unavailable.")?;
-    let request_id = request.get("id").ok_or("MCP request has no ID.")?;
+    let upstream_id = upstream_id.ok_or("Provider request has no upstream ID.")?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut buffered = String::new();
     let response = loop {
         if !session_active()? {
             return Err("Context session revoked before provider response.".into());
         }
-        for notification in take_cancellations(key, capability, request_id) {
+        let cancellations = take_cancellations(key, capability, request_id);
+        for notification in &cancellations {
+            let mut notification: serde_json::Value = serde_json::from_str(notification)
+                .map_err(|_| "Invalid provider cancellation.".to_string())?;
+            notification["params"]["requestId"] = serde_json::json!(upstream_id);
             write_shared_provider_request(
                 &process.stdin,
-                &notification,
+                &notification.to_string(),
                 Duration::from_secs(1),
                 || {
                     if session_active()? {
@@ -2084,6 +2252,16 @@ fn exchange_provider_request(
                     }
                 },
             )?;
+        }
+        if !cancellations.is_empty() {
+            let cancelled = serde_json::json!({"jsonrpc":"2.0","id":request_id,
+                "error":{"code":-32800,"message":"Provider request cancelled."}})
+            .to_string();
+            if buffered.len() + cancelled.len() > 1024 * 1024 {
+                return Err("Buffered provider output exceeds 1 MiB.".into());
+            }
+            buffered.push_str(&cancelled);
+            break buffered;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -2109,11 +2287,17 @@ fn exchange_provider_request(
                 }
             }
             Ok(ProviderEvent::Response(message)) => {
-                let value: serde_json::Value = serde_json::from_str(message.trim_end())
+                let mut value: serde_json::Value = serde_json::from_str(message.trim_end())
                     .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
-                if value.get("id") != Some(request_id) {
+                let response_id = value.get("id").and_then(serde_json::Value::as_u64);
+                if response_id.is_some_and(|id| id > 0 && id < upstream_id) {
+                    continue;
+                }
+                if response_id != Some(upstream_id) {
                     return Err("Provider response ID did not match the request.".into());
                 }
+                value["id"] = request_id.clone();
+                let message = value.to_string();
                 if buffered.len() + message.len() > 1024 * 1024 {
                     return Err("Buffered provider output exceeds 1 MiB.".into());
                 }
@@ -3150,11 +3334,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn cancellation_reaches_a_waiting_provider_without_ending_other_calls() {
-        let repository = Repository::new("runtime-cancellation");
+    fn shared_agents_keep_request_ids_and_resource_subscriptions_independent() {
+        let repository = Repository::new("runtime-shared-identities");
         repository.configure();
+        fs::write(
+            repository.0.join(".sail/strict-provider-ids"),
+            b"unique IDs",
+        )
+        .unwrap();
         let key = project_key(&repository.0).unwrap();
-        let _stop = StopProvider(key);
+        let _stop = StopProvider(key.clone());
         let executable = repository.provider_fixture();
         let store_path = repository.0.join("approvals.json");
         let fingerprint = locked_store(&store_path, |store| {
@@ -3164,65 +3353,172 @@ mod tests {
             Ok((fingerprint, true))
         })
         .unwrap();
-        let owner = ActiveSession::new();
-        let other = ActiveSession::new();
-        let request = r#"{"jsonrpc":"2.0","id":1,"method":"wait-for-cancel"}"#;
-        let cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"owner"}}"#;
-        let other_cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"other"}}"#;
-        let unrelated_cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":999,"reason":"other"}}"#;
-        let call = |message, capability: &str| {
-            provider_request_at(
+        let a = ActiveSession::new();
+        let b = ActiveSession::new();
+        let call = |capability: &str, request: serde_json::Value| {
+            let result = provider_request_at(
                 &repository.0,
                 &fingerprint,
                 Some(capability),
-                message,
+                &request.to_string(),
                 &store_path,
                 &repository.0.join("data"),
             )
+            .unwrap();
+            result.map(|result| {
+                serde_json::from_str::<serde_json::Value>(result.lines().last().unwrap()).unwrap()
+            })
         };
+        for capability in [&a.0, &b.0] {
+            let response = call(
+                capability,
+                serde_json::json!({"jsonrpc":"2.0","id":1,
+                "method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}),
+            )
+            .unwrap();
+            assert_eq!(response["id"], 1);
+            assert!(response.get("result").is_some());
+            assert!(call(
+                capability,
+                serde_json::json!({"jsonrpc":"2.0",
+                "method":"notifications/initialized"})
+            )
+            .is_none());
+        }
+        let tools = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let first = call(&a.0, tools.clone()).unwrap();
+        let second = call(&b.0, tools.clone()).unwrap();
+        assert_eq!(first["id"], 1);
+        assert_eq!(second["id"], 1);
+        assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+        assert!(second["result"]["tools"].is_array());
+        let subscription = |id, method| {
+            serde_json::json!({"jsonrpc":"2.0","id":id,
+            "method":method,"params":{"uri":"fixture://shared"}})
+        };
+        call(&a.0, subscription("a-subscribe", "resources/subscribe")).unwrap();
+        call(&b.0, subscription("b-subscribe", "resources/subscribe")).unwrap();
+        let shared = call(&b.0, tools.clone()).unwrap();
+        assert_eq!(shared["result"]["subscriptions"], 1);
+        call(&a.0, subscription("a-unsubscribe", "resources/unsubscribe")).unwrap();
+        let remaining = call(&b.0, tools.clone()).unwrap();
+        assert_eq!(remaining["result"]["unsubscriptions"], 0);
+        assert_eq!(remaining["result"]["subscribed"], true);
+        stop_provider_if_fingerprint(&key, &fingerprint)
+            .unwrap()
+            .join()
+            .unwrap();
+        let replacement = call(&b.0, tools.clone()).unwrap();
+        assert_ne!(replacement["result"]["pid"], first["result"]["pid"]);
+        assert_eq!(replacement["result"]["subscriptions"], 1);
+        assert_eq!(replacement["result"]["subscribed"], true);
+        call(&b.0, subscription("b-unsubscribe", "resources/unsubscribe")).unwrap();
+        let final_state = call(&b.0, tools).unwrap();
+        assert_eq!(final_state["result"]["unsubscriptions"], 1);
+        assert_eq!(final_state["result"]["subscribed"], false);
+        call(
+            &a.0,
+            subscription("a-subscribe-again", "resources/subscribe"),
+        )
+        .unwrap();
+        drop(a);
+        let closed = call(
+            &b.0,
+            serde_json::json!({"jsonrpc":"2.0","id":"closed-owner",
+            "method":"tools/list"}),
+        )
+        .unwrap();
+        assert_eq!(closed["result"]["unsubscriptions"], 2);
+        assert_eq!(closed["result"]["subscribed"], false);
+    }
 
-        let (notifications, received) = std::sync::mpsc::sync_channel(1);
-        std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| {
-                let mut notify = |message: &str| {
-                    notifications
-                        .send(message.to_owned())
-                        .map_err(|error| error.to_string())
-                };
-                provider_request_with_notifications_at(
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancellation_reaches_a_waiting_provider_without_ending_other_calls() {
+        for method in ["wait-for-cancel", "wait-for-cancel-no-response"] {
+            let repository = Repository::new("runtime-cancellation");
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopProvider(key);
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let other = ActiveSession::new();
+            let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method}).to_string();
+            let cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"owner"}}"#;
+            let other_cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"other"}}"#;
+            let unrelated_cancellation = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":999,"reason":"other"}}"#;
+            let call = |message, capability: &str| {
+                provider_request_at(
                     &repository.0,
                     &fingerprint,
-                    Some(&owner.0),
-                    request,
+                    Some(capability),
+                    message,
                     &store_path,
                     &repository.0.join("data"),
-                    Some(&mut notify),
                 )
-            });
-            let notification = received
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
-            let notification: serde_json::Value = serde_json::from_str(&notification).unwrap();
-            assert_eq!(notification["method"], "notifications/message");
-            assert_eq!(notification["params"]["data"], "waiting for cancellation");
-            assert_eq!(call(other_cancellation, &other.0).unwrap(), None);
-            assert_eq!(call(unrelated_cancellation, &owner.0).unwrap(), None);
-            assert_eq!(call(cancellation, &owner.0).unwrap(), None);
-            let response = waiting.join().unwrap().unwrap().unwrap();
-            let value: serde_json::Value =
-                serde_json::from_str(response.lines().last().unwrap()).unwrap();
-            let next = call(
-                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            };
+            let before = call(
+                r#"{"jsonrpc":"2.0","id":"before","method":"tools/list"}"#,
                 &owner.0,
             )
             .unwrap()
             .unwrap();
-            let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+            let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+            let started = std::time::Instant::now();
 
-            assert_eq!(value["result"]["cancelled"], true);
-            assert_eq!(value["result"]["cancelledBy"], "owner");
-            assert_eq!(value["result"]["pid"], next["result"]["pid"]);
-        });
+            let (notifications, received) = std::sync::mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let waiting = scope.spawn(|| {
+                    let mut notify = |message: &str| {
+                        notifications
+                            .send(message.to_owned())
+                            .map_err(|error| error.to_string())
+                    };
+                    provider_request_with_notifications_at(
+                        &repository.0,
+                        &fingerprint,
+                        Some(&owner.0),
+                        &request,
+                        &store_path,
+                        &repository.0.join("data"),
+                        Some(&mut notify),
+                    )
+                });
+                let notification = received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let notification: serde_json::Value = serde_json::from_str(&notification).unwrap();
+                assert_eq!(notification["method"], "notifications/message");
+                assert_eq!(notification["params"]["data"], "waiting for cancellation");
+                assert_eq!(call(other_cancellation, &other.0).unwrap(), None);
+                assert_eq!(call(unrelated_cancellation, &owner.0).unwrap(), None);
+                assert_eq!(call(cancellation, &owner.0).unwrap(), None);
+                let response = waiting.join().unwrap().unwrap().unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(response.lines().last().unwrap()).unwrap();
+                let next = call(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                    &owner.0,
+                )
+                .unwrap()
+                .unwrap();
+                let next: serde_json::Value = serde_json::from_str(&next).unwrap();
+
+                assert_eq!(value["id"], 1);
+                assert_eq!(value["error"]["code"], -32800);
+                assert!(next["result"]["pid"].is_number());
+                assert_eq!(next["result"]["pid"], before["result"]["pid"]);
+                assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            });
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -3517,6 +3813,8 @@ mod tests {
                 fingerprint: fingerprint.clone(),
                 initialization: None,
                 initialized_notification_sent: false,
+                request_sequence: 0,
+                subscriptions: HashSet::new(),
                 stdout: Some(std::io::BufReader::new(child.stdout.take().unwrap())),
                 output: None,
                 child,
