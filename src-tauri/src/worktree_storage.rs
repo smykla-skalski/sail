@@ -1191,7 +1191,7 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         }
     }
     pending.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
-    forget_resolved_pending(&cache_root, &pending);
+    forget_vanished_pending();
     pending
 }
 
@@ -3836,27 +3836,18 @@ pub(crate) fn forget_reported_pending() {
         .clear();
 }
 
-fn forget_resolved_pending(cache_root: &Path, pending: &[CleanupPending]) {
+fn forget_vanished_pending() {
     let mut reported = REPORTED_PENDING
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_vanished(&mut reported);
+}
+
+fn prune_vanished(reported: &mut BTreeMap<String, ReportedPending>) {
     reported.retain(|_, entry| {
-        let Ok(relative) = entry.path.strip_prefix(cache_root) else {
-            return true;
-        };
-        if fs::symlink_metadata(&entry.path)
+        !fs::symlink_metadata(&entry.path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
-            return false;
-        }
-        let mut components = relative.components();
-        match (components.next(), components.next()) {
-            (Some(name), None) => pending
-                .iter()
-                .any(|item| item.cache_key.as_str() == name.as_os_str()),
-            _ => true,
-        }
     });
 }
 
@@ -4156,24 +4147,36 @@ mod tests {
     }
 
     #[test]
-    fn resolved_pending_record_is_forgotten_and_repends_log_again() {
+    fn vanished_pending_record_is_forgotten_and_repends_log_again() {
         let fixture = GitFixture::new();
-        let root = fixture.cache.join("terminal-worktrees");
-        let directory = root.join("ab".repeat(32));
+        let directory = fixture.cache.join("terminal-worktrees").join("ab");
         fs::create_dir_all(&directory).unwrap();
-        let key = cache_key(&directory).unwrap();
-        assert!(first_report(&key, "active-use", &directory));
-        assert!(!first_report(&key, "active-use", &directory));
-        let still_pending = [pending_item("ab".repeat(32), "active-use", None, false)];
-        forget_resolved_pending(&root, &still_pending);
-        assert!(!first_report(&key, "active-use", &directory));
-        forget_resolved_pending(&root, &[]);
-        assert!(first_report(&key, "active-use", &directory));
+        let mut reported = BTreeMap::new();
+        let now = Instant::now();
+        assert!(note_report(
+            &mut reported,
+            "k",
+            "active-use",
+            &directory,
+            now
+        ));
+        prune_vanished(&mut reported);
+        assert!(!note_report(
+            &mut reported,
+            "k",
+            "active-use",
+            &directory,
+            now
+        ));
         fs::remove_dir_all(&directory).unwrap();
-        forget_resolved_pending(&root, &still_pending);
-        fs::create_dir_all(&directory).unwrap();
-        assert!(first_report(&key, "active-use", &directory));
-        forget_reported_pending();
+        prune_vanished(&mut reported);
+        assert!(note_report(
+            &mut reported,
+            "k",
+            "active-use",
+            &directory,
+            now
+        ));
     }
 
     #[cfg(unix)]
