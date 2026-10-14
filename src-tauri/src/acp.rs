@@ -2150,24 +2150,37 @@ fn runtime_environment(
         ("NPM_CONFIG_CACHE", shared_download_cache.join("npm")),
         ("YARN_CACHE_FOLDER", shared_download_cache.join("yarn")),
         ("COREPACK_HOME", shared_download_cache.join("corepack")),
-        ("MISE_STATE_DIR", data_directory.join("mise-state")),
         ("UV_TOOL_DIR", data_directory.join("uv-tools")),
+        ("UV_TOOL_BIN_DIR", data_directory.join("bin")),
     ]);
     environment
 }
 
-fn configured_tool_paths(home: Option<&Path>) -> Vec<PathBuf> {
-    let Some(home) = home else {
-        return Vec::new();
-    };
-    [
-        home.join(".local/share/mise/shims"),
-        home.join(".local/bin"),
-        home.join(".cargo/bin"),
-    ]
-    .into_iter()
-    .filter(|path| path.is_dir())
-    .collect()
+fn configured_tool_paths(
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if windows {
+        if let Some(local) = local_app_data {
+            paths.push(local.join("mise/shims"));
+        }
+    } else if let Some(home) = home {
+        paths.push(home.join(".local/share/mise/shims"));
+    }
+    if let Some(home) = home {
+        paths.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
+    }
+    paths.into_iter().filter(|path| path.is_dir()).collect()
+}
+
+fn agent_path(
+    paths: impl IntoIterator<Item = PathBuf>,
+    original: &std::ffi::OsStr,
+) -> Result<std::ffi::OsString, String> {
+    std::env::join_paths(paths.into_iter().chain(std::env::split_paths(original)))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(unix)]
@@ -2195,7 +2208,7 @@ fn prepare_runtime_directories(data_directory: &Path, temp_directory: &Path) -> 
         temp_directory.to_path_buf(),
         data_directory.join("cache"),
         data_directory.join("build"),
-        data_directory.join("mise-state"),
+        data_directory.join("bin"),
         data_directory.join("uv-tools"),
         temp_directory.join("go-tmp"),
     ] {
@@ -5038,11 +5051,13 @@ fn connect_blocking_inner(
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     let home =
         std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     #[cfg(feature = "e2e")]
     let test_agent = std::env::var_os("SAIL_ACP_TEST_AGENT");
     #[cfg(not(feature = "e2e"))]
     let test_agent: Option<std::ffi::OsString> = None;
-    let mut paths = configured_tool_paths(home.as_deref());
+    let mut paths =
+        configured_tool_paths(home.as_deref(), local_app_data.as_deref(), cfg!(windows));
     let is_test_agent = test_agent.is_some();
     let mut owned_temp = None;
     let background = crate::background_priority::enabled(&app);
@@ -5092,11 +5107,6 @@ fn connect_blocking_inner(
             }
         }
     };
-    paths.extend(std::env::split_paths(&original_path));
-    command.env(
-        "PATH",
-        std::env::join_paths(paths).map_err(|error| error.to_string())?,
-    );
     if let Some(connection_file) = crate::hook_activity::connection_file(
         app.state::<crate::hook_activity::HookActivityManager>()
             .inner(),
@@ -5119,6 +5129,8 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
+    paths.insert(0, data_directory.join("bin"));
+    command.env("PATH", agent_path(paths, &original_path)?);
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
     #[cfg(not(unix))]
@@ -8955,6 +8967,12 @@ time.sleep(10)
             runtime_environment(&first_data, &first_temp, Some(&first_scratch), None);
         let second_environment =
             runtime_environment(&second_data, &second_temp, Some(&second_scratch), None);
+        assert!(
+            first_environment
+                .iter()
+                .all(|(name, _)| *name != "MISE_STATE_DIR"),
+            "agent runtimes must inherit mise's trusted configuration state"
+        );
         let path = |environment: &[(&str, PathBuf)], name| {
             environment
                 .iter()
@@ -8969,8 +8987,8 @@ time.sleep(10)
             "CARGO_TARGET_DIR",
             "GOCACHE",
             "GOTMPDIR",
-            "MISE_STATE_DIR",
             "UV_TOOL_DIR",
+            "UV_TOOL_BIN_DIR",
         ] {
             assert_ne!(
                 path(&first_environment, name),
@@ -8985,12 +9003,12 @@ time.sleep(10)
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
-            first_data.join("mise-state"),
+            first_data.join("bin"),
             first_data.join("uv-tools"),
             first_temp.join("go-tmp"),
             second_temp.clone(),
             second_data.join("cache"),
-            second_data.join("mise-state"),
+            second_data.join("bin"),
             second_data.join("uv-tools"),
             second_temp.join("go-tmp"),
         ] {
@@ -9022,15 +9040,34 @@ time.sleep(10)
         let shims = root.join(".local/share/mise/shims");
         let local = root.join(".local/bin");
         let cargo = root.join(".cargo/bin");
-        for directory in [&shims, &local, &cargo] {
+        let local_app_data = root.join("AppData/Local");
+        let windows_shims = local_app_data.join("mise/shims");
+        for directory in [&shims, &local, &cargo, &windows_shims] {
             std::fs::create_dir_all(directory).unwrap();
         }
 
         assert_eq!(
-            configured_tool_paths(Some(&root)),
-            vec![shims, local, cargo]
+            configured_tool_paths(Some(&root), None, false),
+            vec![shims, local.clone(), cargo.clone()]
         );
-        assert!(configured_tool_paths(None).is_empty());
+        assert_eq!(
+            configured_tool_paths(Some(&root), Some(&local_app_data), true),
+            vec![windows_shims.clone(), local, cargo]
+        );
+        assert_eq!(
+            configured_tool_paths(None, Some(&local_app_data), true),
+            vec![windows_shims]
+        );
+        assert!(configured_tool_paths(None, None, false).is_empty());
+
+        let scoped_bin = root.join("agent-data/bin");
+        let inherited =
+            std::env::join_paths([root.join("system/bin"), root.join("usr/bin")]).unwrap();
+        let joined = agent_path([scoped_bin.clone()], &inherited).unwrap();
+        assert_eq!(
+            std::env::split_paths(&joined).collect::<Vec<_>>(),
+            vec![scoped_bin, root.join("system/bin"), root.join("usr/bin")]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
