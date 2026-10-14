@@ -578,6 +578,22 @@ bool sail_context_session_request(void *handle, const char *message,
     return message && sessionExchange(handle, "request", message, output, outputLength, error, errorLength);
 }
 
+bool sail_context_session_cancel(void *handle, const char *message) {
+    @autoreleasepool {
+        if (!handle || !message) return false;
+        SailContextSession *session = (__bridge SailContextSession *)handle;
+        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(request, "op", "request");
+        xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
+        xpc_dictionary_set_string(request, "request", message);
+        xpc_connection_send_message_with_reply(
+            session.connection, request,
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+            ^(xpc_object_t ignored) { (void)ignored; });
+        return true;
+    }
+}
+
 bool sail_context_session_notifications(void *handle, char *output, size_t outputLength,
                                         char *error, size_t errorLength) {
     return sessionExchange(handle, "notifications", NULL, output, outputLength, error, errorLength);
