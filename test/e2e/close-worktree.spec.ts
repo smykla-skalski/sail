@@ -1901,4 +1901,103 @@ describe('close worktree shortcut', () => {
     expect(existsSync(parent)).toBe(true);
     expect(existsSync(child)).toBe(true);
   });
+
+  it('keeps a moved and opened Sail child in its parent cleanup preview', async () => {
+    const parent = join(worktrees, 'moved-parent');
+    const original = join(worktrees, 'moved-child-original');
+    const moved = join(worktrees, 'moved-child-current');
+    await select(first, false);
+    await carryTaskRegisteredWorktrees();
+    git('worktree', 'add', '-q', '-b', 'moved-parent', parent);
+    git('worktree', 'add', '-q', '-b', 'moved-child', original);
+    const beforeMove = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = (path: string) => {
+      const value = beforeMove.find((item) => item.path === path)?.generation;
+      if (!value) throw new Error(`Missing moved-child fixture generation at ${path}`);
+      return value;
+    };
+    const parentGeneration = generation(parent);
+    const childGeneration = generation(original);
+    git('worktree', 'move', original, moved);
+    const afterMove = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    expect(afterMove.find((item) => item.path === moved)?.generation).toBe(childGeneration);
+    await browser.execute(
+      (repo, parentPath, oldChildPath, parentIdentity, childIdentity) => {
+        const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+        catalog.worktrees[repo].push(
+          { path: parentPath, branch: 'moved-parent', generation: parentIdentity },
+          {
+            path: oldChildPath,
+            branch: 'moved-child',
+            generation: childIdentity,
+            origin: {
+              sourcePath: parentPath,
+              sourceGeneration: parentIdentity,
+              agent: 'codex',
+              sessionId: 'moved-child-session',
+              sessionTitle: 'Moved child',
+            },
+          },
+        );
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      parent,
+      original,
+      parentGeneration,
+      childGeneration,
+    );
+    await browser.refresh();
+    const external = $(`.project-worktree-select[title="${moved}"]`);
+    await diagnose('Moved child external row', () => expect(external).toBeDisplayed());
+    await external.click();
+    await diagnose('Moved child Sail ancestry restored', () =>
+      browser.waitUntil(async () =>
+        browser.execute(
+          (repo, oldPath, currentPath, sourcePath) => {
+            const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
+            const entries = catalog.worktrees?.[repo] ?? [];
+            return (
+              !entries.some((item: { path: string }) => item.path === oldPath) &&
+              entries.some(
+                (item: { path: string; origin?: { sourcePath: string } }) =>
+                  item.path === currentPath && item.origin?.sourcePath === sourcePath,
+              )
+            );
+          },
+          repository,
+          original,
+          moved,
+          parent,
+        ),
+      ),
+    );
+    await openRemovalConfirmation(parent, 'moved-parent');
+    const dialog = $('dialog.confirmation-dialog[open]');
+    await expect(dialog).toHaveText(expect.stringContaining(moved));
+    await dialog.$('button=Mark 2 pending').click();
+    await diagnose('Moved child and parent remain pending', () =>
+      browser.waitUntil(
+        async () => !!(await pendingCleanup(parent)) && !!(await pendingCleanup(moved)),
+      ),
+    );
+    await $(`[data-pending-worktree="${parent}"]`).$('button=Clean up this worktree…').click();
+    await expect($('.app-shell [role="alert"]')).toHaveText(
+      expect.stringContaining('A live descendant remains registered'),
+    );
+    expect(existsSync(parent)).toBe(true);
+    expect(existsSync(moved)).toBe(true);
+  });
 });

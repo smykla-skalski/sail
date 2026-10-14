@@ -593,6 +593,7 @@
     owningRepository,
     removeRepository,
     removeWorktree,
+    reconcileMovedWorktrees,
     reconcileSelectedRemovedWorktreeStorage,
     worktreeDescendants,
     worktreeAt,
@@ -8921,15 +8922,15 @@
 
   async function adoptExternalWorktree(repository: string, worktree: ProjectWorktree) {
     try {
-      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
-        repository,
-        paths: [worktree.path],
-      });
+      const canonicalCatalog = await canonicalizedProjectCatalog(repository);
+      if (canonicalCatalog !== projectCatalog) await saveProjectCatalogDurably(canonicalCatalog);
+      const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
       const current = registered.find((entry) => entry.path === worktree.path);
       if (!current || current.generation !== worktree.generation)
         throw new Error('The external Git worktree changed. Refresh the list and try again.');
-      saveProjectCatalog(
-        addWorktree(projectCatalog, repository, {
+      const reconciled = reconcileMovedWorktrees(projectCatalog, repository, registered);
+      await saveProjectCatalogDurably(
+        addWorktree(reconciled, repository, {
           path: worktree.path,
           branch: current.branch ?? 'detached',
           generation: current.generation,
@@ -9167,6 +9168,8 @@
       const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
       if (worktreeRegistrationPending(repository))
         throw new Error('A worktree is being created. Retry deletion when it finishes.');
+      const reconciled = reconcileMovedWorktrees(projectCatalog, repository, registered);
+      if (reconciled !== projectCatalog) await saveProjectCatalogDurably(reconciled);
       if (unmergedCatalogDescendants(projectCatalog, repository, registered, path).length)
         throw new Error(
           'A live descendant is saved under another repository path. Restore that repository alias before retrying cleanup.',
@@ -9594,6 +9597,27 @@
     const canonicalCatalog = await canonicalizedProjectCatalog(repository);
     if (canonicalCatalog !== projectCatalog) await saveProjectCatalogDurably(canonicalCatalog);
     const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+    const selectedGeneration = projectCatalog.worktrees[repository]?.find(
+      (worktree) => worktree.path === selectedPath && worktree.pendingCleanup,
+    )?.generation;
+    try {
+      const reconciled = reconcileMovedWorktrees(projectCatalog, repository, registered);
+      if (reconciled !== projectCatalog) await saveProjectCatalogDurably(reconciled);
+    } catch (cause) {
+      error = `Could not verify moved worktree ancestry: ${describe(cause)}`;
+      return;
+    }
+    if (
+      selectedGeneration &&
+      !projectCatalog.worktrees[repository]?.some(
+        (worktree) => worktree.path === selectedPath && worktree.generation === selectedGeneration,
+      )
+    ) {
+      selectedPath =
+        projectCatalog.worktrees[repository]?.find(
+          (worktree) => worktree.generation === selectedGeneration && worktree.pendingCleanup,
+        )?.path ?? selectedPath;
+    }
     const pending = (projectCatalog.worktrees[repository] ?? []).filter(
       (worktree) => worktree.pendingCleanup && worktree.path === selectedPath,
     );

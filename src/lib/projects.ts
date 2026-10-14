@@ -365,6 +365,65 @@ export function addWorktree(
   };
 }
 
+export function reconcileMovedWorktrees(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null; branch?: string | null }[],
+): ProjectCatalog {
+  const liveByGeneration = new Map<string, (typeof registered)[number]>();
+  for (const worktree of registered) {
+    if (!worktree.generation) continue;
+    const prior = liveByGeneration.get(worktree.generation);
+    if (prior && prior.path !== worktree.path)
+      throw new Error('A Git generation is registered at multiple paths. No worktree was adopted.');
+    liveByGeneration.set(worktree.generation, worktree);
+  }
+  let entries = catalog.worktrees[repository] ?? [];
+  let changed = false;
+  for (const [generation, live] of liveByGeneration) {
+    const sameGeneration = entries.filter((entry) => entry.generation === generation);
+    const stale = sameGeneration.filter((entry) => entry.path !== live.path);
+    if (!stale.length) continue;
+    if (stale.length !== 1)
+      throw new Error('A moved Git generation has multiple saved owners. No worktree was adopted.');
+    const saved = stale[0];
+    const atDestination = entries.find((entry) => entry.path === live.path);
+    if (atDestination && atDestination.generation !== generation)
+      throw new Error('A moved Git generation conflicts with saved data at its new path.');
+    const moved = {
+      ...saved,
+      path: live.path,
+      branch: live.branch ?? saved.branch,
+      ...(saved.pendingCleanup
+        ? {
+            pendingCleanup: movePendingWorktreeCleanup(
+              saved.pendingCleanup,
+              saved.path,
+              live.path,
+              generation,
+            ),
+          }
+        : {}),
+    };
+    const merged = atDestination
+      ? mergeSavedWorktrees(moved, {
+          ...atDestination,
+          branch: live.branch ?? atDestination.branch,
+        })
+      : moved;
+    entries = entries.flatMap((entry) => {
+      if (entry === saved) return [merged];
+      if (entry === atDestination) return [];
+      if (entry.origin?.sourcePath === saved.path && entry.origin.sourceGeneration === generation)
+        return [{ ...entry, origin: { ...entry.origin, sourcePath: live.path } }];
+      return [entry];
+    });
+    changed = true;
+  }
+  if (!changed) return catalog;
+  return { ...catalog, worktrees: { ...catalog.worktrees, [repository]: entries } };
+}
+
 export function currentCatalogWorktrees(
   catalog: ProjectCatalog,
   repository: string,

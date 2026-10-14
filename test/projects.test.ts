@@ -14,6 +14,7 @@ import {
   owningRepository,
   removeRepository,
   removeWorktree,
+  reconcileMovedWorktrees,
   reconcileSelectedRemovedWorktreeStorage,
   replaceRepositoryPath,
   setWorktreePullRequest,
@@ -973,6 +974,155 @@ await test('selects only live Sail descendants in leaf-first order', () => {
     catalog.worktrees['/repo'].find((entry) => entry.path === '/external-child'),
   ]);
   assert.deepEqual(worktreeDescendants(catalog, '/repo', registered, '/missing'), []);
+});
+
+const movedChildOrigin = (sourcePath: string, sourceGeneration: string) => ({
+  sourcePath,
+  sourceGeneration,
+  agent: 'codex',
+  sessionId: 'session',
+  sessionTitle: 'Task',
+});
+
+await test('reconciles a Git-moved child and its nested ancestry before parent cleanup', () => {
+  const parent = testGeneration(1);
+  const child = testGeneration(2);
+  const grandchild = testGeneration(3);
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo'],
+      worktrees: {
+        '/repo': [
+          { path: '/parent', branch: 'parent', generation: parent },
+          {
+            path: '/old-child',
+            branch: 'child',
+            generation: child,
+            origin: movedChildOrigin('/parent', parent),
+          },
+          {
+            path: '/grandchild',
+            branch: 'grandchild',
+            generation: grandchild,
+            origin: movedChildOrigin('/old-child', child),
+          },
+        ],
+      },
+    }),
+    '/repo',
+  );
+  const registered = [
+    { path: '/parent', generation: parent, branch: 'parent' },
+    { path: '/moved-child', generation: child, branch: 'child' },
+    { path: '/grandchild', generation: grandchild, branch: 'grandchild' },
+  ];
+  assert.deepEqual(worktreeDescendants(catalog, '/repo', registered, '/parent'), []);
+
+  const reconciled = reconcileMovedWorktrees(catalog, '/repo', registered);
+
+  assert.deepEqual(
+    worktreeDescendants(reconciled, '/repo', registered, '/parent').map((item) => item.path),
+    ['/grandchild', '/moved-child'],
+  );
+  assert.equal(
+    reconciled.worktrees['/repo'].find((item) => item.path === '/grandchild')?.origin?.sourcePath,
+    '/moved-child',
+  );
+  assert.deepEqual(externalGitWorktrees(reconciled, '/repo', registered), []);
+});
+
+await test('adopting a moved generation preserves its saved Sail origin and pending evidence', () => {
+  const parent = testGeneration(1);
+  const child = testGeneration(2);
+  const pendingCleanup = {
+    originalPath: '/old-child',
+    recoveryPath: '/old-child',
+    sizeBytes: 12,
+    reason: 'Files remain pending.',
+    storagePaths: ['/private/cache/child'],
+    storageKeys: ['a'.repeat(64)],
+    selectedWorktreeCleanupConfirmed: true,
+  };
+  const saved = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+    path: '/old-child',
+    branch: 'child',
+    generation: child,
+    origin: {
+      sourcePath: '/parent',
+      sourceGeneration: parent,
+      agent: 'codex',
+      sessionId: 'child-session',
+      sessionTitle: 'Child',
+    },
+    pendingCleanup,
+  });
+  const adopted = addWorktree(saved, '/repo', {
+    path: '/moved-child',
+    branch: 'child',
+    generation: child,
+  });
+  const registered = [
+    { path: '/parent', generation: parent, branch: 'parent' },
+    { path: '/moved-child', generation: child, branch: 'child' },
+  ];
+  assert.deepEqual(worktreeDescendants(adopted, '/repo', registered, '/parent'), []);
+
+  const reconciled = reconcileMovedWorktrees(adopted, '/repo', registered);
+  const childRow = reconciled.worktrees['/repo'].find((item) => item.generation === child);
+
+  assert.equal(reconciled.worktrees['/repo'].length, 1);
+  assert.equal(childRow?.path, '/moved-child');
+  assert.equal(childRow?.origin?.sourcePath, '/parent');
+  assert.equal(childRow?.pendingCleanup?.originalPath, '/old-child');
+  assert.equal(childRow?.pendingCleanup?.recoveryPath, '/moved-child');
+  assert.deepEqual(childRow?.pendingCleanup?.storagePaths, pendingCleanup.storagePaths);
+  assert.equal(childRow?.pendingCleanup?.selectedWorktreeCleanupConfirmed, undefined);
+  assert.deepEqual(
+    worktreeDescendants(reconciled, '/repo', registered, '/parent').map((item) => item.path),
+    ['/moved-child'],
+  );
+});
+
+await test('ambiguous moved generations refuse catalog adoption without losing saved rows', () => {
+  const generation = testGeneration(2);
+  const saved = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+    path: '/old-child',
+    branch: 'child',
+    generation,
+  });
+  const cases = [
+    {
+      name: 'destination has another pending generation',
+      catalog: addWorktree(saved, '/repo', {
+        path: '/new-child',
+        branch: 'other',
+        generation: testGeneration(3),
+        pendingCleanup: {
+          originalPath: '/new-child',
+          recoveryPath: '/new-child',
+          sizeBytes: 4,
+          reason: 'Retained data.',
+        },
+      }),
+      registered: [{ path: '/new-child', generation, branch: 'child' }],
+    },
+    {
+      name: 'same Git generation has two registered paths',
+      catalog: saved,
+      registered: [
+        { path: '/old-child', generation, branch: 'child' },
+        { path: '/new-child', generation, branch: 'child' },
+      ],
+    },
+  ];
+  for (const scenario of cases) {
+    assert.throws(
+      () => reconcileMovedWorktrees(scenario.catalog, '/repo', scenario.registered),
+      /generation|conflicts/i,
+      scenario.name,
+    );
+    assert.equal(scenario.catalog.worktrees['/repo'][0].path, '/old-child', scenario.name);
+  }
 });
 
 await test('shows an external worktree when Git reuses a stale catalog path', () => {
