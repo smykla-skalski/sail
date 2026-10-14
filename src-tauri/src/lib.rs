@@ -4733,17 +4733,38 @@ pub fn run() {
                 .name("sail-startup-maintenance".into())
                 .spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(2));
+                    #[cfg(unix)]
+                    scratch_cleanup::lower_thread_priority();
                     let started = std::time::Instant::now();
                     diagnostics::record("startup_maintenance_started", serde_json::json!({}));
+                    let mut phases = serde_json::Map::new();
+                    let mut timed = |name: &str, run: &mut dyn FnMut()| {
+                        let phase_started = std::time::Instant::now();
+                        run();
+                        phases.insert(
+                            format!("{name}Ms"),
+                            serde_json::json!(phase_started.elapsed().as_millis() as u64),
+                        );
+                    };
                     if let Some(cache_directory) = cache_directory.as_ref() {
-                        worktree_storage::reconcile(cache_directory);
-                        git_overlay::restore_registered(cache_directory);
+                        timed("worktreeStorage", &mut || {
+                            worktree_storage::reconcile(cache_directory);
+                        });
+                        timed("gitOverlay", &mut || {
+                            git_overlay::restore_registered(cache_directory);
+                        });
                     }
                     #[cfg(unix)]
-                    scratch_cleanup::sweep_on_startup(cache_directory.as_deref());
+                    timed("scratchSweep", &mut || {
+                        scratch_cleanup::sweep_on_startup(cache_directory.as_deref());
+                    });
+                    phases.insert(
+                        "elapsedMs".into(),
+                        serde_json::json!(started.elapsed().as_millis() as u64),
+                    );
                     diagnostics::record(
                         "startup_maintenance_finished",
-                        serde_json::json!({"elapsedMs":started.elapsed().as_millis()}),
+                        serde_json::Value::Object(phases),
                     );
                 })
                 .map_err(std::io::Error::other)?;
