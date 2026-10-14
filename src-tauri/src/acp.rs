@@ -2185,9 +2185,16 @@ fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn agent_path(
-    paths: impl IntoIterator<Item = PathBuf>,
+    mut paths: Vec<PathBuf>,
+    scoped_tool_bin: PathBuf,
     original: &std::ffi::OsStr,
 ) -> Result<std::ffi::OsString, String> {
+    let scoped_index = usize::from(
+        paths
+            .first()
+            .is_some_and(|path| path.ends_with(Path::new("mise/shims"))),
+    );
+    paths.insert(scoped_index, scoped_tool_bin);
     std::env::join_paths(paths.into_iter().chain(std::env::split_paths(original)))
         .map_err(|error| error.to_string())
 }
@@ -5138,8 +5145,10 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
-    paths.insert(0, data_directory.join("bin"));
-    command.env("PATH", agent_path(paths, &original_path)?);
+    command.env(
+        "PATH",
+        agent_path(paths, data_directory.join("bin"), &original_path)?,
+    );
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
     #[cfg(not(unix))]
@@ -9060,7 +9069,7 @@ time.sleep(10)
 
         assert_eq!(
             configured_tool_paths(Some(&root), None, false),
-            vec![shims, local.clone(), cargo.clone()]
+            vec![shims.clone(), local.clone(), cargo.clone()]
         );
         assert_eq!(
             configured_tool_paths(Some(&root), Some(&local_app_data), true),
@@ -9068,17 +9077,46 @@ time.sleep(10)
         );
         assert_eq!(
             configured_tool_paths(None, Some(&local_app_data), true),
-            vec![windows_shims]
+            vec![windows_shims.clone()]
         );
         assert!(configured_tool_paths(None, None, false).is_empty());
 
         let scoped_bin = root.join("agent-data/bin");
         let inherited =
             std::env::join_paths([root.join("system/bin"), root.join("usr/bin")]).unwrap();
-        let joined = agent_path([scoped_bin.clone()], &inherited).unwrap();
+        let joined = agent_path(
+            configured_tool_paths(Some(&root), None, false),
+            scoped_bin.clone(),
+            &inherited,
+        )
+        .unwrap();
         assert_eq!(
             std::env::split_paths(&joined).collect::<Vec<_>>(),
-            vec![scoped_bin, root.join("system/bin"), root.join("usr/bin")]
+            vec![
+                shims,
+                scoped_bin.clone(),
+                root.join(".local/bin"),
+                root.join(".cargo/bin"),
+                root.join("system/bin"),
+                root.join("usr/bin")
+            ]
+        );
+        let windows_joined = agent_path(
+            configured_tool_paths(Some(&root), Some(&local_app_data), true),
+            scoped_bin,
+            &inherited,
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&windows_joined).collect::<Vec<_>>(),
+            vec![
+                windows_shims,
+                root.join("agent-data/bin"),
+                root.join(".local/bin"),
+                root.join(".cargo/bin"),
+                root.join("system/bin"),
+                root.join("usr/bin")
+            ]
         );
         std::fs::remove_dir_all(root).unwrap();
     }
