@@ -17,6 +17,7 @@ const PRIVATE_MARKER_VALUE: &str = "sail-cleanup-private-v1\n";
 const PRIVATE_OWNER: &str = ".sail-cleanup-owner";
 
 pub(crate) fn sweep_on_startup(cache_directory: Option<&Path>) {
+    lower_thread_priority();
     let root = std::env::temp_dir();
     let now = SystemTime::now();
     let mut phases = serde_json::Map::new();
@@ -728,6 +729,7 @@ fn make_directories_writable(root: &Path) {
 }
 
 fn stop_root_processes(root: &Path) {
+    STOP_EPOCH.with(|epoch| epoch.set(epoch.get() + 1));
     let Ok(canonical) = fs::canonicalize(root) else {
         return;
     };
@@ -939,6 +941,8 @@ fn owner_status(marker: &Path) -> Option<bool> {
 }
 
 fn inspect(path: &Path, device: u64, now: SystemTime) -> std::io::Result<Option<u64>> {
+    #[cfg(test)]
+    INSPECT_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut pending = vec![path.to_path_buf()];
     let mut bytes = 0;
     while let Some(current) = pending.pop() {
@@ -968,7 +972,18 @@ pub(crate) fn lower_thread_priority() {
     }
 }
 
-const UNLINKED_CACHE_AGE: Duration = Duration::from_secs(60);
+#[cfg(test)]
+thread_local! {
+    static INSPECT_WALKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    // Stopping a process can release an unlinked file, so a scan read before
+    // that is stale for the root being swept.
+    static STOP_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+const UNLINKED_CACHE_AGE: Duration = Duration::from_secs(20);
 
 fn lsof_binary() -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -996,17 +1011,21 @@ fn background_lsof() -> Command {
 // `lsof +L1` scans every process, so one sweep pass shares its result across
 // roots. A root's final check, made after it is hidden in quarantine, reads it
 // fresh.
+// When and under which stop epoch the scan was read, and its output.
+type UnlinkedScan = (std::time::Instant, u64, std::sync::Arc<Vec<u8>>);
+
 #[derive(Default)]
 struct OpenFileProbe {
     reads: std::cell::Cell<u32>,
-    unlinked: std::cell::RefCell<Option<(std::time::Instant, std::sync::Arc<Vec<u8>>)>>,
+    unlinked: std::cell::RefCell<Option<UnlinkedScan>>,
 }
 
 impl OpenFileProbe {
     fn unlinked_open_files(&self, fresh: bool) -> Option<std::sync::Arc<Vec<u8>>> {
         if !fresh {
-            if let Some((read, output)) = self.unlinked.borrow().as_ref() {
-                if read.elapsed() < UNLINKED_CACHE_AGE {
+            let epoch = STOP_EPOCH.with(std::cell::Cell::get);
+            if let Some((read, read_epoch, output)) = self.unlinked.borrow().as_ref() {
+                if read.elapsed() < UNLINKED_CACHE_AGE && *read_epoch == epoch {
                     return Some(output.clone());
                 }
             }
@@ -1020,7 +1039,11 @@ impl OpenFileProbe {
             return None;
         }
         let output = std::sync::Arc::new(unlinked.stdout);
-        *self.unlinked.borrow_mut() = Some((std::time::Instant::now(), output.clone()));
+        *self.unlinked.borrow_mut() = Some((
+            std::time::Instant::now(),
+            STOP_EPOCH.with(std::cell::Cell::get),
+            output.clone(),
+        ));
         Some(output)
     }
 
@@ -1744,25 +1767,37 @@ mod tests {
         assert_eq!(probe.reads.get(), 1 + roots.len() as u32);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stopping_a_process_discards_the_shared_unlinked_scan() {
+        let temp = fixture();
+        let first = temp.join("sail-699-target.first");
+        let second = temp.join("sail-699-target.second");
+        for root in [&first, &second] {
+            fs::create_dir(root).unwrap();
+        }
+        let held = second.join("held");
+        let handle = fs::File::create(&held).unwrap();
+        fs::remove_file(&held).unwrap();
+        let probe = OpenFileProbe::default();
+        assert_eq!(probe.check(&first), Some(false));
+        assert_eq!(probe.check(&second), Some(true));
+        drop(handle);
+        assert_eq!(probe.check(&second), Some(true), "scan still shared");
+        stop_root_processes(&first);
+        assert_eq!(probe.check(&second), Some(false));
+    }
+
     #[test]
     fn a_live_owner_root_is_never_walked() {
         let temp = fixture();
         let live = temp.join("sail-699-target.live");
         fs::create_dir(&live).unwrap();
         fs::write(live.join(MARKER), owner_identity().unwrap()).unwrap();
-        let locked = live.join("locked");
-        fs::create_dir(&locked).unwrap();
-        fs::write(locked.join("file"), "x").unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let walked = std::cell::Cell::new(false);
+        let before = INSPECT_WALKS.with(std::cell::Cell::get);
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
-        sweep(&temp, future, |_| {
-            walked.set(true);
-            Some(false)
-        })
-        .unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(!walked.get());
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert_eq!(INSPECT_WALKS.with(std::cell::Cell::get), before);
         assert!(live.exists());
     }
 

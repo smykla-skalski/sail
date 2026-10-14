@@ -4733,8 +4733,6 @@ pub fn run() {
                 .name("sail-startup-maintenance".into())
                 .spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(2));
-                    #[cfg(unix)]
-                    scratch_cleanup::lower_thread_priority();
                     let started = std::time::Instant::now();
                     diagnostics::record("startup_maintenance_started", serde_json::json!({}));
                     let mut phases = serde_json::Map::new();
