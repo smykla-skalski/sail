@@ -317,8 +317,14 @@ int sail_context_service_main(void) {
                                         NSDictionary *latest = sessions[key] == session
                                             ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
                                         if ([latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
-                                            accepted = enqueueNotification(sessions, key, session,
-                                                                           text, sharedNotification(text));
+                                            accepted = true;
+                                            for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+                                                if (!line.length) continue;
+                                                NSString *notification = [line stringByAppendingString:@"\n"];
+                                                accepted = enqueueNotification(sessions, key, session,
+                                                    notification, sharedNotification(notification));
+                                                if (!accepted) break;
+                                            }
                                         } else if (sessions[key] == session) {
                                             stopInvalidatedProvider(session, latest);
                                             closeSession(sessions, key);

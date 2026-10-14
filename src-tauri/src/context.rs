@@ -1553,6 +1553,20 @@ fn provider_request_at(
 type NotificationSink<'a> = Option<&'a mut dyn FnMut(&str) -> Result<(), String>>;
 
 #[cfg(target_os = "macos")]
+fn flush_provider_notifications(
+    notify: &mut NotificationSink<'_>,
+    pending: &mut String,
+) -> Result<(), String> {
+    if let Some(notify) = notify {
+        if !pending.is_empty() {
+            notify(pending)?;
+            pending.clear();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn provider_request_with_notifications_at(
     directory: &Path,
     expected: &str,
@@ -1645,8 +1659,37 @@ fn provider_request_with_notifications_at(
             .map_err(|error| error.to_string())?;
     };
     drop(registry);
-    let mut provider = slot.lock().map_err(|error| error.to_string())?;
     let session_active = || session_is_active(capability);
+    let mut provider = loop {
+        match slot.try_lock() {
+            Ok(provider) => break provider,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if !session_active()? {
+                    return Err("Context session revoked before provider request.".into());
+                }
+                if let Some(id) = request.get("id") {
+                    if !take_cancellations(&key, capability, id).is_empty() {
+                        let current = locked_store(store_path, |store| {
+                            Ok((status(&canonical, store), false))
+                        })?;
+                        if current.state != "approved"
+                            || current.fingerprint.as_deref() != Some(expected)
+                            || !session_active()?
+                        {
+                            return Err("Context approval changed or was revoked.".into());
+                        }
+                        return Ok(Some(cancelled_provider_response(id)));
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err("Provider request timed out waiting for another request.".into());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
     if !session_active()? {
         if provider.is_none() {
             drop(provider);
@@ -2299,9 +2342,15 @@ fn exchange_provider_request(
     let upstream_id = upstream_id.ok_or("Provider request has no upstream ID.")?;
     let deadline = deadline.unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(30));
     let mut buffered = String::new();
+    let mut notifications = String::new();
+    let mut flush_at = std::time::Instant::now() + Duration::from_millis(10);
     let response = loop {
         if !session_active()? {
             return Err("Context session revoked before provider response.".into());
+        }
+        if std::time::Instant::now() >= flush_at {
+            flush_provider_notifications(&mut notify, &mut notifications)?;
+            flush_at = std::time::Instant::now() + Duration::from_millis(10);
         }
         let cancellations = take_cancellations(key, capability, request_id);
         for notification in &cancellations {
@@ -2361,8 +2410,12 @@ fn exchange_provider_request(
                     value["params"]["progressToken"] = progress_token.clone();
                     message = format!("{value}\n");
                 }
-                if let Some(notify) = &mut notify {
-                    notify(&message)?;
+                if notify.is_some() {
+                    if notifications.len() + message.len() > 1024 * 1024 {
+                        flush_provider_notifications(&mut notify, &mut notifications)?;
+                        flush_at = std::time::Instant::now() + Duration::from_millis(10);
+                    }
+                    notifications.push_str(&message);
                 } else {
                     if buffered.len() + message.len() > 1024 * 1024 {
                         return Err("Buffered provider output exceeds 1 MiB.".into());
@@ -2380,6 +2433,7 @@ fn exchange_provider_request(
                 if response_id != Some(upstream_id) {
                     return Err("Provider response ID did not match the request.".into());
                 }
+                flush_provider_notifications(&mut notify, &mut notifications)?;
                 value["id"] = request_id.clone();
                 let message = value.to_string();
                 if buffered.len() + message.len() > 1024 * 1024 {
@@ -3254,12 +3308,14 @@ mod tests {
         let request = json!({"jsonrpc":"2.0","id":1,"method":"many-progress","params":{"_meta":{"progressToken":"fixture"}}}).to_string();
         let mut count = 0;
         let mut notify = |message: &str| {
-            let value: serde_json::Value = serde_json::from_str(message).unwrap();
-            assert_eq!(value["method"], "notifications/progress");
-            assert_eq!(value["params"]["progressToken"], "fixture");
-            assert_eq!(value["params"]["progress"], count);
-            count += 1;
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            for line in message.lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(value["method"], "notifications/progress");
+                assert_eq!(value["params"]["progressToken"], "fixture");
+                assert_eq!(value["params"]["progress"], count);
+                count += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
             Ok(())
         };
         let response = provider_request_with_notifications_at(
@@ -3831,6 +3887,7 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":request_id,"method":"tools/list"}).to_string();
             let queued_cancellation = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id}}).to_string();
             let (ready, received) = std::sync::mpsc::sync_channel(1);
+            let (completion, completed) = std::sync::mpsc::sync_channel(1);
 
             let cancelled = std::thread::scope(|scope| {
                 let active = scope.spawn(|| {
@@ -3848,11 +3905,15 @@ mod tests {
                 received
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
-                let queued = scope.spawn(|| call(&queued_request, &owner.0));
-                call(&queued_cancellation, &owner.0).unwrap();
+                let queued = scope.spawn(|| {
+                    completion.send(call(&queued_request, &peer.0)).unwrap();
+                });
+                call(&queued_cancellation, &peer.0).unwrap();
+                let cancelled = completed.recv_timeout(std::time::Duration::from_secs(2));
                 call(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":10}}"#, &owner.0).unwrap();
                 active.join().unwrap().unwrap();
-                queued.join().unwrap()
+                queued.join().unwrap();
+                cancelled.expect("Queued cancellation waited for the unrelated active request")
             });
 
             let cancelled = cancelled.unwrap().unwrap();
@@ -4073,11 +4134,13 @@ mod tests {
             .to_string();
             let mut count = 0;
             let mut notify = |message: &str| {
-                let value: serde_json::Value = serde_json::from_str(message).unwrap();
-                assert_eq!(value["method"], "notifications/progress");
-                assert_eq!(value["params"]["progressToken"], token);
-                assert_eq!(value["params"]["progress"], count);
-                count += 1;
+                for line in message.lines() {
+                    let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    assert_eq!(value["method"], "notifications/progress");
+                    assert_eq!(value["params"]["progressToken"], token);
+                    assert_eq!(value["params"]["progress"], count);
+                    count += 1;
+                }
                 Ok(())
             };
             let response = provider_request_with_notifications_at(
