@@ -71,6 +71,44 @@ describe('reported agent focus', () => {
       { timeout: 25_000 },
     );
   });
+  it('retains current Tasks focus when the working session is hidden and reopened through Agents', async () => {
+    await $('.agent-composer [data-pane-prompt]').setValue('Report session focus');
+    const send = $('.agent-actions button:last-child');
+    await send.waitForEnabled();
+    await send.click();
+    const panel = $('#session-details [aria-label="Session tasks"]');
+    await expect(panel.$('[data-focus-source="Agent report"]')).toHaveText(
+      expect.stringContaining('Test live tasks'),
+    );
+    const reportedAt = await panel.$('time').getAttribute('datetime');
+    const storedReport = await browser.execute(() => localStorage.getItem('sai-session-tasks'));
+    expect(storedReport).toBeTruthy();
+    await $('.project-agent-menu').click();
+    await $('[role="menuitem"]*=Remove from sidebar').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await expect(panel.$('[data-focus-source="Agent report"]')).toHaveText(
+      expect.stringContaining('Test live tasks'),
+    );
+    await expect(panel.$('time')).toHaveAttribute('datetime', reportedAt);
+    expect(await browser.execute(() => localStorage.getItem('sai-session-tasks'))).toBe(
+      storedReport,
+    );
+    await $('.agent-status-summary').click();
+    await expect($('.agent-status-popover [data-focus-source="Agent report"]')).toHaveText(
+      expect.stringContaining('Test live tasks'),
+    );
+    await expect($('.agent-status-popover time')).toHaveAttribute('datetime', reportedAt);
+    await $('.agent-status-row').click();
+    await expect(panel.$('[data-focus-source="Agent report"]')).toHaveText(
+      expect.stringContaining('Test live tasks'),
+    );
+    await expect(panel.$('time')).toHaveAttribute('datetime', reportedAt);
+    expect(await browser.execute(() => localStorage.getItem('sai-session-tasks'))).toBe(
+      storedReport,
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await expect(panel.$('[data-focus-source="Agent report"]')).not.toExist();
+  });
   it('suppresses current focus while an elicitation form waits for input', async () => {
     await $('.agent-composer [data-pane-prompt]').setValue('Report focus then ask');
     const send = $('.agent-actions button:last-child');

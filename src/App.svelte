@@ -13079,7 +13079,7 @@
         {#if acpAgent}<div class:inactive={activeSideTab !== 'tasks'} class="side-view">
             <TasksPanel
               snapshot={taskSnapshot}
-              status={acpThread ? (taskOverviewStatuses[threadKey(acpThread)] ?? null) : null}
+              status={acpThread ? (agentStatusStatuses[threadKey(acpThread)] ?? null) : null}
             />
           </div>{/if}
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
