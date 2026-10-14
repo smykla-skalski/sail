@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +34,8 @@ const RECORD_KEYS: &[&str] = &[
 ];
 
 const RECORD_PREFIXES: &[&str] = &[
+    "sai-agent-failed-draft:",
+    "sai-pending-worktree-start:",
     "sai-implementation-",
     "sai-issue-graph:",
     "sai-plan-draft:",
@@ -67,9 +69,9 @@ fn parse(contents: &str) -> Option<(String, String)> {
     ))
 }
 
-fn sync_directory(directory: &Path) {
+pub(crate) fn sync_directory(directory: &Path) {
     #[cfg(unix)]
-    if let Ok(handle) = File::open(directory) {
+    if let Ok(handle) = fs::File::open(directory) {
         let _ = handle.sync_all();
     }
     #[cfg(not(unix))]
@@ -115,8 +117,13 @@ pub(crate) fn read_all(settings: &Path) -> Result<Records, String> {
 
 pub(crate) fn write(settings: &Path, key: &str, value: &str) -> Result<(), String> {
     let directory = directory(settings);
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Cannot create settings records folder: {error}"))?;
+    if !directory.exists() {
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("Cannot create settings records folder: {error}"))?;
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent);
+        }
+    }
     let name = file_name(key);
     let temporary = directory.join(format!("{name}.tmp"));
     let contents = serde_json::to_vec(&serde_json::json!({ "key": key, "value": value }))

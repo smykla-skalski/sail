@@ -568,7 +568,7 @@ fn migrate_records(path: &Path) -> Result<(), String> {
     let mut file = read_settings_file(path)?;
     if file.keys().any(|key| is_record_key(key)) {
         for (key, value) in &file {
-            if is_record_key(key) && records::read(path, key)?.is_none() {
+            if is_record_key(key) {
                 records::write(path, key, value)?;
             }
         }
@@ -679,6 +679,9 @@ fn write_settings_file(path: &Path, settings: &Settings) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     fs::rename(&temporary, path).map_err(|error| format!("Cannot save settings: {error}"))?;
+    if let Some(parent) = path.parent() {
+        records::sync_directory(parent);
+    }
     Ok(())
 }
 
@@ -1690,17 +1693,17 @@ mod tests {
     }
 
     #[test]
-    fn a_crash_after_copying_records_loses_nothing_on_the_next_load() {
+    fn settings_file_copy_wins_so_a_downgrade_write_is_not_lost() {
         let path = scratch_settings("crash");
         let legacy = Settings::from([
             ("sai-theme".to_string(), "dark".to_string()),
             ("sai-ship-runs".to_string(), "[\"old\"]".to_string()),
         ]);
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        records::write(&path, "sai-ship-runs", "[\"newer\"]").unwrap();
+        records::write(&path, "sai-ship-runs", "[\"stale\"]").unwrap();
 
         let loaded = read_settings(&path).unwrap();
-        assert_eq!(loaded["sai-ship-runs"], "[\"newer\"]");
+        assert_eq!(loaded["sai-ship-runs"], "[\"old\"]");
         assert_eq!(loaded["sai-theme"], "dark");
         assert!(!read_settings_file(&path)
             .unwrap()
