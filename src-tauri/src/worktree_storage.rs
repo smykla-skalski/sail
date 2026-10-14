@@ -3779,31 +3779,52 @@ fn remove_quarantine_with_identity(
     }
 }
 
-static REPORTED_PENDING: OnceLock<Mutex<BTreeMap<String, (String, Instant)>>> = OnceLock::new();
+struct ReportedPending {
+    reason: String,
+    at: Instant,
+    path: PathBuf,
+}
+
+static REPORTED_PENDING: OnceLock<Mutex<BTreeMap<String, ReportedPending>>> = OnceLock::new();
 const REPORT_REPEAT_AFTER: Duration = Duration::from_secs(60 * 60);
+const REPORT_MAP_LIMIT: usize = 256;
 
 // Pollers re-enter the pending paths every second; log a key again only
-// when its reason changes, a retry clears the record, or the item resolved
-// and the stale record expired.
-fn first_report(key: &str, reason: &str) -> bool {
+// when its reason changes, a retry clears the record, the item resolved
+// or the stale record expired.
+fn first_report(key: &str, reason: &str, path: &Path) -> bool {
     let mut reported = REPORTED_PENDING
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    note_report(&mut reported, key, reason, Instant::now())
+    note_report(&mut reported, key, reason, path, Instant::now())
 }
 
 fn note_report(
-    reported: &mut BTreeMap<String, (String, Instant)>,
+    reported: &mut BTreeMap<String, ReportedPending>,
     key: &str,
     reason: &str,
+    path: &Path,
     now: Instant,
 ) -> bool {
-    reported.retain(|_, (_, at)| now.saturating_duration_since(*at) < REPORT_REPEAT_AFTER);
-    if reported.get(key).is_some_and(|(last, _)| last == reason) {
+    let fresh = |at: Instant| now.saturating_duration_since(at) < REPORT_REPEAT_AFTER;
+    if reported.len() > REPORT_MAP_LIMIT {
+        reported.retain(|_, entry| fresh(entry.at));
+    }
+    if reported
+        .get(key)
+        .is_some_and(|entry| entry.reason == reason && fresh(entry.at))
+    {
         return false;
     }
-    reported.insert(key.to_string(), (reason.to_string(), now));
+    reported.insert(
+        key.to_string(),
+        ReportedPending {
+            reason: reason.to_string(),
+            at: now,
+            path: path.to_path_buf(),
+        },
+    );
     true
 }
 
@@ -3816,26 +3837,32 @@ pub(crate) fn forget_reported_pending() {
 }
 
 fn forget_resolved_pending(cache_root: &Path, pending: &[CleanupPending]) {
-    let Ok(entries) = fs::read_dir(cache_root) else {
-        return;
-    };
     let mut reported = REPORTED_PENDING
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+    reported.retain(|_, entry| {
+        let Ok(relative) = entry.path.strip_prefix(cache_root) else {
+            return true;
         };
-        if !pending.iter().any(|item| item.cache_key == name) {
-            reported.remove(&name);
+        if fs::symlink_metadata(&entry.path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return false;
         }
-    }
+        let mut components = relative.components();
+        match (components.next(), components.next()) {
+            (Some(name), None) => pending
+                .iter()
+                .any(|item| item.cache_key.as_str() == name.as_os_str()),
+            _ => true,
+        }
+    });
 }
 
 fn report_pending(path: &Path, reason: &str) {
     let key = cache_key(path).unwrap_or_else(|_| "unknown".into());
-    if !first_report(&key, reason) {
+    if !first_report(&key, reason, path) {
         return;
     }
     crate::diagnostics::record(
@@ -4106,19 +4133,47 @@ mod tests {
     #[test]
     fn pending_report_repeats_only_on_reason_change_or_expiry() {
         let mut reported = BTreeMap::new();
+        let path = Path::new("/cache/terminal-worktrees/a");
         let start = Instant::now();
-        assert!(note_report(&mut reported, "k", "failed", start));
+        assert!(note_report(&mut reported, "k", "failed", path, start));
         for second in 1..=5 {
             let now = start + Duration::from_secs(second);
-            assert!(!note_report(&mut reported, "k", "failed", now));
+            assert!(!note_report(&mut reported, "k", "failed", path, now));
         }
-        assert!(note_report(&mut reported, "k", "active-use", start));
-        assert!(!note_report(&mut reported, "k", "active-use", start));
-        assert!(note_report(&mut reported, "other", "active-use", start));
+        assert!(note_report(&mut reported, "k", "active-use", path, start));
+        assert!(!note_report(&mut reported, "k", "active-use", path, start));
+        assert!(note_report(
+            &mut reported,
+            "other",
+            "active-use",
+            path,
+            start
+        ));
         let later = start + REPORT_REPEAT_AFTER;
-        assert!(note_report(&mut reported, "k", "active-use", later));
+        assert!(note_report(&mut reported, "k", "active-use", path, later));
         reported.clear();
-        assert!(note_report(&mut reported, "k", "active-use", later));
+        assert!(note_report(&mut reported, "k", "active-use", path, later));
+    }
+
+    #[test]
+    fn resolved_pending_record_is_forgotten_and_repends_log_again() {
+        let fixture = GitFixture::new();
+        let root = fixture.cache.join("terminal-worktrees");
+        let directory = root.join("ab".repeat(32));
+        fs::create_dir_all(&directory).unwrap();
+        let key = cache_key(&directory).unwrap();
+        assert!(first_report(&key, "active-use", &directory));
+        assert!(!first_report(&key, "active-use", &directory));
+        let still_pending = [pending_item("ab".repeat(32), "active-use", None, false)];
+        forget_resolved_pending(&root, &still_pending);
+        assert!(!first_report(&key, "active-use", &directory));
+        forget_resolved_pending(&root, &[]);
+        assert!(first_report(&key, "active-use", &directory));
+        fs::remove_dir_all(&directory).unwrap();
+        forget_resolved_pending(&root, &still_pending);
+        fs::create_dir_all(&directory).unwrap();
+        assert!(first_report(&key, "active-use", &directory));
+        forget_reported_pending();
     }
 
     #[cfg(unix)]
