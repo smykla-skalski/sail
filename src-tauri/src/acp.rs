@@ -2175,6 +2175,15 @@ fn configured_tool_paths(
     paths.into_iter().filter(|path| path.is_dir()).collect()
 }
 
+fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
+    let directory = home?.join(".gnupg");
+    std::fs::symlink_metadata(&directory)
+        .ok()?
+        .file_type()
+        .is_dir()
+        .then_some(directory)
+}
+
 fn agent_path(
     paths: impl IntoIterator<Item = PathBuf>,
     original: &std::ffi::OsStr,
@@ -5143,6 +5152,9 @@ fn connect_blocking_inner(
             .join("terminal-package-downloads");
         std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
         let mut writable = vec![temp.0.clone(), data_directory.clone(), shared_cache];
+        if let Some(gnupg) = default_gnupg_directory(home.as_deref()) {
+            writable.push(gnupg);
+        }
         if let Some(overlay) = overlay.as_ref() {
             writable.push(overlay.git_dir.clone());
         }
@@ -9071,6 +9083,50 @@ time.sleep(10)
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn default_gnupg_access_is_limited_to_the_existing_directory() {
+        let root = scratch("default-gnupg");
+        let home = root.join("home");
+        let assigned = root.join("assigned");
+        let gnupg = home.join(".gnupg");
+        let sibling = home.join(".ssh");
+        for directory in [&assigned, &gnupg, &sibling] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        assert_eq!(default_gnupg_directory(Some(&home)), Some(gnupg.clone()));
+        assert!(default_gnupg_directory(Some(&root.join("missing-home"))).is_none());
+        assert!(default_gnupg_directory(None).is_none());
+
+        let access = CodexWorkspaceAccess::capture(
+            &assigned,
+            std::slice::from_ref(&default_gnupg_directory(Some(&home)).unwrap()),
+        )
+        .unwrap();
+        let rules = serde_json::from_str::<Value>(&access.profile_config().unwrap()).unwrap()
+            ["configOverrides"][2]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let writable_rule = |path: &Path| {
+            format!(
+                "{}=\"write\"",
+                serde_json::to_string(path.to_str().unwrap()).unwrap()
+            )
+        };
+        assert!(rules.contains(&writable_rule(&gnupg.canonicalize().unwrap())));
+        assert!(!rules.contains(&writable_rule(&home.canonicalize().unwrap())));
+        assert!(!rules.contains(&writable_rule(&sibling.canonicalize().unwrap())));
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&gnupg).unwrap();
+            std::os::unix::fs::symlink(&sibling, &gnupg).unwrap();
+            assert!(default_gnupg_directory(Some(&home)).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn duplicate_elicitation_ids_route_to_the_requested_profile_and_session() {
@@ -9739,6 +9795,47 @@ time.sleep(10)
             .status
             .success());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_workspace_access_runs_gpg_without_granting_home() {
+        let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") else {
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let gnupg = default_gnupg_directory(Some(&home)).unwrap();
+        let gpg = find_executable("gpg").unwrap();
+        let assigned = scratch("codex-gpg-access");
+        std::fs::create_dir_all(&assigned).unwrap();
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&gnupg)).unwrap();
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let run = |arguments: &[&str]| {
+            let mut command = Command::new(&codex);
+            command
+                .arg("sandbox")
+                .args(["-P", "sail-agent", "-C"])
+                .arg(&assigned);
+            for value in config["configOverrides"].as_array().unwrap() {
+                command.arg("-c").arg(value.as_str().unwrap());
+            }
+            command.arg("--").args(arguments).output().unwrap()
+        };
+
+        let trustdb = run(&[gpg.to_str().unwrap(), "--check-trustdb"]);
+        assert!(
+            trustdb.status.success(),
+            "{}",
+            String::from_utf8_lossy(&trustdb.stderr)
+        );
+
+        let denied = home.join(format!(".sail-codex-gpg-denied-{}", std::process::id()));
+        assert!(!denied.exists());
+        let denied_write = run(&["/usr/bin/touch", denied.to_str().unwrap()]);
+        assert!(!denied_write.status.success());
+        assert!(!denied.exists());
+        std::fs::remove_dir_all(assigned).unwrap();
     }
 
     #[test]
