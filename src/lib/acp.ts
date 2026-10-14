@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { getSetting, setSetting, setTranscriptSetting } from './settings.ts';
+import { flushTranscriptWrite, getSetting, setSetting, setTranscriptSetting } from './settings.ts';
 import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
 import { sessionTasks } from './session-tasks.ts';
@@ -443,6 +443,7 @@ if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', () => {
     for (const pending of pendingTranscripts.values())
       saveRecentTranscript(pending.thread, pending.entries);
+    flushTranscriptWrite();
   });
 }
 

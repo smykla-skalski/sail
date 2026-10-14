@@ -254,6 +254,7 @@ pub fn exec_with_scratch_owner() -> ! {
     scratch_cleanup::exec_with_scratch_owner()
 }
 mod settings;
+mod settings_records;
 mod shell_command;
 mod ship_actions;
 mod stderr_log;
