@@ -440,6 +440,7 @@ for await (const line of createInterface({ input: process.stdin })) {
           sessionCapabilities: {
             resume: {},
             subagents: {},
+            ...(agent === 'codex' ? { close: {} } : {}),
             ...(agent === 'opencode' ? { list: {} } : {}),
           },
         },
@@ -483,6 +484,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         }),
       delayWorktreeDeleteSession ? 10_000 : delayFirstAttentionSession ? 3000 : 1000,
     );
+  } else if (message.method === 'session/close') {
+    const closing = sessions.get(message.params.sessionId);
+    if (closing) closing.evicted = true;
+    if (process.env.SAIL_E2E_ACP_CLOSE_LOG)
+      appendFileSync(process.env.SAIL_E2E_ACP_CLOSE_LOG, `${message.params.sessionId}\n`);
+    send({ id: message.id, result: {} });
   } else if (message.method === 'session/list') {
     const pageSize = 2;
     const cwd = message.params.cwd;

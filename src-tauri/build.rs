@@ -171,6 +171,8 @@ fn main() {
             "acp_elicitation",
             "acp_pending_inbox",
             "acp_activity",
+            "acp_session_visible",
+            "acp_set_idle_close_timeout",
             "acp_native_subagents",
             "acp_prepare_restart",
             "acp_set_config",

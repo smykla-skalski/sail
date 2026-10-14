@@ -215,6 +215,7 @@ fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 mod acp;
+mod acp_idle;
 mod acp_terminal;
 mod attention;
 pub mod background_priority;
@@ -4748,6 +4749,7 @@ pub fn run() {
             let process_directory = _app.path().app_config_dir()?.join("owned-processes");
             owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;
+            acp::start_idle_session_sweeper(_app.handle().clone());
             if let Err(error) = hook_activity::start_bridge(_app.handle()) {
                 eprintln!("Sail hook receiver unavailable: {error}");
             }
@@ -4913,6 +4915,8 @@ pub fn run() {
             acp::acp_elicitation,
             acp::acp_pending_inbox,
             acp::acp_activity,
+            acp::acp_session_visible,
+            acp::acp_set_idle_close_timeout,
             acp::acp_native_subagents,
             acp::acp_prepare_restart,
             acp::acp_set_config,

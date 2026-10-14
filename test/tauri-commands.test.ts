@@ -45,7 +45,11 @@ await test('every Tauri command has a generated permission and capability', () =
     assert.ok(generated.has(command), `${command} has no generated permission`);
     assert.ok(allowed.has(`allow-${command.replaceAll('_', '-')}`), `${command} is not allowed`);
   }
-  for (const permission of ['allow-acp-reset-test-runtimes', 'allow-reset-test-settings']) {
+  for (const permission of [
+    'allow-acp-reset-test-runtimes',
+    'allow-acp-set-idle-close-timeout',
+    'allow-reset-test-settings',
+  ]) {
     assert.ok(!productionPermissions.has(permission), `${permission} must be E2E-only`);
   }
 });

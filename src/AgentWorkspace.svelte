@@ -94,6 +94,7 @@
     markLiveMessageBoundary,
     restoredLiveTurnIsCurrent,
     recoverMissingSession,
+    SESSION_VISIBLE_INTERVAL_MS,
     loadRecentTranscript,
     restoreEntryTimes,
     restoreOwnedEntries,
@@ -599,6 +600,14 @@
         mergeHookActivities(items.map(parseHookActivity).filter((item) => item !== null)),
       )
       .catch(() => undefined);
+  });
+  $effect(() => {
+    const sessionId = activeSessionId;
+    if (!mounted || !sessionId) return;
+    const beat = () => void acp.sessionVisible(agent, directory, sessionId).catch(() => undefined);
+    beat();
+    const timer = setInterval(beat, SESSION_VISIBLE_INTERVAL_MS);
+    return () => clearInterval(timer);
   });
   let disposed = false;
   let stopRequested = false;

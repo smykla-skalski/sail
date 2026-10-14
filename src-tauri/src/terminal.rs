@@ -805,6 +805,20 @@ impl Drop for TerminalManager {
 }
 
 impl TerminalManager {
+    /// Whether a terminal opened for this owner still runs. A lock failure counts as running.
+    pub fn owner_has_running(&self, owner: &str) -> bool {
+        let Ok(sessions) = self.0.lock() else {
+            return true;
+        };
+        sessions.values().any(|session| {
+            session.owner.as_deref() == Some(owner)
+                && session
+                    .output
+                    .lock()
+                    .map_or(true, |output| output.exit_code.is_none())
+        })
+    }
+
     pub fn stop_owner(&self, owner: &str) -> Result<(), String> {
         let sessions = self
             .0

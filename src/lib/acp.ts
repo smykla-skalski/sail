@@ -135,6 +135,9 @@ export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
   return outcome.stopReason === 'cancelled' || outcome.sailInterrupted === true;
 }
 
+/** The backend closes a finished thread nobody has seen for 10 minutes; views report in well inside that. */
+export const SESSION_VISIBLE_INTERVAL_MS = 60_000;
+
 /** An attached thread skips restore on open, so a session the adapter dropped is restored here. */
 export async function recoverMissingSession<T>(
   prompt: () => Promise<T>,
@@ -1395,6 +1398,8 @@ export const acp = {
     invoke<Record<AgentId, AgentActivity>>('acp_activity', { directory }),
   nativeSubagents: (directory: string) =>
     invoke<NativeSubagentSnapshotSet>('acp_native_subagents', { directory }),
+  sessionVisible: (agent: AgentId, directory: string, sessionId: string) =>
+    invoke<void>('acp_session_visible', { agent, directory, sessionId }),
   turnEvidence: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
     invoke<AcpTurnEvidence | null>('get_acp_turn_evidence', {
       agent,

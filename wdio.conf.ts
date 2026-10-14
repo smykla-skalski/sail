@@ -40,6 +40,9 @@ process.env.SAIL_E2E_OPEN_URL_LOG = attach
   ? (process.env.SAIL_E2E_OPEN_URL_LOG ?? join(state, 'external-link.log'))
   : join(state, 'external-link.log');
 process.env.SAIL_ACP_TEST_AGENT = resolve('test/e2e/acp-agent.mjs');
+process.env.SAIL_E2E_ACP_CLOSE_LOG = attach
+  ? (process.env.SAIL_E2E_ACP_CLOSE_LOG ?? join(state, 'acp-close.log'))
+  : join(state, 'acp-close.log');
 
 const fakeGhDirectory = join(state, 'fake-gh');
 if (!attach && process.platform !== 'win32' && !process.env.SAIL_E2E_FAKE_GH_DIR) {

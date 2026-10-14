@@ -137,6 +137,19 @@ impl NativeSubagentRegistry {
         .into();
     }
 
+    fn is_live(entry: &NativeSubagentState) -> bool {
+        !matches!(
+            entry.outcome.as_str(),
+            "completed" | "failed" | "interrupted"
+        )
+    }
+
+    fn involves_live_work(&self, session_id: &str) -> bool {
+        self.0.iter().any(|(id, entry)| {
+            Self::is_live(entry) && (id == session_id || entry.parent_session_id == session_id)
+        })
+    }
+
     fn active_in(&self, directory: &Path) -> Vec<String> {
         self.0
             .iter()
@@ -545,6 +558,7 @@ struct Connection {
     session_creation: Mutex<()>,
     restores: Mutex<HashMap<String, RestoreClaim>>,
     restore_ready: Condvar,
+    idle: Mutex<crate::acp_idle::IdleSessions>,
     ready: Condvar,
     _owned_temp: Option<OwnedTempDir>,
 }
@@ -4506,7 +4520,341 @@ fn register_session(
         .lock()
         .map_err(|error| error.to_string())?
         .insert(session_id.to_string(), profile);
+    runtime
+        .idle
+        .lock()
+        .map_err(|error| error.to_string())?
+        .mark_attached(session_id, Instant::now());
     Ok(runtime)
+}
+
+/// Agents whose adapter turns `session/close` into releasing the loaded thread and its MCP servers.
+const IDLE_CLOSE_AGENTS: &[&str] = &["codex"];
+
+impl Connection {
+    fn touch_session(&self, session_id: &str) {
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.touch(session_id, Instant::now());
+        }
+    }
+
+    fn supports_session_close(&self) -> bool {
+        IDLE_CLOSE_AGENTS.contains(&self.agent.as_str())
+            && self.capabilities.lock().is_ok_and(|capabilities| {
+                capabilities
+                    .pointer("/agentCapabilities/sessionCapabilities/close")
+                    .is_some_and(Value::is_object)
+            })
+    }
+
+    /// Whether a turn, permission, background task, subagent or terminal still needs the loaded thread.
+    fn session_holds_work(
+        &self,
+        session_id: &str,
+        prompts: &PromptState,
+        restores: &HashMap<String, RestoreClaim>,
+        terminal_running: bool,
+    ) -> Result<bool, String> {
+        if terminal_running
+            || prompts.active.contains_key(session_id)
+            || prompts.finishing.contains(session_id)
+            || restores.contains_key(session_id)
+        {
+            return Ok(true);
+        }
+        let asks_about_session = |message: &Value| {
+            message.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
+        };
+        {
+            let permissions = self
+                .permission_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if permissions.canceling_sessions.contains_key(session_id)
+                || permissions
+                    .pending
+                    .values()
+                    .any(|pending| asks_about_session(&pending.message))
+            {
+                return Ok(true);
+            }
+        }
+        if self
+            .elicitation_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .any(|pending| asks_about_session(&pending.message))
+        {
+            return Ok(true);
+        }
+        if self
+            .idle
+            .lock()
+            .map_err(|error| error.to_string())?
+            .has_async_tasks(session_id)
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .native_subagents
+            .lock()
+            .map_err(|error| error.to_string())?
+            .involves_live_work(session_id))
+    }
+
+    /// Closes a session that finished its work and went unseen past `idle`. Returns whether it closed.
+    fn close_session_if_idle(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        directory: &Path,
+        idle: Duration,
+    ) -> Result<bool, String> {
+        let owner = format!("{}\0acp:{}:{}", directory.display(), self.agent, session_id);
+        let terminal_running = app
+            .state::<crate::acp_terminal::AcpTerminalManager>()
+            .session_has_running(&self.agent, self.profile, &self.worktree, session_id)
+            || app
+                .state::<crate::terminal::TerminalManager>()
+                .owner_has_running(&owner);
+        let (profile, directory) = {
+            let restores = self.restores.lock().map_err(|error| error.to_string())?;
+            let prompts = self
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if self.session_holds_work(session_id, &prompts, &restores, terminal_running)? {
+                self.touch_session(session_id);
+                return Ok(false);
+            }
+            let expired = self
+                .idle
+                .lock()
+                .map_err(|error| error.to_string())?
+                .expired(session_id, Instant::now(), idle);
+            if !expired {
+                return Ok(false);
+            }
+            let mut profiles = self
+                .session_profiles
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let mut directories = self
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let (Some(profile), Some(directory)) =
+                (profiles.remove(session_id), directories.remove(session_id))
+            else {
+                return Ok(false);
+            };
+            self.idle
+                .lock()
+                .map_err(|error| error.to_string())?
+                .mark_closed(session_id);
+            (profile, directory)
+        };
+        match self.request(
+            "session/close",
+            json!({"sessionId":session_id}),
+            Duration::from_secs(30),
+        ) {
+            Ok(_) => {
+                crate::diagnostics::record(
+                    "idle_session_closed",
+                    json!({"agent":self.agent,"sessionId":session_id}),
+                );
+                Ok(true)
+            }
+            Err(error) if is_unknown_session_error(&error) => Ok(true),
+            Err(error) => {
+                if let (Ok(mut profiles), Ok(mut directories)) = (
+                    self.session_profiles.lock(),
+                    self.session_directories.lock(),
+                ) {
+                    profiles.insert(session_id.to_string(), profile);
+                    directories.insert(session_id.to_string(), directory);
+                }
+                if let Ok(mut idle) = self.idle.lock() {
+                    idle.mark_attached(session_id, Instant::now());
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+fn is_unknown_session_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    (error.contains("session") || error.contains("thread"))
+        && (error.contains("not found") || error.contains("unknown"))
+}
+
+impl AgentManager {
+    /// Closes finished sessions nobody has looked at for `idle`, so their MCP servers exit.
+    pub fn close_idle_sessions(&self, app: &AppHandle, idle: Duration) -> usize {
+        let connections = self
+            .0
+            .lock()
+            .map(|agents| {
+                agents
+                    .values()
+                    .filter(|runtime| {
+                        runtime.alive.load(Ordering::Acquire) && runtime.supports_session_close()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut closed = 0;
+        for runtime in connections {
+            let sessions = runtime
+                .session_directories
+                .lock()
+                .map(|directories| {
+                    directories
+                        .iter()
+                        .map(|(id, directory)| (id.clone(), directory.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for (session_id, directory) in sessions {
+                match runtime.close_session_if_idle(app, &session_id, &directory, idle) {
+                    Ok(true) => closed += 1,
+                    Ok(false) => {}
+                    Err(error) => crate::diagnostics::record(
+                        "idle_session_close_failed",
+                        json!({"agent":runtime.agent,"sessionId":session_id,"error":error}),
+                    ),
+                }
+            }
+        }
+        closed
+    }
+
+    fn idle_closed_connection(
+        &self,
+        agent: &str,
+        session_id: &str,
+        directory: &Path,
+    ) -> Option<Arc<Connection>> {
+        let worktree = worktree_identity(directory);
+        let owner = session_owner(session_id);
+        self.0
+            .lock()
+            .ok()?
+            .values()
+            .find(|runtime| {
+                runtime.agent == agent
+                    && runtime.worktree == worktree
+                    && runtime.owner.as_deref() == owner
+                    && runtime.alive.load(Ordering::Acquire)
+                    && runtime
+                        .idle
+                        .lock()
+                        .is_ok_and(|idle| idle.is_closed(session_id))
+            })
+            .cloned()
+    }
+}
+
+/// Sweeps for idle sessions for the life of the app.
+pub fn start_idle_session_sweeper(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("sail-idle-session-sweep".into())
+        .spawn(move || loop {
+            let idle = crate::acp_idle::idle_timeout();
+            let pause = idle.map_or(Duration::from_secs(30), |idle| {
+                (idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(30))
+            });
+            std::thread::sleep(pause);
+            let (Some(idle), Some(manager)) = (idle, app.try_state::<AgentManager>()) else {
+                continue;
+            };
+            manager.close_idle_sessions(&app, idle);
+        });
+}
+
+/// Reattaches a session the idle sweep closed, so a prompt to it works as if it were still loaded.
+async fn reattach_idle_closed(
+    app: &AppHandle,
+    manager: &AgentManager,
+    browser: &crate::browser_agent::BrowserManager,
+    agent: &str,
+    session_id: &str,
+    directory: &Path,
+) -> Result<bool, String> {
+    let Some(runtime) = manager.idle_closed_connection(agent, session_id, directory) else {
+        return Ok(false);
+    };
+    let params = RestoreSessionCommand {
+        agent: agent.to_string(),
+        cwd: directory.to_string_lossy().into_owned(),
+        session_id: session_id.to_string(),
+        profile: Some(runtime.profile.as_str().to_string()),
+        restore_token: None,
+    };
+    let (app, manager, browser) = (app.clone(), manager.clone(), browser.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        restore_session_blocking(app, &manager, &browser, params, "session/resume")
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(true)
+}
+
+async fn connection_for_session_reattaching(
+    app: &AppHandle,
+    manager: &AgentManager,
+    browser: &crate::browser_agent::BrowserManager,
+    agent: &str,
+    session_id: &str,
+    directory: &Path,
+) -> Result<Arc<Connection>, String> {
+    let runtime = match connection_for_session(manager, agent, session_id, directory) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            if !reattach_idle_closed(app, manager, browser, agent, session_id, directory).await? {
+                return Err(error);
+            }
+            connection_for_session(manager, agent, session_id, directory)?
+        }
+    };
+    runtime.touch_session(session_id);
+    Ok(runtime)
+}
+
+/// E2E specs share one app process and shorten the idle timeout for their own run.
+/// The command is only permitted by the E2E capability and has no production effect.
+#[tauri::command]
+pub fn acp_set_idle_close_timeout(seconds: Option<u64>) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        crate::acp_idle::override_idle_seconds(seconds);
+        Ok(())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = seconds;
+        Err("The idle close timeout override requires the E2E build".into())
+    }
+}
+
+/// Heartbeat from a view showing the session; an unseen thread closes after the idle timeout.
+#[tauri::command]
+pub fn acp_session_visible(
+    manager: State<'_, AgentManager>,
+    agent: String,
+    directory: String,
+    session_id: String,
+) -> Result<(), String> {
+    if let Ok(runtime) =
+        connection_for_session(&manager, &agent, &session_id, Path::new(&directory))
+    {
+        runtime.touch_session(&session_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5159,6 +5507,7 @@ fn connect_blocking_inner(
         session_creation: Mutex::new(()),
         restores: Mutex::new(HashMap::new()),
         restore_ready: Condvar::new(),
+        idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
         ready: Condvar::new(),
         _owned_temp: owned_temp,
     });
@@ -5208,6 +5557,9 @@ fn connect_blocking_inner(
                 {
                     if let Ok(mut prompts) = reader.prompt_state.lock() {
                         prompts.observe_update(session_id, update);
+                    }
+                    if let Ok(mut idle) = reader.idle.lock() {
+                        idle.observe_update(session_id, update);
                     }
                     if let Err(error) = reader.remember_session_ui(session_id, update) {
                         crate::diagnostics::record(
@@ -6339,6 +6691,22 @@ async fn restore_session(
     params: RestoreSessionCommand,
     method: &'static str,
 ) -> Result<Value, String> {
+    let manager = manager.inner().clone();
+    let browser = browser.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        restore_session_blocking(app, &manager, &browser, params, method)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn restore_session_blocking(
+    app: AppHandle,
+    manager: &AgentManager,
+    browser: &crate::browser_agent::BrowserManager,
+    params: RestoreSessionCommand,
+    method: &'static str,
+) -> Result<Value, String> {
     let RestoreSessionCommand {
         agent,
         cwd,
@@ -6348,12 +6716,10 @@ async fn restore_session(
     } = params;
     let manager_generation = manager.forget_generation(&agent, &cwd, &session_id)?;
     let profile = parse_profile(profile.as_deref())?;
-    let manager = manager.inner().clone();
-    let browser = browser.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    {
         let capabilities = connect_blocking_owned(
             app.clone(),
-            &manager,
+            manager,
             agent.clone(),
             profile,
             Path::new(&cwd),
@@ -6369,7 +6735,7 @@ async fn restore_session(
             &cwd,
             &session_id,
             manager_generation,
-            || register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
+            || register_session(manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
         )?;
         with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
             // Forget must not finish while this restore mints a browser token.
@@ -6462,7 +6828,7 @@ async fn restore_session(
             }
             let result = result?;
             complete_restore_if_current(
-                &manager,
+                manager,
                 &runtime.prompt_state,
                 &agent,
                 &cwd,
@@ -6481,9 +6847,7 @@ async fn restore_session(
                 },
             )
         })
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    }
 }
 
 fn prompt_content(
@@ -6651,6 +7015,7 @@ mod task_reporting_tests {
 pub async fn acp_prompt(
     app: AppHandle,
     manager: State<'_, AgentManager>,
+    browser: State<'_, crate::browser_agent::BrowserManager>,
     params: AcpPromptParams,
 ) -> Result<Value, String> {
     let AcpPromptParams {
@@ -6663,7 +7028,15 @@ pub async fn acp_prompt(
     } = params;
     let mut content = prepare_prompt_content(&app, &text, image_paths).await?;
     content.push(json!({"type":"text","text":TASK_REPORT_GUIDANCE}));
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+    let runtime = connection_for_session_reattaching(
+        &app,
+        &manager,
+        &browser,
+        &agent,
+        &session_id,
+        Path::new(&directory),
+    )
+    .await?;
     let preflight_runtime = Arc::clone(&runtime);
     let preflight_session = session_id.clone();
     let preflight_turn = turn_id.clone();
@@ -6683,6 +7056,14 @@ pub async fn acp_prompt(
             .lock()
             .map_err(|error| error.to_string())?;
         prompts.ensure_prompt_available(&preflight_session)?;
+        if !preflight_runtime
+            .session_profiles
+            .lock()
+            .map_err(|error| error.to_string())?
+            .contains_key(&preflight_session)
+        {
+            return Err("Agent session is not connected in this worktree.".to_string());
+        }
         if preflight_runtime
             .cancelled_prompts
             .lock()
@@ -7775,14 +8156,27 @@ pub async fn acp_permission(
 
 #[tauri::command]
 pub async fn acp_set_config(
-    manager: State<'_, AgentManager>,
+    app: AppHandle,
     agent: String,
     directory: String,
     session_id: String,
     config_id: String,
     value: String,
 ) -> Result<Value, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+    let manager = app.state::<AgentManager>().inner().clone();
+    let browser = app
+        .state::<crate::browser_agent::BrowserManager>()
+        .inner()
+        .clone();
+    let runtime = connection_for_session_reattaching(
+        &app,
+        &manager,
+        &browser,
+        &agent,
+        &session_id,
+        Path::new(&directory),
+    )
+    .await?;
     tauri::async_runtime::spawn_blocking(move || {
         let result = runtime.request(
             "session/set_config_option",
@@ -8447,6 +8841,7 @@ time.sleep(10)
             session_creation: Mutex::new(()),
             restores: Mutex::new(HashMap::new()),
             restore_ready: Condvar::new(),
+            idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
             ready: Condvar::new(),
             _owned_temp: None,
         })
@@ -8820,6 +9215,7 @@ time.sleep(10)
                 session_creation: Mutex::new(()),
                 restores: Mutex::new(HashMap::new()),
                 restore_ready: Condvar::new(),
+                idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
                 ready: Condvar::new(),
                 _owned_temp: None,
             })
@@ -9923,6 +10319,7 @@ mod native_subagent_fence_tests {
             session_creation: Mutex::new(()),
             restores: Mutex::new(HashMap::new()),
             restore_ready: Condvar::new(),
+            idle: Mutex::new(crate::acp_idle::IdleSessions::default()),
             ready: Condvar::new(),
             _owned_temp: None,
         });
@@ -10674,5 +11071,142 @@ mod native_agent_tests {
                 .collect();
         assert_eq!(ids, ["claude", "codex", "opencode"]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod idle_close_tests {
+    use super::*;
+
+    fn runtime(session: &str) -> Arc<Connection> {
+        let directory = std::env::temp_dir();
+        let runtime = super::session_config_tests::test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &directory,
+            session,
+            None,
+        );
+        runtime.elicitation_state.lock().unwrap().clear();
+        runtime.permission_state.lock().unwrap().pending.clear();
+        runtime
+    }
+
+    #[test]
+    fn pending_question_keeps_the_session_loaded() {
+        let runtime = runtime("ses_question");
+        runtime.elicitation_state.lock().unwrap().insert(
+            "1".into(),
+            PendingElicitation {
+                message: json!({"method":"elicitation/create","id":1,"params":{"sessionId":"ses_question"}}),
+                received_at: 1,
+            },
+        );
+        assert!(holds_work(&runtime, "ses_question", false));
+    }
+
+    fn holds_work(runtime: &Connection, session: &str, terminal_running: bool) -> bool {
+        let restores = runtime.restores.lock().unwrap();
+        let prompts = runtime.prompt_state.lock().unwrap();
+        runtime
+            .session_holds_work(session, &prompts, &restores, terminal_running)
+            .unwrap()
+    }
+
+    fn active_prompt() -> ActivePrompt {
+        ActivePrompt {
+            turn_id: "turn".into(),
+            text: "task".into(),
+            dispatched: true,
+            memory_capture: crate::memory_capture::TurnCapture::default(),
+            last_agent_message: String::new(),
+            agent_message_open: false,
+            agent_message_overflow: false,
+            known_tool_calls: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn finished_session_without_work_may_close() {
+        let runtime = runtime("ses_done");
+        assert!(!holds_work(&runtime, "ses_done", false));
+    }
+
+    #[test]
+    fn running_turn_keeps_the_session_loaded() {
+        let runtime = runtime("ses_turn");
+        runtime
+            .prompt_state
+            .lock()
+            .unwrap()
+            .active
+            .insert("ses_turn".into(), active_prompt());
+        assert!(holds_work(&runtime, "ses_turn", false));
+    }
+
+    #[test]
+    fn running_terminal_keeps_the_session_loaded() {
+        let runtime = runtime("ses_terminal");
+        assert!(holds_work(&runtime, "ses_terminal", true));
+    }
+
+    #[test]
+    fn background_task_keeps_the_session_loaded_until_it_ends() {
+        let runtime = runtime("ses_task");
+        let update = |value: Value| {
+            runtime
+                .idle
+                .lock()
+                .unwrap()
+                .observe_update("ses_task", &value)
+        };
+        update(json!({"sessionUpdate":"async_task_spawned","asyncTaskId":"shell"}));
+        assert!(holds_work(&runtime, "ses_task", false));
+        update(
+            json!({"sessionUpdate":"async_task_state_update","asyncTaskId":"shell","state":"completed"}),
+        );
+        assert!(!holds_work(&runtime, "ses_task", false));
+    }
+
+    #[test]
+    fn live_subagent_keeps_its_parent_loaded_until_it_ends() {
+        let runtime = runtime("ses_parent");
+        runtime.native_subagents.lock().unwrap().spawn(
+            "ses_parent",
+            "ses_child",
+            std::env::temp_dir(),
+        );
+        assert!(holds_work(&runtime, "ses_parent", false));
+        assert!(holds_work(&runtime, "ses_child", false));
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .update("ses_child", "completed");
+        assert!(!holds_work(&runtime, "ses_parent", false));
+        assert!(!holds_work(&runtime, "ses_child", false));
+    }
+
+    #[test]
+    fn restoring_session_keeps_it_loaded() {
+        let runtime = runtime("ses_restore");
+        runtime.begin_restore("ses_restore").unwrap();
+        assert!(holds_work(&runtime, "ses_restore", false));
+    }
+
+    #[test]
+    fn close_support_requires_a_codex_adapter_that_advertises_it() {
+        let runtime = runtime("ses_caps");
+        assert!(!runtime.supports_session_close());
+        *runtime.capabilities.lock().unwrap() =
+            json!({"agentCapabilities":{"sessionCapabilities":{"close":{}}}});
+        assert!(runtime.supports_session_close());
+    }
+
+    #[test]
+    fn unknown_session_close_errors_count_as_closed() {
+        assert!(is_unknown_session_error("Session not found"));
+        assert!(is_unknown_session_error("unknown thread abc"));
+        assert!(!is_unknown_session_error("request timed out"));
     }
 }

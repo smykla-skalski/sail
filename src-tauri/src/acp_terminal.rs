@@ -338,6 +338,38 @@ impl AcpTerminalManager {
             .unwrap_or_default()
     }
 
+    /// Whether a terminal the agent started for this session still runs. A lock failure counts as running.
+    pub fn session_has_running(
+        &self,
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+    ) -> bool {
+        let session_ids = [session_id.to_string()];
+        let scope = TerminalConnectionScope {
+            agent,
+            profile,
+            worktree,
+            session_ids: &session_ids,
+        };
+        let Ok(active) = self.active.lock() else {
+            return true;
+        };
+        active.values().any(|terminal| {
+            terminal_belongs_to_connection(
+                &terminal.agent,
+                terminal.profile,
+                &terminal.session_id,
+                &terminal.directory,
+                &scope,
+            ) && terminal
+                .output
+                .lock()
+                .map_or(true, |output| output.exit.is_none())
+        })
+    }
+
     pub fn stop_sessions(
         &self,
         agent: &str,
