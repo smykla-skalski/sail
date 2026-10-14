@@ -502,19 +502,23 @@ struct Connection {
     _owned_temp: Option<OwnedTempDir>,
 }
 
-struct OwnedTempDir(PathBuf);
+struct OwnedTempDir(PathBuf, crate::WorktreeDirectoryIdentity);
 
 impl OwnedTempDir {
     fn create() -> Result<Self, String> {
         let path = std::env::temp_dir().join(format!("sail-codex-{}", Uuid::new_v4()));
         std::fs::create_dir(&path).map_err(|error| error.to_string())?;
-        Ok(Self(path))
+        let identity =
+            crate::worktree_directory_identity(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path, identity))
     }
 }
 
 impl Drop for OwnedTempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if crate::worktree_directory_identity(&self.0).is_ok_and(|identity| identity == self.1) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -561,6 +565,21 @@ struct SessionUiState {
 }
 
 impl Connection {
+    fn validate_codex_workspace(&self, cwd: Option<&str>) -> Result<(), String> {
+        let Some(access) = &self.codex_workspace_access else {
+            return Ok(());
+        };
+        if let Err(error) = access.validate(cwd) {
+            if let Err(stop_error) = self.terminate() {
+                return Err(format!(
+                    "{error} Agent shutdown requires recovery: {stop_error}"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn remember_session_ui(&self, session_id: &str, source: &Value) -> Result<(), String> {
         let config_options = source.get("configOptions").filter(|value| value.is_array());
         let available_commands = source
@@ -1566,10 +1585,8 @@ impl Connection {
         write_message: impl FnOnce(&Value) -> Result<(), String>,
         after_write: impl FnOnce(),
     ) -> Result<PendingResponse, String> {
-        if method.starts_with("session/") {
-            if let Some(access) = &self.codex_workspace_access {
-                access.validate(params.get("cwd").and_then(Value::as_str))?;
-            }
+        if method.starts_with("session/") || method.starts_with("_session/") {
+            self.validate_codex_workspace(params.get("cwd").and_then(Value::as_str))?;
         }
 
         if !self.alive.load(Ordering::Acquire) {
@@ -4445,9 +4462,7 @@ fn connect_blocking_inner(
         .cloned();
     if let Some(existing) = existing {
         if existing.alive.load(Ordering::Acquire) {
-            if let Some(access) = &existing.codex_workspace_access {
-                access.validate(None)?;
-            }
+            existing.validate_codex_workspace(None)?;
             drop(_startup);
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut capabilities = existing
@@ -4610,7 +4625,7 @@ fn connect_blocking_inner(
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
     #[cfg(not(unix))]
-    let scratch_path = None;
+    let scratch_path: Option<&Path> = None;
     let codex_workspace_access = if let Some(temp) = owned_temp.as_ref() {
         let shared_cache = data_directory
             .parent()
@@ -8551,6 +8566,35 @@ time.sleep(10)
         assert_eq!(request["mcpServers"][0]["name"], "sail-browser");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_workspace_access_rejects_steering_and_stops_invalid_runtime() {
+        let assigned = std::env::current_dir().unwrap();
+        let previous = assigned.parent().unwrap();
+        let runtime = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &assigned,
+            "session",
+            None,
+        );
+        let mut runtime = Arc::try_unwrap(runtime).ok().unwrap();
+        let mut access = CodexWorkspaceAccess::capture(&assigned, &[]).unwrap();
+        access.directories[0].identity = crate::worktree_directory_identity(previous).unwrap();
+        runtime.codex_workspace_access = Some(access);
+        let error = runtime
+            .request(
+                "_session/steering",
+                json!({"sessionId":"session"}),
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(error.contains("replaced"), "{error}");
+        assert!(!runtime.alive.load(Ordering::Acquire));
+        assert!(runtime.pending.lock().unwrap().is_empty());
+        assert!(runtime.child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
     #[test]
     fn codex_workspace_access_is_canonical_and_survives_restore_checks() {
         let root = scratch("codex-access");
@@ -8767,7 +8811,9 @@ time.sleep(10)
                 value.contains("filesystem")
                     && value.contains(
                         &serde_json::to_string(
-                            &overlay.git_dir.canonicalize().unwrap().to_string_lossy(),
+                            &dunce::canonicalize(&overlay.git_dir)
+                                .unwrap()
+                                .to_string_lossy(),
                         )
                         .unwrap(),
                     )
@@ -8776,8 +8822,10 @@ time.sleep(10)
         assert!(overrides
             .iter()
             .any(|value| value.as_str().is_some_and(|value| value.contains(
-                &serde_json::to_string(&build_cache.canonicalize().unwrap().to_string_lossy())
-                    .unwrap()
+                &serde_json::to_string(
+                    &dunce::canonicalize(&build_cache).unwrap().to_string_lossy()
+                )
+                .unwrap()
             ))));
         let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
         assert_eq!(
