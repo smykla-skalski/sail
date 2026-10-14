@@ -8,6 +8,7 @@ import {
   artifactKey,
   artifactMatches,
   nativeEnvironment,
+  nativeFailurePhase,
   nativeVerdict,
   setupAttemptLimit,
 } from '../scripts/native-test-policy.mjs';
@@ -17,6 +18,15 @@ await test('setup attempts are finite and reject malformed limits', () => {
   assert.equal(setupAttemptLimit('5'), 5);
   for (const invalid of ['0', '6', '-1', '1.5', 'Infinity', '', '01'])
     assert.throws(() => setupAttemptLimit(invalid), /must be 1–5/);
+});
+
+await test('setup failure diagnostics name the failed precondition', () => {
+  assert.equal(
+    nativeFailurePhase({ status: 'failed', precondition: 'post-test agent request cleanup' }),
+    'post-test agent request cleanup',
+  );
+  assert.equal(nativeFailurePhase({ status: 'ready' }), null);
+  assert.equal(nativeFailurePhase({ status: 'failed' }), null);
 });
 
 await test('exit success cannot produce PASS before every native precondition passes', () => {
