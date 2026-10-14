@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const OWNER_FILE: &str = "worktree-owner-v2";
 const OWNER_HEADER: &str = "sail-terminal-worktree-owner-v2";
@@ -1190,6 +1191,7 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         }
     }
     pending.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
+    forget_resolved_pending(&cache_root, &pending);
     pending
 }
 
@@ -3093,6 +3095,7 @@ pub(crate) fn retry_selected_removed_worktree_storage(
     if !valid_cache_key(selected_cache_key) {
         return Err("Invalid selected private storage key.".into());
     }
+    forget_reported_pending();
     let data_directory = cache_directory
         .join("terminal-worktrees")
         .join(selected_cache_key);
@@ -3776,32 +3779,58 @@ fn remove_quarantine_with_identity(
     }
 }
 
-static REPORTED_PENDING: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+static REPORTED_PENDING: OnceLock<Mutex<BTreeMap<String, (String, Instant)>>> = OnceLock::new();
+const REPORT_REPEAT_AFTER: Duration = Duration::from_secs(60 * 60);
 
 // Pollers re-enter the pending paths every second; log a key again only
-// when its reason changes or a retry clears the record.
+// when its reason changes, a retry clears the record, or the item resolved
+// and the stale record expired.
 fn first_report(key: &str, reason: &str) -> bool {
     let mut reported = REPORTED_PENDING
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    note_report(&mut reported, key, reason)
+    note_report(&mut reported, key, reason, Instant::now())
 }
 
-fn note_report(reported: &mut BTreeMap<String, String>, key: &str, reason: &str) -> bool {
-    if reported.get(key).is_some_and(|last| last == reason) {
+fn note_report(
+    reported: &mut BTreeMap<String, (String, Instant)>,
+    key: &str,
+    reason: &str,
+    now: Instant,
+) -> bool {
+    reported.retain(|_, (_, at)| now.saturating_duration_since(*at) < REPORT_REPEAT_AFTER);
+    if reported.get(key).is_some_and(|(last, _)| last == reason) {
         return false;
     }
-    reported.insert(key.to_string(), reason.to_string());
+    reported.insert(key.to_string(), (reason.to_string(), now));
     true
 }
 
-fn forget_reported_pending() {
+pub(crate) fn forget_reported_pending() {
     REPORTED_PENDING
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
+}
+
+fn forget_resolved_pending(cache_root: &Path, pending: &[CleanupPending]) {
+    let Ok(entries) = fs::read_dir(cache_root) else {
+        return;
+    };
+    let mut reported = REPORTED_PENDING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !pending.iter().any(|item| item.cache_key == name) {
+            reported.remove(&name);
+        }
+    }
 }
 
 fn report_pending(path: &Path, reason: &str) {
@@ -3817,9 +3846,6 @@ fn report_pending(path: &Path, reason: &str) {
 
 fn report_selected(path: &Path, reason: &str) {
     let key = cache_key(path).unwrap_or_else(|_| "unknown".into());
-    if !first_report(&key, reason) {
-        return;
-    }
     crate::diagnostics::record(
         "worktree_storage_cleanup_pending",
         json!({
@@ -4078,17 +4104,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_report_repeats_only_on_reason_change() {
+    fn pending_report_repeats_only_on_reason_change_or_expiry() {
         let mut reported = BTreeMap::new();
-        assert!(note_report(&mut reported, "k", "turn-temp-cleanup-failed"));
-        for _ in 0..5 {
-            assert!(!note_report(&mut reported, "k", "turn-temp-cleanup-failed"));
+        let start = Instant::now();
+        assert!(note_report(&mut reported, "k", "failed", start));
+        for second in 1..=5 {
+            let now = start + Duration::from_secs(second);
+            assert!(!note_report(&mut reported, "k", "failed", now));
         }
-        assert!(note_report(&mut reported, "k", "active-use"));
-        assert!(!note_report(&mut reported, "k", "active-use"));
-        assert!(note_report(&mut reported, "other", "active-use"));
+        assert!(note_report(&mut reported, "k", "active-use", start));
+        assert!(!note_report(&mut reported, "k", "active-use", start));
+        assert!(note_report(&mut reported, "other", "active-use", start));
+        let later = start + REPORT_REPEAT_AFTER;
+        assert!(note_report(&mut reported, "k", "active-use", later));
         reported.clear();
-        assert!(note_report(&mut reported, "k", "active-use"));
+        assert!(note_report(&mut reported, "k", "active-use", later));
     }
 
     #[cfg(unix)]

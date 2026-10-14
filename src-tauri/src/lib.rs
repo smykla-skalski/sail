@@ -5014,6 +5014,7 @@ async fn retry_worktree_storage_cleanup(
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
+        worktree_storage::forget_reported_pending();
         app.state::<acp::AgentManager>()
             .retry_turn_temp_cleanup(&app);
         worktree_storage::retry_cleanup(&cache)
