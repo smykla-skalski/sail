@@ -1635,7 +1635,7 @@ describe('close worktree shortcut', () => {
     git('worktree', 'remove', moved);
   });
 
-  it('retains and retries an interrupted private Git overlay manifest after checkout deletion', async () => {
+  it('retains an interrupted private Git overlay for separate recovery', async () => {
     const path = join(worktrees, 'interrupted-overlay');
     git('worktree', 'add', '-q', '-b', 'interrupted-overlay', path);
     const registered = await browser.tauri.execute(
@@ -1706,6 +1706,7 @@ describe('close worktree shortcut', () => {
         promotion: null,
       }),
     );
+    const manifestBytes = readFileSync(manifest);
     await browser.refresh();
     expect((await pendingCleanup(path))?.storagePaths).toEqual([deletedStorage]);
     await expect($(`[data-pending-worktree="${path}"]`)).toHaveText(
@@ -1713,19 +1714,23 @@ describe('close worktree shortcut', () => {
     );
     await $(`[data-pending-worktree="${path}"]`).$('button=Recheck storage').click();
     await diagnose('Interrupted overlay retained', () =>
-      browser.waitUntil(async () =>
-        (await pendingCleanup(path))?.reason.includes('private Git state remains pending'),
-      ),
+      browser.waitUntil(async () => (await pendingCleanup(path))?.reason.includes(manifest)),
     );
     expect((await pendingCleanup(path))?.storagePaths ?? []).toEqual([]);
     await browser.refresh();
     expect((await pendingCleanup(path))?.storagePaths ?? []).toEqual([]);
-    expect(existsSync(manifest)).toBe(true);
-    await $(`[data-pending-worktree="${path}"]`).$('button=Clean up this worktree…').click();
-    await diagnose('Interrupted overlay cleared by selected retry', () =>
-      browser.waitUntil(async () => !(await catalogPaths()).includes(path)),
+    const row = $(`[data-pending-worktree="${path}"]`);
+    await expect(row).toHaveText(expect.stringContaining(manifest));
+    await expect(row).toHaveText(expect.stringContaining('bytes'));
+    await expect(row).toHaveText(expect.stringContaining('separate recovery'));
+    await expect(row.$('button=Clean up this worktree…')).toBeDisabled();
+    expect((await catalogPaths()).includes(path)).toBe(true);
+    expect(readFileSync(manifest).equals(manifestBytes)).toBe(true);
+    await row.$('button=Recheck worktree').click();
+    await diagnose('Interrupted overlay stays pending after recheck', () =>
+      browser.waitUntil(async () => (await pendingCleanup(path))?.reason.includes(manifest)),
     );
-    expect(existsSync(manifest)).toBe(false);
+    expect(readFileSync(manifest).equals(manifestBytes)).toBe(true);
   });
 
   it('settles a confirmed checkout removed before its catalog update after restart', async () => {

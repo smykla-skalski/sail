@@ -9417,8 +9417,13 @@
                 originalWorktree: pending.originalPath,
               });
               if (!overlayAbsent) {
-                reason =
-                  'The Git checkout was removed, but private Git state remains pending. Retry selected cleanup after the cause is fixed.';
+                const overlay = await invoke<{ path: string; sizeBytes: number | null } | null>(
+                  'pending_cleanup_overlay_status',
+                  { originalWorktree: pending.originalPath },
+                );
+                reason = overlay
+                  ? `The Git checkout was removed, but private Git state remains at ${overlay.path} (${overlay.sizeBytes ?? 'unknown'} bytes). Its use cannot be verified after interruption; leave it pending for separate recovery.`
+                  : 'The Git checkout was removed, but private Git state or an active owner remains. Its use cannot be verified after interruption; leave it pending for separate recovery.';
                 const reconciled =
                   pending.selectedStorageCleanupConfirmed && absent
                     ? await reconcileSelectedRemovedWorktreeStorage(pending, [], async () => absent)
@@ -9618,17 +9623,14 @@
             originalWorktree: recovery.originalPath,
           });
           if (!overlayAbsent) {
-            const current = await invoke<RegisteredWorktree[]>('repository_worktrees', {
-              repository,
-            });
-            const reason = selectedCleanupDescendantReason(repository, selectedPath, current);
-            if (reason) throw new Error(reason);
-            await invoke('retry_removed_worktree_overlay_cleanup', {
-              repository,
-              originalWorktree: recovery.originalPath,
-              expectedGeneration: pending[0].generation,
-              confirmedUnused: true,
-            });
+            const overlay = await invoke<{ path: string; sizeBytes: number | null } | null>(
+              'pending_cleanup_overlay_status',
+              { originalWorktree: recovery.originalPath },
+            );
+            const reason = overlay
+              ? `Private Git state at ${overlay.path} (${overlay.sizeBytes ?? 'unknown'} bytes) remains pending. Its use cannot be verified after interruption; recover it separately.`
+              : 'Private Git state or an active owner remains pending. Its use cannot be verified after interruption; recover it separately.';
+            throw new Error(reason);
           }
         } catch (cause) {
           error = `Private Git cleanup remains pending: ${describe(cause)}`;

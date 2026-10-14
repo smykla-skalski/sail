@@ -476,6 +476,16 @@
     );
   }
 
+  function overlayRetryUnavailable(repository: string, worktree: ProjectWorktree): boolean {
+    const pending = worktree.pendingCleanup;
+    return !!(
+      pending &&
+      pendingIdentityMissing(repository, worktree) &&
+      !pending.storagePaths?.length &&
+      (pending.selectedWorktreeCleanupConfirmed || pending.selectedStorageCleanupConfirmed)
+    );
+  }
+
   function pendingCleanupSize(bytes: number | null): string {
     if (bytes === null) return 'Unknown';
     if (bytes < 1024) return `${bytes} B`;
@@ -1332,6 +1342,10 @@
                       >
                       <button
                         class="project-worktree-retry"
+                        disabled={overlayRetryUnavailable(path, worktree)}
+                        title={overlayRetryUnavailable(path, worktree)
+                          ? 'Interrupted private Git state requires separate recovery. Recheck the pending worktree.'
+                          : undefined}
                         onclick={() => void onremovependingcleanup(path, worktree.path)}
                         >{worktree.pendingCleanup.storagePaths?.length
                           ? 'Retry selected storage cleanup…'
@@ -1539,6 +1553,10 @@
                     >
                     <button
                       class="project-worktree-retry"
+                      disabled={overlayRetryUnavailable(path, worktree)}
+                      title={overlayRetryUnavailable(path, worktree)
+                        ? 'Interrupted private Git state requires separate recovery. Recheck the pending worktree.'
+                        : undefined}
                       onclick={() => void onremovependingcleanup(path, worktree.path)}
                       >{worktree.pendingCleanup.storagePaths?.length
                         ? 'Retry selected storage cleanup…'

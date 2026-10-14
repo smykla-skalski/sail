@@ -69,6 +69,7 @@ fn main() {
             "repository_path_available",
             "pending_cleanup_paths_absent",
             "pending_cleanup_overlay_absent",
+            "pending_cleanup_overlay_status",
             "opencode_plan_review_plugin",
             "validate_repository",
             "list_picker_directory",

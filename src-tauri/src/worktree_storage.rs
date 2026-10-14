@@ -30,6 +30,7 @@ const LEGACY_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
 const TEMP_PROCESS_UNSTARTED: &str = "sail-temp-process-state-v1\nunstarted\n";
 const TEMP_PROCESS_EXPOSED: &str = "sail-temp-process-state-v1\nexposed\n";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
+const TEMP_QUARANTINE_PREFIX: &str = ".sail-selected-temp-";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
 const CACHE_LIMIT_FILE: &str = "sail-cache-limit-v1";
@@ -133,6 +134,8 @@ pub(crate) struct CleanupPending {
     pub(crate) size_bytes: Option<u64>,
     pub(crate) cleanup_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) directory_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) owner_path: Option<String>,
@@ -150,7 +153,7 @@ pub(crate) struct CacheUsage {
     pub(crate) reason: Option<String>,
 }
 
-fn pending_size(path: &Path) -> Option<u64> {
+pub(crate) fn pending_size(path: &Path) -> Option<u64> {
     let mut total = 0u64;
     let mut remaining = vec![path.to_path_buf()];
     while let Some(path) = remaining.pop() {
@@ -167,15 +170,30 @@ fn pending_size(path: &Path) -> Option<u64> {
 }
 
 fn pending_item(key: String, reason: &str, path: Option<&Path>, can_clean: bool) -> CleanupPending {
+    let size_bytes = path.and_then(pending_size);
+    let directory_id = path.and_then(|path| match directory_identity(path) {
+        Ok(identity) => Some(identity),
+        Err(_)
+            if fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Some("absent".into())
+        }
+        Err(_) => None,
+    });
     CleanupPending {
         cache_key: key,
         reason: reason.into(),
-        size_bytes: path.and_then(pending_size),
-        cleanup_token: if can_clean {
+        size_bytes,
+        cleanup_token: if can_clean
+            && directory_id.is_some()
+            && (size_bytes.is_some() || directory_id.as_deref() == Some("absent"))
+        {
             path.and_then(|path| cache_key(path).ok())
         } else {
             None
         },
+        directory_id,
         path: None,
         owner_path: None,
     }
@@ -1810,12 +1828,21 @@ pub(crate) fn clean_pending_temp_checked(
     token: &str,
     expected_path: &Path,
     expected_owner_path: &Path,
+    expected_directory_id: &str,
+    expected_size_bytes: Option<u64>,
+    expected_reason: &str,
 ) -> Result<Vec<CleanupPending>, String> {
     clean_pending_temp_inner(
         cache_directory,
         token,
         None,
-        Some((expected_path, expected_owner_path)),
+        Some((
+            expected_path,
+            expected_owner_path,
+            expected_directory_id,
+            expected_size_bytes,
+            expected_reason,
+        )),
     )?;
     Ok(retry_cleanup(cache_directory))
 }
@@ -1824,7 +1851,7 @@ fn clean_pending_temp_inner(
     cache_directory: &Path,
     token: &str,
     selected_storage: Option<(&Path, &DurableCleanupIdentity)>,
-    expected_view: Option<(&Path, &Path)>,
+    expected_view: Option<(&Path, &Path, &str, Option<u64>, &str)>,
 ) -> Result<(), String> {
     if !valid_cache_key(token) {
         return Err("Invalid pending temporary data token.".into());
@@ -1844,7 +1871,16 @@ fn clean_pending_temp_inner(
     if !verified_data_owner(cache_directory, &data_directory) {
         return Err("Private storage ownership changed; refresh cleanup status.".into());
     }
-    if let Some((expected_path, expected_owner_path)) = expected_view {
+    if !selected_temp_quarantines(&data_directory)?.is_empty() {
+        return Err("Selected temporary data quarantine requires separate recovery.".into());
+    }
+    let current = temp_directory_status(cache_directory, &data_directory)
+        .into_iter()
+        .find(|item| item.cleanup_token.as_deref() == Some(token))
+        .ok_or("Temporary data is no longer pending; refresh cleanup status.")?;
+    if let Some((expected_path, expected_owner_path, expected_id, expected_size, expected_reason)) =
+        expected_view
+    {
         let owner_path = read_owner(&data_directory)
             .ok()
             .filter(|identity| {
@@ -1855,9 +1891,14 @@ fn clean_pending_temp_inner(
             })
             .map(|identity| identity.root)
             .or_else(|| read_plain_owner(cache_directory, &data_directory).ok());
-        if target != expected_path || owner_path.as_deref() != Some(expected_owner_path) {
+        if target != expected_path
+            || owner_path.as_deref() != Some(expected_owner_path)
+            || current.directory_id.as_deref() != Some(expected_id)
+            || current.size_bytes != expected_size
+            || current.reason != expected_reason
+        {
             return Err(
-                "Pending temporary data path or owner changed; refresh cleanup status.".into(),
+                "Pending temporary data path, owner, identity, size, or reason changed; refresh cleanup status.".into(),
             );
         }
     }
@@ -1872,12 +1913,10 @@ fn clean_pending_temp_inner(
             );
         }
     }
-    if !temp_directory_status(cache_directory, &data_directory)
-        .iter()
-        .any(|item| item.cleanup_token.as_deref() == Some(token))
-    {
-        return Err("Temporary data is no longer pending; refresh cleanup status.".into());
-    }
+    let expected_directory_id = expected_view
+        .map(|(_, _, id, _, _)| id)
+        .or(current.directory_id.as_deref())
+        .ok_or("Temporary directory identity cannot be verified.")?;
     if target == data_directory.join(TEMP_ROOT) {
         let states = process_state_paths(cache_directory, &cache_key(&data_directory)?)?;
         if !states.iter().any(|path| !unstarted_process_state(path)) {
@@ -1896,12 +1935,29 @@ fn clean_pending_temp_inner(
             return Err("Temporary data still has an active owner.".into());
         }
         match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target).map_err(|error| {
-                report_pending(&target, "manual-temp-removal-failed");
-                format!("Cannot remove pending temporary data: {error}")
-            })?,
+            Ok(metadata) if metadata.is_dir() && expected_directory_id != "absent" => {
+                let quarantine =
+                    quarantine_selected_temp(&data_directory, &target, expected_directory_id)?;
+                if temp_directory_in_use(&quarantine) {
+                    return Err(format!(
+                        "Temporary data is still in use and was preserved at {}.",
+                        quarantine.display()
+                    ));
+                }
+                fs::remove_dir_all(&quarantine).map_err(|error| {
+                    report_pending(&quarantine, "manual-temp-removal-failed");
+                    format!(
+                        "Cannot remove pending temporary data at {}: {error}",
+                        quarantine.display()
+                    )
+                })?;
+            }
             Ok(_) => return Err("Temporary root is not an unused directory.".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if expected_directory_id != "absent" {
+                    return Err("Temporary root changed since confirmation.".into());
+                }
+            }
             Err(error) => return Err(error.to_string()),
         }
         for state in states {
@@ -1934,6 +1990,20 @@ fn clean_pending_temp_inner(
             return Err("Temporary data still has a verified active owner.".into());
         }
     }
+    let quarantine = quarantine_selected_temp(&data_directory, &target, expected_directory_id)?;
+    if temp_directory_in_use(&quarantine) {
+        return Err(format!(
+            "Temporary data is still in use and was preserved at {}.",
+            quarantine.display()
+        ));
+    }
+    fs::remove_dir_all(&quarantine).map_err(|error| {
+        report_pending(&quarantine, "manual-temp-removal-failed");
+        format!(
+            "Cannot remove pending temporary data at {}: {error}",
+            quarantine.display()
+        )
+    })?;
     if let Some(lock_directory) = &lock_directory {
         let process_state_file = process_state_path(cache_directory, lock_directory)?;
         if unstarted_process_state(&process_state_file) {
@@ -1947,10 +2017,6 @@ fn clean_pending_temp_inner(
             }
         }
     }
-    fs::remove_dir_all(&target).map_err(|error| {
-        report_pending(&target, "manual-temp-removal-failed");
-        format!("Cannot remove pending temporary data: {error}")
-    })?;
     drop(_temp_lock);
     drop(_lease);
     drop(_mutation);
@@ -2009,6 +2075,40 @@ fn find_pending_temp(
     Err("Pending temporary data was not found; refresh cleanup status.".into())
 }
 
+fn selected_temp_quarantines(data_directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(data_directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(TEMP_QUARANTINE_PREFIX)
+        {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn quarantine_selected_temp(
+    data_directory: &Path,
+    target: &Path,
+    expected_directory_id: &str,
+) -> Result<PathBuf, String> {
+    let quarantine =
+        data_directory.join(format!("{TEMP_QUARANTINE_PREFIX}{}", uuid::Uuid::new_v4()));
+    crate::rename_without_replace(target, &quarantine)
+        .map_err(|error| format!("Cannot quarantine selected temporary data: {error}"))?;
+    if directory_identity(&quarantine).ok().as_deref() != Some(expected_directory_id) {
+        report_pending(&quarantine, "selected-temp-identity-changed");
+        return Err(format!(
+            "Selected temporary data changed before removal and was preserved at {}. Refresh cleanup status.",
+            quarantine.display()
+        ));
+    }
+    Ok(quarantine)
+}
+
 fn original_run_name(name: &str) -> Option<&str> {
     let original = name
         .strip_prefix('.')
@@ -2053,13 +2153,34 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
         }
         item
     };
+    let quarantines = match selected_temp_quarantines(data_directory) {
+        Ok(paths) => paths,
+        Err(_) => {
+            pending.push(temp_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "selected-temp-quarantine-scan-failed",
+                Some(data_directory),
+                false,
+            ));
+            return pending;
+        }
+    };
+    for path in &quarantines {
+        pending.push(temp_item(
+            cache_key(path).unwrap_or_else(|_| "unknown".into()),
+            "selected-temp-quarantine-recovery-required",
+            Some(path),
+            false,
+        ));
+    }
     let root = data_directory.join(TEMP_ROOT);
     match cache_key(data_directory).and_then(|key| exposed_process_states(cache_directory, &key)) {
         Ok(states) if !states.is_empty() => {
-            let can_clean = match fs::symlink_metadata(&root) {
-                Ok(metadata) => metadata.is_dir(),
-                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-            };
+            let can_clean = quarantines.is_empty()
+                && match fs::symlink_metadata(&root) {
+                    Ok(metadata) => metadata.is_dir(),
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                };
             let mut item = temp_item(
                 cache_key(&root).unwrap_or_else(|_| "unknown".into()),
                 "turn-temp-owner-unverifiable",
@@ -3506,6 +3627,9 @@ fn remove_quarantine(path: &Path, key: &str) -> Result<(), String> {
 }
 
 fn quarantine_temporary_data(path: &Path) -> Result<Option<PathBuf>, String> {
+    if let Some(selected) = selected_temp_quarantines(path)?.into_iter().next() {
+        return Ok(Some(selected));
+    }
     let legacy = path.join("tmp");
     match fs::symlink_metadata(&legacy) {
         Ok(_) => return Ok(Some(legacy)),
@@ -4345,11 +4469,115 @@ mod tests {
             item.cleanup_token.as_deref().unwrap(),
             &temp.join("another-run"),
             &fixture.first,
+            item.directory_id.as_deref().unwrap(),
+            item.size_bytes,
+            &item.reason,
         )
         .is_err());
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "retain");
         assert_pending_temp_cleaned(&fixture.cache, item.cleanup_token.as_deref().unwrap());
         assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn selected_temp_preview_rejects_a_same_size_path_replacement() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let target = directory.join("tmp");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "old").unwrap();
+        let preview = pending_with_reason(&fixture.cache, "legacy-temp-owner-unverified");
+        let original = fixture.root.join("previewed-temp");
+        fs::rename(&target, &original).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "new").unwrap();
+
+        let result = clean_pending_temp_checked(
+            &fixture.cache,
+            preview.cleanup_token.as_deref().unwrap(),
+            Path::new(preview.path.as_deref().unwrap()),
+            Path::new(preview.owner_path.as_deref().unwrap()),
+            preview.directory_id.as_deref().unwrap(),
+            preview.size_bytes,
+            &preview.reason,
+        );
+
+        assert!(result.unwrap_err().contains("identity"));
+        assert_eq!(
+            fs::read_to_string(original.join("artifact")).unwrap(),
+            "old"
+        );
+        assert_eq!(fs::read_to_string(target.join("artifact")).unwrap(), "new");
+    }
+
+    #[test]
+    fn selected_temp_swap_at_atomic_move_preserves_replacement_in_quarantine() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let target = directory.join("tmp");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "old").unwrap();
+        let previewed_id = directory_identity(&target).unwrap();
+        let original = fixture.root.join("previewed-temp");
+        fs::rename(&target, &original).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "new").unwrap();
+
+        let result = quarantine_selected_temp(&directory, &target, &previewed_id);
+        assert!(result.unwrap_err().contains("preserved at"));
+        let pending = temp_directory_status(&fixture.cache, &directory);
+        let quarantined = pending
+            .iter()
+            .find(|item| item.reason == "selected-temp-quarantine-recovery-required")
+            .unwrap();
+        assert!(quarantined.cleanup_token.is_none());
+        let path = Path::new(quarantined.path.as_deref().unwrap());
+        assert_eq!(quarantined.size_bytes, Some(3));
+        assert_eq!(fs::read_to_string(path.join("artifact")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(original.join("artifact")).unwrap(),
+            "old"
+        );
+        retry_cleanup(&fixture.cache);
+        assert_eq!(fs::read_to_string(path.join("artifact")).unwrap(), "new");
+    }
+
+    #[test]
+    fn selected_temp_preview_removes_the_verified_directory() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let target = directory.join("tmp");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), "unused").unwrap();
+        let preview = pending_with_reason(&fixture.cache, "legacy-temp-owner-unverified");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match clean_pending_temp_checked(
+                &fixture.cache,
+                preview.cleanup_token.as_deref().unwrap(),
+                Path::new(preview.path.as_deref().unwrap()),
+                Path::new(preview.owner_path.as_deref().unwrap()),
+                preview.directory_id.as_deref().unwrap(),
+                preview.size_bytes,
+                &preview.reason,
+            ) {
+                Ok(_) => break,
+                Err(error)
+                    if error == "Private storage still has an active owner."
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("verified selected temp cleanup failed: {error}"),
+            }
+        }
+
+        assert!(!target.exists());
+        assert!(selected_temp_quarantines(&directory).unwrap().is_empty());
     }
 
     #[test]

@@ -553,6 +553,31 @@ fn pending_cleanup_overlay_absent(original_worktree: String) -> Result<bool, Str
     git_overlay::removed_worktree_overlay_absent(original)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingOverlayInfo {
+    path: String,
+    size_bytes: Option<u64>,
+}
+
+#[tauri::command]
+fn pending_cleanup_overlay_status(
+    original_worktree: String,
+) -> Result<Option<PendingOverlayInfo>, String> {
+    let original = Path::new(&original_worktree);
+    if !original.is_absolute() {
+        return Err("A pending worktree path is not absolute.".into());
+    }
+    Ok(
+        git_overlay::removed_worktree_overlay_pending_path(original)?.map(|path| {
+            PendingOverlayInfo {
+                size_bytes: worktree_storage::pending_size(&path),
+                path: path.to_string_lossy().into_owned(),
+            }
+        }),
+    )
+}
+
 fn validate_repository_path(path: String) -> Result<String, String> {
     let directory = Path::new(&path)
         .git_canonical()
@@ -2797,6 +2822,15 @@ async fn retry_removed_worktree_overlay_cleanup(
         {
             return Err("The selected Git generation is still registered. Private Git state remains intact.".into());
         }
+        // An interrupted overlay has no enforceable writer lease. Keep it for
+        // separate recovery instead of using a prior checkout confirmation to
+        // authorize deletion of bytes that may have changed since the failure.
+        if let Some(path) = git_overlay::removed_worktree_overlay_pending_path(&original)? {
+            return Err(format!(
+                "Private Git state at {} cannot be verified unused after interruption. Its bytes remain pending for separate recovery.",
+                path.display()
+            ));
+        }
         git_overlay::forget_removed_worktree_for_repository(&original, &repository)
     })
     .await
@@ -3258,7 +3292,7 @@ fn archive_ignored_and_remove(
 }
 
 #[cfg(unix)]
-fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -3292,7 +3326,7 @@ fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<
 }
 
 #[cfg(windows)]
-fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
@@ -4619,6 +4653,7 @@ pub fn run() {
             repository_path_available,
             pending_cleanup_paths_absent,
             pending_cleanup_overlay_absent,
+            pending_cleanup_overlay_status,
             opencode_config::opencode_plan_review_plugin,
             validate_repository,
             list_picker_directory,
@@ -4916,18 +4951,31 @@ async fn set_worktree_cache_limit(
     .map_err(|error| error.to_string())?
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingTempPreview {
+    path: String,
+    owner_path: String,
+    directory_id: String,
+    size_bytes: Option<u64>,
+    reason: String,
+}
+
 #[tauri::command]
 async fn clean_pending_worktree_temp(
     app: tauri::AppHandle,
     token: String,
-    expected_path: String,
-    expected_owner_path: String,
+    expected_preview: PendingTempPreview,
     confirmed_unused: bool,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
     if !confirmed_unused {
         return Err("Confirm that no process is using this temporary data.".into());
     }
-    if !Path::new(&expected_path).is_absolute() || !Path::new(&expected_owner_path).is_absolute() {
+    if !Path::new(&expected_preview.path).is_absolute()
+        || !Path::new(&expected_preview.owner_path).is_absolute()
+        || expected_preview.directory_id.is_empty()
+        || expected_preview.reason.is_empty()
+    {
         return Err("The selected temporary data path or owner is invalid.".into());
     }
     let cache = app
@@ -4938,8 +4986,11 @@ async fn clean_pending_worktree_temp(
         worktree_storage::clean_pending_temp_checked(
             &cache,
             &token,
-            Path::new(&expected_path),
-            Path::new(&expected_owner_path),
+            Path::new(&expected_preview.path),
+            Path::new(&expected_preview.owner_path),
+            &expected_preview.directory_id,
+            expected_preview.size_bytes,
+            &expected_preview.reason,
         )
     })
     .await

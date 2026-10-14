@@ -72,6 +72,7 @@
     reason: string;
     sizeBytes: number | null;
     cleanupToken: string | null;
+    directoryId?: string;
     path?: string;
     ownerPath?: string;
   };
@@ -331,23 +332,38 @@
   }
 
   async function cleanPendingTemp(item: WorktreeStoragePending) {
-    if (!item.cleanupToken || !item.path || !item.ownerPath || worktreeStorageLoading) return;
+    if (
+      !item.cleanupToken ||
+      !item.path ||
+      !item.ownerPath ||
+      !item.directoryId ||
+      worktreeStorageLoading
+    )
+      return;
     worktreeStorageLoading = true;
     worktreeStorageError = '';
+    let failure = '';
     try {
       worktreeStoragePending = await invoke<WorktreeStoragePending[]>(
         'clean_pending_worktree_temp',
         {
           token: item.cleanupToken,
-          expectedPath: item.path,
-          expectedOwnerPath: item.ownerPath,
+          expectedPreview: {
+            path: item.path,
+            ownerPath: item.ownerPath,
+            directoryId: item.directoryId,
+            sizeBytes: item.sizeBytes,
+            reason: item.reason,
+          },
           confirmedUnused: true,
         },
       );
     } catch (cause) {
-      worktreeStorageError = `Private agent storage cleanup: ${String(cause)}`;
+      failure = `Private agent storage cleanup: ${String(cause)}`;
     } finally {
       worktreeStorageLoading = false;
+      await refreshWorktreeStorage();
+      if (failure) worktreeStorageError = failure;
     }
   }
 
@@ -1304,8 +1320,8 @@
         >
         {#if worktreeStorageError}<p class="runtime-diagnostic" role="alert">
             {worktreeStorageError}
-          </p>
-        {:else if worktreeStoragePending.length > 0}
+          </p>{/if}
+        {#if worktreeStoragePending.length > 0}
           <p role="status">
             {worktreeStoragePending.length} cleanup item(s) are pending. Their data was retained because
             Sail could not verify that no process still owns it or that its Git worktree identity is unchanged.
@@ -1322,7 +1338,7 @@
                 {:else}
                   <code>{item.cacheKey}</code>
                 {/if}
-                {#if item.cleanupToken && item.path && item.ownerPath}
+                {#if item.cleanupToken && item.path && item.ownerPath && item.directoryId}
                   <Button
                     size="sm"
                     disabled={worktreeStorageLoading}
@@ -2475,7 +2491,8 @@
 <ConfirmDialog
   request={pendingTempConfirmation?.cleanupToken &&
   pendingTempConfirmation.path &&
-  pendingTempConfirmation.ownerPath
+  pendingTempConfirmation.ownerPath &&
+  pendingTempConfirmation.directoryId
     ? {
         id: pendingTempConfirmation.cleanupToken,
         title: 'Clean pending temporary data',

@@ -245,6 +245,24 @@ pub(crate) fn removed_worktree_overlay_absent(worktree: &Path) -> Result<bool, S
     Ok(true)
 }
 
+pub(crate) fn removed_worktree_overlay_pending_path(
+    worktree: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let root = crate::acp_terminal::stable_worktree_identity(worktree);
+    let cache = CACHE
+        .get()
+        .ok_or("Private Git cache is unavailable for cleanup verification.")?;
+    let (private, manifest, _) = paths(cache, &root);
+    for path in [private, manifest.clone(), manifest.with_extension("bak")] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
+}
+
 /// A staged checkout can still own a synchronized overlay keyed to its old path.
 /// Keep that overlay in place so it becomes usable again after the Git move.
 pub(crate) fn require_recoverable_private_state_at_missing(
