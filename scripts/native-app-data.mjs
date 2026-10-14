@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const identifierPattern = /^dev\.smykla\.sail\.e2e\.([a-f0-9]{32})$/;
@@ -77,13 +77,16 @@ export function bundleIdentifiers(app) {
 
 /**
  * Everything a live run protects: its token, its bundle identifier and the build identifier its
- * app resolves log and data folders from.
+ * app resolves log and data folders from. An app without a recorded build identifier (an older
+ * runner, or an unreadable plist) leaves `unresolved` set, because any folder could be its own.
  */
 export function liveProtection(processCommands, readBundleIdentifiers = bundleIdentifiers) {
   const apps = new Set([...processCommands.matchAll(appPathPattern)].map((match) => match[1]));
+  const read = [...apps].map((app) => readBundleIdentifiers(app));
   return {
     tokens: liveRunTokens(processCommands),
-    identifiers: new Set([...apps].flatMap((app) => readBundleIdentifiers(app))),
+    identifiers: new Set(read.flat()),
+    unresolved: read.some((identifiers) => identifiers.length < 2),
   };
 }
 
@@ -130,24 +133,31 @@ export async function removeRunData(identifier, roots, pause = 500) {
 
 /**
  * The app resolves its log and data folders from the identifier compiled into the build, which a
- * cached artifact shares between runs. Those folders stay while a live app was built with them.
+ * cached artifact shares between runs. Those folders stay while a live app was built with them or
+ * while a live app does not say which build it came from. The process table is read again right
+ * before the removal, and there is no second pass, so a run that just started keeps its folders.
  */
 export async function removeIdleBuildData(
   identifier,
   roots,
   readProcessCommands,
   readBundleIdentifiers = bundleIdentifiers,
-  pause = 500,
 ) {
-  const protection = liveProtection(readProcessCommands(), readBundleIdentifiers);
-  if (isProtected(identifier, protection)) return [];
-  return removeRunData(identifier, roots, pause);
+  const idle = () => {
+    const protection = liveProtection(readProcessCommands(), readBundleIdentifiers);
+    return !protection.unresolved && !isProtected(identifier, protection);
+  };
+  if (!idle() || !idle()) return [];
+  for (const path of runFolders(identifier, roots)) removeFolder(path);
+  return runFolders(identifier, roots);
 }
 
 /**
  * Removes folders of every run whose app process no longer exists. Candidates are listed before the
- * process table is read, so a run that starts during the sweep is seen as live. A folder that cannot
- * be removed is reported in `failed` without stopping the sweep.
+ * process table is read, which is read again right before the removal, so a run that starts during
+ * the sweep is seen as live. While a live app does not record its build identifier, only folders
+ * that also exist in the WebKit folder, which holds data of run identifiers alone, are removed. A
+ * folder that cannot be removed is reported in `failed` without stopping the sweep.
  */
 export function sweepRunData(
   roots,
@@ -162,8 +172,16 @@ export function sweepRunData(
       .map((name) => ({ name, path: join(root, name) })),
   );
   if (candidates.length === 0) return { removed: [], failed: [] };
-  const protection = liveProtection(readProcessCommands(), readBundleIdentifiers);
-  const stale = candidates.filter(({ name }) => !isProtected(name, protection));
+  const webKit = roots.find((root) => basename(root) === 'WebKit');
+  const staleNow = (list) => {
+    const protection = liveProtection(readProcessCommands(), readBundleIdentifiers);
+    return list.filter(
+      ({ name }) =>
+        !isProtected(name, protection) &&
+        (!protection.unresolved || (webKit !== undefined && existsSync(join(webKit, name)))),
+    );
+  };
+  const stale = staleNow(staleNow(candidates));
   const removed = [];
   const failed = [];
   for (const { path } of stale) (removeFolder(path) ? removed : failed).push(path);

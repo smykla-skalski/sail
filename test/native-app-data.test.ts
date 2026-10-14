@@ -182,3 +182,27 @@ await test('build identity folders stay while a live app was built with them', a
   assert.deepEqual(await removeIdleBuildData(build, roots, () => '', readBundle, 0), []);
   assert.deepEqual(remaining(build), []);
 });
+
+await test('an app that does not record its build keeps unverifiable folders', async (context) => {
+  const { roots, populate, remaining } = fixture(context);
+  const legacy = identifier('a6');
+  const deadRun = identifier('d6');
+  const buildOnly = identifier('b6');
+  populate(deadRun);
+  for (const root of roots.filter((path) => !path.endsWith('WebKit')))
+    mkdirSync(join(root, buildOnly));
+  const readLegacy = () => [legacy];
+
+  assert.deepEqual(
+    await removeIdleBuildData(buildOnly, roots, () => appPath(legacy), readLegacy),
+    [],
+  );
+  const swept = sweepRunData(roots, () => appPath(legacy), [], readLegacy);
+
+  assert.equal(swept.removed.length, roots.length);
+  assert.deepEqual(remaining(deadRun), []);
+  assert.deepEqual(
+    remaining(buildOnly),
+    roots.filter((path) => !path.endsWith('WebKit')),
+  );
+});

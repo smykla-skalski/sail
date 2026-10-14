@@ -423,12 +423,17 @@ async function main() {
         if (env.SAIL_E2E_BINARY) await stopApp(env.SAIL_E2E_BINARY);
       } finally {
         sweepStateRoots(env.TMPDIR);
-        const leftovers = [
-          ...(runIdentifier ? await removeRunData(runIdentifier, dataRoots) : []),
-          ...(buildIdentifier
-            ? await removeIdleBuildData(buildIdentifier, dataRoots, listProcessCommands)
-            : []),
-        ];
+        const leftovers = runIdentifier ? await removeRunData(runIdentifier, dataRoots) : [];
+        if (buildIdentifier) {
+          try {
+            leftovers.push(
+              ...(await removeIdleBuildData(buildIdentifier, dataRoots, listProcessCommands)),
+            );
+          } catch (error) {
+            leftovers.push(buildIdentifier);
+            process.stderr.write(`Could not remove build identity data: ${error.message}\n`);
+          }
+        }
         result.leftovers = leftovers;
         if (leftovers.length > 0)
           process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
