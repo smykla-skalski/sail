@@ -27,6 +27,7 @@ export type SettingsSnapshot = {
   notificationPrefs: NotificationPrefs;
   notificationSound: boolean;
   autoCopyEnabled: boolean;
+  worktreeAutodiscoveryEnabled: boolean;
   personalPostTurnChecks: string[];
   agentWorktreesEnabled: boolean;
   agentTerminalsEnabled: boolean;
@@ -48,6 +49,7 @@ export type SettingsAction =
   | { type: 'notification-pref'; notification: NotificationType; value: NotificationPreference }
   | { type: 'notification-sound'; value: boolean }
   | { type: 'auto-copy'; value: boolean }
+  | { type: 'worktree-autodiscovery'; value: boolean }
   | { type: 'personal-post-turn-checks'; value: string[] }
   | { type: 'agent-worktrees'; value: boolean }
   | { type: 'agent-terminals'; value: boolean }

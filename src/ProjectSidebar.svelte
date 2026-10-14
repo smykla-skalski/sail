@@ -70,6 +70,7 @@
     worktreeDialogRequest: { id: string; path: string; fromPalette: boolean } | null;
     worktreeCreations: WorktreeCreation[];
     worktreeDeletions: Record<string, string>;
+    worktreeAutodiscoveryEnabled: boolean;
     onretryworktree: (id: string) => void;
     ondismissworktree: (id: string) => void;
     onworktreecancelled: (repository: string) => void;
@@ -134,6 +135,7 @@
     worktreeDialogRequest,
     worktreeCreations,
     worktreeDeletions,
+    worktreeAutodiscoveryEnabled,
     onretryworktree,
     ondismissworktree,
     onworktreecancelled,
@@ -404,6 +406,8 @@
 
   async function refreshWorktreeRegistrations() {
     const repositories = catalog.repositories;
+    const savedWorktrees = catalog.worktrees;
+    const autodiscoveryEnabled = worktreeAutodiscoveryEnabled;
     ++registrationSequence;
     if (registrationRefreshRunning) {
       registrationRefreshPending = true;
@@ -414,9 +418,18 @@
       const sequence = registrationSequence;
       const results = await Promise.all(
         repositories.map(async (repository) => {
-          const worktrees = await invoke<RegisteredWorktree[]>('repository_worktrees', {
-            repository,
-          }).catch(() => []);
+          const worktrees = await invoke<RegisteredWorktree[]>(
+            autodiscoveryEnabled ? 'repository_worktrees' : 'registered_worktrees',
+            autodiscoveryEnabled
+              ? { repository }
+              : {
+                  repository,
+                  paths: [
+                    repository,
+                    ...new Set((savedWorktrees[repository] ?? []).map((worktree) => worktree.path)),
+                  ],
+                },
+          ).catch(() => []);
           return [repository, worktrees] as const;
         }),
       );
@@ -457,12 +470,19 @@
   });
 
   function railWorktrees(path: string): ProjectWorktree[] {
-    return repositoryCollapsed(path)
-      ? []
-      : visibleRailWorktrees(catalog, path, registeredWorktrees[path] ?? []);
+    const registered = registeredWorktrees[path] ?? [];
+    const visible = worktreeAutodiscoveryEnabled
+      ? registered
+      : registered.filter(
+          (entry) =>
+            entry.path === path ||
+            (catalog.worktrees[path] ?? []).some((worktree) => worktree.path === entry.path),
+        );
+    return repositoryCollapsed(path) ? [] : visibleRailWorktrees(catalog, path, visible);
   }
 
   function externalWorktrees(repository: string): ProjectWorktree[] {
+    if (!worktreeAutodiscoveryEnabled) return [];
     return externalGitWorktrees(catalog, repository, registeredWorktrees[repository] ?? []);
   }
 

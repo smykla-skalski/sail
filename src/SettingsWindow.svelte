@@ -1174,6 +1174,26 @@
           <p>Selecting text outside inputs copies it and announces "Copied".</p>
         </section>
         <section class="settings-card">
+          <h2>Worktrees</h2>
+          <label class="attention-setting">
+            <input
+              id="worktree-autodiscovery"
+              type="checkbox"
+              checked={snapshot.worktreeAutodiscoveryEnabled}
+              onchange={(event) =>
+                send({
+                  type: 'worktree-autodiscovery',
+                  value: event.currentTarget.checked,
+                })}
+            />
+            Discover external Git worktrees automatically
+          </label>
+          <p>
+            Off by default. When enabled, Sail shows worktrees created outside Sail and lets you add
+            them. Saved worktrees are always checked for identity and cleanup safety.
+          </p>
+        </section>
+        <section class="settings-card">
           <h2>Performance</h2>
           <label class="attention-setting">
             <input

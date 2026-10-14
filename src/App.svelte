@@ -440,6 +440,7 @@
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     acpSessionOwner,
+    forgetAcpConnections,
     archiveOwnedTranscriptUpdate,
     applyLiveTranscriptUpdate,
     forgetRecentTranscript,
@@ -1279,6 +1280,9 @@
   );
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
+  let worktreeAutodiscoveryEnabled = $state(
+    getSetting('sai-worktree-autodiscovery-enabled') === 'true',
+  );
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
   let copiedStatusGeneration = 0;
@@ -2242,6 +2246,7 @@
       notificationPrefs,
       notificationSound,
       autoCopyEnabled,
+      worktreeAutodiscoveryEnabled,
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
@@ -2440,6 +2445,9 @@
         } else if (action.type === 'auto-copy') {
           autoCopyEnabled = action.value;
           setSetting('sai-auto-copy-enabled', String(action.value));
+        } else if (action.type === 'worktree-autodiscovery') {
+          worktreeAutodiscoveryEnabled = action.value;
+          setSetting('sai-worktree-autodiscovery-enabled', String(action.value));
         } else if (action.type === 'personal-post-turn-checks') {
           personalPostTurnChecks = action.value;
           setSetting('sai-post-turn-personal', JSON.stringify(action.value));
@@ -13181,6 +13189,7 @@
   }
 
   function handleAgentEvent(event: AgentEvent) {
+    if (event.message.method === 'sail/disconnected') forgetAcpConnections(event.agent);
     if (event.message.method === 'sail/disconnected' && !event.directory) {
       const sessionDirectories = event.message.params?.sessionDirectories;
       if (sessionDirectories && typeof sessionDirectories === 'object') {
@@ -13970,6 +13979,7 @@
         worktreeDialogRequest={paletteWorktreeRequest}
         {worktreeCreations}
         {worktreeDeletions}
+        {worktreeAutodiscoveryEnabled}
         onretryworktree={retryWorktreeCreation}
         ondismissworktree={dismissWorktreeCreation}
         onworktreecancelled={(repository) =>
