@@ -5052,14 +5052,7 @@ mod tests {
         worker.wait().unwrap();
         lease.release_clean().unwrap();
         drop(lease);
-        for _ in 0..100 {
-            retry_cleanup(&fixture.cache);
-            if !directory.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(!directory.exists());
+        assert_storage_reclaimed_after_retry(&fixture.cache, &directory);
     }
 
     #[cfg(unix)]
