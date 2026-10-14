@@ -9152,9 +9152,9 @@ time.sleep(10)
                 serde_json::to_string(path.to_str().unwrap()).unwrap()
             )
         };
-        assert!(rules.contains(&writable_rule(&gnupg.canonicalize().unwrap())));
-        assert!(!rules.contains(&writable_rule(&home.canonicalize().unwrap())));
-        assert!(!rules.contains(&writable_rule(&sibling.canonicalize().unwrap())));
+        assert!(rules.contains(&writable_rule(&dunce::canonicalize(&gnupg).unwrap())));
+        assert!(!rules.contains(&writable_rule(&dunce::canonicalize(&home).unwrap())));
+        assert!(!rules.contains(&writable_rule(&dunce::canonicalize(&sibling).unwrap())));
 
         #[cfg(unix)]
         {
