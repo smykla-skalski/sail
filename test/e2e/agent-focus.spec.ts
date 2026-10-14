@@ -109,6 +109,50 @@ describe('reported agent focus', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await expect(panel.$('[data-focus-source="Agent report"]')).not.toExist();
   });
+  it('suppresses split Tasks focus and report time immediately while waiting for input', async () => {
+    await browser.setWindowSize(2560, 1440);
+    await browser.keys(['Meta', 'd']);
+    await $('.pane-leaf.focused [data-pane-picker]').click();
+    await $('.pane-leaf.focused [data-agent-choice]:not(:disabled)').click();
+    const pane = $('.pane-leaf.focused');
+    const auth = pane.$('.agent-auth');
+    if (await auth.isExisting()) await auth.$('button').click();
+    await expect(pane.$('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.keys(['Meta', 'l']);
+    await pane.$('.agent-composer [data-pane-prompt]').setValue('Report focus then ask');
+    const send = pane.$('.agent-actions button:last-child');
+    await send.waitForEnabled();
+    await send.click();
+    const panel = pane.$('[aria-label="Session tasks"]');
+    await expect(panel.$('[data-focus-source="Agent report"]')).toExist();
+    await expect(panel.$('time')).toExist();
+    const question = pane.$('[aria-label="Agent question"]');
+    await expect(question).toBeDisplayed();
+    await expect(pane.$('.agent-header')).toHaveText(expect.stringContaining('Needs input'));
+    try {
+      const waiting = await browser.execute(() => {
+        const leaf = document.querySelector('.pane-leaf.focused');
+        const tasks = leaf?.querySelector('[aria-label="Session tasks"]');
+        return {
+          question: leaf?.querySelector('[aria-label="Agent question"]') !== null,
+          header: leaf?.querySelector('.agent-header')?.textContent,
+          tasks: tasks?.textContent,
+          source: tasks?.querySelector('[data-focus-source]')?.getAttribute('data-focus-source'),
+          report: tasks?.querySelector('[data-focus-source="Agent report"]') !== null,
+          time: tasks?.querySelector('time') !== null,
+        };
+      });
+      expect(waiting.question).toBe(true);
+      expect(waiting.header).toContain('Needs input');
+      expect(waiting.tasks).toContain('Waiting for input');
+      expect(waiting.tasks).not.toContain('Current focus');
+      expect(waiting.source).toBe('Observed status');
+      expect(waiting.report).toBe(false);
+      expect(waiting.time).toBe(false);
+    } finally {
+      if (await question.isDisplayed()) await question.$('button*=Decline').click();
+    }
+  });
   it('suppresses current focus while an elicitation form waits for input', async () => {
     await $('.agent-composer [data-pane-prompt]').setValue('Report focus then ask');
     const send = $('.agent-actions button:last-child');

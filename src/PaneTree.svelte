@@ -60,6 +60,7 @@
   } from './lib/panes';
 
   type Props = {
+    agentStatusStatuses: Record<string, ThreadStatus | null>;
     active: boolean;
     pane: Pane;
     focused: string;
@@ -168,6 +169,7 @@
   };
 
   let {
+    agentStatusStatuses,
     active,
     pane,
     focused,
@@ -521,6 +523,7 @@
     bind:clientHeight={splitHeight}
   >
     <PaneTree
+      {agentStatusStatuses}
       {active}
       {coordinationMessages}
       {spawnReceipts}
@@ -635,6 +638,7 @@
       onkeydown={resizeKey}
     ></div>
     <PaneTree
+      {agentStatusStatuses}
       {active}
       {coordinationMessages}
       {spawnReceipts}
@@ -949,7 +953,12 @@
                     aria-label="Session task list"
                     tabindex="0"
                   >
-                    <TasksPanel snapshot={taskSnapshot} />
+                    <TasksPanel
+                      snapshot={taskSnapshot}
+                      status={pane.thread
+                        ? (agentStatusStatuses[threadKey(pane.thread)] ?? null)
+                        : null}
+                    />
                   </div>
                 {:else if acpTab === 'plan' && (acpSnapshot.plan || acpSnapshot.questions)}
                   <PlanPanel

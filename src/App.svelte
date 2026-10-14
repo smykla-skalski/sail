@@ -14132,6 +14132,7 @@
     {/if}
     <div class="workspace-pane-host" hidden={workspaceView !== 'workspace'}>
       <PaneTree
+        {agentStatusStatuses}
         active={workspaceView === 'workspace'}
         pane={paneLayout}
         focused={focusedPane}
