@@ -206,12 +206,15 @@ int sail_context_service_main(void) {
                 if (xpc_get_type(message) != XPC_TYPE_DICTIONARY) return;
                 xpc_object_t reply = xpc_dictionary_create_reply(message);
                 if (!reply) return;
-                NSString *sender = senderBundlePath(message);
+                NSString *op = field(message, "op");
+                NSDictionary *session = sessions[key];
+                // The listener's peer requirement applies for the lifetime of this immutable
+                // connection. Resolve the signed bundle path once, before creating a session;
+                // approval and capability state are still validated for every operation below.
+                NSString *sender = session ? bundle : senderBundlePath(message);
                 if (!sender || ![sender isEqualToString:bundle]) {
                     xpc_dictionary_set_string(reply, "error", "Sail client signature or path rejected.");
                 } else {
-                    NSString *op = field(message, "op");
-                    NSDictionary *session = sessions[key];
                     if ([op isEqualToString:@"begin"]) {
                         NSString *directory = field(message, "directory");
                         NSDictionary *binding = directory.length <= 4096 ? approval(directory, nil) : nil;
@@ -554,10 +557,8 @@ static bool sessionExchange(void *handle, const char *op, const char *message,
         xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
         if (message) xpc_dictionary_set_string(request, "request", message);
         xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
-        if (![senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)]) {
-            writeError(error, errorLength, @"Context service signature or path rejected.");
-            return false;
-        }
+        // sail_context_session_open authenticated this service on the same immutable XPC
+        // connection. The connection's peer signing requirement remains active for every reply.
         const char *response = xpc_get_type(reply) == XPC_TYPE_DICTIONARY
             ? xpc_dictionary_get_string(reply, "response") : NULL;
         if (response && strlen(response) < outputLength) {

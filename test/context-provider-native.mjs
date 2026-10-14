@@ -356,9 +356,11 @@ try {
   const first = startClient(project);
   const second = startClient(project);
   const peer = startClient(project);
-  const a = await first.request(1, 'initialize');
-  const b = await second.request(2, 'initialize');
-  const c = await peer.request(11, 'initialize');
+  const [a, b, c] = await Promise.all([
+    first.request(1, 'initialize'),
+    second.request(2, 'initialize'),
+    peer.request(11, 'initialize'),
+  ]);
   assert.equal(a.id, 1);
   assert.equal(b.id, 2);
   assert.ok(a.result.pid > 0);
