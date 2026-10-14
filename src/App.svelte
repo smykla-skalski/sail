@@ -9232,7 +9232,7 @@
           registered,
         );
       } else {
-        await deleteProjectWorktreeWithDescendants(repository, path, branch, [], registered);
+        await deleteProjectWorktreeOnce(repository, path, branch, false);
       }
     } catch (cause) {
       error = describe(cause);
