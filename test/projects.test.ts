@@ -1083,6 +1083,74 @@ await test('adopting a moved generation preserves its saved Sail origin and pend
   );
 });
 
+await test('a moved child under an unavailable alias keeps ancestry before and after external adoption', async () => {
+  const parent = testGeneration(1);
+  const child = testGeneration(2);
+  const grandchild = testGeneration(3);
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo', '/unavailable-alias'],
+      worktrees: {
+        '/repo': [{ path: '/parent', branch: 'parent', generation: parent }],
+        '/unavailable-alias': [
+          {
+            path: '/old-child',
+            branch: 'child',
+            generation: child,
+            origin: movedChildOrigin('/parent', parent),
+            pendingCleanup: {
+              originalPath: '/old-child',
+              recoveryPath: '/old-child',
+              sizeBytes: 12,
+              reason: 'Retained data.',
+            },
+          },
+          {
+            path: '/grandchild',
+            branch: 'grandchild',
+            generation: grandchild,
+            origin: movedChildOrigin('/old-child', child),
+          },
+        ],
+      },
+    }),
+    '/repo',
+  );
+  const preservedAlias = await canonicalizeRepositoryAliases(catalog, '/repo', async () => {
+    throw new Error('Repository alias is unavailable');
+  });
+  const registered = [
+    { path: '/parent', generation: parent, branch: 'parent' },
+    { path: '/moved-child', generation: child, branch: 'child' },
+    { path: '/grandchild', generation: grandchild, branch: 'grandchild' },
+  ];
+
+  for (const externallyAdopted of [false, true]) {
+    const before = externallyAdopted
+      ? addWorktree(preservedAlias, '/repo', {
+          path: '/moved-child',
+          branch: 'child',
+          generation: child,
+        })
+      : preservedAlias;
+    assert.deepEqual(unmergedCatalogDescendants(before, '/repo', registered, '/parent'), []);
+    const reconciled = reconcileMovedWorktrees(before, '/repo', registered);
+    assert.deepEqual(reconciled.worktrees['/unavailable-alias'], []);
+    assert.deepEqual(
+      worktreeDescendants(reconciled, '/repo', registered, '/parent').map((item) => item.path),
+      ['/grandchild', '/moved-child'],
+    );
+    const moved = reconciled.worktrees['/repo'].find((item) => item.generation === child);
+    assert.equal(moved?.origin?.sourcePath, '/parent');
+    assert.equal(moved?.pendingCleanup?.originalPath, '/old-child');
+    assert.equal(moved?.pendingCleanup?.recoveryPath, '/moved-child');
+    assert.equal(
+      reconciled.worktrees['/repo'].filter((item) => item.generation === child).length,
+      1,
+    );
+  }
+});
+
 await test('ambiguous moved generations refuse catalog adoption without losing saved rows', () => {
   const generation = testGeneration(2);
   const saved = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
@@ -1113,6 +1181,18 @@ await test('ambiguous moved generations refuse catalog adoption without losing s
         { path: '/old-child', generation, branch: 'child' },
         { path: '/new-child', generation, branch: 'child' },
       ],
+    },
+    {
+      name: 'same Git generation has two stale saved owners across repository buckets',
+      catalog: {
+        ...saved,
+        repositories: [...saved.repositories, '/unavailable-alias'],
+        worktrees: {
+          ...saved.worktrees,
+          '/unavailable-alias': [{ path: '/alias-child', branch: 'child', generation }],
+        },
+      },
+      registered: [{ path: '/new-child', generation, branch: 'child' }],
     },
   ];
   for (const scenario of cases) {

@@ -403,13 +403,11 @@ describe('merged Ship pending cleanup', () => {
       const alert = $('.app-shell [role="alert"]');
       return (
         (await alert.isExisting()) &&
-        (await alert.getText()).includes('A live descendant is saved under another repository path')
+        (await alert.getText()).includes('A live descendant remains registered')
       );
     });
     await expect($('dialog.confirmation-dialog[open]')).not.toExist();
-    await expect(row).toHaveText(
-      expect.stringContaining('A live descendant is saved under another repository path'),
-    );
+    await expect(row).toHaveText(expect.stringContaining('A live descendant remains registered'));
     expect(git('worktree', 'list')).toContain(parent);
     expect(git('worktree', 'list')).toContain(child);
   });

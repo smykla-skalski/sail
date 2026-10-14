@@ -1902,10 +1902,11 @@ describe('close worktree shortcut', () => {
     expect(existsSync(child)).toBe(true);
   });
 
-  it('keeps a moved and opened Sail child in its parent cleanup preview', async () => {
+  it('keeps a moved Sail child from an unavailable alias in parent cleanup', async () => {
     const parent = join(worktrees, 'moved-parent');
     const original = join(worktrees, 'moved-child-original');
     const moved = join(worktrees, 'moved-child-current');
+    const unavailableAlias = join(worktrees, 'moved-child-unavailable-alias');
     await select(first, false);
     await carryTaskRegisteredWorktrees();
     git('worktree', 'add', '-q', '-b', 'moved-parent', parent);
@@ -1934,10 +1935,15 @@ describe('close worktree shortcut', () => {
     );
     expect(afterMove.find((item) => item.path === moved)?.generation).toBe(childGeneration);
     await browser.execute(
-      (repo, parentPath, oldChildPath, parentIdentity, childIdentity) => {
+      (repo, alias, parentPath, oldChildPath, parentIdentity, childIdentity) => {
         const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
-        catalog.worktrees[repo].push(
-          { path: parentPath, branch: 'moved-parent', generation: parentIdentity },
+        catalog.repositories.push(alias);
+        catalog.worktrees[repo].push({
+          path: parentPath,
+          branch: 'moved-parent',
+          generation: parentIdentity,
+        });
+        catalog.worktrees[alias] = [
           {
             path: oldChildPath,
             branch: 'moved-child',
@@ -1950,10 +1956,11 @@ describe('close worktree shortcut', () => {
               sessionTitle: 'Moved child',
             },
           },
-        );
+        ];
         localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
       },
       repository,
+      unavailableAlias,
       parent,
       original,
       parentGeneration,
@@ -1966,11 +1973,14 @@ describe('close worktree shortcut', () => {
     await diagnose('Moved child Sail ancestry restored', () =>
       browser.waitUntil(async () =>
         browser.execute(
-          (repo, oldPath, currentPath, sourcePath) => {
+          (repo, alias, oldPath, currentPath, sourcePath) => {
             const catalog = JSON.parse(localStorage.getItem('sai-project-catalog') ?? '{}');
             const entries = catalog.worktrees?.[repo] ?? [];
             return (
               !entries.some((item: { path: string }) => item.path === oldPath) &&
+              !(catalog.worktrees?.[alias] ?? []).some(
+                (item: { path: string }) => item.path === oldPath,
+              ) &&
               entries.some(
                 (item: { path: string; origin?: { sourcePath: string } }) =>
                   item.path === currentPath && item.origin?.sourcePath === sourcePath,
@@ -1978,6 +1988,7 @@ describe('close worktree shortcut', () => {
             );
           },
           repository,
+          unavailableAlias,
           original,
           moved,
           parent,
