@@ -3780,18 +3780,20 @@ fn remove_quarantine_with_identity(
 }
 
 struct ReportedPending {
-    reason: String,
     at: Instant,
     path: PathBuf,
 }
 
-static REPORTED_PENDING: OnceLock<Mutex<BTreeMap<String, ReportedPending>>> = OnceLock::new();
+// One record per (key, reason): a path can carry several reasons in a pass.
+type ReportedMap = BTreeMap<(String, String), ReportedPending>;
+
+static REPORTED_PENDING: OnceLock<Mutex<ReportedMap>> = OnceLock::new();
 const REPORT_REPEAT_AFTER: Duration = Duration::from_secs(60 * 60);
 const REPORT_MAP_LIMIT: usize = 256;
 
-// Pollers re-enter the pending paths every second; log a key again only
-// when its reason changes, a retry clears the record, the item resolved
-// or the stale record expired.
+// Pollers re-enter the pending paths every second; log a (key, reason)
+// again only when a retry clears the record, the path vanished or an hour
+// passed.
 fn first_report(key: &str, reason: &str, path: &Path) -> bool {
     let mut reported = REPORTED_PENDING
         .get_or_init(Default::default)
@@ -3801,7 +3803,7 @@ fn first_report(key: &str, reason: &str, path: &Path) -> bool {
 }
 
 fn note_report(
-    reported: &mut BTreeMap<String, ReportedPending>,
+    reported: &mut ReportedMap,
     key: &str,
     reason: &str,
     path: &Path,
@@ -3811,16 +3813,13 @@ fn note_report(
     if reported.len() > REPORT_MAP_LIMIT {
         reported.retain(|_, entry| fresh(entry.at));
     }
-    if reported
-        .get(key)
-        .is_some_and(|entry| entry.reason == reason && fresh(entry.at))
-    {
+    let id = (key.to_string(), reason.to_string());
+    if reported.get(&id).is_some_and(|entry| fresh(entry.at)) {
         return false;
     }
     reported.insert(
-        key.to_string(),
+        id,
         ReportedPending {
-            reason: reason.to_string(),
             at: now,
             path: path.to_path_buf(),
         },
@@ -3844,7 +3843,7 @@ fn forget_vanished_pending() {
     prune_vanished(&mut reported);
 }
 
-fn prune_vanished(reported: &mut BTreeMap<String, ReportedPending>) {
+fn prune_vanished(reported: &mut ReportedMap) {
     reported.retain(|_, entry| {
         !fs::symlink_metadata(&entry.path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -4144,6 +4143,20 @@ mod tests {
         assert!(note_report(&mut reported, "k", "active-use", path, later));
         reported.clear();
         assert!(note_report(&mut reported, "k", "active-use", path, later));
+    }
+
+    #[test]
+    fn several_reasons_on_one_path_each_log_once() {
+        let mut reported = BTreeMap::new();
+        let path = Path::new("/cache/terminal-worktrees/a");
+        let now = Instant::now();
+        assert!(note_report(&mut reported, "k", "a", path, now));
+        assert!(note_report(&mut reported, "k", "b", path, now));
+        for _ in 0..4 {
+            assert!(!note_report(&mut reported, "k", "a", path, now));
+            assert!(!note_report(&mut reported, "k", "b", path, now));
+        }
+        assert_eq!(reported.len(), 2);
     }
 
     #[test]
