@@ -76,7 +76,9 @@ describe('styled app dialogs', () => {
       );
       throw cause;
     }
-    await expect($('.confirmation-dialog')).toHaveText(expect.stringContaining('Delete worktree'));
+    await expect($('.confirmation-dialog')).toHaveText(
+      expect.stringContaining('Force delete worktree'),
+    );
     await $('.confirmation-dialog button:first-child').click();
     await expect($('.confirmation-dialog')).not.toBeDisplayed();
     expect(existsSync(linked)).toBe(true);

@@ -92,16 +92,16 @@ describe('merged Ship pending cleanup', () => {
   };
 
   async function cleanPending(path: string): Promise<boolean> {
-    await openPendingConfirmation(path, 'Clean up this worktree…');
+    await openPendingConfirmation(path, 'Force delete this worktree…');
     await diagnose('Pending cleanup dialog', async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
       await expect(dialog).toHaveText(
         expect.stringContaining(
-          'no other process will write to, move, or replace either until cleanup finishes',
+          'Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files',
         ),
       );
-      await dialog.$('button=Remove this worktree').click();
+      await dialog.$('button=Force delete').click();
     });
     await diagnose('Pending checkout result', () =>
       browser.waitUntil(
@@ -398,7 +398,7 @@ describe('merged Ship pending cleanup', () => {
     await browser.refresh();
     const row = $(`[data-pending-worktree="${parent}"]`);
     await browser.waitUntil(() => row.isDisplayed());
-    await row.$('button=Clean up this worktree…').click();
+    await row.$('button=Force delete this worktree…').click();
     await browser.waitUntil(async () => {
       const alert = $('.app-shell [role="alert"]');
       return (

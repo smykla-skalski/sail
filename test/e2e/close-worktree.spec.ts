@@ -123,7 +123,11 @@ describe('close worktree shortcut', () => {
   });
 
   after(async () => {
-    await browser.execute(() => localStorage.clear());
+    await browser.execute(() => {
+      localStorage.clear();
+      sessionStorage.removeItem('sai-e2e-pause-force-cleanup');
+      sessionStorage.removeItem('sai-e2e-pause-selected-force-cleanup');
+    });
     rmSync(repository, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     rmSync(worktrees, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -140,6 +144,7 @@ describe('close worktree shortcut', () => {
     await browser.execute(
       (repo, selected, firstPath, secondPath, firstGeneration, secondGeneration) => {
         sessionStorage.removeItem('sai-e2e-delete-worktree');
+        sessionStorage.setItem('sai-e2e-pause-force-cleanup', 'true');
         localStorage.setItem('sai-directory', selected);
         localStorage.setItem(`sai-main-pane-empty:${selected}`, 'true');
         localStorage.setItem(
@@ -255,26 +260,30 @@ describe('close worktree shortcut', () => {
     expectSuccess = false,
     expectedArchiveWarning = false,
   ): Promise<boolean> {
-    await openPendingConfirmation(path, 'Clean up this worktree…');
+    await browser.execute((pause) => {
+      if (pause) sessionStorage.setItem('sai-e2e-pause-selected-force-cleanup', 'true');
+      else sessionStorage.removeItem('sai-e2e-pause-selected-force-cleanup');
+    }, !expectSuccess);
+    await openPendingConfirmation(path, 'Force delete this worktree…');
     await diagnose(`Pending cleanup dialog ${path}`, async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
       await expect(dialog).toHaveText(
         expect.stringContaining(
-          'no other process will write to, move, or replace either until cleanup finishes',
+          'Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files',
         ),
       );
       if (expectedArchiveWarning)
         await expect(dialog).toHaveText(
           expect.stringContaining(
-            'The configured archive command will not run during selected cleanup',
+            'The configured archive command will not run during pending cleanup',
           ),
         );
       if (expectedSize !== undefined)
         await expect(dialog).toHaveText(
           expect.stringContaining(`Retained size: ${expectedSize} bytes`),
         );
-      await dialog.$('button=Remove this worktree').click();
+      await dialog.$('button=Force delete').click();
     });
     if (expectSuccess) {
       await diagnose(`Pending cleanup success ${path}`, () =>
@@ -564,11 +573,11 @@ describe('close worktree shortcut', () => {
     );
     if (current.sizeBytes === null || current.sizeBytes === 0)
       throw new Error('The stale-size fixture did not differ from the current checkout');
-    await $(`[data-pending-worktree="${second}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${second}"]`).$('button=Force delete this worktree…').click();
     const declined = $('dialog.confirmation-dialog[open]');
     await expect(declined).toHaveText(
       expect.stringContaining(
-        'no other process will write to, move, or replace either until cleanup finishes',
+        'Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files',
       ),
     );
     await declined.$('button=Cancel').click();
@@ -605,7 +614,7 @@ describe('close worktree shortcut', () => {
     await browser.refresh();
     await expect($(`.project-worktree-select[title="${eligible}"]`)).toBeDisplayed();
     await openRemovalConfirmation(eligible, 'eligible-selected');
-    await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Force delete').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(eligible)));
     const unrelatedAfterMark = join(worktrees, 'unrelated-after-mark');
     git('worktree', 'add', '-q', '-b', 'unrelated-after-mark', unrelatedAfterMark);
@@ -785,7 +794,7 @@ describe('close worktree shortcut', () => {
     git('worktree', 'remove', reused);
   });
 
-  it('preserves a detached descendant changed after preview', async () => {
+  it('force deletes a detached descendant changed after preview', async () => {
     const detached = join(worktrees, 'detached');
     const newFile = join(detached, 'new.txt');
     git('worktree', 'add', '-q', '-b', 'detached-child', detached);
@@ -852,20 +861,16 @@ describe('close worktree shortcut', () => {
     const dialog = $('dialog.confirmation-dialog[open]');
     await expect(dialog).toHaveText(expect.stringContaining('detached'));
     writeFileSync(newFile, 'keep this file');
-    await dialog.$('button=Mark 2 pending').click();
+    await dialog.$('button=Force delete 2 worktrees').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(detached)));
     await $(`[data-pending-worktree="${detached}"]`).$('button=Recheck worktree').click();
     await browser.waitUntil(async () =>
       (await pendingCleanup(detached))?.reason.includes('Files changed'),
     );
-    await $(`[data-pending-worktree="${detached}"]`).$('button=Clean up this worktree…').click();
-    await expect($('.app-shell [role="alert"]')).toHaveText(
-      expect.stringContaining('Pending worktrees with files'),
-    );
-    expect(existsSync(newFile)).toBe(true);
+    expect(await cleanPending(detached, undefined, true)).toBe(true);
+    expect(existsSync(newFile)).toBe(false);
     expect(existsSync(first)).toBe(true);
-    expect(await catalogPaths()).toEqual([first, detached]);
-    git('worktree', 'remove', '--force', detached);
+    expect(await catalogPaths()).toEqual([first]);
   });
 
   it('retains a detached descendant and its commit when private temp is unverifiable', async () => {
@@ -957,7 +962,7 @@ describe('close worktree shortcut', () => {
     await $('[aria-label="Delete worktree first"]').click();
     const dialog = $('dialog.confirmation-dialog[open]');
     await expect(dialog).toHaveText(expect.stringContaining('detached'));
-    await dialog.$('button=Mark 2 pending').click();
+    await dialog.$('button=Force delete 2 worktrees').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(detached)));
     expect(existsSync(first)).toBe(true);
     expect(existsSync(detached)).toBe(true);
@@ -1012,11 +1017,11 @@ describe('close worktree shortcut', () => {
       expect($(`.project-worktree-select[title="${parent}"]`)).toBeDisplayed(),
     );
     await openRemovalConfirmation(parent, 'inventory-parent');
-    await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Force delete').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(parent)));
     git('worktree', 'add', '-q', '-b', 'inventory-new-child', child);
-    await openPendingConfirmation(parent, 'Clean up this worktree…');
-    await $('dialog.confirmation-dialog[open]').$('button=Remove this worktree').click();
+    await openPendingConfirmation(parent, 'Force delete this worktree…');
+    await $('dialog.confirmation-dialog[open]').$('button=Force delete').click();
     await expect($('.app-shell [role="alert"]')).toHaveText(
       expect.stringContaining('registered worktree is not in this catalog'),
     );
@@ -1202,11 +1207,11 @@ describe('close worktree shortcut', () => {
     expect(existsSync(grandchild)).toBe(true);
 
     await openRemoval();
-    await $('dialog.confirmation-dialog[open]').$('button=Mark 3 pending').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Force delete 3 worktrees').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(grandchild)));
-    await $(`[data-pending-worktree="${grandchild}"]`).$('button=Clean up this worktree…').click();
-    await expect($('.app-shell [role="alert"]')).toHaveText(
-      expect.stringContaining('Pending worktrees with files'),
+    expect(await cleanPending(grandchild)).toBe(false);
+    expect((await pendingCleanup(grandchild))?.reason).toMatch(
+      /temporary data is still in use or cannot be verified|agent inventory request is still running/,
     );
     expect(existsSync(uncommitted)).toBe(true);
     expect(existsSync(first)).toBe(true);
@@ -1295,14 +1300,18 @@ describe('close worktree shortcut', () => {
     await expect($(`[data-pending-worktree="${recovery}"]`)).toHaveText(
       expect.stringContaining('Original path was occupied'),
     );
-    await $(`[data-pending-worktree="${recovery}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${recovery}"]`)
+      .$('button=Force delete this worktree…')
+      .click();
     await expect($('.app-shell [role="alert"]')).toHaveText(expect.stringContaining('is occupied'));
     expect(existsSync(original)).toBe(true);
     expect(existsSync(recovery)).toBe(true);
     expect(git('worktree', 'list')).toContain(recovery);
 
     git('worktree', 'remove', original);
-    await $(`[data-pending-worktree="${recovery}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${recovery}"]`)
+      .$('button=Force delete this worktree…')
+      .click();
     await browser.waitUntil(
       async () =>
         !!(await pendingCleanup(original)) ||
@@ -1322,7 +1331,9 @@ describe('close worktree shortcut', () => {
     expect((await pendingCleanup(original))?.recoveryPath).toBe(original);
     await browser.refresh();
     await browser.waitUntil(async () => $(`[data-pending-worktree="${original}"]`).isDisplayed());
-    await $(`[data-pending-worktree="${original}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${original}"]`)
+      .$('button=Force delete this worktree…')
+      .click();
     const dialog = $('dialog.confirmation-dialog[open]');
     const alert = $('.app-shell [role="alert"]');
     await browser.waitUntil(
@@ -1331,7 +1342,7 @@ describe('close worktree shortcut', () => {
         ((await alert.isExisting()) && (await alert.getText()).includes('Private Git state')),
     );
     if (await dialog.isExisting()) {
-      await dialog.$('button=Remove this worktree').click();
+      await dialog.$('button=Force delete').click();
       await diagnose('Recovery cleanup result', () =>
         browser.waitUntil(
           async () => {
@@ -1419,7 +1430,9 @@ describe('close worktree shortcut', () => {
     await expect($(`[data-pending-worktree="${recovery}"]`)).toHaveText(
       expect.stringContaining('interrupted cleanup'),
     );
-    await $(`[data-pending-worktree="${recovery}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${recovery}"]`)
+      .$('button=Force delete this worktree…')
+      .click();
     await expect($('.app-shell [role="alert"]')).toHaveText(
       expect.stringContaining('Recovery worktree kept at'),
     );
@@ -1459,7 +1472,7 @@ describe('close worktree shortcut', () => {
       expect($(`.project-worktree-select[title="${original}"]`)).toBeDisplayed(),
     );
     await openRemovalConfirmation(original, 'moved-pending');
-    await $('dialog.confirmation-dialog[open]').$('button=Mark 1 pending').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Force delete').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(original)));
     git('worktree', 'move', original, moved);
     await $(`[data-pending-worktree="${original}"]`).$('button=Recheck worktree').click();
@@ -1470,7 +1483,7 @@ describe('close worktree shortcut', () => {
     await diagnose('Moved row after restart', () =>
       expect($(`[data-pending-worktree="${moved}"]`)).toBeDisplayed(),
     );
-    await $(`[data-pending-worktree="${moved}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${moved}"]`).$('button=Force delete this worktree…').click();
     await diagnose('Restored original row', () =>
       browser.waitUntil(async () => (await pendingCleanup(original))?.recoveryPath === original),
     );
@@ -1547,12 +1560,14 @@ describe('close worktree shortcut', () => {
     await expect($('dialog.confirmation-dialog[open]')).toHaveText(
       expect.stringContaining(recovery),
     );
-    await $('dialog.confirmation-dialog[open]').$('button=Mark 2 pending').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Force delete 2 worktrees').click();
     await browser.waitUntil(async () => !!(await pendingCleanup(parent)));
     expect((await pendingCleanup(recovery))?.originalPath).toBe(original);
     await browser.refresh();
     expect((await pendingCleanup(recovery))?.originalPath).toBe(original);
-    await $(`[data-pending-worktree="${recovery}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${recovery}"]`)
+      .$('button=Force delete this worktree…')
+      .click();
     await diagnose('Child restored after parent mark', () =>
       browser.waitUntil(async () => (await pendingCleanup(original))?.recoveryPath === original),
     );
@@ -1723,7 +1738,7 @@ describe('close worktree shortcut', () => {
     await expect(row).toHaveText(expect.stringContaining(manifest));
     await expect(row).toHaveText(expect.stringContaining('bytes'));
     await expect(row).toHaveText(expect.stringContaining('separate recovery'));
-    await expect(row.$('button=Clean up this worktree…')).toBeDisabled();
+    await expect(row.$('button=Force delete this worktree…')).toBeDisabled();
     expect((await catalogPaths()).includes(path)).toBe(true);
     expect(readFileSync(manifest).equals(manifestBytes)).toBe(true);
     await row.$('button=Recheck worktree').click();
@@ -1998,13 +2013,13 @@ describe('close worktree shortcut', () => {
     await openRemovalConfirmation(parent, 'moved-parent');
     const dialog = $('dialog.confirmation-dialog[open]');
     await expect(dialog).toHaveText(expect.stringContaining(moved));
-    await dialog.$('button=Mark 2 pending').click();
+    await dialog.$('button=Force delete 2 worktrees').click();
     await diagnose('Moved child and parent remain pending', () =>
       browser.waitUntil(
         async () => !!(await pendingCleanup(parent)) && !!(await pendingCleanup(moved)),
       ),
     );
-    await $(`[data-pending-worktree="${parent}"]`).$('button=Clean up this worktree…').click();
+    await $(`[data-pending-worktree="${parent}"]`).$('button=Force delete this worktree…').click();
     await expect($('.app-shell [role="alert"]')).toHaveText(
       expect.stringContaining('A live descendant remains registered'),
     );

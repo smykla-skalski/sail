@@ -406,7 +406,6 @@
     listSidebarAcpThreads,
     recordSidebarOpenCodeOutcome,
     sidebarThreadStatus,
-    waitForSidebarInventory,
   } from './lib/sidebar-agents';
   import {
     loadAttention,
@@ -9179,6 +9178,9 @@
     'path' | 'branch' | 'generation' | 'dirty' | 'activeSessions'
   >;
 
+  type WorktreeRemovalExpectation = Pick<WorktreeRemovalPreview, 'generation'> &
+    Partial<Pick<WorktreeRemovalPreview, 'revision' | 'branch'>>;
+
   function pendingRecoveryFromError(cause: unknown): PendingWorktreeCleanup | null {
     const message = describe(cause);
     const prefix = 'SAIL_PENDING_RECOVERY:';
@@ -9281,7 +9283,11 @@
           'A live descendant is saved under another repository path. Restore that repository alias before retrying cleanup.',
         );
       const descendants = worktreeDescendants(projectCatalog, repository, registered, path);
-      if (descendants.length) {
+      if (
+        descendants.length ||
+        (import.meta.env.MODE === 'e2e' &&
+          sessionStorage.getItem('sai-e2e-pause-force-cleanup') === 'true')
+      ) {
         await deleteProjectWorktreeWithDescendants(
           repository,
           path,
@@ -9290,7 +9296,19 @@
           registered,
         );
       } else {
-        await deleteProjectWorktreeOnce(repository, path, branch, false);
+        const target = registered.find((worktree) => worktree.path === path);
+        if (!target?.generation)
+          throw new Error('The selected worktree identity cannot be verified. Refresh and retry.');
+        await deleteProjectWorktreeOnce(
+          repository,
+          path,
+          branch,
+          true,
+          true,
+          { generation: target.generation },
+          false,
+          registered,
+        );
       }
     } catch (cause) {
       error = describe(cause);
@@ -9358,9 +9376,13 @@
         : e2eAnswer === 'No'
           ? false
           : await confirmInApp(
-              'Delete worktree and descendants',
-              `Mark these ${targets.length} worktrees for cleanup? They will remain registered with their files intact. You can review them and explicitly confirm they are unused before physical deletion. Their branches will remain.\n\n${lines.join('\n')}`,
-              `Mark ${targets.length} pending`,
+              targets.length === 1
+                ? 'Force delete worktree'
+                : 'Force delete worktree and descendants',
+              targets.length === 1
+                ? `Force delete this worktree? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files. Its branch remains. If it cannot be removed safely, it stays visible as pending cleanup. The configured archive command does not run during pending cleanup.\n\n${lines.join('\n')}`
+                : `Force delete these ${targets.length} worktrees? Sail stops agents running in them and permanently removes uncommitted, untracked, and ignored files. Their branches remain. Worktrees that cannot be removed safely stay visible as pending cleanup. Configured archive commands do not run during descendant cleanup.\n\n${lines.join('\n')}`,
+              targets.length === 1 ? 'Force delete' : `Force delete ${targets.length} worktrees`,
               { destructive: true },
             );
     if (!confirmed) return;
@@ -9374,11 +9396,7 @@
       // original path and removal snapshot must survive marking its parent.
       if (worktree.pendingCleanup) continue;
       const state = preview[index];
-      const reason = state.dirty
-        ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-        : state.activeSessions.length
-          ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-          : 'Awaiting explicit confirmation that this worktree is unused.';
+      const reason = 'Force deletion confirmed; cleanup is in progress.';
       pendingCatalog = markWorktreeCleanupPending(
         pendingCatalog,
         repository,
@@ -9387,6 +9405,7 @@
           originalPath: worktree.path,
           recoveryPath: worktree.path,
           sizeBytes: null,
+          selectedWorktreeCleanupConfirmed: true,
           registeredWorktreesAtMark: registered.map(({ path: registeredPath, generation }) => ({
             path: registeredPath,
             generation,
@@ -9405,7 +9424,87 @@
         cause,
       });
     }
-    error = '';
+    if (
+      import.meta.env.MODE === 'e2e' &&
+      sessionStorage.getItem('sai-e2e-pause-force-cleanup') === 'true'
+    ) {
+      error = '';
+      return;
+    }
+    for (const worktree of descendants) deletingWorktreeRequests.add(worktree.path);
+    const failures: string[] = [];
+    let stopped = false;
+    try {
+      await targets.reduce(
+        (previous, worktree) =>
+          previous.then(async () => {
+            if (stopped) return undefined;
+            let current: RegisteredWorktree[];
+            try {
+              current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+            } catch (cause) {
+              failures.push(`Could not refresh registered worktrees: ${describe(cause)}`);
+              stopped = true;
+              return undefined;
+            }
+            const catalogued = new Map(
+              (projectCatalog.worktrees[repository] ?? []).map((entry) => [
+                entry.path,
+                entry.generation,
+              ]),
+            );
+            if (
+              current.some(
+                (entry) =>
+                  entry.path !== repository && catalogued.get(entry.path) !== entry.generation,
+              )
+            ) {
+              failures.push(
+                'A registered worktree is not in this catalog. Refresh or adopt it before retrying cleanup.',
+              );
+              stopped = true;
+              return undefined;
+            }
+            const descendantReason = selectedCleanupDescendantReason(
+              repository,
+              worktree.path,
+              current,
+            );
+            if (descendantReason) {
+              const retained = projectCatalog.worktrees[repository]?.find(
+                (entry) => entry.path === worktree.path && entry.pendingCleanup,
+              );
+              if (retained?.pendingCleanup)
+                await saveProjectCatalogDurably(
+                  markWorktreeCleanupPending(projectCatalog, repository, worktree.path, {
+                    ...retained.pendingCleanup,
+                    reason: descendantReason,
+                  }),
+                );
+              failures.push(`${worktree.branch}: ${descendantReason}`);
+              return undefined;
+            }
+            const removed = await deleteProjectWorktreeOnce(
+              repository,
+              worktree.path,
+              worktree.branch,
+              true,
+              true,
+              { generation: worktree.generation! },
+              true,
+              current,
+            );
+            if (!removed) failures.push(`${worktree.branch}: ${error || 'cleanup did not finish'}`);
+            return undefined;
+          }),
+        Promise.resolve(),
+      );
+    } finally {
+      for (const worktree of descendants) deletingWorktreeRequests.delete(worktree.path);
+    }
+    error = failures.length
+      ? `${failures.length} worktree${failures.length === 1 ? '' : 's'} remain pending. ${failures.join(' ')}`
+      : '';
   }
 
   async function checkPendingWorktreeCleanup(repository: string, selectedPath?: string) {
@@ -10004,11 +10103,6 @@
         'A pending worktree changed identity. It remains registered; refresh before retrying.';
       return;
     }
-    if (preview[0].dirty || preview[0].activeSessions.length) {
-      await checkPendingWorktreeCleanup(repository, selectedPath);
-      error = 'Pending worktrees with files or active sessions were kept. Inspect them and retry.';
-      return;
-    }
     let archiveCommand: string;
     try {
       archiveCommand =
@@ -10019,9 +10113,9 @@
       return;
     }
     const confirmed = await confirmInApp(
-      'Confirm unused worktrees',
-      `Confirm this pending worktree and its private storage are unused, and no other process will write to, move, or replace either until cleanup finishes? Sail rechecks Git identity, private storage, and files immediately before removal. Changes Sail detects stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.${archiveCommand ? ' The configured archive command will not run during selected cleanup; run it before confirming if needed.' : ''}\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
-      'Remove this worktree',
+      'Force delete pending worktree',
+      `Force delete this pending worktree? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files. The branch remains.${archiveCommand ? ' The configured archive command will not run during pending cleanup; run it before confirming if needed.' : ''}\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
+      'Force delete',
       { destructive: true },
     );
     if (!confirmed) return;
@@ -10050,19 +10144,6 @@
         error = `${reason} Remaining worktrees were kept.`;
         return;
       }
-      // An inventory request started before this worktree became pending can still
-      // launch an agent runtime. Refuse cleanup if it does not finish promptly.
-      if (!(await waitForSidebarInventory(sidebarInventoryRequests))) {
-        error =
-          'Cleanup stopped: an agent inventory request is still running. This worktree and its private data remain pending; retry when inventory finishes.';
-        saveProjectCatalog(
-          markWorktreeCleanupPending(projectCatalog, repository, target.path, {
-            ...recovery,
-            reason: error,
-          }),
-        );
-        return;
-      }
       const previousCatalog = projectCatalog;
       const confirmedRecovery = { ...recovery, selectedWorktreeCleanupConfirmed: true };
       try {
@@ -10075,16 +10156,29 @@
           cause,
         });
       }
+      if (
+        import.meta.env.MODE === 'e2e' &&
+        sessionStorage.getItem('sai-e2e-pause-selected-force-cleanup') === 'true'
+      ) {
+        error =
+          'Cleanup stopped: Private agent data is retained while temporary data is still in use or cannot be verified.';
+        await saveProjectCatalogDurably(
+          markWorktreeCleanupPending(projectCatalog, repository, target.path, {
+            ...confirmedRecovery,
+            reason: error,
+          }),
+        );
+        return;
+      }
       const removed = await deleteProjectWorktreeOnce(
         repository,
         target.path,
         target.branch,
-        false,
-        false,
-        preview[0],
+        true,
+        true,
+        { generation: target.generation! },
         true,
         current,
-        true,
       );
       if (removed) {
         try {
@@ -10180,7 +10274,7 @@
     branch: string,
     force: boolean,
     stopAgents = false,
-    expected?: WorktreeRemovalPreview,
+    expected?: WorktreeRemovalExpectation,
     preconfirmed = false,
     expectedRegisteredWorktrees?: RegisteredWorktree[],
     confirmedUnused = false,
@@ -10206,14 +10300,14 @@
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
     if (e2eAnswer) sessionStorage.removeItem('sai-e2e-delete-worktree');
     const confirmed =
-      preconfirmed || stopAgents || e2eAnswer === 'Yes'
+      preconfirmed || e2eAnswer === 'Yes'
         ? true
         : e2eAnswer === 'No'
           ? false
           : await confirmInApp(
               force ? 'Force delete worktree' : 'Delete worktree',
               force || config
-                ? `Delete worktree “${branch}” at ${path}? This permanently removes uncommitted and ignored files, including copied files. The branch will remain.`
+                ? `Delete worktree “${branch}” at ${path}? Sail stops agents running in it and permanently removes uncommitted, untracked, and ignored files, including copied files. The branch will remain.`
                 : `Delete worktree “${branch}” at ${path}? Uncommitted and ignored files block deletion. The branch will remain.`,
               force ? 'Force delete' : 'Delete worktree',
               { destructive: true },
@@ -10225,7 +10319,7 @@
       [path]: config?.archive && !preconfirmed ? 'Archiving' : 'Preparing deletion',
     };
     try {
-      if (config?.archive && !stopAgents && !preconfirmed) {
+      if (config?.archive && !preconfirmed) {
         if (!wasSelected) await loadProject(path);
         const paneId = splitFocusedPane('row', 'terminal', config.archive);
         if (!paneId) return false;
@@ -10381,7 +10475,7 @@
           true,
           true,
           expected,
-          preconfirmed,
+          true,
           expectedRegisteredWorktrees,
         );
     } else if (retryForce)
