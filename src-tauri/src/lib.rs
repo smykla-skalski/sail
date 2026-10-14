@@ -4747,6 +4747,10 @@ pub fn run() {
                     );
                 })
                 .map_err(std::io::Error::other)?;
+            #[cfg(unix)]
+            if let Err(error) = scratch_cleanup::spawn_runtime_sweeper() {
+                eprintln!("Sail runtime scratch sweep unavailable: {error}");
+            }
             let process_directory = _app.path().app_config_dir()?.join("owned-processes");
             owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;
