@@ -2154,7 +2154,7 @@ fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
                         ProviderEvent::Notification(line)
                     } else {
                         if value.get("id").is_none()
-                            || (value.get("result").is_none() && value.get("error").is_none())
+                            || (value.get("result").is_some() == value.get("error").is_some())
                         {
                             return Err("Provider returned an invalid response.".into());
                         }
@@ -2342,7 +2342,7 @@ fn exchange_provider_request(
             }
         }
     };
-    if method == "initialize" {
+    if method == "initialize" && successful_provider_response(Some(&response)) {
         if let Some(result) = response
             .lines()
             .last()
@@ -2732,6 +2732,71 @@ mod tests {
             "params":{"name":"fixture_ping","arguments":{}}}));
         assert_eq!(called["result"]["content"][0]["text"], "fixture reply");
         assert_eq!(called["result"]["pid"], initialized["result"]["pid"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_initialization_never_creates_a_shared_success() {
+        for mode in ["both", "neither", "error"] {
+            let repository = Repository::new("runtime-malformed-initialize");
+            repository.write(".sail/initialize-response", mode);
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopAndWait(key.clone());
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let peer = ActiveSession::new();
+            let call = |capability: &str, id| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(capability),
+                    &json!({"jsonrpc":"2.0","id":id,"method":"initialize",
+                        "params":{"protocolVersion":"2025-06-18"}})
+                    .to_string(),
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            for capability in [&owner.0, &peer.0] {
+                let response = call(capability, 1);
+                if mode == "error" {
+                    let response: serde_json::Value =
+                        serde_json::from_str(&response.unwrap().unwrap()).unwrap();
+                    assert_eq!(response["id"], 1);
+                    assert_eq!(response["error"]["message"], "startup failed");
+                    assert!(response.get("result").is_none());
+                } else {
+                    assert!(response.unwrap_err().contains("invalid response"), "{mode}");
+                    assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+                }
+                assert!(active_sessions()
+                    .lock()
+                    .unwrap()
+                    .get(capability)
+                    .unwrap()
+                    .is_none());
+            }
+            fs::remove_file(repository.0.join(".sail/initialize-response")).unwrap();
+            let first: serde_json::Value =
+                serde_json::from_str(&call(&owner.0, 2).unwrap().unwrap()).unwrap();
+            let second: serde_json::Value =
+                serde_json::from_str(&call(&peer.0, 3).unwrap().unwrap()).unwrap();
+            assert_eq!(first["id"], 2);
+            assert_eq!(second["id"], 3);
+            assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+            let initialize_count = if mode == "error" { 3 } else { 1 };
+            assert_eq!(first["result"]["initializeCount"], initialize_count);
+            assert_eq!(second["result"]["initializeCount"], initialize_count);
+        }
     }
 
     #[cfg(target_os = "macos")]

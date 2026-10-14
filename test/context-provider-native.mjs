@@ -313,6 +313,37 @@ try {
     run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
     'approved',
   );
+  for (const mode of ['both', 'neither']) {
+    const malformed = join(root, `initialize-${mode}`);
+    makeProject(malformed, 'fixture-provider');
+    const marker = join(malformed, '.sail/initialize-response');
+    writeFileSync(marker, mode);
+    assert.equal(
+      run(binary, ['--context-auth-approve-probe', malformed, 'fixture-provider', provider]),
+      'approved',
+    );
+    const owner = startClient(malformed);
+    const peer = startClient(malformed);
+    for (const client of [owner, peer]) {
+      await assert.rejects(client.request(1, 'initialize'), /invalid response/i);
+      await client.waitForExit();
+      assert.match(client.stderr(), /invalid response/i);
+    }
+    rmSync(marker);
+    const recoveredOwner = startClient(malformed);
+    const recoveredPeer = startClient(malformed);
+    const recovered = await recoveredOwner.request(2, 'initialize');
+    const shared = await recoveredPeer.request(3, 'initialize');
+    assert.ok(recovered.result.pid > 0);
+    assert.equal(shared.result.pid, recovered.result.pid);
+    assert.equal(recovered.result.initializeCount, 1);
+    assert.equal(shared.result.initializeCount, 1);
+    assert.equal((await recoveredPeer.request(4)).result.pid, recovered.result.pid);
+    recoveredOwner.child.stdin.end();
+    recoveredPeer.child.stdin.end();
+    await Promise.all([recoveredOwner.waitForExit(), recoveredPeer.waitForExit()]);
+    await waitForProcessExit(recovered.result.pid);
+  }
   const first = startClient(project);
   const second = startClient(project);
   const peer = startClient(project);

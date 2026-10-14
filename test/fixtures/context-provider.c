@@ -53,6 +53,30 @@ int main(void) {
             continue;
         }
         last_request_id = value;
+        if (strstr(line, "\"method\":\"initialize\"")) {
+            FILE *mode = fopen(".sail/initialize-response", "r");
+            if (mode) {
+                char response[16] = {0};
+                int read = fscanf(mode, "%15s", response);
+                fclose(mode);
+                if (read != 1) return 1;
+                if (strcmp(response, "both") == 0) {
+                    printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{"
+                           "\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+                           "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}},"
+                           "\"error\":{\"code\":-32603,\"message\":\"startup failed\"}}\n", value);
+                } else if (strcmp(response, "neither") == 0) {
+                    printf("{\"jsonrpc\":\"2.0\",\"id\":%ld}\n", value);
+                } else if (strcmp(response, "error") == 0) {
+                    printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"error\":{"
+                           "\"code\":-32603,\"message\":\"startup failed\"}}\n", value);
+                } else {
+                    return 1;
+                }
+                fflush(stdout);
+                continue;
+            }
+        }
         char *progress_token = strstr(line, "\"progressToken\"");
         long progress_id = progress_token && (progress_token = strchr(progress_token, ':'))
             ? strtol(progress_token + 1, NULL, 10) : 0;
