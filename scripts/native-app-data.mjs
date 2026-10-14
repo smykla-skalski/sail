@@ -6,6 +6,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const identifierPattern = /^dev\.smykla\.sail\.e2e\.([a-f0-9]{32})$/;
 const productNamePattern = /Sail E2E ([a-f0-9]{8})\.app\//g;
+const appPathPattern = /^(\/.*?Sail E2E [a-f0-9]{8}\.app)\/Contents\/MacOS\//gm;
+export const buildIdentifierKey = 'SailE2EBuildIdentifier';
 
 export function isRunIdentifier(name) {
   return identifierPattern.test(name);
@@ -59,6 +61,36 @@ export function isRunLive(identifier, live) {
   return Boolean(match) && live.has(match[1].slice(0, 8));
 }
 
+/** Identifiers a live app was built or bundled with, read from its Info.plist. */
+export function bundleIdentifiers(app) {
+  return ['CFBundleIdentifier', buildIdentifierKey].flatMap((key) => {
+    const result = spawnSync(
+      '/usr/libexec/PlistBuddy',
+      ['-c', `Print :${key}`, join(app, 'Contents/Info.plist')],
+      {
+        encoding: 'utf8',
+      },
+    );
+    return result.status === 0 ? [result.stdout.trim()] : [];
+  });
+}
+
+/**
+ * Everything a live run protects: its token, its bundle identifier and the build identifier its
+ * app resolves log and data folders from.
+ */
+export function liveProtection(processCommands, readBundleIdentifiers = bundleIdentifiers) {
+  const apps = new Set([...processCommands.matchAll(appPathPattern)].map((match) => match[1]));
+  return {
+    tokens: liveRunTokens(processCommands),
+    identifiers: new Set([...apps].flatMap((app) => readBundleIdentifiers(app))),
+  };
+}
+
+function isProtected(identifier, protection) {
+  return isRunLive(identifier, protection.tokens) || protection.identifiers.has(identifier);
+}
+
 function listNames(root) {
   try {
     return readdirSync(root);
@@ -97,11 +129,32 @@ export async function removeRunData(identifier, roots, pause = 500) {
 }
 
 /**
+ * The app resolves its log and data folders from the identifier compiled into the build, which a
+ * cached artifact shares between runs. Those folders stay while a live app was built with them.
+ */
+export async function removeIdleBuildData(
+  identifier,
+  roots,
+  readProcessCommands,
+  readBundleIdentifiers = bundleIdentifiers,
+  pause = 500,
+) {
+  const protection = liveProtection(readProcessCommands(), readBundleIdentifiers);
+  if (isProtected(identifier, protection)) return [];
+  return removeRunData(identifier, roots, pause);
+}
+
+/**
  * Removes folders of every run whose app process no longer exists. Candidates are listed before the
  * process table is read, so a run that starts during the sweep is seen as live. A folder that cannot
  * be removed is reported in `failed` without stopping the sweep.
  */
-export function sweepRunData(roots, readProcessCommands, keep = []) {
+export function sweepRunData(
+  roots,
+  readProcessCommands,
+  keep = [],
+  readBundleIdentifiers = bundleIdentifiers,
+) {
   const kept = new Set(keep);
   const candidates = roots.flatMap((root) =>
     listNames(root)
@@ -109,8 +162,8 @@ export function sweepRunData(roots, readProcessCommands, keep = []) {
       .map((name) => ({ name, path: join(root, name) })),
   );
   if (candidates.length === 0) return { removed: [], failed: [] };
-  const live = liveRunTokens(readProcessCommands());
-  const stale = candidates.filter(({ name }) => !isRunLive(name, live));
+  const protection = liveProtection(readProcessCommands(), readBundleIdentifiers);
+  const stale = candidates.filter(({ name }) => !isProtected(name, protection));
   const removed = [];
   const failed = [];
   for (const { path } of stale) (removeFolder(path) ? removed : failed).push(path);

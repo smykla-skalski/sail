@@ -20,7 +20,9 @@ import { fileURLToPath } from 'node:url';
 import { e2eContextService, e2eIdentity } from './e2e-identity.mjs';
 import { sweepStateRoots } from './e2e-state.mjs';
 import {
+  buildIdentifierKey,
   listProcessCommands,
+  removeIdleBuildData,
   removeRunData,
   sweepRunData,
   systemRunDataRoots,
@@ -200,6 +202,11 @@ function prepareApp(source, attempt, env) {
     plist,
   ]);
   command('/usr/libexec/PlistBuddy', ['-c', `Set :CFBundleName ${identity.productName}`, plist]);
+  command('/usr/libexec/PlistBuddy', [
+    '-c',
+    `Add :${buildIdentifierKey} string ${identifier(source)}`,
+    plist,
+  ]);
   const template = readFileSync(
     join(checkout, 'src-tauri/macos/dev.smykla.sai-harness.context-supervisor.plist'),
     'utf8',
@@ -344,8 +351,10 @@ async function main() {
     const env = nativeEnvironment(attempt, checkout, process.env, await availablePort());
     let phase = 'artifact';
     let runIdentifier;
+    let buildIdentifier;
     try {
       const built = await artifact(canonical, requirements, attempt);
+      buildIdentifier = identifier(built.app);
       phase = 'signing and identity';
       const { app, identity } = prepareApp(built.app, attempt, env);
       runIdentifier = identity.identifier;
@@ -414,12 +423,15 @@ async function main() {
         if (env.SAIL_E2E_BINARY) await stopApp(env.SAIL_E2E_BINARY);
       } finally {
         sweepStateRoots(env.TMPDIR);
-        if (runIdentifier) {
-          const leftovers = await removeRunData(runIdentifier, dataRoots);
-          result.leftovers = leftovers;
-          if (leftovers.length > 0)
-            process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
-        }
+        const leftovers = [
+          ...(runIdentifier ? await removeRunData(runIdentifier, dataRoots) : []),
+          ...(buildIdentifier
+            ? await removeIdleBuildData(buildIdentifier, dataRoots, listProcessCommands)
+            : []),
+        ];
+        result.leftovers = leftovers;
+        if (leftovers.length > 0)
+          process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
       }
     }
     if (result.verdict === 'SETUP_FAILED') return runAttempt(index + 1);

@@ -10,6 +10,7 @@ import {
   isRunLive,
   listProcessCommands,
   liveRunTokens,
+  removeIdleBuildData,
   removeRunData,
   runDataRoots,
   sweepRunData,
@@ -161,3 +162,23 @@ await test(
     }
   },
 );
+
+await test('build identity folders stay while a live app was built with them', async (context) => {
+  const { roots, populate, remaining } = fixture(context);
+  const build = identifier('b5');
+  const live = identifier('a5');
+  const other = identifier('c5');
+  populate(build);
+  const readBundle = (app: string) => (app.includes(live.slice(-32, -24)) ? [live, build] : []);
+
+  assert.deepEqual(await removeIdleBuildData(build, roots, () => appPath(live), readBundle, 0), []);
+  assert.deepEqual(remaining(build), roots);
+  assert.equal(sweepRunData(roots, () => appPath(live), [], readBundle).removed.length, 0);
+  assert.deepEqual(remaining(build), roots);
+
+  populate(other);
+  assert.deepEqual(await removeIdleBuildData(other, roots, () => appPath(live), readBundle, 0), []);
+  assert.deepEqual(remaining(other), []);
+  assert.deepEqual(await removeIdleBuildData(build, roots, () => '', readBundle, 0), []);
+  assert.deepEqual(remaining(build), []);
+});
