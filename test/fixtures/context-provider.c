@@ -88,6 +88,20 @@ int main(void) {
             unsubscriptions++;
             subscribed = 0;
         }
+        if (strstr(line, "\"method\":\"resources/subscribe\"") ||
+            strstr(line, "\"method\":\"resources/unsubscribe\"")) {
+            if (access(".sail/hold-resource-subscriptions", F_OK) == 0) {
+                char marker[64];
+                snprintf(marker, sizeof(marker), "subscription-ready-%ld", (long)getpid());
+                if (!write_marker(marker)) return 1;
+                while (access(".sail/release-resource-subscriptions", F_OK) != 0) {
+                    usleep(10000);
+                }
+            }
+            if (access(".sail/slow-resource-subscriptions", F_OK) == 0) {
+                usleep(750000);
+            }
+        }
         if (strstr(line, "\"method\":\"invalid-slow\"")) {
             if (!write_marker("protocol-fault-ready")) return 1;
             sleep(1);

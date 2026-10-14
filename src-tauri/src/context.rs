@@ -1721,6 +1721,7 @@ fn provider_request_with_notifications_at(
                     &initialize,
                     &initialize.to_string(),
                     None,
+                    None,
                 )?;
                 if process
                     .initialization
@@ -1743,6 +1744,7 @@ fn provider_request_with_notifications_at(
                         &initialized,
                         &initialized.to_string(),
                         None,
+                        None,
                     )?;
                 }
             }
@@ -1761,53 +1763,16 @@ fn provider_request_with_notifications_at(
                 })
                 .flat_map(|session| session.subscriptions.iter().cloned())
                 .collect();
-            for uri in subscriptions
-                .difference(&process.subscriptions)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                let subscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-subscription",
-                    "method":"resources/subscribe","params":{"uri":uri}});
-                let response = exchange_provider_request(
-                    process,
-                    &key,
-                    None,
-                    &subscribe,
-                    &subscribe.to_string(),
-                    notify
-                        .as_mut()
-                        .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
-                )?;
-                if !successful_provider_response(response.as_deref()) {
-                    return Err(
-                        "Replacement provider rejected an active resource subscription.".into(),
-                    );
-                }
-                process.subscriptions.insert(uri);
-            }
-            for uri in process
-                .subscriptions
-                .difference(&subscriptions)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                let unsubscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-unsubscription",
-                    "method":"resources/unsubscribe","params":{"uri":uri}});
-                let response = exchange_provider_request(
-                    process,
-                    &key,
-                    None,
-                    &unsubscribe,
-                    &unsubscribe.to_string(),
-                    notify
-                        .as_mut()
-                        .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
-                )?;
-                if !successful_provider_response(response.as_deref()) {
-                    return Err("Provider rejected an expired resource subscription.".into());
-                }
-                process.subscriptions.remove(&uri);
-            }
+            synchronize_provider_subscriptions(
+                process,
+                &key,
+                capability,
+                &subscriptions,
+                notify
+                    .as_mut()
+                    .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+                std::time::Instant::now() + Duration::from_secs(30),
+            )?;
         }
         let uri = request
             .get("params")
@@ -1848,7 +1813,7 @@ fn provider_request_with_notifications_at(
                 .ok_or("MCP resource subscription request has no ID.")?;
             Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}).to_string())
         } else {
-            exchange_provider_request(process, &key, capability, &request, message, notify)?
+            exchange_provider_request(process, &key, capability, &request, message, notify, None)?
         };
         if successful_provider_response(response.as_deref()) {
             if let Some(uri) = uri {
@@ -2172,6 +2137,65 @@ fn start_provider_output(process: &mut ProviderProcess) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+fn synchronize_provider_subscriptions(
+    process: &mut ProviderProcess,
+    key: &str,
+    capability: Option<&str>,
+    subscriptions: &HashSet<String>,
+    mut notify: NotificationSink<'_>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    for uri in subscriptions
+        .difference(&process.subscriptions)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let subscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-subscription",
+            "method":"resources/subscribe","params":{"uri":uri}});
+        let response = exchange_provider_request(
+            process,
+            key,
+            capability,
+            &subscribe,
+            &subscribe.to_string(),
+            notify
+                .as_mut()
+                .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+            Some(deadline),
+        )?;
+        if !successful_provider_response(response.as_deref()) {
+            return Err("Replacement provider rejected an active resource subscription.".into());
+        }
+        process.subscriptions.insert(uri);
+    }
+    for uri in process
+        .subscriptions
+        .difference(subscriptions)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let unsubscribe = serde_json::json!({"jsonrpc":"2.0","id":"sail-unsubscription",
+            "method":"resources/unsubscribe","params":{"uri":uri}});
+        let response = exchange_provider_request(
+            process,
+            key,
+            capability,
+            &unsubscribe,
+            &unsubscribe.to_string(),
+            notify
+                .as_mut()
+                .map(|sink| &mut **sink as &mut dyn FnMut(&str) -> Result<(), String>),
+            Some(deadline),
+        )?;
+        if !successful_provider_response(response.as_deref()) {
+            return Err("Provider rejected an expired resource subscription.".into());
+        }
+        process.subscriptions.remove(&uri);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn exchange_provider_request(
     process: &mut ProviderProcess,
     key: &str,
@@ -2179,6 +2203,7 @@ fn exchange_provider_request(
     request: &serde_json::Value,
     message: &str,
     mut notify: NotificationSink<'_>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Option<String>, String> {
     use std::time::Duration;
     let session_active = || session_is_active(capability);
@@ -2218,7 +2243,10 @@ fn exchange_provider_request(
     } else {
         message
     };
-    write_shared_provider_request(&process.stdin, message, Duration::from_secs(30), || {
+    let write_timeout = deadline.map_or(Duration::from_secs(30), |deadline| {
+        deadline.saturating_duration_since(std::time::Instant::now())
+    });
+    write_shared_provider_request(&process.stdin, message, write_timeout, || {
         if !session_active()? {
             return Err("Context session revoked during provider stdin write.".into());
         }
@@ -2242,7 +2270,7 @@ fn exchange_provider_request(
         .as_mut()
         .ok_or("Provider output unavailable.")?;
     let upstream_id = upstream_id.ok_or("Provider request has no upstream ID.")?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = deadline.unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(30));
     let mut buffered = String::new();
     let response = loop {
         if !session_active()? {
@@ -3547,6 +3575,195 @@ mod tests {
         .unwrap();
         assert_eq!(closed["result"]["unsubscriptions"], 2);
         assert_eq!(closed["result"]["subscribed"], false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restored_subscriptions_stop_when_session_authorization_is_removed() {
+        type RemoveAuthorization = fn(&Repository, &Path, &ActiveSession);
+        let cases: [(&str, RemoveAuthorization); 2] = [
+            ("session-close", |_, _, owner| {
+                let capability = std::ffi::CString::new(owner.0.clone()).unwrap();
+                unsafe { sail_context_session_deactivate(capability.as_ptr()) };
+            }),
+            ("approval-revocation", |repository, store_path, owner| {
+                locked_store(store_path, |store| {
+                    let removed = revoke(&repository.0, store)?;
+                    Ok(((), removed))
+                })
+                .unwrap();
+                let capability = std::ffi::CString::new(owner.0.clone()).unwrap();
+                unsafe { sail_context_session_deactivate(capability.as_ptr()) };
+            }),
+        ];
+        for (name, remove_authorization) in cases {
+            let repository = Repository::new(name);
+            repository.configure();
+            let key = project_key(&repository.0).unwrap();
+            let _stop = StopAndWait(key.clone());
+            let executable = repository.provider_fixture();
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", &executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            let owner = ActiveSession::new();
+            let call = |request: serde_json::Value| {
+                provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    Some(&owner.0),
+                    &request.to_string(),
+                    &store_path,
+                    &repository.0.join("data"),
+                )
+            };
+            call(json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"protocolVersion":"2025-06-18","capabilities":{}}}))
+            .unwrap();
+            call(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).unwrap();
+            call(
+                json!({"jsonrpc":"2.0","id":2,"method":"resources/subscribe",
+                "params":{"uri":"fixture://first"}}),
+            )
+            .unwrap();
+            call(
+                json!({"jsonrpc":"2.0","id":3,"method":"resources/subscribe",
+                "params":{"uri":"fixture://second"}}),
+            )
+            .unwrap();
+            stop_provider_if_fingerprint(&key, &fingerprint)
+                .unwrap()
+                .join()
+                .unwrap();
+            fs::write(
+                repository.0.join(".sail/hold-resource-subscriptions"),
+                b"hold",
+            )
+            .unwrap();
+
+            std::thread::scope(|scope| {
+                let (send, receive) = std::sync::mpsc::channel();
+                let request = scope.spawn(move || {
+                    let result = call(json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}));
+                    send.send(result).unwrap();
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let marker = loop {
+                    let marker = fs::read_dir(repository.0.join("data").join(&key))
+                        .ok()
+                        .and_then(|entries| {
+                            entries.filter_map(Result::ok).find(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with("subscription-ready-")
+                            })
+                        });
+                    if let Some(marker) = marker {
+                        break marker;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{name}: replay did not start"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                };
+                let pid: i32 = marker
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix("subscription-ready-")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                remove_authorization(&repository, &store_path, &owner);
+                let key_c = std::ffi::CString::new(key.clone()).unwrap();
+                unsafe { sail_context_provider_stop(key_c.as_ptr()) };
+                let interrupted = receive.recv_timeout(std::time::Duration::from_secs(2));
+                fs::write(
+                    repository.0.join(".sail/release-resource-subscriptions"),
+                    b"release",
+                )
+                .unwrap();
+                request.join().unwrap();
+
+                assert!(
+                    interrupted
+                        .unwrap()
+                        .unwrap_err()
+                        .contains("session revoked"),
+                    "{name}"
+                );
+                assert_eq!(
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                    Err(nix::errno::Errno::ESRCH),
+                    "{name}: revoked provider is still running"
+                );
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn subscription_restoration_shares_one_deadline_across_slow_replies() {
+        let repository = Repository::new("runtime-subscription-deadline");
+        repository.configure();
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let current = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((status(&repository.0, store), true))
+        })
+        .unwrap();
+        let key = project_key(&repository.0).unwrap();
+        let owner = ActiveSession::new();
+        let mut process =
+            spawn_provider(&repository.0, &current, &repository.0.join("data")).unwrap();
+        let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18","capabilities":{}}});
+        exchange_provider_request(
+            &mut process,
+            &key,
+            Some(&owner.0),
+            &initialize,
+            &initialize.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        exchange_provider_request(
+            &mut process,
+            &key,
+            Some(&owner.0),
+            &initialized,
+            &initialized.to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        fs::write(
+            repository.0.join(".sail/slow-resource-subscriptions"),
+            b"slow",
+        )
+        .unwrap();
+        let subscriptions = HashSet::from(["fixture://first".into(), "fixture://second".into()]);
+
+        let result = synchronize_provider_subscriptions(
+            &mut process,
+            &key,
+            Some(&owner.0),
+            &subscriptions,
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+
+        assert!(result.unwrap_err().contains("timed out"));
     }
 
     #[cfg(target_os = "macos")]
