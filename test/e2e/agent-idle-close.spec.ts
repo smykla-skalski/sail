@@ -188,7 +188,7 @@ describe('idle session close', () => {
         async ({ core }, agent, path, id) => {
           await core.invoke('acp_begin_session_restore', {
             agent,
-            directory: path,
+            cwd: path,
             sessionId: id,
           });
         },
