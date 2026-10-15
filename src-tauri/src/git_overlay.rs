@@ -1641,6 +1641,33 @@ impl GitOverlay {
         command.env_remove("GIT_INDEX_FILE");
     }
 
+    /// Routes Git to this overlay only when `directory` belongs to its worktree.
+    /// An explicitly selected worktree elsewhere keeps its own Git state, and
+    /// overlay routing an agent forwarded in the environment is dropped.
+    pub(crate) fn apply_for_directory(&self, command: &mut Command, directory: &Path) {
+        let selected = crate::terminal::git_worktree_root(directory);
+        if crate::acp_terminal::stable_worktree_identity(&selected)
+            == crate::acp_terminal::stable_worktree_identity(&self.worktree)
+        {
+            self.apply(command);
+            return;
+        }
+        let overlay_git_dir = git_config_path(&self.git_dir);
+        let forwarded = command
+            .get_envs()
+            .any(|(name, value)| name == "GIT_DIR" && value == Some(overlay_git_dir.as_os_str()));
+        if forwarded {
+            for key in [
+                "GIT_DIR",
+                "GIT_COMMON_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+            ] {
+                command.env_remove(key);
+            }
+        }
+    }
+
     pub(crate) fn promote_quiescent(
         &mut self,
         check_quiescence: impl FnOnce() -> Result<(), String>,
@@ -2561,6 +2588,67 @@ mod tests {
         overlay.apply(&mut command);
         let result = output(command.arg("-C").arg(&overlay.worktree).args(arguments)).unwrap();
         String::from_utf8(result.stdout).unwrap().trim().to_string()
+    }
+
+    fn toplevel_from(overlay: &GitOverlay, directory: &Path, forwarded: bool) -> PathBuf {
+        let mut command = git_command();
+        if forwarded {
+            command.env("GIT_DIR", git_config_path(&overlay.git_dir));
+            command.env("GIT_WORK_TREE", git_config_path(&overlay.worktree));
+        }
+        overlay.apply_for_directory(&mut command, directory);
+        let result = output(
+            command
+                .current_dir(directory)
+                .args(["rev-parse", "--show-toplevel"]),
+        )
+        .unwrap();
+        dunce::canonicalize(String::from_utf8(result.stdout).unwrap().trim()).unwrap()
+    }
+
+    #[test]
+    fn selected_worktree_outside_the_overlay_keeps_its_own_git_state() {
+        let fixture = OverlayFixture::new();
+        let other = fixture.root.join("other");
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                other.to_str().unwrap(),
+            ],
+        );
+        let other = dunce::canonicalize(other).unwrap();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let nested = fixture.task.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        for forwarded in [false, true] {
+            assert_eq!(toplevel_from(&overlay, &other, forwarded), other);
+            assert_eq!(
+                toplevel_from(&overlay, &fixture.main, forwarded),
+                dunce::canonicalize(&fixture.main).unwrap()
+            );
+            assert_eq!(toplevel_from(&overlay, &nested, forwarded), fixture.task);
+        }
+
+        let mut command = git_command();
+        overlay.apply_for_directory(&mut command, &nested);
+        let result = output(
+            command
+                .current_dir(&nested)
+                .args(["rev-parse", "--git-dir"]),
+        )
+        .unwrap();
+        assert_eq!(
+            dunce::canonicalize(String::from_utf8(result.stdout).unwrap().trim()).unwrap(),
+            dunce::canonicalize(&overlay.git_dir).unwrap()
+        );
     }
 
     #[test]

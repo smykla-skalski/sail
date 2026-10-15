@@ -946,7 +946,7 @@ pub fn handle(
                     .map_err(|error| error.to_string())?,
                 worktree,
             )? {
-                overlay.apply(&mut command);
+                overlay.apply_for_directory(&mut command, directory);
             }
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             storage_lease.prepare_process_start()?;
