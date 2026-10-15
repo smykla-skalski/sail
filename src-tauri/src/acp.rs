@@ -7647,6 +7647,8 @@ pub async fn acp_begin_session_restore(
             if let Some(token) = result.get("restoreToken").and_then(Value::as_str) {
                 runtime.release_restore(&session_id, token)?;
             }
+            // The delete landed after the reservation registered the thread.
+            unregister_session(&runtime, &session_id)?;
             return Err(error);
         }
         Ok(result)
