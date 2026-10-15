@@ -179,6 +179,27 @@ describe('idle session close', () => {
   });
 
   for (const provider of ['codex', 'claude'] as const) {
+    it(`closes an abandoned ${provider} restore after its reservation expires`, async () => {
+      expect(closeLog).not.toBe('');
+      const directory = realpathSync(repository);
+      const [session] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [session]);
+      await browser.tauri.execute(
+        async ({ core }, agent, path, id) => {
+          await core.invoke('acp_begin_session_restore', {
+            agent,
+            directory: path,
+            sessionId: id,
+          });
+        },
+        provider,
+        directory,
+        session,
+      );
+      await closeIdleThreads(session);
+      expect(await attached(provider, directory)).not.toContain(session);
+    });
+
     it(`closes finished unseen ${provider} threads, spares busy and visible ones, and reattaches on prompt`, async () => {
       expect(closeLog).not.toBe('');
       const directory = realpathSync(repository);

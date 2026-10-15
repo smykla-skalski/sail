@@ -5590,7 +5590,9 @@ impl Connection {
         if terminal_running
             || prompts.active.contains_key(session_id)
             || prompts.finishing.contains(session_id)
-            || restores.contains_key(session_id)
+            || restores
+                .get(session_id)
+                .is_some_and(|claim| claim.request_active || claim.expires > Instant::now())
         {
             return Ok(true);
         }
@@ -13718,6 +13720,40 @@ mod idle_close_tests {
         let runtime = runtime("ses_restore");
         runtime.begin_restore("ses_restore").unwrap();
         assert!(holds_work(&runtime, "ses_restore", false));
+    }
+
+    #[test]
+    fn expired_restore_reservation_does_not_keep_the_session_loaded() {
+        let runtime = runtime("ses_abandoned");
+        runtime.begin_restore("ses_abandoned").unwrap();
+        runtime
+            .restores
+            .lock()
+            .unwrap()
+            .get_mut("ses_abandoned")
+            .unwrap()
+            .expires = Instant::now();
+        assert!(!holds_work(&runtime, "ses_abandoned", false));
+    }
+
+    #[test]
+    fn active_restore_keeps_the_session_loaded_after_reservation_expiry() {
+        let runtime = runtime("ses_slow_restore");
+        let reservation = runtime.begin_restore("ses_slow_restore").unwrap();
+        let token = reservation["restoreToken"].as_str().unwrap();
+        let request = runtime
+            .begin_restore_request("ses_slow_restore", token)
+            .unwrap();
+        runtime
+            .restores
+            .lock()
+            .unwrap()
+            .get_mut("ses_slow_restore")
+            .unwrap()
+            .expires = Instant::now();
+        assert!(holds_work(&runtime, "ses_slow_restore", false));
+        drop(request);
+        assert!(holds_work(&runtime, "ses_slow_restore", false));
     }
 
     #[test]
