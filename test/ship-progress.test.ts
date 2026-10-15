@@ -1941,6 +1941,20 @@ void test('a gate without a requested revision records the head when the worktre
   assert.equal(requireGateTargetCommit('', null), undefined);
 });
 
+void test('Ship gates require an explicit target revision before starting', () => {
+  for (const requested of [undefined, null, '']) {
+    for (const commit of [head, null]) {
+      assert.throws(
+        () => requireGateTargetCommit(requested, commit, true),
+        /Ship validation gates require a target revision/,
+      );
+      assert.equal(requireGateTargetCommit(requested, commit), commit ?? undefined);
+    }
+  }
+  assert.equal(requireGateTargetCommit('dfcc5f1a', head, true), head);
+  assert.throws(() => requireGateTargetCommit('1f34a371', head, true), /not the head/);
+});
+
 void test('a gate aimed at another commit is rejected before it starts', () => {
   assert.throws(
     () => requireGateTargetCommit('1f34a371', head),

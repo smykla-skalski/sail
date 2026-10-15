@@ -316,9 +316,13 @@ export function validationRevisionDrifted(
 export function requireGateTargetCommit(
   requested: unknown,
   headCommit: string | null,
+  revisionRequired = false,
 ): string | undefined {
-  if (requested === undefined || requested === null || requested === '')
+  if (requested === undefined || requested === null || requested === '') {
+    if (revisionRequired)
+      throw new Error('Ship validation gates require a target revision (commit SHA).');
     return headCommit ?? undefined;
+  }
   if (typeof requested !== 'string' || !/^[0-9a-f]{7,64}$/i.test(requested.trim()))
     throw new Error('Gate revision must be a commit SHA of at least 7 hexadecimal digits.');
   const target = requested.trim().toLowerCase();

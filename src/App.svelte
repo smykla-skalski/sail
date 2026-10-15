@@ -7311,10 +7311,14 @@
       const owner = shipOwner(shipRuns, request.directory, sourceId);
       const requestedRevision = request.arguments.revision;
       // Reject a wrong target before the Ship issue stage or events change.
-      if (requestedRevision !== undefined && requestedRevision !== null && requestedRevision !== '')
+      if (
+        owner ||
+        (requestedRevision !== undefined && requestedRevision !== null && requestedRevision !== '')
+      )
         requireGateTargetCommit(
           requestedRevision,
           await invoke<string | null>('working_tree_commit', { path: request.directory }),
+          Boolean(owner),
         );
       try {
         if (owner) {
@@ -7710,16 +7714,20 @@
       throw new Error('Gate prompt must be 1–8000 characters.');
     const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
     const requestedCommit = request.arguments.revision;
-    if (requestedCommit !== undefined && requestedCommit !== null && requestedCommit !== '')
+    const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
+    if (
+      gateOwner ||
+      (requestedCommit !== undefined && requestedCommit !== null && requestedCommit !== '')
+    )
       requireGateTargetCommit(
         requestedCommit,
         await invoke<string | null>('working_tree_commit', { path: request.directory }),
+        Boolean(gateOwner),
       );
     await recoverImplementationModels(request.directory);
     const activeModels = await activeImplementationModels(request.directory, sourceId);
     if (!activeModels)
       throw new Error('Implementation activity is still unresolved. Wait for the turn to finish.');
-    const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
     const routeRisk = gateOwner?.issue.validationPolicy?.risk ?? 'medium';
     const routeRole = gate === 'test-adversary' ? 'testing' : 'review';
     const configuredGateRoute = modelRouting.routes.find(
@@ -7901,7 +7909,7 @@
           invoke<string | null>('working_tree_commit', { path: request.directory }),
         ]);
         // Recheck after queueing: HEAD may have moved while the gate waited for capacity.
-        const commit = requireGateTargetCommit(requestedCommit, headCommit);
+        const commit = requireGateTargetCommit(requestedCommit, headCommit, Boolean(gateOwner));
         updateSpawnReceipt(receiptId, {
           validation: {
             gate: gate as import('./lib/ship-progress').GateName,
