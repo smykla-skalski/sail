@@ -29,3 +29,5 @@ An explicit Sail-managed worktree or worker assignment establishes Sail mode. An
 ## Shared runtime capacity
 
 Use the available runtime budget after counting the coordinator, issue workers and nested gates, subject to user limits. Reserve gate capacity, grant leases centrally and queue ready gates during saturation. If grandchildren cannot launch, the coordinator dispatches each fresh gate directly without an extra wrapper worker; Sail still requires `validation_gate` receipts. A temporary full pool is not an unavailable capability. Never raise host limits or permissions.
+
+For Sail native sessions, apply the entry's Native capacity rule instead of message-based leases. Separate agent and validation queues enforce their configured limits; workers call `validation_gate` directly and retain its receipt.

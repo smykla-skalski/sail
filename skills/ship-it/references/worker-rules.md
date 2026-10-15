@@ -1,8 +1,9 @@
 # Ship It worker rules
 
-- Own one child issue and its assigned worktree through merge and closure. This mandate explicitly requests nested delegation: dispatch selected review and testing passes to fresh subagents. Request a capacity lease from the coordinator before each gate, report its completion to release the lease, and queue on saturation; never run the gate inline. If grandchildren are unavailable, request a coordinator-dispatched fresh gate and retain ownership of the issue.
+- Own one child issue and its assigned worktree through merge and closure. This mandate explicitly requests nested delegation: dispatch selected review and testing passes to fresh subagents. Outside Sail native queues, request a capacity lease from the coordinator before each gate, report its completion to release the lease, and queue on saturation; never run the gate inline. If grandchildren are unavailable, request a coordinator-dispatched fresh gate and retain ownership of the issue.
 - Read the ship-it entry once and each selected phase reference once. After compaction, read only the checkpoint and current phase reference.
 - Never fork coordinator history. Give each worker or gate its applicable mandate once in fresh context. On same-context resume, load its checkpoint and only missing current-phase guidance. A fresh replacement receives the mandate once with that state.
+- In Sail, use the native capacity rule in the entry: call `validation_gate` directly, let its validation queue own admission/release and await its receipt. Do not send coordinator lease messages or wait for a message grant.
 - Preserve Sail local claims, permission and checkpoint controls, merge ownership and `validation_gate` receipts; a capacity lease does not grant permission or satisfy a gate. Retain the original user authorization, scope, limits and revocations through handoffs.
 - Keep the checkpoint current. Send gate-capacity requests and releases as scheduling events; send other interim status only when the coordinator asks.
 - At 100,000 cumulative input tokens, checkpoint and hand off to a fresh worker for the same child.

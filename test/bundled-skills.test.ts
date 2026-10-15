@@ -253,3 +253,22 @@ void test('bundled scheduling fills capacity before waiting and keeps Sail gates
   assert.match(events, /Never pretend an occupied slot is free/);
   assert.match(worker, /gate-capacity requests and releases as scheduling events/);
 });
+
+void test('Sail native gate admission needs no phase-forbidden or inactive-turn messages', () => {
+  const capacity = sailModeRule('Native capacity');
+  assert.match(capacity, /separate agent and validation resource queues/);
+  assert.match(capacity, /workers call it directly and wait for their own receipts/);
+  assert.match(capacity, /Do not require coordinator lease messages/);
+  for (const name of ['review.md', 'test.md']) {
+    const phase = read('ship-it', `references/${name}`);
+    assert.match(phase, /Outside Sail native queues/);
+    assert.match(
+      phase,
+      /native validation queue owns admission\/release without coordinator lease messages/,
+    );
+  }
+  assert.match(
+    read('ship-it', 'references/worker-rules.md'),
+    /Do not send coordinator lease messages/,
+  );
+});
