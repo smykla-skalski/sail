@@ -125,16 +125,34 @@ async function closeIdleThreads(...ids: string[]) {
 async function beginHeldResume(provider: Provider, directory: string, sessionId: string) {
   writeFileSync(join(directory, 'idle-resume-hold.txt'), 'hold');
   await browser.tauri.execute(
-    async ({ core, event }, agent, path, id) => {
+    async ({ core }, agent, path, id) => {
+      const event = window['__TAURI__']?.event;
+      if (!event?.listen) throw new Error('Native Tauri event API is unavailable');
       let ready!: () => void;
       const waiting = new Promise<void>((resolve) => {
         ready = resolve;
       });
-      const unlisten = await event.listen<{
-        message: { params?: { sessionId?: string; update?: { sessionUpdate?: string } } };
-      }>('acp-event', ({ payload }) => {
-        const params = payload.message.params;
-        if (params?.sessionId === id && params.update?.sessionUpdate === 'idle_resume_waiting')
+      const unlisten = await event.listen('acp-event', ({ payload }) => {
+        const envelope: unknown = payload;
+        if (!envelope || typeof envelope !== 'object' || !('message' in envelope)) return;
+        const message = envelope.message;
+        if (!message || typeof message !== 'object' || !('params' in message)) return;
+        const params = message.params;
+        if (
+          !params ||
+          typeof params !== 'object' ||
+          !('sessionId' in params) ||
+          params.sessionId !== id ||
+          !('update' in params)
+        )
+          return;
+        const update = params.update;
+        if (
+          update &&
+          typeof update === 'object' &&
+          'sessionUpdate' in update &&
+          update.sessionUpdate === 'idle_resume_waiting'
+        )
           ready();
       });
       const reservation = await core.invoke<{ restoreToken: string }>('acp_begin_session_restore', {

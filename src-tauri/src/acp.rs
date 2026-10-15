@@ -5630,11 +5630,20 @@ impl Connection {
             message.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
         };
         {
+            let processed_generation = self.reader_progress.processed()?;
             let permissions = self
                 .permission_state
                 .lock()
                 .map_err(|error| error.to_string())?;
-            if permissions.canceling_sessions.contains_key(session_id)
+            // A settled cancellation still fences late permissions, but holds no work.
+            if permissions
+                .canceling_sessions
+                .get(session_id)
+                .is_some_and(|canceling| {
+                    canceling
+                        .settlement_generation
+                        .is_none_or(|generation| generation > processed_generation)
+                })
                 || permissions
                     .pending
                     .values()
@@ -13925,6 +13934,43 @@ mod idle_close_tests {
     fn finished_session_without_work_may_close() {
         let runtime = runtime("ses_done");
         assert!(!holds_work(&runtime, "ses_done", false));
+    }
+
+    #[test]
+    fn cancelled_session_may_close_after_reader_ack_without_losing_permission_guard() {
+        let runtime = runtime("ses_cancelled");
+        runtime
+            .permission_state
+            .lock()
+            .unwrap()
+            .begin_cancel("ses_cancelled", Some("turn"));
+        assert!(holds_work(&runtime, "ses_cancelled", false));
+
+        runtime
+            .permission_state
+            .lock()
+            .unwrap()
+            .acknowledge_prompt_settlement("ses_cancelled", "turn", 4);
+        assert!(holds_work(&runtime, "ses_cancelled", false));
+
+        runtime.reader_progress.acknowledge(4);
+
+        assert!(!holds_work(&runtime, "ses_cancelled", false));
+        let mut permissions = runtime.permission_state.lock().unwrap();
+        let mut resolved = Vec::new();
+        permissions
+            .record(
+                json!({"id":7,"params":{"sessionId":"ses_cancelled"}}),
+                1,
+                Some("turn".into()),
+                |id| {
+                    resolved.push(id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(resolved, vec![json!(7)]);
+        assert!(permissions.pending.is_empty());
     }
 
     #[test]
