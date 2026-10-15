@@ -60,3 +60,16 @@ export function nativeVerdict(exitCode, setup, cancelled = false) {
   if (setup?.status !== 'ready') return 'SETUP_FAILED';
   return exitCode === 0 ? 'PASS' : 'FAIL';
 }
+
+export function nativeFailurePhase(setup) {
+  if (setup?.status === 'failed' && typeof setup.precondition === 'string')
+    return setup.precondition;
+  return null;
+}
+
+export function nativePreconditionFailure(precondition, detail, preserveProductFailure = false) {
+  const failure = { precondition, detail };
+  return preserveProductFailure
+    ? { status: 'ready', cleanupFailure: failure }
+    : { status: 'failed', ...failure };
+}

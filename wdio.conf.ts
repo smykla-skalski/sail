@@ -9,7 +9,9 @@ import {
   PrivateEndpointGuard,
 } from './test/e2e-isolation.ts';
 import { createStateRoot, removeStateRoot, sweepStateRoots } from './scripts/e2e-state.mjs';
+import { nativePreconditionFailure } from './scripts/native-test-policy.mjs';
 import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
+import { resetAgentFixture } from './test/e2e/fixture-lifecycle.ts';
 import { assertNativeWebviews } from './test/e2e/native-preconditions.ts';
 
 const limitEnvironment = { ...process.env };
@@ -63,23 +65,42 @@ if (!attach && process.platform !== 'win32' && !process.env.SAIL_E2E_FAKE_GH_DIR
 
 const e2eAppearance = process.env.SAIL_E2E_APPEARANCE === 'dark' ? 'dark' : 'light';
 
+function stopForPrecondition(
+  precondition: string,
+  error: unknown,
+  preserveProductFailure = false,
+): never {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  if (process.env.SAIL_E2E_SETUP_REPORT)
+    writeFileSync(
+      process.env.SAIL_E2E_SETUP_REPORT,
+      JSON.stringify(nativePreconditionFailure(precondition, detail, preserveProductFailure)),
+    );
+  writeSync(2, `Fatal E2E fixture reset: ${detail}\n`);
+  process.exit(1);
+}
+
 /** WDIO logs ordinary config-hook errors and continues, so fixture failures must stop the worker. */
-function failClosedSetup(setup: () => Promise<void>): () => Promise<void> {
+function failClosedPrecondition(
+  precondition: string,
+  setup: () => Promise<void>,
+): () => Promise<void> {
   return async () => {
     try {
       await setup();
     } catch (error) {
-      const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
-      if (process.env.SAIL_E2E_SETUP_REPORT)
-        writeFileSync(
-          process.env.SAIL_E2E_SETUP_REPORT,
-          JSON.stringify({ status: 'failed', precondition: 'fixture/webview setup', detail }),
-        );
-      writeSync(2, `Fatal E2E fixture reset: ${detail}\n`);
-      process.exit(1);
+      stopForPrecondition(precondition, error);
     }
   };
 }
+
+const resetNativeAgentFixture = () =>
+  resetAgentFixture((command, args) =>
+    browser.tauri.execute(async ({ core }, request) => core.invoke(request.command, request.args), {
+      command,
+      args: args ?? {},
+    }),
+  );
 
 const binary = resolve(
   process.env.SAIL_E2E_BINARY ??
@@ -122,7 +143,7 @@ export const config = {
     }
   },
   /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
-  before: failClosedSetup(async () => {
+  before: failClosedPrecondition('fixture/webview setup', async () => {
     await browser.switchToWindow('main');
     await browser.setWindowSize(1280, 850);
     if (process.env.SAIL_NATIVE_RUN_ID)
@@ -141,54 +162,6 @@ export const config = {
       if (!Array.isArray(windows) || !windows.every((label) => typeof label === 'string'))
         throw new Error('Invalid Tauri window list');
       if (windows.includes('settings')) await invoke('plugin:window|close', { label: 'settings' });
-      const response: unknown = await invoke('acp_pending_inbox');
-      if (!Array.isArray(response)) throw new Error('Invalid pending inbox response');
-      const pending: unknown[] = response;
-      const resolutions = pending.map((item) => {
-        if (!item || typeof item !== 'object') throw new Error('Invalid pending inbox item');
-        const agent: unknown = Reflect.get(item, 'agent');
-        const directory: unknown = Reflect.get(item, 'directory');
-        const profile: unknown = Reflect.get(item, 'profile');
-        const message: unknown = Reflect.get(item, 'message');
-        if (
-          typeof agent !== 'string' ||
-          typeof directory !== 'string' ||
-          typeof profile !== 'string' ||
-          !message ||
-          typeof message !== 'object'
-        )
-          throw new Error('Invalid pending inbox request');
-        const method: unknown = Reflect.get(message, 'method');
-        const params: unknown = Reflect.get(message, 'params');
-        const sessionId: unknown =
-          params && typeof params === 'object' ? Reflect.get(params, 'sessionId') : null;
-        if (typeof sessionId !== 'string') throw new Error('Pending request has no session');
-        if (method === 'elicitation/create') {
-          const requestId: unknown = Reflect.get(message, 'id');
-          if (typeof requestId !== 'string' && typeof requestId !== 'number')
-            throw new Error('Pending elicitation has no request ID');
-          return invoke('acp_elicitation', {
-            params: {
-              agent,
-              directory,
-              sessionId,
-              profile,
-              requestId,
-              action: 'cancel',
-              content: null,
-            },
-          });
-        }
-        if (method === 'session/request_permission') {
-          return invoke('acp_cancel', { agent, directory, sessionId, turnId: null });
-        }
-        throw new Error(`Unexpected pending request: ${String(method)}`);
-      });
-      await Promise.all(resolutions);
-      const remaining: unknown = await invoke('acp_pending_inbox');
-      if (!Array.isArray(remaining) || remaining.length > 0)
-        throw new Error('E2E setup left pending agent requests');
-      await invoke('acp_reset_test_runtimes');
       const quiesce: unknown = Reflect.get(window, '__SAIL_E2E_QUIESCE_SETTINGS__');
       if (typeof quiesce === 'function') await quiesce();
       else if (document.querySelector('.app-shell'))
@@ -197,6 +170,7 @@ export const config = {
       sessionStorage.clear();
       if (location.search) history.replaceState(null, '', location.pathname);
     });
+    await resetNativeAgentFixture();
     await browser.refresh();
 
     await browser.execute(async () => {
@@ -229,6 +203,16 @@ export const config = {
       writeFileSync(process.env.SAIL_E2E_SETUP_REPORT, JSON.stringify({ status: 'ready' }));
     }
   }),
+  beforeTest: failClosedPrecondition('pre-test agent request cleanup', async () => {
+    await resetNativeAgentFixture();
+  }),
+  async afterTest(_test: unknown, _context: unknown, result: { passed: boolean }) {
+    try {
+      await resetNativeAgentFixture();
+    } catch (error) {
+      stopForPrecondition('post-test agent request cleanup', error, !result.passed);
+    }
+  },
   onComplete() {
     jobs.release();
     removeStateRoot(state);

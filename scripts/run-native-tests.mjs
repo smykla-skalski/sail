@@ -32,6 +32,7 @@ import {
   artifactKey,
   artifactMatches,
   nativeEnvironment,
+  nativeFailurePhase,
   nativeVerdict,
   setupAttemptLimit,
 } from './native-test-policy.mjs';
@@ -407,6 +408,7 @@ async function main() {
         attempt: index,
         setup,
         exitCode: code,
+        ...(nativeFailurePhase(setup) ? { phase: nativeFailurePhase(setup) } : {}),
       };
       if (result.verdict === 'SETUP_FAILED')
         writeFileSync(join(attempt, 'failure.json'), JSON.stringify(result, null, 2));
