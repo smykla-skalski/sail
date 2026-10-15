@@ -36,6 +36,7 @@ import {
 } from './footprint-measure.mjs';
 import { availablePort, nativeApp } from './native-app.mjs';
 import {
+  isRunIdentifier,
   listProcessCommands,
   removeIdleBuildData,
   removeRunData,
@@ -96,11 +97,17 @@ async function loadProfileInWebview(port, binary, branch) {
   });
   const base = `/session/${session.sessionId}`;
   try {
-    await webdriver(port, 'POST', `${base}/execute/sync`, {
-      script: `sessionStorage.setItem('sail-e2e-settings', 'enabled');
-        localStorage.setItem('sai-settings-migrated-v1', '1');`,
-      args: [],
-    });
+    await until(
+      () =>
+        webdriver(port, 'POST', `${base}/execute/sync`, {
+          script: `sessionStorage.setItem('sail-e2e-settings', 'enabled');
+            localStorage.setItem('sai-settings-migrated-v1', '1');
+            return true;`,
+          args: [],
+        }).catch(() => false),
+      Date.now() + 30_000,
+      'The webview never accepted its storage settings',
+    );
     await webdriver(port, 'POST', `${base}/refresh`, {});
     await until(
       () =>
@@ -145,11 +152,12 @@ function readTimes(path) {
 function readMaintenance(home, launchedAt) {
   const logs = join(home, 'Library/Logs');
   if (!existsSync(logs)) return { maintenance: null, log: '' };
-  const log = readdirSync(logs)
-    .map((name) => join(logs, name, 'sail.log'))
-    .filter((path) => existsSync(path))
-    .map((path) => readFileSync(path, 'utf8'))
-    .join('\n');
+  const files = readdirSync(logs).flatMap((folder) =>
+    readdirSync(join(logs, folder))
+      .filter((name) => /^sail\.log(\.\d+)?$/.test(name))
+      .map((name) => join(logs, folder, name)),
+  );
+  const log = files.map((path) => readFileSync(path, 'utf8')).join('\n');
   return { maintenance: startupMaintenance(log, launchedAt), log };
 }
 
@@ -183,6 +191,24 @@ function removeRoot(root) {
   rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
 
+async function removeAppData(runIdentifier, buildIdentifier, dataRoots) {
+  const leftovers = [];
+  const attempt = async (name, remove) => {
+    try {
+      leftovers.push(...(await remove()));
+    } catch (error) {
+      leftovers.push(name);
+      process.stderr.write(`Could not remove data of ${name}: ${error.message}\n`);
+    }
+  };
+  if (runIdentifier) await attempt(runIdentifier, () => removeRunData(runIdentifier, dataRoots));
+  if (buildIdentifier)
+    await attempt(buildIdentifier, () =>
+      removeIdleBuildData(buildIdentifier, dataRoots, listProcessCommands),
+    );
+  return leftovers;
+}
+
 async function main() {
   const options = parseOptions(process.argv.slice(2));
   if (options.help) {
@@ -208,7 +234,10 @@ async function main() {
       : (process.stdout.write('Building the private app\n'), await buildApp(root, run));
     if (!existsSync(join(source, 'Contents/Info.plist')))
       throw new Error(`${source} is not an application bundle`);
-    buildIdentifier = identifier(source);
+    const sourceIdentifier = identifier(source);
+    if (!isRunIdentifier(sourceIdentifier))
+      throw new Error(`${source} is not a build:e2e bundle (identifier ${sourceIdentifier})`);
+    buildIdentifier = sourceIdentifier;
 
     const env = nativeEnvironment(run, checkout, process.env, await availablePort());
     delete env.SAIL_SCRATCH_OWNER_IDENTITY;
@@ -246,22 +275,34 @@ async function main() {
     const samples = [];
     const writes = new WriteCounter();
     let exited = false;
+    let pollFailure;
+    const guarded = (poll) => {
+      try {
+        poll();
+      } catch (error) {
+        pollFailure ??= error;
+      }
+    };
     writes.observe(settingsSignatures(configDirectory), Date.now());
     timers.push(
       setInterval(
-        () => writes.observe(settingsSignatures(configDirectory), Date.now()),
+        () => guarded(() => writes.observe(settingsSignatures(configDirectory), Date.now())),
         writePollMs,
       ),
-      setInterval(() => {
-        const table = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,rss='], {
-          encoding: 'utf8',
-          maxBuffer: 64 * 1024 * 1024,
-        });
-        const tree =
-          table.status === 0 ? measureTree(parseProcessTable(table.stdout), appPid) : null;
-        if (tree) samples.push({ time: Date.now(), ...tree });
-        else exited = true;
-      }, options.intervalSeconds * 1000),
+      setInterval(
+        () =>
+          guarded(() => {
+            const table = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,rss='], {
+              encoding: 'utf8',
+              maxBuffer: 64 * 1024 * 1024,
+            });
+            const tree =
+              table.status === 0 ? measureTree(parseProcessTable(table.stdout), appPid) : null;
+            if (tree) samples.push({ time: Date.now(), ...tree });
+            else exited = true;
+          }),
+        options.intervalSeconds * 1000,
+      ),
     );
     await loadProfileInWebview(env.TAURI_WEBDRIVER_PORT, binary, profile.worktrees[0].branch);
 
@@ -275,6 +316,7 @@ async function main() {
         windowMs,
       });
     const waitUntil = async (offset) => {
+      if (pollFailure) throw pollFailure;
       if (exited) throw new Error('The private app exited during the run');
       const remaining = launchedAt + offset - Date.now();
       if (remaining <= 0) return;
@@ -321,15 +363,10 @@ async function main() {
     return verdict.pass ? 0 : 1;
   } finally {
     for (const timer of timers) clearInterval(timer);
-    const leftovers = [];
     try {
       if (binary) await stopApp(binary);
     } finally {
-      if (runIdentifier) leftovers.push(...(await removeRunData(runIdentifier, dataRoots)));
-      if (buildIdentifier)
-        leftovers.push(
-          ...(await removeIdleBuildData(buildIdentifier, dataRoots, listProcessCommands)),
-        );
+      const leftovers = await removeAppData(runIdentifier, buildIdentifier, dataRoots);
       removeRoot(root);
       if (leftovers.length > 0)
         process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);

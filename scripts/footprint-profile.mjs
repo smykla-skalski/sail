@@ -7,12 +7,19 @@ import process from 'node:process';
 export const scratchMarker = '.sail-scratch-root';
 const staleAgeMs = 3 * 60 * 60 * 1000;
 
+const fixtureGitConfig = [
+  'user.name=Sail Footprint',
+  'user.email=footprint@example.invalid',
+  'commit.gpgsign=false',
+  'tag.gpgsign=false',
+  'core.hooksPath=/dev/null',
+].flatMap((setting) => ['-c', setting]);
+
 function git(directory, args) {
-  const result = spawnSync(
-    'git',
-    ['-c', 'user.name=Sail Footprint', '-c', 'user.email=footprint@example.invalid', ...args],
-    { cwd: directory, encoding: 'utf8' },
-  );
+  const result = spawnSync('git', [...fixtureGitConfig, ...args], {
+    cwd: directory,
+    encoding: 'utf8',
+  });
   if (result.error || result.status !== 0)
     throw new Error(`git ${args[0]}: ${result.error?.message ?? result.stderr}`);
   return result.stdout.trim();

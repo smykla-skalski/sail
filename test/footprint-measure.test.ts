@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -191,6 +199,11 @@ await test('the maintenance duration comes from the last finished event after la
   assert.equal(startupMaintenance('', 0), null);
 });
 
+await test('the latest finished event wins whatever the file order', () => {
+  const log = [finished(9000, 50), finished(7000, 21_000)].join('\n');
+  assert.deepEqual(startupMaintenance(log, 0)?.elapsedMs, 50);
+});
+
 await test('the report prints both snapshots with the difference and the verdicts', () => {
   const first = {
     ...snap(3, 150 * 1024 * 1024, 10 * minute),
@@ -286,4 +299,17 @@ await test('temporary clutter adds the requested number of unrelated entries', (
     7,
   );
   assert.ok(existsSync(join(temporary, 'keep')));
+});
+
+await test('the fixture repository ignores the user git signing configuration', (context) => {
+  const root = scratch(context);
+  const config = join(root, 'gitconfig');
+  writeFileSync(config, '[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /usr/bin/false\n');
+  const previous = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = config;
+  context.after(() => {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previous;
+  });
+  assert.equal(createWorktrees(join(root, 'profile'), 1).worktrees.length, 1);
 });

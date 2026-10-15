@@ -152,18 +152,22 @@ function drift(first, second, tolerance) {
   return { first, second, delta, ratio, pass: Math.abs(ratio) <= tolerance };
 }
 
-/** The details of the last `startup_maintenance_finished` event at or after `since`, or null. */
+/** The details of the latest `startup_maintenance_finished` event at or after `since`, or null. */
 export function startupMaintenance(log, since = 0) {
   let finished = null;
+  let latest = -1;
   for (const line of log.split('\n')) {
     if (!line.includes('startup_maintenance_finished')) continue;
     const event = parseLine(line);
     if (
       event?.event === 'startup_maintenance_finished' &&
       event.timestampMs >= since &&
+      event.timestampMs > latest &&
       typeof event.details?.elapsedMs === 'number'
-    )
+    ) {
       finished = event.details;
+      latest = event.timestampMs;
+    }
   }
   return finished;
 }
