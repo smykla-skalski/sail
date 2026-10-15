@@ -5,12 +5,11 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +19,7 @@ import {
   createWorktrees,
   deadOwnerIdentity,
   privateRoot,
+  removePrivateRoot,
   profileSettings,
   scratchMarker,
 } from './footprint-profile.mjs';
@@ -182,13 +182,6 @@ async function buildApp(root, run) {
   const apps = readdirSync(bundle).filter((name) => name.endsWith('.app'));
   if (apps.length !== 1) throw new Error('The build did not produce exactly one private app');
   return join(bundle, apps[0]);
-}
-
-function removeRoot(root) {
-  const inTemporary = dirname(root) === realpathSync(tmpdir());
-  if (!inTemporary || !basename(root).startsWith('sail-footprint-'))
-    throw new Error(`Refusing to remove ${root}`);
-  rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
 
 async function removeAppData(runIdentifier, buildIdentifier, dataRoots) {
@@ -367,7 +360,7 @@ async function main() {
       if (binary) await stopApp(binary);
     } finally {
       const leftovers = await removeAppData(runIdentifier, buildIdentifier, dataRoots);
-      removeRoot(root);
+      removePrivateRoot(root, realpathSync(tmpdir()));
       if (leftovers.length > 0)
         process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
     }

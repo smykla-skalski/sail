@@ -1,6 +1,16 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import process from 'node:process';
 
 // Matches `.sail-scratch-root` in src-tauri/src/scratch_cleanup.rs: the owner is `<pid> <start>`.
@@ -119,4 +129,27 @@ export function deadOwnerIdentity() {
 
 export function privateRoot(base) {
   return realpathSync(mkdtempSync(join(base, 'sail-footprint-')));
+}
+
+/**
+ * The app's startup sweep hides a root it is removing in a write-only directory, and a cancelled run
+ * can end that sweep half way. Such a directory must be opened before it can be listed or deleted.
+ */
+function makeTreeWritable(root) {
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    const { mode } = lstatSync(directory);
+    if ((mode & 0o700) !== 0o700) chmodSync(directory, mode | 0o700);
+    for (const entry of readdirSync(directory, { withFileTypes: true }))
+      if (entry.isDirectory()) pending.push(join(directory, entry.name));
+  }
+}
+
+/** Removes a root made by `privateRoot` under `base`, refusing any other path. */
+export function removePrivateRoot(root, base) {
+  if (dirname(root) !== base || !basename(root).startsWith('sail-footprint-'))
+    throw new Error(`Refusing to remove ${root}`);
+  makeTreeWritable(root);
+  rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }

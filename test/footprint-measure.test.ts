@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -30,6 +31,7 @@ import {
   createWorktrees,
   deadOwnerIdentity,
   profileSettings,
+  removePrivateRoot,
   scratchMarker,
 } from '../scripts/footprint-profile.mjs';
 
@@ -312,4 +314,26 @@ await test('the fixture repository ignores the user git signing configuration', 
     else process.env.GIT_CONFIG_GLOBAL = previous;
   });
   assert.equal(createWorktrees(join(root, 'profile'), 1).worktrees.length, 1);
+});
+
+await test('a private root holding a write-only quarantine from a killed sweep is removed', (context) => {
+  const base = scratch(context);
+  const root = join(base, 'sail-footprint-abc123');
+  const quarantine = join(root, 'run/tmp/sail-cleanup-private-x/hidden/deep');
+  mkdirSync(quarantine, { recursive: true });
+  writeFileSync(join(quarantine, 'file'), 'x');
+  chmodSync(join(root, 'run/tmp/sail-cleanup-private-x'), 0o300);
+  removePrivateRoot(root, base);
+  assert.equal(existsSync(root), false);
+});
+
+await test('only footprint roots directly under the base are removed', (context) => {
+  const base = scratch(context);
+  const other = join(base, 'sail-other');
+  const nested = join(base, 'nested/sail-footprint-abc123');
+  mkdirSync(other);
+  mkdirSync(nested, { recursive: true });
+  assert.throws(() => removePrivateRoot(other, base), /Refusing/);
+  assert.throws(() => removePrivateRoot(nested, base), /Refusing/);
+  assert.ok(existsSync(other) && existsSync(nested));
 });
