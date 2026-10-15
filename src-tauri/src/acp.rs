@@ -2408,6 +2408,26 @@ fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
         .then_some(directory)
 }
 
+/// Ship It keeps its checkpoints, and the lock files next to them, here. Only
+/// this directory is shared, not the XDG data root or its siblings.
+fn ship_it_checkpoint_directory(data_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    let root = match data_home {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        _ => home?.join(".local/share"),
+    };
+    let directory = root.join("sai/ship-it/checkpoints");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&directory).ok()?;
+    std::fs::symlink_metadata(&directory)
+        .ok()?
+        .file_type()
+        .is_dir()
+        .then_some(directory)
+}
+
 fn agent_path(
     mut paths: Vec<PathBuf>,
     scoped_tool_bin: PathBuf,
@@ -6325,6 +6345,12 @@ fn connect_blocking_inner(
         let mut writable = vec![temp.0.clone(), data_directory.clone(), shared_cache];
         if let Some(gnupg) = default_gnupg_directory(home.as_deref()) {
             writable.push(gnupg);
+        }
+        let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+        if let Some(checkpoints) =
+            ship_it_checkpoint_directory(data_home.as_deref(), home.as_deref())
+        {
+            writable.push(checkpoints);
         }
         if let Some(overlay) = overlay.as_ref() {
             writable.push(overlay.git_dir.clone());
@@ -10476,6 +10502,71 @@ time.sleep(10)
             std::fs::remove_dir(&gnupg).unwrap();
             std::os::unix::fs::symlink(&sibling, &gnupg).unwrap();
             assert!(default_gnupg_directory(Some(&home)).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ship_it_checkpoint_access_is_limited_to_the_checkpoint_directory() {
+        let root = scratch("ship-it-checkpoints");
+        let home = root.join("home");
+        let assigned = root.join("assigned");
+        let data_home = root.join("xdg-data");
+        let sibling = home.join(".local/share/sai/ship-it/evidence");
+        for directory in [&assigned, &data_home, &sibling] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let writable_rule = |path: &Path| {
+            format!(
+                "{}=\"write\"",
+                serde_json::to_string(path.to_str().unwrap()).unwrap()
+            )
+        };
+
+        let default = ship_it_checkpoint_directory(None, Some(&home)).unwrap();
+        assert_eq!(default, home.join(".local/share/sai/ship-it/checkpoints"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&default).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        for name in ["task.json.lock", "task.json.bak", ".task.json.tmp"] {
+            std::fs::write(default.join(name), b"").unwrap();
+        }
+
+        let access =
+            CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&default)).unwrap();
+        let rules = serde_json::from_str::<Value>(&access.profile_config().unwrap()).unwrap()
+            ["configOverrides"][2]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(rules.contains(&writable_rule(&dunce::canonicalize(&default).unwrap())));
+        for denied in [
+            &home,
+            &home.join(".local/share"),
+            &home.join(".local/share/sai/ship-it"),
+            &sibling,
+        ] {
+            assert!(!rules.contains(&writable_rule(&dunce::canonicalize(denied).unwrap())));
+        }
+
+        assert_eq!(
+            ship_it_checkpoint_directory(Some(&data_home), Some(&home)),
+            Some(data_home.join("sai/ship-it/checkpoints"))
+        );
+        assert_eq!(
+            ship_it_checkpoint_directory(Some(Path::new("relative")), Some(&home)),
+            Some(default.clone())
+        );
+        assert!(ship_it_checkpoint_directory(None, None).is_none());
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir_all(&default).unwrap();
+            std::os::unix::fs::symlink(&sibling, &default).unwrap();
+            assert!(ship_it_checkpoint_directory(None, Some(&home)).is_none());
         }
         std::fs::remove_dir_all(root).unwrap();
     }
