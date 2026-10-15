@@ -1658,11 +1658,15 @@ impl GitOverlay {
             "GIT_WORK_TREE",
             "GIT_INDEX_FILE",
         ];
+        let resolve =
+            |path: &Path| dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let git_dir = resolve(&self.git_dir);
+        let worktree = resolve(&self.worktree);
         let forwarded = command.get_envs().any(|(name, value)| {
             ROUTING.iter().any(|key| name == *key)
                 && value.is_some_and(|value| {
-                    let value = Path::new(value);
-                    value.starts_with(&self.git_dir) || value == self.worktree
+                    let value = resolve(Path::new(value));
+                    value.starts_with(&git_dir) || value == worktree
                 })
         });
         if forwarded {
@@ -2631,6 +2635,21 @@ mod tests {
                 "{name} must not survive in a foreign directory"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_overlay_routing_is_dropped_for_a_foreign_directory() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let alias = fixture.root.join("alias-overlay");
+        std::os::unix::fs::symlink(&overlay.git_dir, &alias).unwrap();
+        let mut command = Command::new("git");
+        command.env("GIT_DIR", &alias);
+        overlay.apply_for_directory(&mut command, &fixture.main);
+        assert!(command.get_envs().all(|(_, value)| value.is_none()));
     }
 
     #[test]
