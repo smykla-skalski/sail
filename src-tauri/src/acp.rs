@@ -716,6 +716,7 @@ struct Connection {
     last_activity: Mutex<Instant>,
     input: Mutex<ChildStdin>,
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
+    native_replays: Mutex<HashMap<u64, HashSet<String>>>,
     reader_progress: ReaderProgress,
     permission_state: Mutex<PermissionState>,
     elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
@@ -776,6 +777,21 @@ impl Drop for EndResume<'_> {
     }
 }
 
+struct NativeReplayGuard<'a> {
+    runtime: &'a Connection,
+    id: u64,
+}
+
+impl Drop for NativeReplayGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime
+            .native_replays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
 struct RestoreClaim {
     token: String,
     expires: Instant,
@@ -819,6 +835,35 @@ struct SessionUiState {
 }
 
 impl Connection {
+    fn native_replay_update(&self, parent: &str, update: &Value) -> Result<bool, String> {
+        let mut replays = self
+            .native_replays
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let Some(sessions) = replays
+            .values_mut()
+            .find(|sessions| sessions.contains(parent))
+        else {
+            return Ok(false);
+        };
+        let child = update.get("subagentSessionId").and_then(Value::as_str);
+        if let Some(child) = child {
+            // Preserve authoritative updates for children already running before reattach.
+            if self
+                .native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .0
+                .get(child)
+                .is_some_and(NativeSubagentRegistry::is_live)
+            {
+                return Ok(false);
+            }
+            sessions.insert(child.to_string());
+        }
+        Ok(true)
+    }
+
     fn validate_codex_workspace(&self, cwd: Option<&str>) -> Result<(), String> {
         let Some(access) = &self.codex_workspace_access else {
             return Ok(());
@@ -2174,6 +2219,17 @@ impl Connection {
             .map_err(|error| error.to_string())?
             .insert(id, sender);
         drop(temp_gate);
+        let _replay = if matches!(method, "session/load" | "session/resume") {
+            session_id.as_ref().map(|session| {
+                self.native_replays
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, HashSet::from([session.clone()]));
+                NativeReplayGuard { runtime: self, id }
+            })
+        } else {
+            None
+        };
         if let Err(error) =
             write_message(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         {
@@ -5386,6 +5442,9 @@ fn record_native_subagent_update(
     parent_id: &str,
     update: &Value,
 ) -> Result<(), String> {
+    if runtime.native_replay_update(parent_id, update)? {
+        return Ok(());
+    }
     match update.get("sessionUpdate").and_then(Value::as_str) {
         Some("subagent_spawned") => {
             let child_id = update
@@ -6719,6 +6778,7 @@ fn connect_blocking_inner(
         last_activity: Mutex::new(Instant::now()),
         input: Mutex::new(input),
         pending: Mutex::new(HashMap::new()),
+        native_replays: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
         permission_state: Mutex::new(PermissionState::default()),
         elicitation_state: Mutex::new(HashMap::new()),
@@ -6890,7 +6950,11 @@ fn connect_blocking_inner(
                             json!({"agent":agent_id,"sessionId":session_id,"error":error}),
                         );
                     }
-                    if let Some((activity, active)) = native_activity_fence(update) {
+                    if let Some((activity, active)) = native_activity_fence(update).filter(|_| {
+                        !reader
+                            .native_replay_update(session_id, update)
+                            .unwrap_or(false)
+                    }) {
                         if let Some(directory) = reader
                             .session_directories
                             .lock()
@@ -7125,6 +7189,9 @@ fn connect_blocking_inner(
                     },
                 );
             } else if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                if let Ok(mut replays) = reader.native_replays.lock() {
+                    replays.remove(&id);
+                }
                 if let Some(sender) = reader
                     .pending
                     .lock()
@@ -10395,6 +10462,7 @@ time.sleep(10)
             last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
+            native_replays: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
             permission_state: Mutex::new(PermissionState::default()),
             elicitation_state: Mutex::new(HashMap::from([(
@@ -11303,6 +11371,7 @@ time.sleep(10)
                 last_activity: Mutex::new(Instant::now()),
                 input: Mutex::new(input),
                 pending: Mutex::new(HashMap::new()),
+                native_replays: Mutex::new(HashMap::new()),
                 reader_progress: ReaderProgress::default(),
                 permission_state: Mutex::new(PermissionState::default()),
                 elicitation_state: Mutex::new(HashMap::new()),
@@ -12583,6 +12652,70 @@ mod native_subagent_fence_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn native_restore_replay_does_not_recreate_historical_child_fences() {
+        let runtime = super::session_config_tests::test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            Path::new("/repo"),
+            "parent",
+            None,
+        );
+        runtime
+            .native_replays
+            .lock()
+            .unwrap()
+            .insert(7, HashSet::from(["parent".into()]));
+        let spawn = json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"historical"});
+        assert!(runtime.native_replay_update("parent", &spawn).unwrap());
+        assert!(runtime
+            .native_replay_update("historical", &json!({"sessionUpdate":"tool_call"}))
+            .unwrap());
+        assert!(!runtime.native_replay_update("unrelated", &spawn).unwrap());
+        assert!(runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .task_connections()
+            .is_empty());
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .spawn("parent", "live", PathBuf::from("/repo"), false)
+            .unwrap();
+        assert!(!runtime.native_replay_update("parent", &json!({"sessionUpdate":"subagent_state_update","subagentSessionId":"live","state":"completed"})).unwrap());
+        assert!(runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .task_connections()
+            .contains_key("live"));
+        {
+            let _guard = NativeReplayGuard {
+                runtime: &runtime,
+                id: 7,
+            };
+        }
+        assert!(!runtime.native_replay_update("parent", &spawn).unwrap());
+        assert!(!runtime.native_replay_update("historical", &spawn).unwrap());
+        for method in ["session/load", "session/resume"] {
+            let result = runtime.request_response_around_write(
+                method,
+                json!({"sessionId":"parent"}),
+                Duration::from_secs(1),
+                |_| {
+                    assert!(runtime.native_replay_update("parent", &spawn).unwrap());
+                    Err("write failed".into())
+                },
+                || {},
+            );
+            assert!(result.is_err());
+            assert!(!runtime.native_replay_update("parent", &spawn).unwrap());
+        }
+    }
+
+    #[test]
     fn replayed_spawn_reports_whether_the_child_is_still_live() {
         let mut registry = NativeSubagentRegistry::default();
         let directory = PathBuf::from("/repo");
@@ -12853,6 +12986,7 @@ mod native_subagent_fence_tests {
             last_activity: Mutex::new(Instant::now()),
             input: Mutex::new(input),
             pending: Mutex::new(HashMap::new()),
+            native_replays: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
             permission_state: Mutex::new(PermissionState::default()),
             elicitation_state: Mutex::new(HashMap::new()),
