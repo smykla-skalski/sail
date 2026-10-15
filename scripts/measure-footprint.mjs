@@ -144,9 +144,13 @@ function readTimes(path) {
   return readFileSync(path, 'utf8')
     .split('\n')
     .flatMap((line) => {
-      const time = Number(line.trim());
+      const time = Number(line.trim().split(' ', 1)[0]);
       return Number.isFinite(time) && time > 0 ? [time] : [];
     });
+}
+
+function readLines(path) {
+  return existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean) : [];
 }
 
 function readMaintenance(home, launchedAt) {
@@ -238,6 +242,7 @@ async function main() {
     mkdirSync(home);
     env.HOME = realpathSync(home);
     env.SAIL_E2E_ACP_LIST_LOG = join(run, 'acp-list.log');
+    env.SAIL_E2E_ACP_START_LOG = join(run, 'acp-start.log');
 
     const profile = createWorktrees(root, options.worktrees);
     const configDirectory = env.SAIL_E2E_CONFIG_DIR;
@@ -342,6 +347,12 @@ async function main() {
       staleRootsLeft: staleLeft,
       totals,
       samples,
+      events: {
+        listings: readLines(env.SAIL_E2E_ACP_LIST_LOG),
+        starts: readLines(env.SAIL_E2E_ACP_START_LOG),
+        closes: readLines(env.SAIL_E2E_ACP_CLOSE_LOG),
+        agentLog: log.split('\n').filter((line) => /agent_idle_exit|agent_disconnected/.test(line)),
+      },
       verdict,
     };
     process.stdout.write(
