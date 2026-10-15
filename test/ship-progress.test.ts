@@ -46,6 +46,7 @@ import {
   shipStatus,
   sortShipIssues,
   validateGateVerdict,
+  requireGateTargetCommit,
   validationRevisionDrifted,
 } from '../src/lib/ship-progress.ts';
 
@@ -1926,6 +1927,43 @@ void test('validation revision drift remains sticky after the tree returns', () 
     validationRevisionDrifted({ ...validation, revisionDrifted: true }, 'revision-a'),
     true,
   );
+});
+
+const head = 'dfcc5f1a0123456789abcdef0123456789abcdef';
+
+void test('a gate targeting the worktree head records the full commit', () => {
+  assert.equal(requireGateTargetCommit('dfcc5f1a', head), head);
+  assert.equal(requireGateTargetCommit(' DFCC5F1A0123 ', head), head);
+});
+
+void test('a gate without a requested revision records the head when the worktree is clean', () => {
+  assert.equal(requireGateTargetCommit(undefined, head), head);
+  assert.equal(requireGateTargetCommit('', null), undefined);
+});
+
+void test('a gate aimed at another commit is rejected before it starts', () => {
+  assert.throws(
+    () => requireGateTargetCommit('1f34a371', head),
+    /not the head of this worktree \(dfcc5f1a0123\)/,
+  );
+});
+
+void test('a dirty or unborn worktree cannot be attested as a named commit', () => {
+  assert.throws(() => requireGateTargetCommit('dfcc5f1a', null), /uncommitted changes/);
+});
+
+void test('a gate revision must be a hexadecimal commit SHA', () => {
+  for (const requested of ['main', 'HEAD', 'dfcc5f', 'dfcc5f1a; rm', 7]) {
+    assert.throws(() => requireGateTargetCommit(requested, head), /commit SHA/);
+  }
+});
+
+void test('gate snapshots keep the reviewed commit and worktree', () => {
+  const receipt = validationReceipt();
+  receipt.validation = { ...receipt.validation!, commit: head };
+  const gate = gateSnapshot(receipt);
+  assert.equal(gate?.commit, head);
+  assert.equal(gate?.directory, '/worktree');
 });
 
 for (const [states, expected] of [

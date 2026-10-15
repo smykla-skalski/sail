@@ -34,9 +34,11 @@ struct Client {
     profile: CapabilityProfile,
     native_children: HashMap<String, Option<String>>,
     unattributed_native_activity: HashSet<String>,
+    ended_native_activity: VecDeque<String>,
 }
 
 const RELEASED_TOKENS_KEPT: usize = 64;
+const ENDED_ACTIVITY_KEPT: usize = 256;
 
 #[derive(Default)]
 struct Inner {
@@ -213,6 +215,7 @@ impl BrowserManager {
                     profile: CapabilityProfile::Build,
                     native_children: HashMap::new(),
                     unattributed_native_activity: HashSet::new(),
+                    ended_native_activity: VecDeque::new(),
                 },
             );
         let port = *self.0.port.lock().map_err(|error| error.to_string())?;
@@ -327,6 +330,22 @@ impl BrowserManager {
         }
     }
 
+    /// Drops children the registry already settled; ids are unique, so no parent match is needed.
+    pub fn prune_native_children(&self, agent: &str, directory: &Path, settled: &[String]) {
+        if settled.is_empty() {
+            return;
+        }
+        if let Ok(mut clients) = self.0.clients.lock() {
+            for client in clients.values_mut().filter(|client| {
+                client.agent.as_deref() == Some(agent) && client.directory == directory
+            }) {
+                for child in settled {
+                    client.native_children.remove(child);
+                }
+            }
+        }
+    }
+
     pub fn set_unattributed_native_activity(
         &self,
         agent: &str,
@@ -343,11 +362,22 @@ impl BrowserManager {
                         || client.native_children.contains_key(parent))
             }) {
                 if active {
-                    client
-                        .unattributed_native_activity
-                        .insert(activity.to_string());
+                    // A trailing update for a tool call that already ended must not reopen the fence.
+                    if !client
+                        .ended_native_activity
+                        .iter()
+                        .any(|ended| ended == activity)
+                    {
+                        client
+                            .unattributed_native_activity
+                            .insert(activity.to_string());
+                    }
                 } else {
                     client.unattributed_native_activity.remove(activity);
+                    if client.ended_native_activity.len() >= ENDED_ACTIVITY_KEPT {
+                        client.ended_native_activity.pop_front();
+                    }
+                    client.ended_native_activity.push_back(activity.to_string());
                 }
             }
         }
@@ -1748,7 +1778,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "validation_gate",
-        "Start one fresh Ship It validation pass in this worktree using a selected available agent and model. Returns its actual provider, model, and launch receipt. Run passes in order and wait for each result.",
+        "Start one fresh Ship It validation pass in this worktree using a selected available agent and model. Returns its actual provider, model, and launch receipt. Run passes in order and wait for each result. Pass revision with the commit SHA the pass must review: the request is rejected before launch unless this worktree is clean and at that commit, and the receipt records the commit and worktree reviewed.",
         "gate,prompt",
     ),
     (
@@ -2272,6 +2302,7 @@ pub fn run_mcp_stdio() {
                         "properties":{
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "prompt":{"type":"string"},
+                            "revision":{"type":"string","pattern":"^[0-9a-fA-F]{7,64}$"},
                         },
                         "required":["gate","prompt"]
                     }});
@@ -2823,6 +2854,7 @@ mod native_task_identity_tests {
             profile: CapabilityProfile::Build,
             native_children: HashMap::new(),
             unattributed_native_activity: HashSet::new(),
+            ended_native_activity: VecDeque::new(),
         }
     }
 
@@ -2970,6 +3002,98 @@ mod native_task_identity_tests {
                 resolve_task_session(&clients[key], None).unwrap(),
                 clients[key].session.as_deref().unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn trailing_update_for_an_ended_activity_keeps_the_parent_writable() {
+        let manager = BrowserManager::default();
+        manager
+            .0
+            .clients
+            .lock()
+            .unwrap()
+            .insert("source".into(), client("claude"));
+        let fence = |id: &str, active: bool| {
+            manager.set_unattributed_native_activity(
+                "claude",
+                Path::new("/repo"),
+                "parent",
+                id,
+                active,
+            );
+        };
+
+        fence("first", true);
+        fence("second", true);
+        fence("first", false);
+        fence("second", false);
+        fence("first", true);
+        assert_eq!(
+            resolve_task_session(&manager.0.clients.lock().unwrap()["source"], None).unwrap(),
+            "parent"
+        );
+
+        fence("next", true);
+        assert!(resolve_task_session(&manager.0.clients.lock().unwrap()["source"], None).is_err());
+        fence("next", false);
+        assert_eq!(
+            resolve_task_session(&manager.0.clients.lock().unwrap()["source"], None).unwrap(),
+            "parent"
+        );
+    }
+
+    #[test]
+    fn ended_activity_memory_is_bounded() {
+        let manager = BrowserManager::default();
+        manager
+            .0
+            .clients
+            .lock()
+            .unwrap()
+            .insert("source".into(), client("claude"));
+        for index in 0..=ENDED_ACTIVITY_KEPT {
+            manager.set_unattributed_native_activity(
+                "claude",
+                Path::new("/repo"),
+                "parent",
+                &format!("tool-{index}"),
+                false,
+            );
+        }
+        let clients = manager.0.clients.lock().unwrap();
+        assert_eq!(
+            clients["source"].ended_native_activity.len(),
+            ENDED_ACTIVITY_KEPT
+        );
+        assert!(!clients["source"]
+            .ended_native_activity
+            .iter()
+            .any(|id| id == "tool-0"));
+    }
+
+    #[test]
+    fn pruning_settled_children_reopens_only_matching_connections() {
+        let manager = BrowserManager::default();
+        let mut clients = manager.0.clients.lock().unwrap();
+        clients.insert("source".into(), client("claude"));
+        clients.insert("other-agent".into(), client("codex"));
+        let mut elsewhere = client("claude");
+        elsewhere.directory = PathBuf::from("/elsewhere");
+        clients.insert("other-directory".into(), elsewhere);
+        for client in clients.values_mut() {
+            client.native_children.insert("child".into(), None);
+            client.native_children.insert("live".into(), None);
+        }
+        drop(clients);
+
+        manager.prune_native_children("claude", Path::new("/repo"), &["child".to_string()]);
+
+        let clients = manager.0.clients.lock().unwrap();
+        assert!(!clients["source"].native_children.contains_key("child"));
+        assert!(clients["source"].native_children.contains_key("live"));
+        for key in ["other-agent", "other-directory"] {
+            assert!(clients[key].native_children.contains_key("child"));
         }
     }
 

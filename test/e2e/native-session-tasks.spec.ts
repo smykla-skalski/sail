@@ -10,25 +10,32 @@ describe('native child Tasks identity', () => {
   before(() => execFileSync('git', ['init', '-q', repository]));
   after(() => rmSync(repository, { recursive: true, force: true }));
 
+  async function startAgent(provider: string) {
+    await browser.execute((directory) => {
+      localStorage.clear();
+      localStorage.setItem('sai-directory', directory);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      );
+      localStorage.setItem('sai-notifications-enabled', 'false');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await chooseTopbarAction(
+      'New agent',
+      { opencode: 'OpenCode', claude: 'Claude', codex: 'Codex' }[provider],
+    );
+    const auth = $('.agent-auth');
+    // Codex asks for sign-in after the header already reads Ready.
+    if (provider === 'codex') await auth.waitForExist({ timeout: 10_000 });
+    if (await auth.isExisting()) await auth.$('button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await expect(auth).not.toExist();
+  }
+
   for (const provider of ['opencode', 'claude', 'codex']) {
     it(`keeps ${provider} child task authority separate from its parent`, async () => {
-      await browser.execute((directory) => {
-        localStorage.clear();
-        localStorage.setItem('sai-directory', directory);
-        localStorage.setItem(
-          'sai-project-catalog',
-          JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
-        );
-        localStorage.setItem('sai-notifications-enabled', 'false');
-      }, realpathSync(repository));
-      await browser.refresh();
-      await chooseTopbarAction(
-        'New agent',
-        { opencode: 'OpenCode', claude: 'Claude', codex: 'Codex' }[provider],
-      );
-      const auth = $('.agent-auth');
-      if (await auth.isExisting()) await auth.$('button').click();
-      await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+      await startAgent(provider);
       await $('.agent-composer [data-pane-prompt]').setValue('Native child task reports');
       await $('.agent-actions button:last-child').click();
       await expect($('.project-agent-row[data-depth="1"]')).toBeDisplayed();
@@ -56,6 +63,28 @@ describe('native child Tasks identity', () => {
       );
       expect(reported).toHaveLength(provider === 'opencode' ? 1 : 0);
       if (provider === 'opencode') expect(reported[0].scope.sessionId).toContain(':task-child');
+    });
+  }
+
+  for (const provider of ['opencode', 'claude', 'codex']) {
+    it(`lets the ${provider} parent report tasks after its child settles`, async () => {
+      await startAgent(provider);
+      await $('.agent-composer [data-pane-prompt]').setValue(
+        'Native child settles then parent reports',
+      );
+      await $('.agent-actions button:last-child').click();
+      await expect($('.project-agent-row[data-depth="1"]')).toBeDisplayed();
+      await expect($('.agent-conversation')).toHaveText(
+        expect.stringContaining('Parent result: Task reporting passed'),
+      );
+      const saved = await browser.execute(() =>
+        JSON.parse(localStorage.getItem('sai-session-tasks') ?? '[]'),
+      );
+      const reported = saved.filter((item: { snapshot: { tasks: { id: string }[] } }) =>
+        item.snapshot.tasks.some((task) => task.id === 'smoke'),
+      );
+      expect(reported).toHaveLength(1);
+      expect(reported[0].scope.sessionId).not.toContain(':settled-child');
     });
   }
 });
