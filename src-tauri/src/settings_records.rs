@@ -5,7 +5,7 @@
 //! writes one file instead of re-encoding every setting.
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -62,11 +62,18 @@ fn file_name(key: &str) -> String {
     format!("{name}.json")
 }
 
-fn parse(contents: &str) -> Option<(String, String)> {
+/// A record file. `modified` marks a key a save changed, so a later import of
+/// older webview data does not overwrite it; it lives in the record so the
+/// first save of a key writes one file.
+fn parse(contents: &str) -> Option<(String, String, bool)> {
     let value: serde_json::Value = serde_json::from_str(contents).ok()?;
     Some((
         value.get("key")?.as_str()?.to_string(),
         value.get("value")?.as_str()?.to_string(),
+        value
+            .get("modified")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     ))
 }
 
@@ -163,7 +170,7 @@ fn forget_report(file: &Path) {
 fn corruption(contents: &str, key: &str) -> Option<&'static str> {
     match parse(contents) {
         None => Some("not a valid record"),
-        Some((saved, _)) if saved != key => Some("holds a different key"),
+        Some((saved, _, _)) if saved != key => Some("holds a different key"),
         Some(_) => None,
     }
 }
@@ -190,7 +197,10 @@ pub(crate) fn read(settings: &Path, key: &str) -> Result<Option<String>, String>
                 report_corrupt(&file, Some(key), reason);
                 return Ok(None);
             }
-            Ok(contents.as_deref().and_then(parse).map(|(_, value)| value))
+            Ok(contents
+                .as_deref()
+                .and_then(parse)
+                .map(|(_, value, _)| value))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
@@ -200,11 +210,15 @@ pub(crate) fn read(settings: &Path, key: &str) -> Result<Option<String>, String>
     }
 }
 
-pub(crate) fn read_all(settings: &Path) -> Result<Records, String> {
+/// Every readable record, and the keys whose record is marked modified.
+pub(crate) fn read_all(settings: &Path) -> Result<(Records, BTreeSet<String>), String> {
     let mut records = Records::new();
+    let mut modified = BTreeSet::new();
     let entries = match fs::read_dir(directory(settings)) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((records, modified));
+        }
         Err(error) => return Err(format!("Cannot read settings records: {error}")),
     };
     for entry in entries {
@@ -226,9 +240,12 @@ pub(crate) fn read_all(settings: &Path) -> Result<Records, String> {
             continue;
         };
         match parse(&contents) {
-            Some((key, value))
+            Some((key, value, marked))
                 if path.file_name().and_then(|name| name.to_str()) == Some(&file_name(&key)) =>
             {
+                if marked {
+                    modified.insert(key.clone());
+                }
                 records.insert(key, value);
             }
             Some(_) => report_corrupt(
@@ -243,21 +260,75 @@ pub(crate) fn read_all(settings: &Path) -> Result<Records, String> {
             ),
         }
     }
-    Ok(records)
+    Ok((records, modified))
 }
 
-pub(crate) fn write(settings: &Path, key: &str, value: &str) -> Result<(), String> {
-    let directory = directory(settings);
+/// Whether the key's record exists and is marked modified.
+pub(crate) fn is_marked(settings: &Path, key: &str) -> bool {
+    fs::read(directory(settings).join(file_name(key)))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|contents| parse(&contents))
+        .is_some_and(|(saved, _, marked)| marked && saved == key)
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record files written on this thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_write_count() -> usize {
+    WRITES.with(std::cell::Cell::take)
+}
+
+/// How hard to flush a record before it replaces the old one.
+#[derive(Clone, Copy, PartialEq)]
+enum Flush {
+    /// Reach the drive's permanent storage before returning.
+    Full,
+    /// Hand the data to the drive; the batch's final directory flush commits it.
+    Queued,
+}
+
+/// A full drive flush costs milliseconds on macOS. `fsync` only queues the data,
+/// so a batch queues each file and pays for one full flush at the end.
+fn flush_file(file: &fs::File, flush: Flush) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if flush == Flush::Queued {
+        return nix::unistd::fsync(file).map_err(std::io::Error::from);
+    }
+    let _ = flush;
+    file.sync_all()
+}
+
+fn ensure_directory(directory: &Path) -> Result<(), String> {
     if !directory.exists() {
-        fs::create_dir_all(&directory)
+        fs::create_dir_all(directory)
             .map_err(|error| format!("Cannot create settings records folder: {error}"))?;
         if let Some(parent) = directory.parent() {
             sync_directory(parent);
         }
     }
+    Ok(())
+}
+
+/// Replaces one record file atomically; the caller flushes the directory.
+fn stage(
+    directory: &Path,
+    key: &str,
+    value: &str,
+    modified: bool,
+    flush: Flush,
+) -> Result<PathBuf, String> {
     let name = file_name(key);
     let temporary = directory.join(format!("{name}.tmp"));
-    let contents = serde_json::to_vec(&serde_json::json!({ "key": key, "value": value }))
+    let mut record = serde_json::json!({ "key": key, "value": value });
+    if modified {
+        record["modified"] = serde_json::Value::Bool(true);
+    }
+    let contents = serde_json::to_vec(&record)
         .map_err(|error| format!("Cannot encode settings record: {error}"))?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -270,14 +341,43 @@ pub(crate) fn write(settings: &Path, key: &str, value: &str) -> Result<(), Strin
         .open(&temporary)
         .map_err(|error| format!("Cannot write settings record: {error}"))?;
     file.write_all(&contents)
-        .and_then(|()| file.sync_all())
+        .and_then(|()| flush_file(&file, flush))
         .map_err(|error| format!("Cannot write settings record: {error}"))?;
     drop(file);
     let target = directory.join(name);
     fs::rename(&temporary, &target)
         .map_err(|error| format!("Cannot save settings record: {error}"))?;
-    sync_directory(&directory);
     forget_report(&target);
+    #[cfg(test)]
+    WRITES.with(|writes| writes.set(writes.get() + 1));
+    Ok(target)
+}
+
+/// Saves one record. `mark` flags the key as modified; without it the record
+/// keeps whatever mark it already had.
+pub(crate) fn write(settings: &Path, key: &str, value: &str, mark: bool) -> Result<(), String> {
+    let directory = directory(settings);
+    ensure_directory(&directory)?;
+    let modified = mark || is_marked(settings, key);
+    stage(&directory, key, value, modified, Flush::Full)?;
+    sync_directory(&directory);
+    Ok(())
+}
+
+/// Saves many records with one durable flush instead of one per record. Each
+/// file is replaced atomically, so a crash leaves every record either old or
+/// new; only after this returns is it safe to drop the values from another file.
+pub(crate) fn write_batch(settings: &Path, entries: &[(&str, &str)]) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let directory = directory(settings);
+    ensure_directory(&directory)?;
+    for (key, value) in entries {
+        let modified = is_marked(settings, key);
+        stage(&directory, key, value, modified, Flush::Queued)?;
+    }
+    sync_directory(&directory);
     Ok(())
 }
 
@@ -340,14 +440,14 @@ mod tests {
     #[test]
     fn records_round_trip_one_file_per_key() {
         let path = scratch("round-trip");
-        write(&path, "sai-ship-runs", "[1]").unwrap();
-        write(&path, "sai-acp-plans", "[2]").unwrap();
-        write(&path, "sai-ship-runs", "[3]").unwrap();
+        write(&path, "sai-ship-runs", "[1]", false).unwrap();
+        write(&path, "sai-acp-plans", "[2]", false).unwrap();
+        write(&path, "sai-ship-runs", "[3]", false).unwrap();
         assert_eq!(
             read(&path, "sai-ship-runs").unwrap().as_deref(),
             Some("[3]")
         );
-        assert_eq!(read_all(&path).unwrap().len(), 2);
+        assert_eq!(read_all(&path).unwrap().0.len(), 2);
         remove(&path, "sai-ship-runs").unwrap();
         remove(&path, "sai-ship-runs").unwrap();
         assert_eq!(read(&path, "sai-ship-runs").unwrap(), None);
@@ -358,14 +458,14 @@ mod tests {
     #[test]
     fn a_torn_temporary_file_never_replaces_the_saved_value() {
         let path = scratch("torn");
-        write(&path, "sai-ship-runs", "[old]").unwrap();
+        write(&path, "sai-ship-runs", "[old]", false).unwrap();
         let temporary = directory(&path).join(format!("{}.tmp", file_name("sai-ship-runs")));
         fs::write(&temporary, b"{\"key\":\"sai-ship-ru").unwrap();
         assert_eq!(
             read(&path, "sai-ship-runs").unwrap().as_deref(),
             Some("[old]")
         );
-        assert_eq!(read_all(&path).unwrap().len(), 1);
+        assert_eq!(read_all(&path).unwrap().0.len(), 1);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -386,15 +486,15 @@ mod tests {
         for (label, bytes) in CORRUPT_CONTENTS {
             let path = scratch(label);
             let key = "sai-ship-runs";
-            write(&path, "sai-acp-plans", "[good]").unwrap();
-            write(&path, key, "[old]").unwrap();
+            write(&path, "sai-acp-plans", "[good]", false).unwrap();
+            write(&path, key, "[old]", false).unwrap();
             take_reports();
             let file = directory(&path).join(file_name(key));
             fs::write(&file, bytes).unwrap();
 
             assert_eq!(read(&path, key).unwrap(), None, "{label}");
             assert_eq!(read(&path, key).unwrap(), None, "{label}");
-            let all = read_all(&path).unwrap();
+            let all = read_all(&path).unwrap().0;
             assert_eq!(all.len(), 1, "{label}");
             assert_eq!(all.get("sai-acp-plans").map(String::as_str), Some("[good]"));
 
@@ -414,12 +514,12 @@ mod tests {
     #[test]
     fn a_corrupt_record_found_by_a_full_read_names_its_key() {
         let path = scratch("full-read");
-        write(&path, "sai-ship-runs", "[old]").unwrap();
+        write(&path, "sai-ship-runs", "[old]", false).unwrap();
         take_reports();
         let file = directory(&path).join(file_name("sai-ship-runs"));
         fs::write(&file, b"").unwrap();
-        assert!(read_all(&path).unwrap().is_empty());
-        assert!(read_all(&path).unwrap().is_empty());
+        assert!(read_all(&path).unwrap().0.is_empty());
+        assert!(read_all(&path).unwrap().0.is_empty());
         let reports = take_reports();
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert!(reports[0].contains("sai-ship-runs"), "{}", reports[0]);
@@ -430,12 +530,12 @@ mod tests {
     fn saving_a_key_replaces_its_corrupt_record() {
         let path = scratch("replace");
         let key = "sai-ship-runs";
-        write(&path, key, "[old]").unwrap();
+        write(&path, key, "[old]", false).unwrap();
         let file = directory(&path).join(file_name(key));
         fs::write(&file, b"{\"key\"").unwrap();
         assert_eq!(read(&path, key).unwrap(), None);
 
-        write(&path, key, "[new]").unwrap();
+        write(&path, key, "[new]", false).unwrap();
         assert_eq!(read(&path, key).unwrap().as_deref(), Some("[new]"));
 
         fs::write(&file, b"").unwrap();
@@ -448,14 +548,14 @@ mod tests {
     #[test]
     fn valid_records_are_not_logged() {
         let path = scratch("valid");
-        write(&path, "sai-ship-runs", "[1]").unwrap();
+        write(&path, "sai-ship-runs", "[1]", false).unwrap();
         take_reports();
         assert_eq!(
             read(&path, "sai-ship-runs").unwrap().as_deref(),
             Some("[1]")
         );
         assert_eq!(read(&path, "sai-acp-plans").unwrap(), None);
-        assert_eq!(read_all(&path).unwrap().len(), 1);
+        assert_eq!(read_all(&path).unwrap().0.len(), 1);
         assert!(take_reports().is_empty());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -464,14 +564,14 @@ mod tests {
     fn an_unreadable_record_reads_as_absent_and_is_logged() {
         let path = scratch("unreadable");
         let key = "sai-ship-runs";
-        write(&path, key, "[old]").unwrap();
+        write(&path, key, "[old]", false).unwrap();
         let file = directory(&path).join(file_name(key));
         fs::remove_file(&file).unwrap();
         fs::create_dir(&file).unwrap();
         take_reports();
         assert_eq!(read(&path, key).unwrap(), None);
         assert_eq!(read(&path, key).unwrap(), None);
-        assert!(read_all(&path).unwrap().is_empty());
+        assert!(read_all(&path).unwrap().0.is_empty());
         let reports = take_reports();
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert!(reports[0].contains(key), "{}", reports[0]);
@@ -482,14 +582,14 @@ mod tests {
     fn a_prefixed_key_is_named_once_a_read_by_key_knows_it() {
         let path = scratch("prefixed");
         let key = "sai-session:ses_1";
-        write(&path, key, "[old]").unwrap();
+        write(&path, key, "[old]", false).unwrap();
         let file = directory(&path).join(file_name(key));
         fs::write(&file, b"").unwrap();
         take_reports();
-        assert!(read_all(&path).unwrap().is_empty());
+        assert!(read_all(&path).unwrap().0.is_empty());
         assert_eq!(read(&path, key).unwrap(), None);
         assert_eq!(read(&path, key).unwrap(), None);
-        assert!(read_all(&path).unwrap().is_empty());
+        assert!(read_all(&path).unwrap().0.is_empty());
         let reports = take_reports();
         assert_eq!(reports.len(), 2, "{reports:?}");
         assert!(reports[0].contains("key unknown"), "{}", reports[0]);
@@ -501,13 +601,13 @@ mod tests {
     fn a_hostile_key_in_a_corrupt_record_is_logged_on_one_bounded_line() {
         let path = scratch("hostile");
         let key = "sai-ship-runs";
-        write(&path, key, "[old]").unwrap();
+        write(&path, key, "[old]", false).unwrap();
         let file = directory(&path).join(file_name(key));
         let claimed = format!("evil\nFAKE LOG LINE\u{1b}[31m{}", "k".repeat(20_000));
         let contents = serde_json::json!({"key": claimed, "value": 5}).to_string();
         fs::write(&file, contents).unwrap();
         take_reports();
-        assert!(read_all(&path).unwrap().is_empty());
+        assert!(read_all(&path).unwrap().0.is_empty());
         let reports = take_reports();
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert!(!reports[0].contains('\n') && !reports[0].contains('\u{1b}'));
@@ -518,15 +618,62 @@ mod tests {
     #[test]
     fn a_record_filed_under_another_keys_name_is_reported_for_that_name() {
         let path = scratch("misfiled");
-        write(&path, "sai-ship-runs", "[old]").unwrap();
+        write(&path, "sai-ship-runs", "[old]", false).unwrap();
         let file = directory(&path).join(file_name("sai-ship-runs"));
         fs::write(&file, br#"{"key":"sai-acp-plans","value":"[1]"}"#).unwrap();
         take_reports();
-        assert!(read_all(&path).unwrap().is_empty());
+        assert!(read_all(&path).unwrap().0.is_empty());
         assert_eq!(read(&path, "sai-ship-runs").unwrap(), None);
         let reports = take_reports();
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert!(reports[0].contains("sai-ship-runs"), "{}", reports[0]);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_batch_writes_every_record_and_keeps_existing_marks() {
+        let path = scratch("batch");
+        write(&path, "sai-ship-runs", "[old]", true).unwrap();
+        take_write_count();
+
+        let entries: Vec<(String, String)> = (0..40)
+            .map(|n| (format!("sai-session:{n}"), format!("[{n}]")))
+            .chain([("sai-ship-runs".to_string(), "[new]".to_string())])
+            .collect();
+        let borrowed: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        write_batch(&path, &borrowed).unwrap();
+
+        assert_eq!(take_write_count(), 41);
+        let (records, marked) = read_all(&path).unwrap();
+        assert_eq!(records.len(), 41);
+        assert_eq!(records["sai-ship-runs"], "[new]");
+        assert_eq!(marked, BTreeSet::from(["sai-ship-runs".to_string()]));
+        let leftovers = fs::read_dir(directory(&path))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension().unwrap() != "json")
+            .count();
+        assert_eq!(leftovers, 0);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_marked_record_keeps_the_fields_the_previous_version_reads() {
+        let path = scratch("compat");
+        write(&path, "sai-ship-runs", "[1]", true).unwrap();
+        let contents =
+            fs::read_to_string(directory(&path).join(file_name("sai-ship-runs"))).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(value["key"].as_str(), Some("sai-ship-runs"));
+        assert_eq!(value["value"].as_str(), Some("[1]"));
+        assert!(is_marked(&path, "sai-ship-runs"));
+        write(&path, "sai-ship-runs", "[2]", false).unwrap();
+        assert!(
+            is_marked(&path, "sai-ship-runs"),
+            "a plain write keeps the mark"
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

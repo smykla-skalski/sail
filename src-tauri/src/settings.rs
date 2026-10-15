@@ -555,8 +555,9 @@ fn read_settings_file(path: &Path) -> Result<Settings, String> {
 static MIGRATED: StdMutex<BTreeSet<PathBuf>> = StdMutex::new(BTreeSet::new());
 
 /// Moves record keys out of `settings.json` once per process. Records are written
-/// first, so a crash leaves each key in the file, the store, or both; the record
-/// wins and the file copy is dropped on the next pass.
+/// and flushed first, so a crash leaves each key in the file, the store, or both;
+/// the file copy wins, so a value a downgraded version wrote is not lost, and it
+/// is dropped from the file once every record is durable.
 fn migrate_records(path: &Path) -> Result<(), String> {
     if MIGRATED
         .lock()
@@ -567,11 +568,12 @@ fn migrate_records(path: &Path) -> Result<(), String> {
     }
     let mut file = read_settings_file(path)?;
     if file.keys().any(|key| is_record_key(key)) {
-        for (key, value) in &file {
-            if is_record_key(key) {
-                records::write(path, key, value)?;
-            }
-        }
+        let moving: Vec<(&str, &str)> = file
+            .iter()
+            .filter(|(key, _)| is_record_key(key))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        records::write_batch(path, &moving)?;
         file.retain(|key, _| !is_record_key(key));
         write_settings_file(path, &file)?;
     }
@@ -589,7 +591,17 @@ fn read_file_settings(path: &Path) -> Result<Settings, String> {
 
 fn read_settings(path: &Path) -> Result<Settings, String> {
     let mut settings = read_file_settings(path)?;
-    settings.extend(records::read_all(path)?);
+    let (stored, marked) = records::read_all(path)?;
+    settings.extend(stored);
+    if !marked.is_empty() {
+        let mut modified = modified_keys(&settings);
+        modified.extend(marked);
+        settings.insert(
+            MODIFIED_KEY.to_string(),
+            serde_json::to_string(&modified)
+                .map_err(|error| format!("Cannot encode changes: {error}"))?,
+        );
+    }
     Ok(settings)
 }
 
@@ -613,9 +625,25 @@ fn read_scoped(path: &Path, keys: &[&str]) -> Result<Settings, String> {
 /// Persists the difference between `before` and `after`: one record per changed
 /// record key, and `settings.json` only when its own content changed.
 fn write_settings(path: &Path, before: &Settings, after: &Settings) -> Result<(), String> {
+    write_settings_marking(path, before, after, None)
+}
+
+/// Like `write_settings`, and flags `marked` as modified inside its own record
+/// so that key needs no second write for the modified set.
+fn write_settings_marking(
+    path: &Path,
+    before: &Settings,
+    after: &Settings,
+    marked: Option<&str>,
+) -> Result<(), String> {
     for (key, value) in after {
-        if is_record_key(key) && before.get(key) != Some(value) {
-            records::write(path, key, value)?;
+        if !is_record_key(key) {
+            continue;
+        }
+        let mark = marked == Some(key.as_str());
+        let flag_missing = mark && before.get(key) == Some(value) && !records::is_marked(path, key);
+        if before.get(key) != Some(value) || flag_missing {
+            records::write(path, key, value, mark)?;
         }
     }
     for key in before.keys() {
@@ -1100,36 +1128,41 @@ pub(crate) fn save_setting_sync(
 fn save_setting_at(path: &Path, key: String, value: Option<String>) -> Result<(), String> {
     let path = path.to_path_buf();
     let _lock = lock_settings(&path)?;
-    let mut saved = if is_record_key(&key) {
-        read_scoped(&path, &[&key, MODIFIED_KEY, DELETIONS_KEY])?
+    let marked_in_record = is_record_key(&key) && value.is_some();
+    let mut saved = if marked_in_record {
+        read_scoped(&path, &[&key])?
+    } else if is_record_key(&key) {
+        read_scoped(&path, &[&key, MODIFIED_KEY])?
     } else {
         let mut saved = read_file_settings(&path)?;
         saved.extend(read_scoped(&path, &[MODIFIED_KEY, DELETIONS_KEY])?);
         saved
     };
     let before = saved.clone();
-    let mut modified: BTreeSet<String> = saved
-        .get(MODIFIED_KEY)
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
-    modified.insert(key.clone());
-    saved.insert(
-        MODIFIED_KEY.to_string(),
-        serde_json::to_string(&modified)
-            .map_err(|error| format!("Cannot encode changes: {error}"))?,
-    );
+    if !marked_in_record {
+        let mut modified: BTreeSet<String> = saved
+            .get(MODIFIED_KEY)
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        modified.insert(key.clone());
+        saved.insert(
+            MODIFIED_KEY.to_string(),
+            serde_json::to_string(&modified)
+                .map_err(|error| format!("Cannot encode changes: {error}"))?,
+        );
+    }
     if key == "sai-project-catalog" || key == "sail-agent-threads" {
         update_deletions(&mut saved, &key, value.as_deref().unwrap_or_default())?;
     }
     match value {
         Some(value) => {
-            saved.insert(key, value);
+            saved.insert(key.clone(), value);
         }
         None => {
             saved.remove(&key);
         }
     }
-    write_settings(&path, &before, &saved)
+    write_settings_marking(&path, &before, &saved, marked_in_record.then_some(&key))
 }
 
 fn modified_keys(settings: &Settings) -> BTreeSet<String> {
@@ -1700,7 +1733,7 @@ mod tests {
             ("sai-ship-runs".to_string(), "[\"old\"]".to_string()),
         ]);
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        records::write(&path, "sai-ship-runs", "[\"stale\"]").unwrap();
+        records::write(&path, "sai-ship-runs", "[\"stale\"]", false).unwrap();
 
         let loaded = read_settings(&path).unwrap();
         assert_eq!(loaded["sai-ship-runs"], "[\"old\"]");
@@ -1708,6 +1741,104 @@ mod tests {
         assert!(!read_settings_file(&path)
             .unwrap()
             .contains_key("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_first_save_of_a_record_key_writes_one_record() {
+        let path = scratch_settings("first-save");
+        std::fs::write(&path, b"{ \"sai-theme\": \"dark\" }").unwrap();
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+        records::take_write_count();
+
+        save_setting_at(&path, "sai-acp-plans".into(), Some("[2]".into())).unwrap();
+        assert_eq!(records::take_write_count(), 1);
+        save_setting_at(&path, "sai-acp-plans".into(), Some("[3]".into())).unwrap();
+        assert_eq!(records::take_write_count(), 1);
+        save_setting_at(&path, "sai-acp-plans".into(), Some("[3]".into())).unwrap();
+        assert_eq!(records::take_write_count(), 0, "same value, already marked");
+
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-acp-plans"], "[3]");
+        assert!(modified_keys(&loaded).contains("sai-acp-plans"));
+        assert!(modified_keys(&loaded).contains("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn saving_the_value_a_record_already_holds_still_marks_it_modified() {
+        let path = scratch_settings("mark-same");
+        write_settings(
+            &path,
+            &Settings::new(),
+            &Settings::from([("sai-ship-runs".to_string(), "[1]".to_string())]),
+        )
+        .unwrap();
+        assert!(!modified_keys(&read_settings(&path).unwrap()).contains("sai-ship-runs"));
+        records::take_write_count();
+
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+        assert_eq!(records::take_write_count(), 1);
+        assert!(modified_keys(&read_settings(&path).unwrap()).contains("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_record_key_keeps_it_marked_so_old_data_cannot_return() {
+        let path = scratch_settings("delete-marked");
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+        save_setting_at(&path, "sai-ship-runs".into(), None).unwrap();
+        let loaded = read_settings(&path).unwrap();
+        assert!(!loaded.contains_key("sai-ship-runs"));
+        assert!(modified_keys(&loaded).contains("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_background_write_keeps_the_modified_mark_of_a_record() {
+        let path = scratch_settings("keep-mark");
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+        let before = read_scoped(&path, &["sai-ship-runs"]).unwrap();
+        let mut after = before.clone();
+        after.insert("sai-ship-runs".into(), "[2]".into());
+        write_settings(&path, &before, &after).unwrap();
+        assert!(modified_keys(&read_settings(&path).unwrap()).contains("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn upgrade_keeps_a_modified_mark_while_the_file_copy_replaces_the_value() {
+        let path = scratch_settings("upgrade-mark");
+        records::write(&path, "sai-ship-runs", "[\"mine\"]", true).unwrap();
+        std::fs::write(&path, br#"{"sai-ship-runs":"[\"downgraded\"]"}"#).unwrap();
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-ship-runs"], "[\"downgraded\"]");
+        assert!(modified_keys(&loaded).contains("sai-ship-runs"));
+        assert!(!read_settings_file(&path)
+            .unwrap()
+            .contains_key("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_large_upgrade_moves_every_key_and_leaves_none_in_the_file() {
+        let path = scratch_settings("large-upgrade");
+        let mut legacy = Settings::new();
+        for n in 0..367 {
+            legacy.insert(format!("sai-session:/repo/{n}:ses"), format!("[{n}]"));
+        }
+        legacy.insert("sai-theme".into(), "dark".into());
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        records::take_write_count();
+
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded, legacy);
+        assert_eq!(records::take_write_count(), 367);
+        assert_eq!(
+            read_settings_file(&path).unwrap(),
+            Settings::from([("sai-theme".to_string(), "dark".to_string())])
+        );
+        assert_eq!(read_settings(&path).unwrap(), legacy);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
