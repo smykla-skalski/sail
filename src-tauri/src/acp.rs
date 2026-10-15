@@ -122,7 +122,7 @@ impl NativeSubagentRegistry {
         session_id: &str,
         directory: PathBuf,
         can_cancel: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if let Some(entry) = self.0.get_mut(session_id) {
             if entry.parent_session_id != parent_session_id || entry.directory != directory {
                 return Err("Native child is already bound to another parent or directory.".into());
@@ -141,7 +141,18 @@ impl NativeSubagentRegistry {
                 },
             );
         }
-        Ok(())
+        Ok(self.0.get(session_id).is_some_and(Self::is_live))
+    }
+
+    /// An explicit interaction wakes a settled child; a mere replayed spawn does not.
+    fn revive(&mut self, session_id: &str) -> bool {
+        self.0.get_mut(session_id).is_some_and(|entry| {
+            if !Self::is_live(entry) {
+                entry.outcome = "working".into();
+                entry.task_turn_id = None;
+            }
+            true
+        })
     }
 
     fn cancellation_eligible(&self, session_id: &str) -> Option<bool> {
@@ -687,6 +698,10 @@ struct Connection {
     #[cfg(unix)]
     shared_build_directory: Option<PathBuf>,
     codex_workspace_access: Option<CodexWorkspaceAccess>,
+    /// PATH and identity given to the agent; terminal commands reuse them so a gate sees
+    /// one environment on every surface.
+    runtime_path: std::ffi::OsString,
+    environment_id: String,
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
@@ -1901,6 +1916,11 @@ impl Connection {
         {
             return false;
         }
+        let timeout = if self.lists_only() {
+            timeout.min(OPENCODE_LISTING_IDLE_TIMEOUT)
+        } else {
+            timeout
+        };
         let silent = self
             .last_activity
             .lock()
@@ -1931,6 +1951,15 @@ impl Connection {
             json!({"agent":self.agent,"idleSeconds":silent.as_secs()}),
         );
         true
+    }
+
+    /// The shared sidebar agent holds no session, only its listing requests.
+    fn lists_only(&self) -> bool {
+        self.profile == CapabilityProfile::Explore
+            && self
+                .session_profiles
+                .lock()
+                .is_ok_and(|profiles| profiles.is_empty())
     }
 
     fn has_pending_work(&self) -> bool {
@@ -2380,7 +2409,8 @@ fn runtime_environment(
     environment
 }
 
-fn configured_tool_paths(
+/// Directories Sail may put ahead of the inherited PATH, whether or not they exist yet.
+fn configured_tool_candidates(
     home: Option<&Path>,
     local_app_data: Option<&Path>,
     windows: bool,
@@ -2396,7 +2426,18 @@ fn configured_tool_paths(
     if let Some(home) = home {
         paths.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
     }
-    paths.into_iter().filter(|path| path.is_dir()).collect()
+    paths
+}
+
+fn configured_tool_paths(
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    configured_tool_candidates(home, local_app_data, windows)
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
@@ -2434,6 +2475,33 @@ fn user_writable_directories(home: Option<&Path>, data_home: Option<&Path>) -> V
         .into_iter()
         .chain(ship_it_checkpoint_directory(data_home, home))
         .collect()
+}
+
+/// Identity of the tool environment every agent-owned surface of a worktree shares. It hashes
+/// the candidate tool directories, not only the existing ones, so creating `~/.local/bin`
+/// mid-gate does not change the identity of a worktree.
+pub(crate) fn tool_environment_id(data_directory: &Path) -> String {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    environment_id_for(
+        data_directory,
+        home.as_deref(),
+        local_app_data.as_deref(),
+        cfg!(windows),
+    )
+}
+
+fn environment_id_for(
+    data_directory: &Path,
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> String {
+    crate::acp_terminal::environment_identity(
+        data_directory,
+        &configured_tool_candidates(home, local_app_data, windows),
+    )
 }
 
 fn agent_path(
@@ -4865,12 +4933,18 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
         return None;
     }
     let update = match activity {
-        "started" | "interacted" => json!({
-            "sessionUpdate":"subagent_spawned",
-            "subagentSessionId":child,
-            "name":name,
-            "task":name
-        }),
+        "started" | "interacted" => {
+            let mut spawned = json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":child,
+                "name":name,
+                "task":name
+            });
+            if activity == "interacted" {
+                spawned["revive"] = json!(true);
+            }
+            spawned
+        }
         "completed" | "interrupted" => json!({
             "sessionUpdate":"subagent_state_update",
             "subagentSessionId":child,
@@ -5122,6 +5196,17 @@ fn connection_for_session(
         .ok_or_else(|| "Agent session is not connected in this worktree.".to_string())
 }
 
+/// OpenCode attaches the child's own session ID to its MCP calls; other agents give none.
+fn task_provider_id<'a>(runtime: &Connection, child_id: &'a str) -> Option<&'a str> {
+    (runtime.agent == "opencode").then(|| {
+        runtime
+            .owner
+            .as_ref()
+            .and_then(|owner| child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:")))
+            .unwrap_or(child_id)
+    })
+}
+
 fn register_native_task_connections(
     runtime: &Connection,
     browser: &crate::browser_agent::BrowserManager,
@@ -5133,15 +5218,7 @@ fn register_native_task_connections(
         .task_connections();
     for _ in 0..children.len() {
         for (child_id, child) in &children {
-            let provider_id = (runtime.agent == "opencode").then(|| {
-                runtime
-                    .owner
-                    .as_ref()
-                    .and_then(|owner| {
-                        child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
-                    })
-                    .unwrap_or(child_id)
-            });
+            let provider_id = task_provider_id(runtime, child_id);
             browser.register_native_child(
                 &runtime.agent,
                 &child.directory,
@@ -5150,6 +5227,17 @@ fn register_native_task_connections(
                 provider_id,
             );
         }
+    }
+    // Settled ancestors only bridge registration of live descendants.
+    for (child_id, child) in children
+        .iter()
+        .filter(|(_, child)| !NativeSubagentRegistry::is_live(child))
+    {
+        browser.prune_native_children(
+            &runtime.agent,
+            &child.directory,
+            std::slice::from_ref(child_id),
+        );
     }
     Ok(())
 }
@@ -5289,19 +5377,21 @@ fn record_native_subagent_update(
                     .0
                     .get(parent_id)
                     .is_some_and(|parent| parent.task_turn_id.is_some());
-            native.spawn(parent_id, child_id, directory.clone(), can_cancel)?;
+            let child_live = native.spawn(parent_id, child_id, directory.clone(), can_cancel)?;
             native.task_scope(child_id, agent == "opencode", live);
-            let provider_id = (agent == "opencode").then(|| {
-                runtime
-                    .owner
-                    .as_ref()
-                    .and_then(|owner| {
-                        child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
-                    })
-                    .unwrap_or(child_id)
-            });
-            app.state::<crate::browser_agent::BrowserManager>()
-                .register_native_child(agent, &directory, parent_id, child_id, provider_id);
+            let child_live = if update.get("revive").and_then(Value::as_bool) == Some(true) {
+                native.revive(child_id)
+            } else {
+                child_live
+            };
+            let provider_id = task_provider_id(runtime, child_id);
+            let browser = app.state::<crate::browser_agent::BrowserManager>();
+            // A replayed spawn of a settled child must not hold the parent's task identity.
+            if child_live {
+                browser.register_native_child(agent, &directory, parent_id, child_id, provider_id);
+            } else {
+                browser.prune_native_children(agent, &directory, &[child_id.to_string()]);
+            }
             let generation = fence.generations.entry(directory).or_default();
             *generation = generation.saturating_add(1);
             Ok(())
@@ -5345,6 +5435,15 @@ fn record_native_subagent_update(
                             .is_some_and(|parent| parent.task_turn_id.is_some())
                 });
                 native.task_scope(child_id, agent == "opencode", live);
+                // A resumed child must hold the task bridge again until it settles.
+                app.state::<crate::browser_agent::BrowserManager>()
+                    .register_native_child(
+                        agent,
+                        &directory,
+                        parent_id,
+                        child_id,
+                        task_provider_id(runtime, child_id),
+                    );
             }
             let generation = fence.generations.entry(directory.clone()).or_default();
             *generation = generation.saturating_add(1);
@@ -5558,7 +5657,7 @@ impl Connection {
             || app
                 .state::<crate::terminal::TerminalManager>()
                 .owner_has_running(&owner);
-        let (profile, directory) = {
+        let (profile, directory, deleted) = {
             let restores = self.restores.lock().map_err(|error| error.to_string())?;
             let prompts = self
                 .prompt_state
@@ -5593,7 +5692,7 @@ impl Connection {
                 .lock()
                 .map_err(|error| error.to_string())?
                 .begin_close(session_id);
-            (profile, directory)
+            (profile, directory, prompts.forgotten.contains(session_id))
         };
         let closed = self.request(
             "session/close",
@@ -5603,6 +5702,10 @@ impl Connection {
         let end_close = || {
             if let Ok(mut idle) = self.idle.lock() {
                 idle.end_close(session_id);
+                // A deleted thread must stay gone, so it is not marked closed for a reattach.
+                if deleted {
+                    idle.forget(session_id);
+                }
             }
         };
         match closed {
@@ -6335,9 +6438,12 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
+    let runtime_path = agent_path(paths, data_directory.join("bin"), &original_path)?;
+    command.env("PATH", &runtime_path);
+    let environment_id = tool_environment_id(&data_directory);
     command.env(
-        "PATH",
-        agent_path(paths, data_directory.join("bin"), &original_path)?,
+        crate::acp_terminal::ENVIRONMENT_ID_VARIABLE,
+        &environment_id,
     );
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
@@ -6481,6 +6587,8 @@ fn connect_blocking_inner(
         #[cfg(unix)]
         shared_build_directory,
         codex_workspace_access,
+        runtime_path,
+        environment_id,
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
@@ -6780,6 +6888,8 @@ fn connect_blocking_inner(
                                             directory,
                                             scratch_owner,
                                             build_directory: build_directory.as_deref(),
+                                            runtime_path: Some(runtime.runtime_path.as_os_str()),
+                                            environment_id: Some(runtime.environment_id.as_str()),
                                         },
                                     )
                                 };
@@ -7545,19 +7655,43 @@ pub async fn acp_forget_session(
                 return Err(error.to_string());
             }
         }
-        if let Err(error) = runtime
+        let restoring = match runtime
             .restores
             .lock()
             .map(|mut claims| claims.remove(&session_id))
         {
+            Ok(claim) => claim.is_some(),
+            Err(error) => {
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        };
+        runtime.restore_ready.notify_all();
+        // A restore reservation registered the thread; a deleted thread must not stay registered.
+        let cleared = runtime
+            .idle
+            .lock()
+            .map(|mut idle| idle.forget(&session_id))
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                if restoring {
+                    unregister_session(&runtime, &session_id)
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = cleared {
             runtime
                 .prompt_state
                 .lock()
                 .map_err(|cause| cause.to_string())?
                 .finish_forget(&session_id, false);
-            return Err(error.to_string());
+            return Err(error);
         }
-        runtime.restore_ready.notify_all();
         let mut configs = match runtime.session_configs.lock() {
             Ok(configs) => configs,
             Err(error) => {
@@ -7649,6 +7783,8 @@ pub async fn acp_begin_session_restore(
             if let Some(token) = result.get("restoreToken").and_then(Value::as_str) {
                 runtime.release_restore(&session_id, token)?;
             }
+            // The delete landed after the reservation registered the thread.
+            unregister_session(&runtime, &session_id)?;
             return Err(error);
         }
         Ok(result)
@@ -7892,7 +8028,8 @@ fn restore_session_blocking(
                 )
             },
         )?;
-        with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
+        let loaded = std::cell::Cell::new(false);
+        let outcome = with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
             // A reattach already holds the claim for the thread it resumes.
             let mut resume = if resume_claimed {
                 None
@@ -7977,18 +8114,10 @@ fn restore_session_blocking(
                         browser.release(token)
                     });
                 }
-                runtime
-                    .session_directories
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .remove(&session_id);
-                runtime
-                    .session_profiles
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .remove(&session_id);
+                unregister_session(&runtime, &session_id)?;
             }
             let result = result?;
+            loaded.set(true);
             complete_restore_if_current(
                 manager,
                 &runtime.prompt_state,
@@ -8012,8 +8141,56 @@ fn restore_session_blocking(
                 resume.resumed = true;
             }
             Ok(restored)
-        })
+        });
+        // A delete that lands during the restore leaves nothing registered for the thread.
+        if outcome.is_err()
+            && unregister_if_deleted(&runtime, &session_id)?
+            && loaded.get()
+            && runtime.supports_session_close()
+        {
+            // The idle sweep no longer sees the thread, so release what the resume loaded.
+            if let Err(error) = runtime.request(
+                "session/close",
+                json!({"sessionId":session_id}),
+                Duration::from_secs(30),
+            ) {
+                crate::diagnostics::record(
+                    "deleted_session_close_failed",
+                    json!({"agent":agent,"sessionId":session_id,"error":error}),
+                );
+            }
+        }
+        outcome
     }
+}
+
+/// Unregisters a thread whose delete is committed or in progress, whether it began before or
+/// during the failed restore. An aborted delete clears its fence, so a live thread stays registered.
+fn unregister_if_deleted(runtime: &Connection, session_id: &str) -> Result<bool, String> {
+    let forgotten = runtime
+        .prompt_state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .forgotten
+        .contains(session_id);
+    if forgotten {
+        unregister_session(runtime, session_id)?;
+    }
+    Ok(forgotten)
+}
+
+fn unregister_session(runtime: &Connection, session_id: &str) -> Result<(), String> {
+    runtime
+        .session_directories
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(session_id);
+    runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(session_id);
+    Ok(())
 }
 
 fn prompt_content(
@@ -8792,6 +8969,10 @@ fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
 const IDLE_EXIT_ERROR: &str = "Agent session is not connected in this worktree.";
 
 const OPENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A listing-only agent has no session to resume, so it leaves well before a working agent does;
+/// the next listing starts it again.
+const OPENCODE_LISTING_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Idle limit for OpenCode agents; `SAIL_OPENCODE_IDLE_TIMEOUT_SECS=0` keeps them until app exit.
 fn opencode_idle_timeout() -> Option<Duration> {
@@ -10035,6 +10216,8 @@ time.sleep(10)
             #[cfg(unix)]
             shared_build_directory: build_directory,
             codex_workspace_access: None,
+            runtime_path: std::ffi::OsString::new(),
+            environment_id: String::new(),
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
@@ -10112,6 +10295,32 @@ time.sleep(10)
             IDLE_EXIT_ERROR,
             "a request racing the idle exit must be recoverable by reattaching"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_only_agent_exits_before_the_idle_limit_of_a_working_agent() {
+        let listing = idle_runtime("opencode", None);
+        listing.session_profiles.lock().unwrap().clear();
+        *listing.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let working = idle_runtime("opencode", None);
+        *working.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+
+        assert!(listing.exit_if_idle(Duration::from_secs(600), || false));
+        assert!(!working.exit_if_idle(Duration::from_secs(600), || false));
+        assert!(working.alive.load(Ordering::Acquire));
+        working.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_only_agent_follows_a_shorter_configured_limit() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(40);
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(60), || false));
+        assert!(runtime.exit_if_idle(Duration::from_secs(30), || false));
     }
 
     #[cfg(unix)]
@@ -10398,6 +10607,23 @@ time.sleep(10)
             );
         }
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn environment_id_ignores_tool_directories_created_later() {
+        let root = scratch("environment-id-late-tools");
+        let data = root.join("agent-data");
+        let before = environment_id_for(&data, Some(&root), None, false);
+
+        std::fs::create_dir_all(root.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(root.join(".cargo/bin")).unwrap();
+
+        assert_eq!(before, environment_id_for(&data, Some(&root), None, false));
+        assert_ne!(
+            before,
+            environment_id_for(&root.join("other-data"), Some(&root), None, false)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10700,6 +10926,8 @@ time.sleep(10)
                 #[cfg(unix)]
                 shared_build_directory: None,
                 codex_workspace_access: None,
+                runtime_path: std::ffi::OsString::new(),
+                environment_id: String::new(),
                 _storage_lease: None,
                 child: Mutex::new(child),
                 scratch_owner: None,
@@ -11916,6 +12144,73 @@ mod native_subagent_fence_tests {
     }
 
     #[test]
+    fn replayed_spawn_reports_whether_the_child_is_still_live() {
+        let mut registry = NativeSubagentRegistry::default();
+        let directory = PathBuf::from("/repo");
+        assert!(registry
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap());
+        assert!(registry
+            .spawn("parent", "child", directory.clone(), true)
+            .unwrap());
+        for outcome in ["completed", "failed", "cancelled"] {
+            registry.update("parent", "child", outcome).unwrap();
+            assert!(!registry
+                .spawn("parent", "child", directory.clone(), false)
+                .unwrap());
+        }
+        registry.update("parent", "child", "working").unwrap();
+        assert!(registry
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap());
+        assert!(registry.spawn("other", "child", directory, false).is_err());
+    }
+
+    #[test]
+    fn interaction_revives_a_settled_child_but_a_replayed_spawn_does_not() {
+        let mut registry = NativeSubagentRegistry::default();
+        let directory = PathBuf::from("/repo");
+        registry
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap();
+        registry.update("parent", "child", "completed").unwrap();
+        assert!(!registry.spawn("parent", "child", directory, false).unwrap());
+        assert_eq!(registry.0["child"].outcome, "completed");
+        assert!(registry.revive("child"));
+        assert_eq!(registry.0["child"].outcome, "working");
+        registry.update("parent", "child", "completed").unwrap();
+        assert!(!NativeSubagentRegistry::is_live(&registry.0["child"]));
+        assert!(!registry.revive("unknown"));
+    }
+
+    #[test]
+    fn codex_interaction_is_marked_as_a_revival() {
+        let activity = |kind: &str| {
+            json!({
+                "method":"session/update",
+                "params":{"sessionId":"parent","update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":format!("activity-{kind}"),
+                    "subagent":true,
+                    "status":"completed",
+                    "input":{
+                        "activityKind":kind,
+                        "agentPath":"/root/child",
+                        "agentThreadId":"child-thread"
+                    }
+                }}
+            })
+        };
+        let interacted = codex_native_activity_update(&activity("interacted"), None).unwrap();
+        assert_eq!(
+            interacted.pointer("/params/update/revive"),
+            Some(&json!(true))
+        );
+        let started = codex_native_activity_update(&activity("started"), None).unwrap();
+        assert!(started.pointer("/params/update/revive").is_none());
+    }
+
+    #[test]
     fn native_task_turn_is_own_live_scope_and_settles_before_reopening() {
         let mut registry = NativeSubagentRegistry::default();
         registry
@@ -12106,6 +12401,8 @@ mod native_subagent_fence_tests {
             #[cfg(unix)]
             shared_build_directory: None,
             codex_workspace_access: None,
+            runtime_path: std::ffi::OsString::new(),
+            environment_id: String::new(),
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
@@ -13603,6 +13900,57 @@ mod idle_close_tests {
             .unwrap()
             .is_none());
         assert!(!runtime.idle.lock().unwrap().is_closed("ses_ui_loaded"));
+    }
+
+    #[test]
+    fn deleting_a_thread_during_its_restore_leaves_nothing_registered() {
+        for agent in ["codex", "claude"] {
+            let session = format!("ses_delete_{agent}");
+            let runtime = closed_runtime(agent, &session);
+            let claim = runtime.begin_attaching_restore(&session).unwrap();
+            assert!(claim.is_some(), "{agent}");
+            assert!(runtime
+                .session_profiles
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            assert!(runtime
+                .session_directories
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            // The delete drops the idle state while the resume is still in flight.
+            runtime.idle.lock().unwrap().forget(&session);
+            // An aborted delete leaves the thread live and clears its fence.
+            assert!(!unregister_if_deleted(&runtime, &session).unwrap());
+            assert!(runtime
+                .session_profiles
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            runtime
+                .prompt_state
+                .lock()
+                .unwrap()
+                .mark_forgotten(&session);
+            assert!(unregister_if_deleted(&runtime, &session).unwrap());
+            drop(claim);
+            assert!(!runtime
+                .session_profiles
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            assert!(!runtime
+                .session_directories
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            let idle = runtime.idle.lock().unwrap();
+            assert!(!idle.is_closed(&session), "{agent}: no closed marker");
+            assert!(!idle.is_resuming(&session), "{agent}: claim released");
+            drop(idle);
+            assert_eq!(runtime.reattach_closed(&session, || Ok(())), Ok(None));
+        }
     }
 
     #[test]

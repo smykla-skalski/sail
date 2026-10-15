@@ -21,6 +21,11 @@ import {
   systemRunDataRoots,
 } from './native-app-data.mjs';
 import { availablePort, nativeApp, verifySignature } from './native-app.mjs';
+import {
+  reapDeadRuns,
+  registerRunIfPossible,
+  runRegistryDirectory,
+} from './native-run-registry.mjs';
 import { runOwnedCommand } from './native-test-process.mjs';
 import {
   artifactKey,
@@ -41,13 +46,23 @@ const cancel = () => {
 process.on('SIGINT', cancel);
 process.on('SIGTERM', cancel);
 process.on('SIGHUP', cancel);
-const { command, identifier, prepareApp, readiness, sign, stopApp } = nativeApp({
+const { appProcesses, command, identifier, prepareApp, readiness, sign, stopApp } = nativeApp({
   checkout,
   isCancelled: () => cancelled,
 });
 
-async function loggedCommand(program, args, env, log) {
-  return runOwnedCommand(program, args, { cwd: checkout, env, log, signal: cancellation.signal });
+function reportRegistry(message) {
+  process.stderr.write(`${message}\n`);
+}
+
+async function loggedCommand(program, args, env, log, groupHooks) {
+  return runOwnedCommand(program, args, {
+    cwd: checkout,
+    env,
+    log,
+    signal: cancellation.signal,
+    ...groupHooks,
+  });
 }
 
 function hashFile(path) {
@@ -80,7 +95,7 @@ function sourceRequirements() {
   };
 }
 
-async function artifact(root, requirements, attempt) {
+async function artifact(root, requirements, attempt, groupHooks) {
   const cache = join(root, 'artifacts', artifactKey(requirements));
   mkdirSync(cache, { recursive: true });
   for (const candidate of readdirSync(cache).toSorted((a, b) => b.localeCompare(a))) {
@@ -114,7 +129,13 @@ async function artifact(root, requirements, attempt) {
     npm_config_cache: join(root, 'npm-cache'),
     UV_CACHE_DIR: join(root, 'uv-cache'),
   });
-  const code = await loggedCommand('npm', ['run', 'build:e2e'], env, join(attempt, 'build.log'));
+  const code = await loggedCommand(
+    'npm',
+    ['run', 'build:e2e'],
+    env,
+    join(attempt, 'build.log'),
+    groupHooks,
+  );
   if (code !== 0) throw new Error(`Native build failed (${code}); see build.log`);
   const bundle = join(directory, 'target/debug/bundle/macos');
   const apps = readdirSync(bundle).filter((name) => name.endsWith('.app'));
@@ -161,6 +182,14 @@ async function main() {
   }
   const dataRoots = systemRunDataRoots();
   try {
+    const dead = await reapDeadRuns(runRegistryDirectory(), { stopApp, appProcesses });
+    process.stdout.write(`Stopped ${dead.reaped.length} runs left by killed runners\n`);
+    if (dead.failed.length > 0)
+      process.stderr.write(`Could not stop leftovers of runs: ${dead.failed.join(', ')}\n`);
+  } catch (error) {
+    process.stderr.write(`Could not stop runs left by killed runners: ${error.message}\n`);
+  }
+  try {
     const data = sweepRunData(dataRoots, listProcessCommands);
     const state = sweepStateRoots(tmpdir());
     const removed = [...data.removed, ...state.removed];
@@ -180,12 +209,19 @@ async function main() {
     let phase = 'artifact';
     let runIdentifier;
     let buildIdentifier;
+    const registration = registerRunIfPossible(
+      runRegistryDirectory,
+      `${process.pid}-${Date.now()}-${index}`,
+      reportRegistry,
+    );
+    const groupHooks = registration.groupHooks();
     try {
-      const built = await artifact(canonical, requirements, attempt);
+      const built = await artifact(canonical, requirements, attempt, groupHooks);
       buildIdentifier = identifier(built.app);
       phase = 'signing and identity';
       const { app, identity } = prepareApp(built.app, attempt, env);
       runIdentifier = identity.identifier;
+      registration.setBinary(env.SAIL_E2E_BINARY);
       const fixtureNames = [
         'TMPDIR',
         'SAIL_E2E_CONFIG_DIR',
@@ -226,6 +262,7 @@ async function main() {
         ['run', 'test:e2e', '--', ...process.argv.slice(2)],
         env,
         join(attempt, 'wdio.log'),
+        groupHooks,
       );
       const setup = existsSync(env.SAIL_E2E_SETUP_REPORT)
         ? JSON.parse(readFileSync(env.SAIL_E2E_SETUP_REPORT, 'utf8'))
@@ -266,6 +303,7 @@ async function main() {
         result.leftovers = leftovers;
         if (leftovers.length > 0)
           process.stderr.write(`Run folders remain after cleanup: ${leftovers.join(', ')}\n`);
+        registration.release();
       }
     }
     if (result.verdict === 'SETUP_FAILED') return runAttempt(index + 1);

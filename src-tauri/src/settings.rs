@@ -1162,7 +1162,13 @@ fn save_setting_at(path: &Path, key: String, value: Option<String>) -> Result<()
             saved.remove(&key);
         }
     }
-    write_settings_marking(&path, &before, &saved, marked_in_record.then_some(&key))
+    write_settings_marking(&path, &before, &saved, marked_in_record.then_some(&key))?;
+    // A corrupt or unreadable record reads as absent, so the diff above never
+    // removes it; a delete still clears it.
+    if is_record_key(&key) && !before.contains_key(&key) && !saved.contains_key(&key) {
+        records::remove(&path, &key)?;
+    }
+    Ok(())
 }
 
 fn modified_keys(settings: &Settings) -> BTreeSet<String> {
@@ -1780,6 +1786,78 @@ mod tests {
         save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
         assert_eq!(records::take_write_count(), 1);
         assert!(modified_keys(&read_settings(&path).unwrap()).contains("sai-ship-runs"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn record_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(path.with_file_name("records"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn saving_a_record_key_over_a_directory_replaces_it_and_keeps_the_directory() {
+        let path = scratch_settings("record-dir");
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+        let [file] = record_files(&path).try_into().unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        std::fs::write(file.join("note"), b"keep").unwrap();
+        assert!(!read_settings(&path).unwrap().contains_key("sai-ship-runs"));
+
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[2]".into())).unwrap();
+
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-ship-runs"], "[2]");
+        assert!(modified_keys(&loaded).contains("sai-ship-runs"));
+        let files = record_files(&path);
+        assert_eq!(files.len(), 2, "{files:?}");
+        let aside = files.iter().find(|entry| entry.is_dir()).unwrap();
+        assert_eq!(std::fs::read(aside.join("note")).unwrap(), b"keep");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_record_key_removes_its_corrupt_record() {
+        let path = scratch_settings("delete-corrupt");
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+        save_setting_at(&path, "sai-acp-plans".into(), Some("[2]".into())).unwrap();
+        let corrupt = record_files(&path)
+            .into_iter()
+            .find(|file| {
+                std::fs::read_to_string(file)
+                    .unwrap()
+                    .contains("sai-ship-runs")
+            })
+            .unwrap();
+        std::fs::write(&corrupt, b"{\"key\"").unwrap();
+        assert!(!read_settings(&path).unwrap().contains_key("sai-ship-runs"));
+
+        save_setting_at(&path, "sai-ship-runs".into(), None).unwrap();
+
+        assert!(!corrupt.exists());
+        let loaded = read_settings(&path).unwrap();
+        assert_eq!(loaded["sai-acp-plans"], "[2]");
+        assert!(modified_keys(&loaded).contains("sai-ship-runs"));
+        save_setting_at(&path, "sai-ship-runs".into(), None).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_record_key_over_a_directory_moves_it_aside() {
+        let path = scratch_settings("delete-dir");
+        save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+        let [file] = record_files(&path).try_into().unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+
+        save_setting_at(&path, "sai-ship-runs".into(), None).unwrap();
+
+        assert!(!file.exists());
+        assert!(!read_settings(&path).unwrap().contains_key("sai-ship-runs"));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

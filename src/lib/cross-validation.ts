@@ -62,7 +62,7 @@ export function validationInstructions(
     return [
       'No validation model pool is configured.',
       currentModel ? `Implementation model: ${currentModel}.` : '',
-      'For every review and test attempt, use validation_gate to start a fresh subagent session. Use the assigned Ship worker provider and model by default when available; a different model is optional.',
+      'For every review and test attempt, use validation_gate to start a fresh subagent session. Use the assigned Ship worker provider and model by default when available; a different model is optional. Pass revision (commit SHA) with the gate so the tool rejects a worktree that is not clean at that commit.',
       'If the provider cannot start a fresh session, pause and report the missing capability. Unresolved model metadata does not block a gate when its fresh execution identity is known.',
     ]
       .filter(Boolean)
@@ -75,7 +75,7 @@ export function validationInstructions(
     `Selected agent and model pool:\n${pool}`,
     currentModel ? `Current implementation model: ${currentModel}.` : '',
     'Before each gate, check current availability of the selected pool and choose a selected available model. A validation session must be fresh, but its model may match the implementation model.',
-    'In Sail, use the validation_gate tool for each pass in order, with the gate and prompt. Wait for its receipt before starting the next pass. The tool selects the configured route when present and starts a fresh session. If the tool is unavailable or cannot start a fresh session, pause the gate. Never launch an unselected agent or model as a substitute. Report actual route metadata when available.',
+    'In Sail, use the validation_gate tool for each pass in order, with the gate, the prompt and the revision (commit SHA) the pass must review; the tool rejects a request whose revision is not the clean head of this worktree. Wait for its receipt before starting the next pass. The tool selects the configured route when present and starts a fresh session. If the tool is unavailable or cannot start a fresh session, pause the gate. Never launch an unselected agent or model as a substitute. Report actual route metadata when available.',
   ]
     .filter(Boolean)
     .join('\n');

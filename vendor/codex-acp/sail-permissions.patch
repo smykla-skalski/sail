@@ -6,17 +6,18 @@ index cfd9581..109bfad 100644
 +  minify: true,
 +  supported: {'template-literal': false},
 diff --git a/readme-dev.md b/readme-dev.md
-index 58dd0e8..f8e40a5 100644
+index 58dd0e8..1b287ae 100644
 --- a/readme-dev.md
 +++ b/readme-dev.md
-@@ -15,0 +16,16 @@ Set `CODEX_PATH` to run a different Codex binary; versions other than the one sp
+@@ -15,0 +16,17 @@ Set `CODEX_PATH` to run a different Codex binary; versions other than the one sp
 +### External permission profiles
 +
 +A trusted runtime launcher may set `CODEX_ACP_PERMISSION_PROFILE_CONFIG` to a JSON
 +object containing `configOverrides` for the long-lived Codex app-server and a
 +`modeProfiles` mapping for the `read-only`, `agent`, and `agent-full-access` ACP
-+modes. An optional `developerInstructions` string is appended to Codex's
-+configured developer instructions and applied to new, resumed, loaded, and
++modes. The `workspace-write` mode uses the configured `agent` filesystem
++profile while retaining its own approval policy. An optional
++`developerInstructions` string is appended to Codex's configured developer instructions and applied to new, resumed, loaded, and
 +forked threads. The adapter treats profile definitions as opaque operator policy.
 +
 +When configured, codex-acp selects the matching profile on thread start, resume,
@@ -27,7 +28,7 @@ index 58dd0e8..f8e40a5 100644
 +sandbox behavior.
 +
 diff --git a/src/CodexAcpClient.ts b/src/CodexAcpClient.ts
-index 3b3aca4..4e18f91 100644
+index 3b3aca4..508325c 100644
 --- a/src/CodexAcpClient.ts
 +++ b/src/CodexAcpClient.ts
 @@ -49 +48,0 @@ import type {
@@ -99,13 +100,15 @@ index 3b3aca4..4e18f91 100644
 +        return developerInstructions ? {developerInstructions} : {};
 +    }
 +
-@@ -1056,0 +1102,5 @@ export class CodexAcpClient {
+@@ -1056,0 +1102,6 @@ export class CodexAcpClient {
 +        const sandboxSelection = this.permissionProfileConfig ? {
 +            runtimeWorkspaceRoots: sessionRoots(cwd, additionalDirectories),
 +        } : {
++            approvalsReviewer: agentMode.approvalsReviewer,
 +            sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
 +        };
-@@ -1062 +1112 @@ export class CodexAcpClient {
+@@ -1061,2 +1112 @@ export class CodexAcpClient {
+-            approvalsReviewer: agentMode.approvalsReviewer,
 -            sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
 +            ...sandboxSelection,
 @@ -1069,0 +1120,13 @@ export class CodexAcpClient {
@@ -233,10 +236,10 @@ index 0f79117..4d84b06 100644
 +        codex = spawn(process.execPath, [bundledCodexPath, ...args], {env: spawnEnv});
 diff --git a/src/PermissionProfileConfig.ts b/src/PermissionProfileConfig.ts
 new file mode 100644
-index 0000000..8756edd
+index 0000000..017c851
 --- /dev/null
 +++ b/src/PermissionProfileConfig.ts
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,43 @@
 +import {z} from "zod";
 +
 +export const PERMISSION_PROFILE_CONFIG_ENV = "CODEX_ACP_PERMISSION_PROFILE_CONFIG";
@@ -275,7 +278,8 @@ index 0000000..8756edd
 +}
 +
 +export function permissionProfileForMode(config: PermissionProfileConfig, modeId: string): string {
-+    const profile = config.modeProfiles[modeId as keyof PermissionProfileConfig["modeProfiles"]];
++    const profileId = modeId === "workspace-write" ? "agent" : modeId;
++    const profile = config.modeProfiles[profileId as keyof PermissionProfileConfig["modeProfiles"]];
 +    if (!profile) throw new Error(`No permission profile configured for ACP mode ${modeId}`);
 +    return profile;
 +}
@@ -296,13 +300,19 @@ index 1a533df..a3c6e1a 100644
 +        ...dependencies.developerInstructionSelection(),
 +        ...dependencies.permissionProfileSelection(request.cwd, additionalDirectories),
 diff --git a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
-index fc673fa..a57f7f1 100644
+index fc673fa..db49b0f 100644
 --- a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
 +++ b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
 @@ -11,0 +12 @@ import {
 +    TEST_PERMISSION_PROFILE_CONFIG,
-@@ -530,0 +532,55 @@ describe('ACP server test', { timeout: 40_000 }, () => {
-+    it('selects external permission profiles without losing workspace roots', async () => {
+@@ -530,0 +532,108 @@ describe('ACP server test', { timeout: 40_000 }, () => {
++    it.each([
++        {modeId: "read-only", profile: "external-read-only", approvalPolicy: "on-request"},
++        {modeId: "workspace-write", profile: "external-agent", approvalPolicy: "on-request"},
++        {modeId: "agent", profile: "external-agent", approvalPolicy: "on-request"},
++        {modeId: "agent-full-access", profile: "external-full-access", approvalPolicy: "never"},
++    ])('selects $modeId external profile without losing workspace roots', async ({modeId, profile, approvalPolicy}) => {
++        vi.stubEnv("INITIAL_AGENT_MODE", modeId);
 +        const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
 +        const codexAcpClient = mockFixture.getCodexAcpClient();
 +        const codexAppServerClient = mockFixture.getCodexAppServerClient();
@@ -332,12 +342,59 @@ index fc673fa..a57f7f1 100644
 +
 +        const request = threadStartSpy.mock.calls[0]![0];
 +        expect(request).toMatchObject({
-+            approvalPolicy: "on-request",
-+            permissions: "external-agent",
++            approvalPolicy,
++            permissions: profile,
 +            runtimeWorkspaceRoots: ["/workspace", "/workspace/extra"],
 +            developerInstructions: "configured policy\n\nexternal process policy",
 +        });
 +    });
++
++    it.each([AgentMode.ReadOnly, AgentMode.WorkspaceWrite, AgentMode.Agent, AgentMode.AgentFullAccess])(
++        'inherits the configured reviewer for external profile turns in mode $id', async (mode) => {
++            const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
++            const client = mockFixture.getCodexAcpClient();
++            const server = mockFixture.getCodexAppServerClient();
++            vi.spyOn(server, "skillsExtraRootsSet").mockResolvedValue(undefined);
++            vi.spyOn(server, "listSkills").mockResolvedValue({data: []});
++            const runTurn = vi.spyOn(server, "runTurn").mockResolvedValue({} as TurnCompletedNotification);
++
++            await client.sendPrompt(
++                {sessionId: "thread-id", prompt: [{type: "text", text: "hello"}]},
++                mode, ModelId.create("gpt-5", "medium"), null, false,
++                "/workspace", ["/workspace/extra"],
++            );
++
++            const request = runTurn.mock.calls[0]![0];
++            expect(request).not.toHaveProperty("approvalsReviewer");
++            expect(request).not.toHaveProperty("sandboxPolicy");
++            expect(request).toMatchObject({
++                approvalPolicy: mode.approvalPolicy,
++                runtimeWorkspaceRoots: ["/workspace", "/workspace/extra"],
++            });
++        },
++    );
++
++    it.each([AgentMode.ReadOnly, AgentMode.WorkspaceWrite, AgentMode.Agent, AgentMode.AgentFullAccess])(
++        'preserves the mode reviewer for legacy turns in mode $id', async (mode) => {
++            const mockFixture = createCodexMockTestFixture();
++            const client = mockFixture.getCodexAcpClient();
++            const server = mockFixture.getCodexAppServerClient();
++            vi.spyOn(server, "skillsExtraRootsSet").mockResolvedValue(undefined);
++            vi.spyOn(server, "listSkills").mockResolvedValue({data: []});
++            const runTurn = vi.spyOn(server, "runTurn").mockResolvedValue({} as TurnCompletedNotification);
++
++            await client.sendPrompt(
++                {sessionId: "thread-id", prompt: [{type: "text", text: "hello"}]},
++                mode, ModelId.create("gpt-5", "medium"), null, false, "/workspace", [],
++            );
++
++            expect(runTurn.mock.calls[0]![0]).toMatchObject({
++                approvalPolicy: mode.approvalPolicy,
++                approvalsReviewer: mode.approvalsReviewer,
++                sandboxPolicy: mode.sandboxPolicy,
++            });
++        },
++    );
 +
 +    it('preserves per-thread developer instructions before appending external policy', async () => {
 +        const mockFixture = createCodexMockTestFixture(
@@ -357,17 +414,78 @@ index fc673fa..a57f7f1 100644
 +            .toBe("per-thread policy\n\nexternal process policy");
 +    });
 +
-@@ -532 +588 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+@@ -532 +641 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 -        const mockFixture = createCodexMockTestFixture();
 +        const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
 diff --git a/src/__tests__/CodexACPAgent/session-config-options.test.ts b/src/__tests__/CodexACPAgent/session-config-options.test.ts
-index eea8183..ffc904b 100644
+index eea8183..3c55a30 100644
 --- a/src/__tests__/CodexACPAgent/session-config-options.test.ts
 +++ b/src/__tests__/CodexACPAgent/session-config-options.test.ts
-@@ -242 +242,2 @@ describe("Session config options", () => {
+@@ -3 +3 @@ import * as acp from "@agentclientprotocol/sdk";
+-import {createCodexMockTestFixture, createTestModel} from "../acp-test-utils";
++import {createCodexMockTestFixture, createTestModel, TEST_PERMISSION_PROFILE_CONFIG} from "../acp-test-utils";
+@@ -8,0 +9 @@ import {
++import type {PermissionProfileConfig} from "../../PermissionProfileConfig";
+@@ -44,0 +46 @@ async function createSession(
++    permissionProfileConfig?: PermissionProfileConfig,
+@@ -46 +48 @@ async function createSession(
+-    const fixture = createCodexMockTestFixture();
++    const fixture = createCodexMockTestFixture(undefined, undefined, permissionProfileConfig);
+@@ -242 +244,2 @@ describe("Session config options", () => {
 -        const {codexAcpAgent} = await createSession("fast-model[medium]", [fast]);
 +        const {codexAcpAgent, codexAcpClient} = await createSession("fast-model[medium]", [fast]);
 +        const update = vi.spyOn((codexAcpClient as any).codexClient, "threadSettingsUpdate").mockResolvedValue(undefined);
+@@ -310,0 +314,50 @@ describe("Session config options", () => {
++    it.each(["session/set_mode", "session/set_config_option"])(
++        "selects every advertised external profile through %s without replacing filesystem boundaries",
++        async (selection) => {
++            const {fast} = buildModels();
++            const {fixture, codexAcpAgent, response} = await createSession(
++                "fast-model[medium]", [fast], undefined, ["/test/extra"], TEST_PERMISSION_PROFILE_CONFIG,
++            );
++            const appServer = fixture.getCodexAppServerClient();
++            const update = vi.spyOn(appServer, "threadSettingsUpdate").mockResolvedValue(undefined);
++            vi.spyOn(appServer, "listSkills").mockResolvedValue({data: []});
++            const turn: Turn = {
++                id: "turn-id", items: [], itemsView: "notLoaded", status: "inProgress", error: null,
++                startedAt: null, completedAt: null, durationMs: null,
++            };
++            const turnStart = vi.spyOn(appServer, "turnStart").mockResolvedValue({turn});
++            vi.spyOn(appServer, "awaitTurnCompleted").mockResolvedValue({
++                threadId: response.sessionId, turn: {...turn, status: "completed"},
++            });
++            const expectedProfiles: Record<string, string> = {
++                "read-only": "external-read-only", "workspace-write": "external-agent",
++                "agent": "external-agent", "agent-full-access": "external-full-access",
++            };
++            for (const mode of response.modes!.availableModes) {
++                update.mockClear();
++                turnStart.mockClear();
++                if (selection === "session/set_mode") {
++                    await codexAcpAgent.setSessionMode({sessionId: response.sessionId, modeId: mode.id});
++                } else {
++                    const result = await codexAcpAgent.setSessionConfigOption({
++                        sessionId: response.sessionId, configId: "mode", value: mode.id,
++                    });
++                    expect(result.configOptions.find(option => option.id === "mode")?.currentValue).toBe(mode.id);
++                }
++                expect(update).toHaveBeenCalledExactlyOnceWith({
++                    threadId: response.sessionId,
++                    approvalPolicy: mode.id === "agent-full-access" ? "never" : "on-request",
++                    permissions: expectedProfiles[mode.id],
++                });
++                expect(codexAcpAgent.getSessionState(response.sessionId).agentMode.id).toBe(mode.id);
++                await codexAcpAgent.prompt({
++                    sessionId: response.sessionId, prompt: [{type: "text", text: "Reply OK"}],
++                });
++                const request = turnStart.mock.calls[0]![0];
++                expect(request.runtimeWorkspaceRoots).toEqual(["/test/cwd", "/test/extra"]);
++                expect(request).not.toHaveProperty("sandboxPolicy");
++                expect(request).not.toHaveProperty("approvalsReviewer");
++            }
++        },
++    );
++
 diff --git a/src/__tests__/acp-test-utils.ts b/src/__tests__/acp-test-utils.ts
 index ca4901d..5b684b0 100644
 --- a/src/__tests__/acp-test-utils.ts

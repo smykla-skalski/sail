@@ -67,6 +67,7 @@
     beginLatestRefresh,
     nextValidationReservation,
     gateSnapshot,
+    requireGateTargetCommit,
     currentShipBlockedReason,
     loadShipRunStore,
     repositoryForRemote,
@@ -266,6 +267,7 @@
     createSidebarPassOwnership,
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
+    sidebarRefreshOnWindowEvent,
     unlistedSidebarPaths,
     type SidebarRefreshPaths,
   } from './lib/sidebar-inventory';
@@ -2629,8 +2631,8 @@
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
-    window.addEventListener('focus', refreshSidebarOnFocus);
-    document.addEventListener('visibilitychange', refreshSidebarOnFocus);
+    window.addEventListener('focus', refreshSidebarOnWindowEvent);
+    document.addEventListener('visibilitychange', refreshSidebarOnWindowEvent);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
       if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading)
@@ -2653,8 +2655,8 @@
       clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
-      window.removeEventListener('focus', refreshSidebarOnFocus);
-      document.removeEventListener('visibilitychange', refreshSidebarOnFocus);
+      window.removeEventListener('focus', refreshSidebarOnWindowEvent);
+      document.removeEventListener('visibilitychange', refreshSidebarOnWindowEvent);
       clearTimeout(sidebarInventoryTimer);
       clearTimeout(sidebarFocusTimer);
       clearInterval(diffPollTimer);
@@ -4417,7 +4419,7 @@
       await acp.connect(run.provider, created.path, 'build', { owner: receiptId });
       ensureClaimHeld();
       const gateExecution =
-        'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
+        'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry, passing revision with the exact commit SHA to review. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
       const gateReporting =
         'Each validation session reports its own gate verdict through ship_progress; do not report review or test verdicts from this implementation session.';
       const target = shippingTarget;
@@ -7307,6 +7309,13 @@
     }
     if (request.name === 'validation_gate') {
       const owner = shipOwner(shipRuns, request.directory, sourceId);
+      const requestedRevision = request.arguments.revision;
+      // Reject a wrong target before the Ship issue stage or events change.
+      if (requestedRevision !== undefined && requestedRevision !== null && requestedRevision !== '')
+        requireGateTargetCommit(
+          requestedRevision,
+          await invoke<string | null>('working_tree_commit', { path: request.directory }),
+        );
       try {
         if (owner) {
           const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
@@ -7700,6 +7709,12 @@
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
     const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
+    const requestedCommit = request.arguments.revision;
+    if (requestedCommit !== undefined && requestedCommit !== null && requestedCommit !== '')
+      requireGateTargetCommit(
+        requestedCommit,
+        await invoke<string | null>('working_tree_commit', { path: request.directory }),
+      );
     await recoverImplementationModels(request.directory);
     const activeModels = await activeImplementationModels(request.directory, sourceId);
     if (!activeModels)
@@ -7874,7 +7889,7 @@
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
         await saveShipRuns();
         await ensureSelected();
-        const [revision, mutationGeneration, baseRevision] = await Promise.all([
+        const [revision, mutationGeneration, baseRevision, headCommit] = await Promise.all([
           invoke<string>('working_tree_revision', { path: request.directory }),
           invoke<string>('working_tree_generation', { path: request.directory }),
           shippingTarget
@@ -7883,7 +7898,10 @@
                 baseRef: shippingTarget.baseRef,
               })
             : Promise.resolve(undefined),
+          invoke<string | null>('working_tree_commit', { path: request.directory }),
         ]);
+        // Recheck after queueing: HEAD may have moved while the gate waited for capacity.
+        const commit = requireGateTargetCommit(requestedCommit, headCommit);
         updateSpawnReceipt(receiptId, {
           validation: {
             gate: gate as import('./lib/ship-progress').GateName,
@@ -7893,6 +7911,7 @@
             revision,
             mutationGeneration,
             baseRevision,
+            commit,
             protocolVersion: 2,
           },
         });
@@ -11038,6 +11057,11 @@
     }, delay);
   }
 
+  function refreshSidebarOnWindowEvent(event: Event) {
+    if (sidebarRefreshOnWindowEvent(event.type, document.visibilityState, document.hasFocus()))
+      refreshSidebarOnFocus();
+  }
+
   // OpenCode sessions made outside Sail appear when the window regains focus, not by polling.
   function refreshSidebarOnFocus() {
     clearTimeout(sidebarFocusTimer);
@@ -11054,10 +11078,9 @@
     const now = Date.now();
     if (!sidebarListingClock.focusRefreshDue(now)) {
       // Focus stays put after this event, so check again once the last listing is old enough.
-      sidebarFocusTimer = setTimeout(
-        refreshSidebarOnFocus,
-        sidebarListingClock.focusRefreshDelay(now),
-      );
+      sidebarFocusTimer = setTimeout(() => {
+        if (document.hasFocus()) refreshSidebarOnFocus();
+      }, sidebarListingClock.focusRefreshDelay(now));
       return;
     }
     if (sidebarInventoryTimer === undefined)

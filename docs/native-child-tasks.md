@@ -15,13 +15,14 @@
 
 - An inherited parent token alone is insufficient child authority. Tool arguments, model-provided child fields, and generic `sessionID` metadata cannot select a child scope. Only adapter-marked activity can create or clear the attribution fence.
 - Descendant registration is restricted to the same parent connection, provider, capability profile, and worktree. A token for another parent does not gain access to that child.
+- Child state follows the provider-neutral registry, not the order of adapter updates. A spawn replayed for an already settled child, and a trailing update for a tool call that already ended, never reclaim the parent's identity; once all child activity has ended, the parent reads and reports its own tasks again.
 - Where identity is unavailable, Sail skips the missing-report corrective prompt. The task report error remains explicit; the child cannot silently write the parent's task list.
 
 ## Checks
 
 - `test/native-session-tasks.test.ts` exercises separate parent/child tasks, rejected old-turn writes, completion, interruption, failure, stale snapshots, and durable restoration.
 - Rust `native_task_identity_tests` exercise provider metadata, descendant registration, nested children, ambiguous IDs, owned session aliases, and cross-parent/provider/worktree rejection.
-- `test/e2e/native-session-tasks.spec.ts` drives fixture child flows for all three providers through the real desktop bridge. OpenCode succeeds with provider metadata; Claude and Codex display observed activity and explicit task identity errors.
+- `test/e2e/native-session-tasks.spec.ts` drives fixture child flows for all three providers through the real desktop bridge, including a parent that reports tasks after its child settled and its spawn was replayed. OpenCode succeeds with provider metadata; Claude and Codex display observed activity and explicit task identity errors.
 - Authenticated provider runs require a private provider environment authorized for this issue. Fixture coverage does not establish installed provider conformance.
 
 - `test/e2e/native-session-tasks-real.spec.ts` runs only with `SAIL_REAL_TASK_PROVIDER` in an explicitly authorized private provider environment. It spawns one native child, separates the parent report from the child report, and asserts supported OpenCode attribution or observed Codex/Claude limitations without editing files or inspecting credentials.

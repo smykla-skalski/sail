@@ -93,6 +93,7 @@ export type GateMetadata = {
   revision?: string;
   mutationGeneration?: string;
   baseRevision?: string;
+  commit?: string;
   revisionDrifted?: boolean;
   verdict?: GateVerdict;
   reason?: string;
@@ -199,6 +200,7 @@ export const gateMetadataSchema = z.object({
   revision: z.string().min(1).optional(),
   mutationGeneration: z.string().min(1).optional(),
   baseRevision: z.string().min(1).optional(),
+  commit: z.string().min(1).optional(),
   revisionDrifted: z.boolean().optional(),
   verdict: z.enum(verdicts).optional(),
   reason: z.string().optional(),
@@ -308,6 +310,27 @@ export function validationRevisionDrifted(
     validation.revisionDrifted === true ||
     (validation.revision !== undefined && validation.revision !== currentRevision)
   );
+}
+
+/** Rejects a gate aimed at a commit other than the worktree head; returns the head to record. */
+export function requireGateTargetCommit(
+  requested: unknown,
+  headCommit: string | null,
+): string | undefined {
+  if (requested === undefined || requested === null || requested === '')
+    return headCommit ?? undefined;
+  if (typeof requested !== 'string' || !/^[0-9a-f]{7,64}$/i.test(requested.trim()))
+    throw new Error('Gate revision must be a commit SHA of at least 7 hexadecimal digits.');
+  const target = requested.trim().toLowerCase();
+  if (!headCommit)
+    throw new Error(
+      `This worktree has uncommitted changes or no commit, so it cannot be attested as ${target}. Commit the change and retry.`,
+    );
+  if (!headCommit.toLowerCase().startsWith(target))
+    throw new Error(
+      `Gate target ${target} is not the head of this worktree (${headCommit.slice(0, 12)}). Run the gate from the worktree that has ${target} checked out.`,
+    );
+  return headCommit;
 }
 
 export async function commitRevisionBoundValidation<T>({

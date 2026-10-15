@@ -106,17 +106,59 @@ async function attached(provider: Provider, directory: string) {
   );
 }
 
-// Closes the thread through the idle sweep, then stops further sweeps from closing it again.
-async function closeIdleThread(id: string) {
-  const closes = closeCount(id);
+// Closes the threads through the idle sweep, then stops further sweeps from closing them again.
+async function closeIdleThreads(...ids: string[]) {
+  const closes = ids.map(closeCount);
   await browser.tauri.execute(async ({ core }) => {
     await core.invoke('acp_set_idle_close_timeout', { seconds: 2 });
   });
-  await browser.waitUntil(async () => closeCount(id) > closes, {
+  await browser.waitUntil(async () => ids.every((id, index) => closeCount(id) > closes[index]), {
     timeout: 20_000,
     interval: 500,
     timeoutMsg: 'the finished thread was never closed',
   });
+  await browser.tauri.execute(async ({ core }) => {
+    await core.invoke('acp_set_idle_close_timeout', { seconds: 3600 });
+  });
+}
+
+// Deletes the thread after its restore reservation and before its resume, which may still arrive.
+async function deleteDuringReservation(
+  provider: Provider,
+  directory: string,
+  sessionId: string,
+  resumes: boolean,
+) {
+  await browser.tauri.execute(
+    async ({ core }, agent, path, id, resume) => {
+      const reservation = await core.invoke<{ restoreToken: string }>('acp_begin_session_restore', {
+        agent,
+        cwd: path,
+        sessionId: id,
+      });
+      await core.invoke('acp_forget_session', { agent, directory: path, sessionId: id });
+      if (resume)
+        await core
+          .invoke('acp_resume_session', {
+            params: { agent, cwd: path, sessionId: id, restoreToken: reservation.restoreToken },
+          })
+          .catch(() => undefined);
+      await core.invoke('acp_end_session_restore', {
+        agent,
+        directory: path,
+        sessionId: id,
+        restoreToken: reservation.restoreToken,
+      });
+    },
+    provider,
+    directory,
+    sessionId,
+    resumes,
+  );
+}
+
+// An earlier test leaves a short timeout behind, which could close a thread before the test counts.
+async function pauseIdleClose() {
   await browser.tauri.execute(async ({ core }) => {
     await core.invoke('acp_set_idle_close_timeout', { seconds: 3600 });
   });
@@ -341,9 +383,10 @@ describe('idle session close', () => {
   for (const provider of ['codex', 'claude'] as const) {
     it(`restores a closed ${provider} thread from the UI without racing config changes, and keeps it closed when the resume fails`, async () => {
       const directory = realpathSync(repository);
+      await pauseIdleClose();
       const [id] = await newSessions(provider, directory, 1);
       await finishTurns(provider, directory, [id]);
-      await closeIdleThread(id);
+      await closeIdleThreads(id);
       expect(await attached(provider, directory)).not.toContain(id);
 
       const slowResume = join(directory, 'idle-slow-resume.txt');
@@ -399,7 +442,7 @@ describe('idle session close', () => {
       expect(racing).toEqual(['resumed', 'applied']);
       expect(await attached(provider, directory)).toContain(id);
 
-      await closeIdleThread(id);
+      await closeIdleThreads(id);
       writeFileSync(join(directory, 'idle-fail-next-resume.txt'), 'fail');
       const failed = await browser.tauri.execute(
         async ({ core }, agent, path, session) => {
@@ -437,6 +480,107 @@ describe('idle session close', () => {
       const retried = await setConfig(provider, directory, id, 'effort', 'low');
       expect(retried.find((option) => option.id === 'effort')?.currentValue).toBe('low');
       expect(await attached(provider, directory)).toContain(id);
+    });
+  }
+
+  for (const provider of ['codex', 'claude'] as const) {
+    it(`drops a closed ${provider} thread's idle state when it is deleted, also during a resume`, async () => {
+      const directory = realpathSync(repository);
+      await pauseIdleClose();
+      const [closed, resuming, reserved, reservedResumed] = await newSessions(
+        provider,
+        directory,
+        4,
+      );
+      await finishTurns(provider, directory, [closed, resuming]);
+      await closeIdleThreads(closed, resuming);
+
+      const forget = (id: string) =>
+        browser.tauri.execute(
+          async ({ core }, agent, path, session) => {
+            await core.invoke('acp_forget_session', {
+              agent,
+              directory: path,
+              sessionId: session,
+            });
+          },
+          provider,
+          directory,
+          id,
+        );
+      await forget(closed);
+      const revived = await browser.tauri.execute(
+        async ({ core }, agent, path, session) =>
+          core
+            .invoke('acp_prompt', {
+              params: {
+                agent,
+                directory: path,
+                sessionId: session,
+                text: 'Task reporting fixture: done',
+                turnId: 'idle-deleted',
+                imagePaths: [],
+              },
+            })
+            .then(
+              () => 'prompted',
+              (error) => String(error),
+            ),
+        provider,
+        directory,
+        closed,
+      );
+      expect(revived).not.toBe('prompted');
+      expect(await attached(provider, directory)).not.toContain(closed);
+
+      const slowResume = join(directory, 'idle-slow-resume.txt');
+      writeFileSync(slowResume, 'slow');
+      const outcome = await browser.tauri.execute(
+        async ({ core }, agent, path, session) => {
+          const reservation = await core.invoke<{ restoreToken: string }>(
+            'acp_begin_session_restore',
+            { agent, cwd: path, sessionId: session },
+          );
+          const resume = core
+            .invoke('acp_resume_session', {
+              params: {
+                agent,
+                cwd: path,
+                sessionId: session,
+                restoreToken: reservation.restoreToken,
+              },
+            })
+            .then(
+              () => 'resumed',
+              (error) => String(error),
+            );
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          await core.invoke('acp_forget_session', { agent, directory: path, sessionId: session });
+          const result = await resume;
+          await core.invoke('acp_end_session_restore', {
+            agent,
+            directory: path,
+            sessionId: session,
+            restoreToken: reservation.restoreToken,
+          });
+          return result;
+        },
+        provider,
+        directory,
+        resuming,
+      );
+      rmSync(slowResume, { force: true });
+      expect(outcome).toContain('deleted while reconnecting');
+      expect(await attached(provider, directory)).not.toContain(resuming);
+
+      // A delete between the restore reservation and its resume leaves nothing registered either,
+      // whether or not the resume still arrives.
+      await finishTurns(provider, directory, [reserved, reservedResumed]);
+      await closeIdleThreads(reserved, reservedResumed);
+      await deleteDuringReservation(provider, directory, reserved, false);
+      expect(await attached(provider, directory)).not.toContain(reserved);
+      await deleteDuringReservation(provider, directory, reservedResumed, true);
+      expect(await attached(provider, directory)).not.toContain(reservedResumed);
     });
   }
 

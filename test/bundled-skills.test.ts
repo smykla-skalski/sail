@@ -237,3 +237,38 @@ void test('an installed ship-it skill keeps Sail stage reporting without the bun
   assert.doesNotMatch(prompt, /Follow this bundled Sail skill/);
   assert.doesNotMatch(prompt, /## Sail mode/);
 });
+
+void test('bundled scheduling fills capacity before waiting and keeps Sail gates authoritative', () => {
+  const scheduling = read('ship-it', 'references/orchestration.md');
+  const events = read('ship-it', 'references/worker-events.md');
+  const worker = read('ship-it', 'references/worker-rules.md');
+  assert.doesNotMatch(shipItCore, /After each subagent dispatch, use one blocking wait/);
+  assert.doesNotMatch(scheduling, /at most three active implementation workers/);
+  assert.match(scheduling, /Dispatch the entire eligible batch before any blocking wait/);
+  assert.match(scheduling, /Grant capacity to ready review\/test gates first/);
+  assert.match(scheduling, /coordinator owns the shared slot ledger/);
+  assert.match(scheduling, /coordinator dispatches the worker's gate request/);
+  assert.match(scheduling, /`validation_gate` and its receipt remains mandatory/);
+  assert.match(events, /Ignore duplicate worker events/);
+  assert.match(events, /Never pretend an occupied slot is free/);
+  assert.match(worker, /gate-capacity requests and releases as scheduling events/);
+});
+
+void test('Sail native gate admission needs no phase-forbidden or inactive-turn messages', () => {
+  const capacity = sailModeRule('Native capacity');
+  assert.match(capacity, /separate agent and validation resource queues/);
+  assert.match(capacity, /workers call it directly and wait for their own receipts/);
+  assert.match(capacity, /Do not require coordinator lease messages/);
+  for (const name of ['review.md', 'test.md']) {
+    const phase = read('ship-it', `references/${name}`);
+    assert.match(phase, /Outside Sail native queues/);
+    assert.match(
+      phase,
+      /native validation queue owns admission\/release without coordinator lease messages/,
+    );
+  }
+  assert.match(
+    read('ship-it', 'references/worker-rules.md'),
+    /Do not send coordinator lease messages/,
+  );
+});

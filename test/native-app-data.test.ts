@@ -158,7 +158,9 @@ await test('a process that only mentions the bundle path does not keep a run liv
 
   const commands = listProcessCommands();
   assert.ok(commands.includes(`tail -f ${mentioned}`));
-  assert.deepEqual([...liveRunTokens(commands)], [real.slice(-32, -24)]);
+  const live = liveRunTokens(commands);
+  assert.equal(live.has(real.slice(-32, -24)), true);
+  assert.equal(live.has(lookAlike.slice(-32, -24)), false);
   assert.equal(sweepRunData(roots, listProcessCommands).removed.length, roots.length);
   assert.deepEqual(remaining(lookAlike), []);
   assert.deepEqual(remaining(real), roots);

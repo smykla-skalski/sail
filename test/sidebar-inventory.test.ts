@@ -7,6 +7,7 @@ import {
   createSidebarThreadLoader,
   mergeSidebarRefreshPaths,
   sidebarFocusRefreshDue,
+  sidebarRefreshOnWindowEvent,
   unlistedSidebarPaths,
   type SidebarRefreshPaths,
 } from '../src/lib/sidebar-inventory.ts';
@@ -332,4 +333,12 @@ void test('a newer pass owns the directories it listed again', () => {
   assert.deepEqual(passes.owned([profile[3]], second), [profile[3]]);
   // Finishing in either order leaves one owner per directory and never loops.
   assert.deepEqual(passes.owned([profile[3]], first), []);
+});
+
+await test('only focus brings back a window that turned visible unattended', () => {
+  assert.equal(sidebarRefreshOnWindowEvent('focus', 'visible', true), true);
+  assert.equal(sidebarRefreshOnWindowEvent('visibilitychange', 'visible', true), true);
+  assert.equal(sidebarRefreshOnWindowEvent('visibilitychange', 'visible', false), false);
+  assert.equal(sidebarRefreshOnWindowEvent('visibilitychange', 'hidden', false), false);
+  assert.equal(sidebarRefreshOnWindowEvent('focus', 'hidden', true), false);
 });

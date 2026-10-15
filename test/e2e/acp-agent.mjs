@@ -494,7 +494,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     send({ id: message.id, result: {} });
   } else if (message.method === 'session/list') {
     if (process.env.SAIL_E2E_ACP_LIST_LOG)
-      appendFileSync(process.env.SAIL_E2E_ACP_LIST_LOG, `${Date.now()}\n`);
+      appendFileSync(
+        process.env.SAIL_E2E_ACP_LIST_LOG,
+        `${Date.now()} ${message.params.cwd ?? ''}\n`,
+      );
     const pageSize = 2;
     const cwd = message.params.cwd;
     if (agent === 'opencode' && existsSync(join(cwd, '.acp-session-list-error'))) {
@@ -779,6 +782,50 @@ for await (const line of createInterface({ input: process.stdin })) {
         1500,
         undefined,
         agent === 'opencode' ? childId : undefined,
+      );
+      continue;
+    }
+    if (text === 'Native child settles then parent reports') {
+      const server = sessions
+        .get(sessionId)
+        .mcpServers.find((item) => item.name === 'sail-browser');
+      const childId = `${sessionId}:settled-child`;
+      sessions.set(childId, {
+        ...sessions.get(sessionId),
+        history: [],
+        nativeControlParent: sessionId,
+      });
+      const spawned = {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: childId,
+        name: 'Settled child',
+        task: 'Finish before the parent reports',
+        capabilities: {},
+      };
+      recordUpdate(sessionId, sessionId, spawned);
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: childId,
+        state: 'completed',
+      });
+      // Adapters replay a spawn after the child settled; it must not hold the parent's tasks.
+      recordUpdate(sessionId, sessionId, spawned);
+      setTimeout(
+        () =>
+          reportSessionTasks(
+            server,
+            (result) => {
+              recordUpdate(sessionId, sessionId, {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text: `Parent result: ${result}` },
+              });
+              send({ id: message.id, result: { stopReason: 'end_turn' } });
+            },
+            1500,
+            undefined,
+            agent === 'opencode' ? sessionId : undefined,
+          ),
+        500,
       );
       continue;
     }

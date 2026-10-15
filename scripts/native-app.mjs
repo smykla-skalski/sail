@@ -6,6 +6,7 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { e2eContextService, e2eIdentity } from './e2e-identity.mjs';
 import { buildIdentifierKey } from './native-app-data.mjs';
+import { isOwnProcess, signalablePid } from './native-signal-guard.mjs';
 
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 
@@ -48,7 +49,13 @@ export function processIdentity(pid) {
  * repository whose entitlements and fixtures the private app uses; `isCancelled` lets a caller end
  * the readiness wait.
  */
-export function nativeApp({ checkout, isCancelled = () => false }) {
+export function nativeApp({
+  checkout,
+  isCancelled = () => false,
+  kill = (pid, signal) => process.kill(pid, signal),
+  identity: readIdentity = processIdentity,
+  listing,
+}) {
   function command(program, args, options = {}) {
     const result = spawnSync(program, args, { cwd: checkout, encoding: 'utf8', ...options });
     if (result.error || result.status !== 0)
@@ -112,8 +119,12 @@ export function nativeApp({ checkout, isCancelled = () => false }) {
     return { app, identity };
   }
 
+  function processTable(columns) {
+    return listing ? listing(columns) : command('/bin/ps', ['-axo', columns]);
+  }
+
   function appProcesses(binary) {
-    const processes = command('/bin/ps', ['-axo', 'pid=,command=']);
+    const processes = processTable('pid=,command=');
     return processes
       .split('\n')
       .filter((line) => line.trim().replace(/^\d+\s+/, '') === binary)
@@ -122,23 +133,34 @@ export function nativeApp({ checkout, isCancelled = () => false }) {
 
   async function stopApp(binary) {
     const appPids = new Set(appProcesses(binary));
-    const tree = command('/bin/ps', ['-axo', 'pid=,ppid='])
+    const tree = processTable('pid=,ppid=')
       .split('\n')
       .map((line) => line.trim().split(/\s+/).map(Number));
-    const descendants = (parents) => {
-      const next = tree.filter(([, parent]) => parents.has(parent)).map(([pid]) => pid);
+    const descendants = (parents, seen = new Set(parents)) => {
+      const next = tree
+        .filter(
+          ([pid, parent]) =>
+            signalablePid(pid) && !isOwnProcess(pid) && parents.has(parent) && !seen.has(pid),
+        )
+        .map(([pid]) => pid);
       if (next.length === 0) return [];
-      return [...descendants(new Set(next)), ...next];
+      for (const pid of next) seen.add(pid);
+      return [...descendants(new Set(next), seen), ...next];
     };
     const owned = [...descendants(appPids), ...appPids].map((pid) => ({
       pid,
-      identity: processIdentity(pid),
+      identity: readIdentity(pid),
     }));
     const signalOwned = (signal) => {
       for (const { pid, identity } of owned) {
-        if (identity && processIdentity(pid) === identity) {
+        if (
+          signalablePid(pid) &&
+          !isOwnProcess(pid) &&
+          identity &&
+          readIdentity(pid) === identity
+        ) {
           try {
-            process.kill(pid, signal);
+            kill(pid, signal);
           } catch (error) {
             if (error.code !== 'ESRCH') throw error;
           }

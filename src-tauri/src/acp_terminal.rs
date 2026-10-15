@@ -95,6 +95,65 @@ pub(crate) fn worktree_contains(root: &Path, candidate: &Path) -> bool {
     candidate == root || candidate.starts_with(&root)
 }
 
+pub(crate) const ENVIRONMENT_ID_VARIABLE: &str = "SAIL_ENVIRONMENT_ID";
+
+/// Canonical identity of the tool environment Sail builds for a worktree. It hashes
+/// only values Sail controls, so leased temp dirs, scratch roots, build directories and the
+/// launch-dependent inherited PATH never change it. Gates attest it instead of raw PATH.
+pub(crate) fn environment_identity(data_directory: &Path, tool_paths: &[PathBuf]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"sail-agent-environment-v1\0");
+    for path in std::iter::once(data_directory.join("bin")).chain(tool_paths.iter().cloned()) {
+        digest.update(path.as_os_str().as_encoded_bytes());
+        digest.update(b"\0");
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn is_path_variable(name: &str) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case("PATH")
+    } else {
+        name == "PATH"
+    }
+}
+
+/// An explicit PATH from the agent wins; otherwise commands get the agent runtime's PATH.
+fn terminal_path<'a>(
+    requested: &[EnvVariable],
+    runtime_path: Option<&'a std::ffi::OsStr>,
+) -> Option<&'a std::ffi::OsStr> {
+    runtime_path.filter(|_| {
+        !requested
+            .iter()
+            .any(|variable| is_path_variable(&variable.name))
+    })
+}
+
+/// The agent's variables apply first; Sail's PATH default and identity follow so the
+/// identity cannot be spoofed.
+fn apply_requested_environment(
+    command: &mut Command,
+    requested: Vec<EnvVariable>,
+    runtime_path: Option<&std::ffi::OsStr>,
+    environment_id: Option<&str>,
+) {
+    let runtime_path = terminal_path(&requested, runtime_path);
+    for variable in requested {
+        command.env(variable.name, variable.value);
+    }
+    if let Some(path) = runtime_path {
+        command.env("PATH", path);
+    }
+    if let Some(identity) = environment_id {
+        command.env(ENVIRONMENT_ID_VARIABLE, identity);
+    }
+}
+
 pub(crate) fn terminal_environment(
     data_directory: &Path,
     temp_directory: &Path,
@@ -846,6 +905,8 @@ pub struct TerminalContext<'a> {
     pub directory: Option<PathBuf>,
     pub scratch_owner: Option<&'a str>,
     pub build_directory: Option<&'a Path>,
+    pub runtime_path: Option<&'a std::ffi::OsStr>,
+    pub environment_id: Option<&'a str>,
 }
 
 pub fn handle(
@@ -920,9 +981,12 @@ pub fn handle(
                     }
                 });
             }
-            for variable in params.env {
-                command.env(variable.name, variable.value);
-            }
+            apply_requested_environment(
+                &mut command,
+                params.env,
+                context.runtime_path,
+                context.environment_id,
+            );
             #[cfg(unix)]
             if let Some(owner) = context.scratch_owner {
                 command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
@@ -946,7 +1010,7 @@ pub fn handle(
                     .map_err(|error| error.to_string())?,
                 worktree,
             )? {
-                overlay.apply(&mut command);
+                overlay.apply_for_directory(&mut command, directory);
             }
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             storage_lease.prepare_process_start()?;
@@ -1890,6 +1954,104 @@ mod tests {
                 "HOME" | "XDG_CONFIG_HOME" | "NPM_CONFIG_CACHE" | "CARGO_HOME"
             )
         }));
+    }
+
+    fn command_environment(command: &Command, name: &str) -> Option<std::ffi::OsString> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+    }
+
+    #[test]
+    fn terminal_commands_get_the_runtime_path_and_an_unspoofable_identity() {
+        let mut command = Command::new("true");
+        let spoofed = vec![EnvVariable {
+            name: ENVIRONMENT_ID_VARIABLE.into(),
+            value: "attacker".into(),
+        }];
+
+        apply_requested_environment(
+            &mut command,
+            spoofed,
+            Some(std::ffi::OsStr::new("/scoped/bin:/usr/bin")),
+            Some("identity-1"),
+        );
+
+        assert_eq!(
+            command_environment(&command, "PATH"),
+            Some("/scoped/bin:/usr/bin".into())
+        );
+        assert_eq!(
+            command_environment(&command, ENVIRONMENT_ID_VARIABLE),
+            Some("identity-1".into())
+        );
+    }
+
+    #[test]
+    fn terminal_commands_keep_an_agent_supplied_path() {
+        let mut command = Command::new("true");
+        let requested = vec![EnvVariable {
+            name: "PATH".into(),
+            value: "/agent/bin".into(),
+        }];
+
+        apply_requested_environment(
+            &mut command,
+            requested,
+            Some(std::ffi::OsStr::new("/scoped/bin")),
+            Some("identity-1"),
+        );
+
+        assert_eq!(
+            command_environment(&command, "PATH"),
+            Some("/agent/bin".into())
+        );
+    }
+
+    #[test]
+    fn environment_identity_tracks_the_tool_environment() {
+        let data = Path::new("/sail-cache/terminal-worktrees/worktree");
+        let tools = [PathBuf::from("/home/u/.local/bin")];
+        let base = environment_identity(data, &tools);
+
+        assert_ne!(
+            base,
+            environment_identity(Path::new("/sail-cache/terminal-worktrees/other"), &tools)
+        );
+        assert_ne!(base, environment_identity(data, &[]));
+        assert_ne!(
+            environment_identity(data, &[PathBuf::from("/a"), PathBuf::from("/b")]),
+            environment_identity(data, &[PathBuf::from("/b"), PathBuf::from("/a")])
+        );
+        assert_ne!(
+            environment_identity(data, &[PathBuf::from("/a/b")]),
+            environment_identity(data, &[PathBuf::from("/a"), PathBuf::from("/b")])
+        );
+    }
+
+    #[test]
+    fn terminal_commands_share_the_agent_path_unless_the_agent_sets_one() {
+        let runtime = std::ffi::OsString::from("/scoped/bin:/usr/bin");
+        let unrelated = [EnvVariable {
+            name: "PATHEXT".into(),
+            value: ".EXE".into(),
+        }];
+        let explicit = [EnvVariable {
+            name: "PATH".into(),
+            value: "/agent/bin".into(),
+        }];
+
+        assert_eq!(
+            terminal_path(&[], Some(runtime.as_os_str())),
+            Some(runtime.as_os_str())
+        );
+        assert_eq!(
+            terminal_path(&unrelated, Some(runtime.as_os_str())),
+            Some(runtime.as_os_str())
+        );
+        assert_eq!(terminal_path(&explicit, Some(runtime.as_os_str())), None);
+        assert_eq!(terminal_path(&[], None), None);
     }
 
     #[test]

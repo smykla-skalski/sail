@@ -81,6 +81,17 @@ impl IdleSessions {
         self.closing.contains(session_id)
     }
 
+    /// A deleted thread keeps no idle state, so nothing can reopen it. A resume in flight stays
+    /// claimed: its guard releases the claim.
+    pub fn forget(&mut self, session_id: &str) {
+        self.touched.remove(session_id);
+        self.closed.remove(session_id);
+        self.closing.remove(session_id);
+        self.fresh.remove(session_id);
+        self.background.remove(session_id);
+        self.async_tasks.remove(session_id);
+    }
+
     /// A session no turn has written to yet. Some adapters keep no transcript for it, so it cannot resume.
     pub fn mark_fresh(&mut self, session_id: &str) {
         self.fresh.insert(session_id.to_string());
@@ -233,6 +244,38 @@ mod tests {
         );
         assert!(!idle.has_async_tasks("a"));
         assert!(!idle.has_async_tasks("b"));
+    }
+
+    #[test]
+    fn forgetting_a_session_drops_its_idle_state() {
+        let now = Instant::now();
+        let mut idle = IdleSessions::default();
+        idle.touch("a", now);
+        idle.mark_fresh("a");
+        idle.begin_close("a");
+        idle.observe_update(
+            "a",
+            &json!({"sessionUpdate":"tool_call","rawInput":{"run_in_background":true}}),
+        );
+        idle.forget("a");
+        assert!(!idle.is_closed("a"));
+        assert!(!idle.is_closing("a"));
+        assert!(!idle.is_fresh("a"));
+        assert!(!idle.has_background_work("a"));
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Open);
+    }
+
+    #[test]
+    fn forgetting_a_session_keeps_an_in_flight_resume_claimed() {
+        let mut idle = IdleSessions::default();
+        idle.begin_close("a");
+        idle.end_close("a");
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Claimed);
+        idle.forget("a");
+        assert!(idle.is_resuming("a"));
+        idle.end_resume("a", false, Instant::now());
+        assert!(!idle.is_resuming("a"));
+        assert!(!idle.is_closed("a"));
     }
 
     #[test]

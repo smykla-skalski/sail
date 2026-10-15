@@ -3,18 +3,28 @@ import { execFileSync, spawn } from 'node:child_process';
 import { realpathSync, writeFileSync } from 'node:fs';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { signalablePid } from './native-signal-guard.mjs';
 
-export async function runOwnedCommand(program, args, { cwd, env, log, signal }) {
+function notify(hook, pid) {
+  try {
+    hook?.(pid);
+  } catch (error) {
+    process.stderr.write(`Run registry update failed: ${error.message}\n`);
+  }
+}
+
+export async function runOwnedCommand(program, args, { cwd, env, log, signal, onStart, onExit }) {
   if (signal.aborted) throw new Error('Native run cancelled');
   const output = [];
   const child = spawn(program, args, { cwd, env, detached: true });
+  if (child.pid) notify(onStart, child.pid);
   const signalGroup = (value) => {
     if (!child.pid) return false;
     try {
       process.kill(-child.pid, value);
       return true;
     } catch (error) {
-      if (error.code !== 'ESRCH') throw error;
+      if (error.code !== 'ESRCH' && error.code !== 'EPERM') throw error;
       return false;
     }
   };
@@ -46,15 +56,16 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal }) 
       signalGroup('SIGKILL');
     }
     await Promise.race([closed, delay(1000)]);
+    if (child.pid) notify(onExit, child.pid);
     writeFileSync(log, Buffer.concat(output));
   }
 }
 
 // `open -n` leaves the fixture app running with PPID 1 when a run fails before
 // it learns the listening pid, so match processes by their executable path.
-export async function stopProcessesUnder(directory, { timeout = 5000 } = {}) {
+export async function stopProcessesUnder(directory, { timeout = 5000, ...system } = {}) {
   try {
-    return await stopMatching(directory, timeout);
+    return await stopMatching(directory, timeout, system);
   } catch (error) {
     // Cleanup must reach the caller's scratch removal even when `ps` is denied.
     console.error('Fixture process cleanup failed:', error);
@@ -69,7 +80,13 @@ function alias(root) {
   return /^\/(var|tmp|etc)(\/|$)/.test(root) ? [root, `/private${root}`] : [root];
 }
 
-async function stopMatching(directory, timeout) {
+const listProcesses = () => execFileSync('ps', ['-axo', 'pid=,comm='], { encoding: 'utf8' });
+
+async function stopMatching(
+  directory,
+  timeout,
+  { list = listProcesses, kill = (pid, signal) => process.kill(pid, signal) },
+) {
   const roots = new Set([directory]);
   try {
     roots.add(realpathSync(directory));
@@ -80,12 +97,13 @@ async function stopMatching(directory, timeout) {
     .flatMap(alias)
     .map((root) => (root.endsWith('/') ? root : `${root}/`));
   const running = () =>
-    execFileSync('ps', ['-axo', 'pid=,comm='], { encoding: 'utf8' })
+    list()
       .split('\n')
       .flatMap((line) => {
         const match = /^\s*(\d+)\s+(.+)$/.exec(line);
         const pid = Number(match?.[1]);
         return match &&
+          signalablePid(pid) &&
           pid !== process.pid &&
           prefixes.some((prefix) => match[2].startsWith(prefix))
           ? [pid]
@@ -101,7 +119,7 @@ async function stopMatching(directory, timeout) {
     if (pids.length === 0 || signals.length === 0) return pids.length === 0;
     for (const pid of pids) {
       try {
-        process.kill(pid, signals[0]);
+        kill(pid, signals[0]);
       } catch {
         /* Already exited. */
       }

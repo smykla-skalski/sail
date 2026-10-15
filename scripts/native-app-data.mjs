@@ -29,10 +29,15 @@ function darwinDirectory(name) {
   return result.status === 0 ? result.stdout.trim() : undefined;
 }
 
+/** The per-user temporary folder, which does not follow a private TMPDIR. */
+export function userTemporaryDirectory() {
+  return darwinDirectory('DARWIN_USER_TEMP_DIR');
+}
+
 export function systemRunDataRoots() {
   return runDataRoots({
     home: homedir(),
-    userTemp: darwinDirectory('DARWIN_USER_TEMP_DIR'),
+    userTemp: userTemporaryDirectory(),
     userCache: darwinDirectory('DARWIN_USER_CACHE_DIR'),
   });
 }

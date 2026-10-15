@@ -34,6 +34,20 @@ export function sidebarFocusRefreshDue(
   return now - lastListing >= minAge;
 }
 
+/**
+ * Whether a window event should refresh the sidebar. A window that turns visible without focus
+ * (uncovered by another window, shown on another Space) is no sign the user came back, and an
+ * unattended Sail would otherwise list every directory each time that happens.
+ */
+export function sidebarRefreshOnWindowEvent(
+  type: string,
+  visibility: DocumentVisibilityState,
+  focused: boolean,
+): boolean {
+  if (visibility === 'hidden') return false;
+  return type === 'focus' || focused;
+}
+
 /** Directories queued for the next listing; `null` means every sidebar directory. */
 export type SidebarRefreshPaths = ReadonlySet<string> | null;
 
