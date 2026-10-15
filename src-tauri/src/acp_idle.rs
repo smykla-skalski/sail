@@ -1,5 +1,6 @@
-//! Idle-thread bookkeeping. A Codex app-server keeps one set of MCP servers for every thread it
-//! has loaded, so a finished thread nobody is looking at is closed after an idle timeout.
+//! Idle-thread bookkeeping. A Codex app-server or Claude adapter keeps one set of MCP servers for
+//! every thread it has loaded, so a finished thread nobody is looking at is closed after an idle
+//! timeout.
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -35,6 +36,9 @@ pub fn idle_timeout() -> Option<Duration> {
 pub struct IdleSessions {
     touched: HashMap<String, Instant>,
     closed: HashSet<String>,
+    closing: HashSet<String>,
+    fresh: HashSet<String>,
+    background: HashSet<String>,
     async_tasks: HashMap<String, HashSet<String>>,
 }
 
@@ -49,9 +53,33 @@ impl IdleSessions {
         now.saturating_duration_since(touched) >= idle
     }
 
-    pub fn mark_closed(&mut self, session_id: &str) {
+    /// Starts a close: reattaches wait for `end_close` so a resume never races the adapter teardown.
+    pub fn begin_close(&mut self, session_id: &str) {
         self.closed.insert(session_id.to_string());
+        self.closing.insert(session_id.to_string());
         self.async_tasks.remove(session_id);
+    }
+
+    pub fn end_close(&mut self, session_id: &str) {
+        self.closing.remove(session_id);
+    }
+
+    pub fn is_closing(&self, session_id: &str) -> bool {
+        self.closing.contains(session_id)
+    }
+
+    /// A session no turn has written to yet. Some adapters keep no transcript for it, so it cannot resume.
+    pub fn mark_fresh(&mut self, session_id: &str) {
+        self.fresh.insert(session_id.to_string());
+    }
+
+    pub fn is_fresh(&self, session_id: &str) -> bool {
+        self.fresh.contains(session_id)
+    }
+
+    /// A shell or monitor started with `run_in_background` dies with the adapter's session.
+    pub fn has_background_work(&self, session_id: &str) -> bool {
+        self.background.contains(session_id)
     }
 
     pub fn is_closed(&self, session_id: &str) -> bool {
@@ -60,6 +88,7 @@ impl IdleSessions {
 
     pub fn mark_attached(&mut self, session_id: &str, now: Instant) {
         self.closed.remove(session_id);
+        self.closing.remove(session_id);
         self.touch(session_id, now);
     }
 
@@ -71,10 +100,27 @@ impl IdleSessions {
 
     /// Tracks adapter background tasks (shells) so a thread running one is never closed.
     pub fn observe_update(&mut self, session_id: &str, update: &Value) {
+        let kind = update.get("sessionUpdate").and_then(Value::as_str);
+        if matches!(
+            kind,
+            Some(
+                "agent_message_chunk"
+                    | "agent_thought_chunk"
+                    | "user_message_chunk"
+                    | "tool_call"
+                    | "tool_call_update"
+            )
+        ) {
+            self.fresh.remove(session_id);
+        }
+        if matches!(kind, Some("tool_call" | "tool_call_update")) && starts_background_work(update)
+        {
+            self.background.insert(session_id.to_string());
+        }
         let Some(task) = update.get("asyncTaskId").and_then(Value::as_str) else {
             return;
         };
-        match update.get("sessionUpdate").and_then(Value::as_str) {
+        match kind {
             Some("async_task_spawned") => {
                 self.async_tasks
                     .entry(session_id.to_string())
@@ -95,6 +141,18 @@ impl IdleSessions {
             _ => {}
         }
     }
+}
+
+fn starts_background_work(update: &Value) -> bool {
+    let claude = update.pointer("/_meta/claudeCode");
+    update.pointer("/rawInput/run_in_background") == Some(&Value::Bool(true))
+        || claude
+            .and_then(|meta| meta.pointer("/toolResponse/backgroundTaskId"))
+            .is_some_and(Value::is_string)
+        || claude
+            .and_then(|meta| meta.get("toolName"))
+            .and_then(Value::as_str)
+            == Some("Monitor")
 }
 
 #[cfg(test)]
@@ -139,9 +197,58 @@ mod tests {
     fn attaching_a_closed_session_reopens_it() {
         let now = Instant::now();
         let mut idle = IdleSessions::default();
-        idle.mark_closed("a");
+        idle.begin_close("a");
         assert!(idle.is_closed("a"));
+        assert!(idle.is_closing("a"));
         idle.mark_attached("a", now);
         assert!(!idle.is_closed("a"));
+        assert!(!idle.is_closing("a"));
+    }
+
+    #[test]
+    fn a_close_stays_in_flight_until_it_ends() {
+        let mut idle = IdleSessions::default();
+        idle.begin_close("a");
+        assert!(idle.is_closing("a"));
+        idle.end_close("a");
+        assert!(!idle.is_closing("a"));
+        assert!(idle.is_closed("a"));
+    }
+
+    #[test]
+    fn fresh_session_stays_loaded_until_a_turn_writes_to_it() {
+        let mut idle = IdleSessions::default();
+        idle.mark_fresh("a");
+        idle.observe_update("a", &json!({"sessionUpdate":"available_commands_update"}));
+        idle.observe_update("a", &json!({"sessionUpdate":"config_option_update"}));
+        assert!(idle.is_fresh("a"));
+        idle.observe_update("a", &json!({"sessionUpdate":"agent_message_chunk"}));
+        assert!(!idle.is_fresh("a"));
+    }
+
+    #[test]
+    fn background_shell_keeps_the_session_loaded_for_good() {
+        let mut idle = IdleSessions::default();
+        idle.observe_update(
+            "a",
+            &json!({"sessionUpdate":"tool_call_update","rawInput":{"command":"sleep 9"}}),
+        );
+        assert!(!idle.has_background_work("a"));
+        idle.observe_update(
+            "a",
+            &json!({"sessionUpdate":"tool_call_update","rawInput":{"command":"sleep 9","run_in_background":true}}),
+        );
+        assert!(idle.has_background_work("a"));
+        idle.observe_update(
+            "b",
+            &json!({"sessionUpdate":"tool_call_update","_meta":{"claudeCode":{"toolResponse":{"backgroundTaskId":"t1"}}}}),
+        );
+        assert!(idle.has_background_work("b"));
+        idle.observe_update(
+            "c",
+            &json!({"sessionUpdate":"tool_call","_meta":{"claudeCode":{"toolName":"Monitor"}}}),
+        );
+        assert!(idle.has_background_work("c"));
+        assert!(!idle.has_background_work("d"));
     }
 }

@@ -440,7 +440,9 @@ for await (const line of createInterface({ input: process.stdin })) {
           sessionCapabilities: {
             resume: {},
             subagents: {},
-            ...(agent === 'codex' ? { close: {} } : {}),
+            ...(agent === 'codex' || agent === 'claude' || agent === 'opencode'
+              ? { close: {} }
+              : {}),
             ...(agent === 'opencode' ? { list: {} } : {}),
           },
         },
@@ -491,6 +493,8 @@ for await (const line of createInterface({ input: process.stdin })) {
       appendFileSync(process.env.SAIL_E2E_ACP_CLOSE_LOG, `${message.params.sessionId}\n`);
     send({ id: message.id, result: {} });
   } else if (message.method === 'session/list') {
+    if (process.env.SAIL_E2E_ACP_LIST_LOG)
+      appendFileSync(process.env.SAIL_E2E_ACP_LIST_LOG, `${Date.now()}\n`);
     const pageSize = 2;
     const cwd = message.params.cwd;
     if (agent === 'opencode' && existsSync(join(cwd, '.acp-session-list-error'))) {
@@ -521,6 +525,13 @@ for await (const line of createInterface({ input: process.stdin })) {
     adoptExternalSession(message.params.sessionId, message.params.cwd);
     applyClaudeDefaults(message.params.sessionId);
     const session = sessions.get(message.params.sessionId);
+    if (agent === 'claude' && session?.evicted && !session.prompted) {
+      send({
+        id: message.id,
+        error: { code: -32002, message: `Resource not found: ${message.params.sessionId}` },
+      });
+      continue;
+    }
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
     else
@@ -627,6 +638,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       continue;
     }
     activePrompts.set(sessionId, message.id);
+    sessions.get(sessionId).prompted = true;
     const text = message.params.prompt[0].text;
     const reportingFixture = sessions.get(sessionId);
     if (text.startsWith('Task reporting fixture:')) {
