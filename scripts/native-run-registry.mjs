@@ -108,9 +108,14 @@ function groupMembers() {
   });
 }
 
-function signalGroup(pgid, signal) {
+// A group id of 0 or 1 turns `kill(-pgid)` into a signal to the caller's own group or, with -1, to
+// every process the user owns.
+const signalableGroup = (pgid) => Number.isSafeInteger(pgid) && pgid > 1;
+
+export function signalGroup(pgid, signal, kill = (pid, name) => process.kill(pid, name)) {
+  if (!signalableGroup(pgid)) throw new RangeError(`Refusing to signal process group ${pgid}`);
   try {
-    process.kill(-pgid, signal);
+    kill(-pgid, signal);
   } catch (error) {
     if (error.code !== 'ESRCH') throw error;
   }
@@ -120,12 +125,14 @@ function signalGroup(pgid, signal) {
  * Stops the members of a command group whose runner died. A group id cannot be reused while a
  * member lives, so a group with a dead leader is still the recorded one; a living leader must also
  * carry the recorded start time, or the recorded group is gone and its pid belongs to a stranger.
+ * A living leader without a recorded start time cannot be told from a stranger, so it is left alone.
  * Returns true when no member remains and false when that cannot be established.
  */
-async function reapGroup(group, { readStart, readMembers, pause }) {
+async function reapGroup(group, { readStart, readMembers, pause, kill }) {
   const leader = readStart(group.pid);
   if (leader === undefined) return false;
-  if (leader !== null && group.started != null && leader !== group.started) return true;
+  if (leader !== null && group.started == null) return false;
+  if (leader !== null && leader !== group.started) return true;
   const alive = () => {
     const members = readMembers();
     return members === undefined ? undefined : members.some((member) => member.pgid === group.pid);
@@ -135,7 +142,7 @@ async function reapGroup(group, { readStart, readMembers, pause }) {
     if (running === undefined) return false;
     if (!running) return true;
     if (signals.length === 0) return false;
-    signalGroup(group.pid, signals[0]);
+    signalGroup(group.pid, signals[0], kill);
     await pause();
     return escalate(signals.slice(1));
   };
@@ -147,6 +154,7 @@ function readRecord(path) {
     const record = JSON.parse(readFileSync(path, 'utf8'));
     if (!record || !Number.isInteger(record.runner?.pid) || !Array.isArray(record.groups))
       return null;
+    if (!record.groups.every((group) => signalableGroup(group?.pid))) return null;
     return record;
   } catch (error) {
     if (error.code === 'ENOENT') return undefined;
@@ -170,6 +178,7 @@ export async function reapDeadRuns(
     readStart = processStart,
     readMembers = groupMembers,
     pause = () => delay(1000),
+    kill,
     now = Date.now(),
   },
 ) {
@@ -191,7 +200,7 @@ export async function reapDeadRuns(
       }
       if (owns(record.runner)) return { outcome: 'kept', id: record.id };
       const groups = await Promise.all(
-        record.groups.map((group) => reapGroup(group, { readStart, readMembers, pause })),
+        record.groups.map((group) => reapGroup(group, { readStart, readMembers, pause, kill })),
       );
       if (record.binary) await stopApp(record.binary);
       const appGone = !record.binary || appProcesses(record.binary).length === 0;

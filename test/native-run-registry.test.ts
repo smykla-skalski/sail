@@ -23,6 +23,7 @@ import {
   registerRun,
   registerRunIfPossible,
   runRegistryDirectory,
+  signalGroup,
 } from '../scripts/native-run-registry.mjs';
 import { runOwnedCommand } from '../scripts/native-test-process.mjs';
 
@@ -175,6 +176,107 @@ await test(
     assert.equal(existsSync(join(registry, 'old.json')), false);
   },
 );
+
+// These tests pass `kill`, `readStart` and `readMembers` so that a regression cannot signal for
+// real: `kill(-1)` reaches every process the user owns.
+const noSignals = (sent: Array<[number, string]>) => (pid: number, signal: string) => {
+  sent.push([pid, signal]);
+};
+
+await test('a record naming group 0, 1, -1 or a non-integer is never signalled', async (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  mkdirSync(registry);
+  writeFileSync(
+    join(registry, 'evil.json'),
+    JSON.stringify({
+      id: 'evil',
+      runner: { pid: 2 ** 22 - 1 },
+      binary: null,
+      groups: [{ pid: -1 }, { pid: 0 }, { pid: 1, started: null }, { pid: '5' }],
+    }),
+  );
+  const sent: Array<[number, string]> = [];
+  const result = await reapDeadRuns(registry, {
+    stopApp: async () => undefined,
+    appProcesses: () => [],
+    owns: () => false,
+    readStart: () => 'Mon Jan  1 00:00:00 2001',
+    readMembers: () => [{ pid: 1, pgid: 1 }],
+    pause: async () => undefined,
+    kill: noSignals(sent),
+  });
+  assert.deepEqual(sent, []);
+  assert.equal(result.failed.length, 1);
+  assert.ok(existsSync(join(registry, 'evil.json')));
+});
+
+await test('a group id that would signal everything is refused', () => {
+  const sent: Array<[number, string]> = [];
+  for (const pgid of [-1, 0, 1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])
+    assert.throws(() => signalGroup(pgid, 'SIGTERM', noSignals(sent)), RangeError);
+  assert.deepEqual(sent, []);
+  signalGroup(2, 'SIGTERM', noSignals(sent));
+  assert.deepEqual(sent, [[-2, 'SIGTERM']]);
+});
+
+await test('a living leader without a recorded start time is left alone', async (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  mkdirSync(registry);
+  writeFileSync(
+    join(registry, 'unverified.json'),
+    JSON.stringify({
+      id: 'unverified',
+      runner: { pid: 2 ** 22 - 1 },
+      binary: null,
+      groups: [{ pid: 4242, started: null }],
+    }),
+  );
+  const sent: Array<[number, string]> = [];
+  const result = await reapDeadRuns(registry, {
+    stopApp: async () => undefined,
+    appProcesses: () => [],
+    owns: () => false,
+    readStart: () => 'Mon Jan  1 00:00:00 2001',
+    readMembers: () => [{ pid: 4242, pgid: 4242 }],
+    pause: async () => undefined,
+    kill: noSignals(sent),
+  });
+  assert.deepEqual(sent, []);
+  assert.deepEqual(result, { reaped: [], kept: [], failed: ['unverified'] });
+  assert.ok(existsSync(join(registry, 'unverified.json')));
+});
+
+await test('a group whose leader died is stopped with SIGTERM, then SIGKILL if needed', async (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  mkdirSync(registry);
+  writeFileSync(
+    join(registry, 'orphaned.json'),
+    JSON.stringify({
+      id: 'orphaned',
+      runner: { pid: 2 ** 22 - 1 },
+      binary: null,
+      groups: [{ pid: 4242, started: null }],
+    }),
+  );
+  const sent: Array<[number, string]> = [];
+  const result = await reapDeadRuns(registry, {
+    stopApp: async () => undefined,
+    appProcesses: () => [],
+    owns: () => false,
+    readStart: () => null,
+    readMembers: () => (sent.length < 2 ? [{ pid: 4243, pgid: 4242 }] : []),
+    pause: async () => undefined,
+    kill: noSignals(sent),
+  });
+  assert.deepEqual(sent, [
+    [-4242, 'SIGTERM'],
+    [-4242, 'SIGKILL'],
+  ]);
+  assert.deepEqual(result, { reaped: ['orphaned'], kept: [], failed: [] });
+});
 
 await test('a run whose process table cannot be read stays registered', async (context) => {
   const root = scratch(context);
