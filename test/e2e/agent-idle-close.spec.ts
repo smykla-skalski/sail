@@ -487,8 +487,8 @@ describe('idle session close', () => {
     it(`removes a loaded or restored ${provider} thread from activity immediately on delete`, async () => {
       const directory = realpathSync(repository);
       await pauseIdleClose();
-      const [loaded, restored] = await newSessions(provider, directory, 2);
-      await finishTurns(provider, directory, [loaded, restored]);
+      const [restored] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [restored]);
       await closeIdleThreads(restored);
       await browser.tauri.execute(
         async ({ core }, agent, path, session) => {
@@ -515,6 +515,8 @@ describe('idle session close', () => {
         directory,
         restored,
       );
+      const [loaded] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [loaded]);
       await Promise.all(
         [loaded, restored].map(async (id) => {
           expect(await attached(provider, directory)).toContain(id);
