@@ -130,7 +130,7 @@ fn bounded(key: &str) -> String {
 }
 
 /// A corrupt record reads as absent; log it once per launch and keep the file so
-/// it can be inspected. The next save of its key replaces it.
+/// it can be inspected. The next save or delete of its key replaces it.
 fn report_corrupt(file: &Path, key: Option<&str>, reason: &str) {
     // A full read cannot always name the key; report again once a read by key can.
     let key = key.map(bounded);
@@ -328,6 +328,38 @@ fn ensure_directory(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Moves a directory sitting where a record file belongs to a sibling name, so
+/// the record can be written; its contents are kept, never deleted.
+fn move_directory_aside(path: &Path, key: &str) -> Result<(), String> {
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(());
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    for attempt in 0..1000 {
+        let aside = path.with_file_name(format!("{name}.dir-{attempt}"));
+        if fs::symlink_metadata(&aside).is_ok() {
+            continue;
+        }
+        fs::rename(path, &aside)
+            .map_err(|error| format!("Cannot move aside settings record folder: {error}"))?;
+        forget_report(path);
+        emit(
+            &format!(
+                "Settings record path was a directory; moved to {:?}",
+                aside.display().to_string()
+            ),
+            Some(&bounded(key)),
+            path,
+            "path is a directory",
+        );
+        return Ok(());
+    }
+    Err("Cannot move aside settings record folder: no free name".to_string())
+}
+
 /// Replaces one record file atomically; the caller flushes the directory.
 fn stage(
     directory: &Path,
@@ -344,6 +376,7 @@ fn stage(
     }
     let contents = serde_json::to_vec(&record)
         .map_err(|error| format!("Cannot encode settings record: {error}"))?;
+    move_directory_aside(&temporary, key)?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -359,6 +392,7 @@ fn stage(
         .map_err(|error| format!("Cannot write settings record: {error}"))?;
     drop(file);
     let target = directory.join(name);
+    move_directory_aside(&target, key)?;
     fs::rename(&temporary, &target)
         .map_err(|error| format!("Cannot save settings record: {error}"))?;
     forget_report(&target);
@@ -394,12 +428,20 @@ pub(crate) fn write_batch(settings: &Path, entries: &[(&str, &str)]) -> Result<(
     flush_directory(&directory)
 }
 
+/// Deletes the key's record file, valid or corrupt, so a deleted key leaves
+/// nothing behind. A directory in its place is moved aside, not deleted.
 pub(crate) fn remove(settings: &Path, key: &str) -> Result<(), String> {
     let directory = directory(settings);
-    match fs::remove_file(directory.join(file_name(key))) {
+    let file = directory.join(file_name(key));
+    if fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
+        move_directory_aside(&file, key)?;
+        sync_directory(&directory);
+        return Ok(());
+    }
+    match fs::remove_file(&file) {
         Ok(()) => {
             sync_directory(&directory);
-            forget_report(&directory.join(file_name(key)));
+            forget_report(&file);
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -687,6 +729,103 @@ mod tests {
             is_marked(&path, "sai-ship-runs"),
             "a plain write keeps the mark"
         );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn aside_names(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory(path))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".dir-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn saving_a_key_whose_record_path_is_a_directory_moves_it_aside() {
+        let path = scratch("dir-save");
+        let key = "sai-ship-runs";
+        write(&path, "sai-acp-plans", "[good]", false).unwrap();
+        let file = directory(&path).join(file_name(key));
+        fs::create_dir(&file).unwrap();
+        fs::write(file.join("keep.txt"), b"precious").unwrap();
+        assert_eq!(read(&path, key).unwrap(), None);
+        take_reports();
+
+        write(&path, key, "[new]", true).unwrap();
+
+        assert_eq!(read(&path, key).unwrap().as_deref(), Some("[new]"));
+        assert!(file.is_file());
+        let aside = aside_names(&path);
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            fs::read(directory(&path).join(&aside[0]).join("keep.txt")).unwrap(),
+            b"precious"
+        );
+        assert_eq!(read_all(&path).unwrap().0.len(), 2);
+        assert_eq!(take_reports().len(), 1, "the move is logged");
+
+        write(&path, key, "[newer]", false).unwrap();
+        assert_eq!(aside_names(&path).len(), 1, "a file is not moved aside");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_second_directory_gets_its_own_aside_name() {
+        let path = scratch("dir-twice");
+        let key = "sai-ship-runs";
+        write(&path, key, "[1]", false).unwrap();
+        let file = directory(&path).join(file_name(key));
+        for round in 0..2 {
+            fs::remove_file(&file).unwrap();
+            fs::create_dir(&file).unwrap();
+            fs::write(file.join("n"), [round]).unwrap();
+            write(&path, key, "[2]", false).unwrap();
+        }
+        assert_eq!(aside_names(&path).len(), 2);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_batch_save_moves_a_directory_aside_too() {
+        let path = scratch("dir-batch");
+        let key = "sai-ship-runs";
+        write(&path, "sai-acp-plans", "[1]", false).unwrap();
+        let file = directory(&path).join(file_name(key));
+        fs::create_dir(&file).unwrap();
+        write_batch(&path, &[(key, "[new]"), ("sai-acp-plans", "[2]")]).unwrap();
+        assert_eq!(read(&path, key).unwrap().as_deref(), Some("[new]"));
+        assert_eq!(aside_names(&path).len(), 1);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_directory_in_the_temporary_path_is_moved_aside() {
+        let path = scratch("dir-temporary");
+        let key = "sai-ship-runs";
+        write(&path, "sai-acp-plans", "[1]", false).unwrap();
+        fs::create_dir(directory(&path).join(format!("{}.tmp", file_name(key)))).unwrap();
+        write(&path, key, "[new]", false).unwrap();
+        assert_eq!(read(&path, key).unwrap().as_deref(), Some("[new]"));
+        assert_eq!(aside_names(&path).len(), 1);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn removing_a_key_deletes_its_corrupt_record_and_moves_a_directory_aside() {
+        let path = scratch("remove-corrupt");
+        let key = "sai-ship-runs";
+        write(&path, key, "[old]", false).unwrap();
+        let file = directory(&path).join(file_name(key));
+        fs::write(&file, b"{\"key\"").unwrap();
+        remove(&path, key).unwrap();
+        assert!(!file.exists());
+
+        fs::create_dir(&file).unwrap();
+        remove(&path, key).unwrap();
+        assert!(!file.exists());
+        assert_eq!(aside_names(&path).len(), 1);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
