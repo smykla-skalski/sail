@@ -532,17 +532,29 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
-    if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
-    if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
-    else
-      send({
-        id: message.id,
-        result: {
-          sessionId: message.params.sessionId,
-          configOptions: configOptions(message.params.sessionId),
-          availableCommands,
-        },
-      });
+    const failResume = join(message.params.cwd, 'idle-fail-next-resume.txt');
+    if (existsSync(failResume)) {
+      unlinkSync(failResume);
+      send({ id: message.id, error: { code: -32002, message: 'Injected resume failure' } });
+      continue;
+    }
+    const finishResume = () => {
+      if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
+      if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
+      else
+        send({
+          id: message.id,
+          result: {
+            sessionId: message.params.sessionId,
+            configOptions: configOptions(message.params.sessionId),
+            availableCommands,
+          },
+        });
+    };
+    // A real adapter loads the thread while it keeps reading requests, so a command sent
+    // before the reply meets a session that is not loaded yet.
+    if (existsSync(join(message.params.cwd, 'idle-slow-resume.txt'))) setTimeout(finishResume, 800);
+    else finishResume();
   } else if (message.method === 'session/load') {
     const failLoad = join(message.params.cwd, 'codex-fail-next-load.txt');
     if (agent === 'codex' && existsSync(failLoad)) {
@@ -575,6 +587,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
   } else if (message.method === 'session/set_config_option') {
     const { sessionId, configId, value } = message.params;
+    if (sessions.get(sessionId)?.evicted) {
+      send({ id: message.id, error: { code: -32002, message: `Session not found: ${sessionId}` } });
+      continue;
+    }
     if (value === 'broken') {
       send({ id: message.id, error: { code: -1, message: 'Model change rejected' } });
       continue;

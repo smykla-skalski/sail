@@ -5358,22 +5358,53 @@ impl Connection {
         }
     }
 
-    /// Waits out an idle close in flight. Returns whether the session is still closed.
-    fn settle_close(&self, session_id: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(35);
-        loop {
-            let state = self
-                .idle
-                .lock()
-                .map(|idle| (idle.is_closing(session_id), idle.is_closed(session_id)));
-            match state {
-                Ok((true, _)) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
+    /// Resumes an idle-closed session once. A caller that finds a close or another resume in flight
+    /// waits for it; `None` means the session was already loaded when the wait ended. A failed
+    /// resume leaves the session closed so the next caller retries it.
+    fn reattach_closed<T>(
+        &self,
+        session_id: &str,
+        resume: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        struct EndResume<'a> {
+            runtime: &'a Connection,
+            session_id: &'a str,
+            resumed: bool,
+        }
+        impl Drop for EndResume<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut idle) = self.runtime.idle.lock() {
+                    idle.end_resume(self.session_id, self.resumed, Instant::now());
                 }
-                Ok((_, closed)) => return closed,
-                Err(_) => return false,
             }
         }
+        // A close ends within its 30 second request and a resume within 60.
+        let deadline = Instant::now() + Duration::from_secs(100);
+        loop {
+            let claim = self
+                .idle
+                .lock()
+                .map_err(|error| error.to_string())?
+                .claim_resume(session_id);
+            match claim {
+                crate::acp_idle::ResumeClaim::Open => return Ok(None),
+                crate::acp_idle::ResumeClaim::Claimed => break,
+                crate::acp_idle::ResumeClaim::Wait if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                crate::acp_idle::ResumeClaim::Wait => {
+                    return Err("The thread is still reconnecting. Try again.".to_string());
+                }
+            }
+        }
+        let mut end = EndResume {
+            runtime: self,
+            session_id,
+            resumed: false,
+        };
+        let resumed = resume()?;
+        end.resumed = true;
+        Ok(Some(resumed))
     }
 
     fn supports_session_close(&self) -> bool {
@@ -5431,6 +5462,7 @@ impl Connection {
             if idle.has_async_tasks(session_id)
                 || idle.has_background_work(session_id)
                 || idle.is_fresh(session_id)
+                || idle.is_resuming(session_id)
             {
                 return Ok(true);
             }
@@ -5637,9 +5669,9 @@ async fn reattach_idle_closed(
     agent: &str,
     session_id: &str,
     directory: &Path,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let Some(runtime) = manager.idle_closed_connection(agent, session_id, directory) else {
-        return Ok(false);
+        return Ok(());
     };
     let params = RestoreSessionCommand {
         agent: agent.to_string(),
@@ -5650,18 +5682,18 @@ async fn reattach_idle_closed(
     };
     let (app, manager, browser) = (app.clone(), manager.clone(), browser.clone());
     tauri::async_runtime::spawn_blocking(move || {
-        if !runtime.settle_close(&params.session_id) {
-            return Ok(());
-        }
         let session_id = params.session_id.clone();
-        let previous = runtime.cached_config_options(&session_id);
-        let resumed = restore_session_blocking(app, &manager, &browser, params, "session/resume")?;
-        runtime.replay_config(&session_id, previous.as_ref(), &resumed);
-        Ok::<(), String>(())
+        runtime.reattach_closed(&session_id, || {
+            let previous = runtime.cached_config_options(&session_id);
+            let resumed =
+                restore_session_blocking(app, &manager, &browser, params, "session/resume")?;
+            runtime.replay_config(&session_id, previous.as_ref(), &resumed);
+            Ok(())
+        })
     })
     .await
     .map_err(|error| error.to_string())??;
-    Ok(true)
+    Ok(())
 }
 
 /// Config selections whose resumed value differs from the one the thread had before the close.
@@ -5713,15 +5745,10 @@ async fn connection_for_session_reattaching(
     session_id: &str,
     directory: &Path,
 ) -> Result<Arc<Connection>, String> {
-    let runtime = match connection_for_session(manager, agent, session_id, directory) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            if !reattach_idle_closed(app, manager, browser, agent, session_id, directory).await? {
-                return Err(error);
-            }
-            connection_for_session(manager, agent, session_id, directory)?
-        }
-    };
+    // A closed session may still look connected while its resume runs, so ask for the reattach
+    // first; it is a no-op for a loaded session.
+    reattach_idle_closed(app, manager, browser, agent, session_id, directory).await?;
+    let runtime = connection_for_session(manager, agent, session_id, directory)?;
     runtime.touch_session(session_id);
     Ok(runtime)
 }
@@ -13232,6 +13259,120 @@ mod idle_close_tests {
             *runtime.capabilities.lock().unwrap() = advertised.clone();
             assert_eq!(runtime.supports_session_close(), closes, "{agent}");
         }
+    }
+
+    fn closed_runtime(agent: &str, session: &str) -> Arc<Connection> {
+        let runtime = super::session_config_tests::test_runtime(
+            agent,
+            CapabilityProfile::Build,
+            &std::env::temp_dir(),
+            session,
+            None,
+        );
+        let mut idle = runtime.idle.lock().unwrap();
+        idle.begin_close(session);
+        idle.end_close(session);
+        drop(idle);
+        runtime
+    }
+
+    /// Stands in for `register_session`, which marks the session attached before the resume request.
+    fn attach(runtime: &Connection, session: &str) {
+        runtime
+            .idle
+            .lock()
+            .unwrap()
+            .mark_attached(session, Instant::now());
+    }
+
+    #[test]
+    fn concurrent_calls_on_a_closed_thread_wait_for_one_resume() {
+        for agent in ["codex", "claude"] {
+            let session = format!("ses_race_{agent}");
+            let runtime = closed_runtime(agent, &session);
+            let resumes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let first = {
+                let (runtime, session, resumes) =
+                    (Arc::clone(&runtime), session.clone(), Arc::clone(&resumes));
+                std::thread::spawn(move || {
+                    runtime.reattach_closed(&session, || {
+                        resumes.fetch_add(1, Ordering::SeqCst);
+                        attach(&runtime, &session);
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                })
+            };
+            started_rx.recv().unwrap();
+            let second_done = Arc::new(AtomicBool::new(false));
+            let second = {
+                let (runtime, session, resumes, done) = (
+                    Arc::clone(&runtime),
+                    session.clone(),
+                    Arc::clone(&resumes),
+                    Arc::clone(&second_done),
+                );
+                std::thread::spawn(move || {
+                    let result = runtime.reattach_closed(&session, || {
+                        resumes.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    });
+                    done.store(true, Ordering::SeqCst);
+                    result
+                })
+            };
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !second_done.load(Ordering::SeqCst),
+                "{agent}: the second caller must wait for the resume"
+            );
+            assert!(runtime.idle.lock().unwrap().is_closed(&session));
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Ok(Some(())), "{agent}");
+            assert_eq!(second.join().unwrap(), Ok(None), "{agent}");
+            assert_eq!(resumes.load(Ordering::SeqCst), 1, "{agent}");
+            assert!(!runtime.idle.lock().unwrap().is_closed(&session));
+        }
+    }
+
+    #[test]
+    fn failed_resume_leaves_the_thread_closed_so_the_next_call_retries() {
+        for agent in ["codex", "claude"] {
+            let session = format!("ses_retry_{agent}");
+            let runtime = closed_runtime(agent, &session);
+            let failed = runtime.reattach_closed(&session, || {
+                attach(&runtime, &session);
+                Err::<(), _>("Session not found".to_string())
+            });
+            assert_eq!(failed, Err("Session not found".to_string()), "{agent}");
+            {
+                let idle = runtime.idle.lock().unwrap();
+                assert!(idle.is_closed(&session), "{agent}: closed marker kept");
+                assert!(!idle.is_resuming(&session), "{agent}: claim released");
+            }
+            let retried = runtime.reattach_closed(&session, || {
+                attach(&runtime, &session);
+                Ok(())
+            });
+            assert_eq!(retried, Ok(Some(())), "{agent}");
+            assert!(!runtime.idle.lock().unwrap().is_closed(&session));
+            assert_eq!(runtime.reattach_closed(&session, || Ok(())), Ok(None));
+        }
+    }
+
+    #[test]
+    fn resuming_thread_is_never_chosen_for_an_idle_close() {
+        let runtime = runtime("ses_resuming");
+        assert!(!holds_work(&runtime, "ses_resuming", false));
+        let mut idle = runtime.idle.lock().unwrap();
+        idle.begin_close("ses_resuming");
+        idle.end_close("ses_resuming");
+        idle.claim_resume("ses_resuming");
+        drop(idle);
+        assert!(holds_work(&runtime, "ses_resuming", false));
     }
 
     #[test]

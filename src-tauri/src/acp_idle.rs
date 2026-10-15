@@ -32,11 +32,23 @@ pub fn idle_timeout() -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 
+/// What a caller that needs a closed session finds when it asks to reattach it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResumeClaim {
+    /// The session is loaded; nothing to resume.
+    Open,
+    /// A close or another caller's resume is in flight; ask again shortly.
+    Wait,
+    /// The caller resumes the session and must call `end_resume`.
+    Claimed,
+}
+
 #[derive(Default)]
 pub struct IdleSessions {
     touched: HashMap<String, Instant>,
     closed: HashSet<String>,
     closing: HashSet<String>,
+    resuming: HashSet<String>,
     fresh: HashSet<String>,
     background: HashSet<String>,
     async_tasks: HashMap<String, HashSet<String>>,
@@ -64,6 +76,7 @@ impl IdleSessions {
         self.closing.remove(session_id);
     }
 
+    #[cfg(test)]
     pub fn is_closing(&self, session_id: &str) -> bool {
         self.closing.contains(session_id)
     }
@@ -86,10 +99,39 @@ impl IdleSessions {
         self.closed.contains(session_id)
     }
 
+    /// A session being resumed stays closed until `end_resume` confirms it, so callers that arrive
+    /// meanwhile wait instead of reaching an agent that has not loaded the thread yet.
     pub fn mark_attached(&mut self, session_id: &str, now: Instant) {
-        self.closed.remove(session_id);
+        if !self.resuming.contains(session_id) {
+            self.closed.remove(session_id);
+        }
         self.closing.remove(session_id);
         self.touch(session_id, now);
+    }
+
+    pub fn claim_resume(&mut self, session_id: &str) -> ResumeClaim {
+        if !self.closed.contains(session_id) {
+            return ResumeClaim::Open;
+        }
+        if self.closing.contains(session_id) || self.resuming.contains(session_id) {
+            return ResumeClaim::Wait;
+        }
+        self.resuming.insert(session_id.to_string());
+        ResumeClaim::Claimed
+    }
+
+    /// A failed resume leaves the session closed, so the next caller retries it.
+    pub fn end_resume(&mut self, session_id: &str, resumed: bool, now: Instant) {
+        self.resuming.remove(session_id);
+        if resumed {
+            self.closed.remove(session_id);
+            self.closing.remove(session_id);
+            self.touch(session_id, now);
+        }
+    }
+
+    pub fn is_resuming(&self, session_id: &str) -> bool {
+        self.resuming.contains(session_id)
     }
 
     pub fn has_async_tasks(&self, session_id: &str) -> bool {
@@ -203,6 +245,38 @@ mod tests {
         idle.mark_attached("a", now);
         assert!(!idle.is_closed("a"));
         assert!(!idle.is_closing("a"));
+    }
+
+    #[test]
+    fn one_caller_resumes_a_closed_session_and_the_rest_wait() {
+        let now = Instant::now();
+        let mut idle = IdleSessions::default();
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Open);
+        idle.begin_close("a");
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Wait);
+        idle.end_close("a");
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Claimed);
+        assert!(idle.is_resuming("a"));
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Wait);
+        idle.mark_attached("a", now);
+        assert!(idle.is_closed("a"), "attaching mid-resume keeps it closed");
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Wait);
+        idle.end_resume("a", true, now);
+        assert!(!idle.is_resuming("a"));
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Open);
+    }
+
+    #[test]
+    fn a_failed_resume_leaves_the_session_closed_for_a_retry() {
+        let now = Instant::now();
+        let mut idle = IdleSessions::default();
+        idle.begin_close("a");
+        idle.end_close("a");
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Claimed);
+        idle.mark_attached("a", now);
+        idle.end_resume("a", false, now);
+        assert!(idle.is_closed("a"));
+        assert_eq!(idle.claim_resume("a"), ResumeClaim::Claimed);
     }
 
     #[test]
