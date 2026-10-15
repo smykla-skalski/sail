@@ -7874,6 +7874,7 @@ fn restore_session_blocking(
                 )
             },
         )?;
+        let loaded = std::cell::Cell::new(false);
         let outcome = with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
             // A reattach already holds the claim for the thread it resumes.
             let mut resume = if resume_claimed {
@@ -7962,6 +7963,7 @@ fn restore_session_blocking(
                 unregister_session(&runtime, &session_id)?;
             }
             let result = result?;
+            loaded.set(true);
             complete_restore_if_current(
                 manager,
                 &runtime.prompt_state,
@@ -7988,12 +7990,56 @@ fn restore_session_blocking(
         });
         // A delete that lands during the restore leaves nothing registered for the thread.
         if outcome.is_err()
-            && manager.forget_generation(&agent, &cwd, &session_id)? != manager_generation
+            && unregister_if_deleted(
+                manager,
+                &runtime,
+                &agent,
+                &cwd,
+                &session_id,
+                manager_generation,
+            )?
+            && loaded.get()
+            && runtime.supports_session_close()
         {
-            unregister_session(&runtime, &session_id)?;
+            // The idle sweep no longer sees the thread, so release what the resume loaded.
+            if let Err(error) = runtime.request(
+                "session/close",
+                json!({"sessionId":session_id}),
+                Duration::from_secs(30),
+            ) {
+                crate::diagnostics::record(
+                    "deleted_session_close_failed",
+                    json!({"agent":agent,"sessionId":session_id,"error":error}),
+                );
+            }
         }
         outcome
     }
+}
+
+/// Unregisters a thread whose delete committed while a restore ran. An aborted delete leaves the
+/// generation bumped but the thread live, so the committed fence decides, not the generation.
+fn unregister_if_deleted(
+    manager: &AgentManager,
+    runtime: &Connection,
+    agent: &str,
+    directory: &str,
+    session_id: &str,
+    manager_generation: u64,
+) -> Result<bool, String> {
+    if manager.forget_generation(agent, directory, session_id)? == manager_generation {
+        return Ok(false);
+    }
+    let forgotten = runtime
+        .prompt_state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .forgotten
+        .contains(session_id);
+    if forgotten {
+        unregister_session(runtime, session_id)?;
+    }
+    Ok(forgotten)
 }
 
 fn unregister_session(runtime: &Connection, session_id: &str) -> Result<(), String> {
@@ -13540,7 +13586,32 @@ mod idle_close_tests {
                 .contains_key(&session));
             // The delete drops the idle state while the resume is still in flight.
             runtime.idle.lock().unwrap().forget(&session);
-            unregister_session(&runtime, &session).unwrap();
+            let manager = AgentManager::default();
+            let directory = std::env::temp_dir();
+            let directory = directory.to_str().unwrap();
+            let generation = manager
+                .forget_generation(agent, directory, &session)
+                .unwrap();
+            manager.mark_forget(agent, directory, &session).unwrap();
+            // An aborted delete bumped the generation but left the thread live.
+            assert!(!unregister_if_deleted(
+                &manager, &runtime, agent, directory, &session, generation
+            )
+            .unwrap());
+            assert!(runtime
+                .session_profiles
+                .lock()
+                .unwrap()
+                .contains_key(&session));
+            runtime
+                .prompt_state
+                .lock()
+                .unwrap()
+                .mark_forgotten(&session);
+            assert!(unregister_if_deleted(
+                &manager, &runtime, agent, directory, &session, generation
+            )
+            .unwrap());
             drop(claim);
             assert!(!runtime
                 .session_profiles
