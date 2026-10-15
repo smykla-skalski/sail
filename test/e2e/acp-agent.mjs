@@ -556,7 +556,16 @@ for await (const line of createInterface({ input: process.stdin })) {
     };
     // A real adapter loads the thread while it keeps reading requests, so a command sent
     // before the reply meets a session that is not loaded yet.
-    if (existsSync(join(message.params.cwd, 'idle-slow-resume.txt'))) setTimeout(finishResume, 800);
+    const resumeHold = join(message.params.cwd, 'idle-resume-hold.txt');
+    if (existsSync(resumeHold)) {
+      update(message.params.sessionId, { sessionUpdate: 'idle_resume_waiting' });
+      const release = setInterval(() => {
+        if (existsSync(resumeHold)) return;
+        clearInterval(release);
+        finishResume();
+      }, 25);
+    } else if (existsSync(join(message.params.cwd, 'idle-slow-resume.txt')))
+      setTimeout(finishResume, 800);
     else finishResume();
   } else if (message.method === 'session/load') {
     const failLoad = join(message.params.cwd, 'codex-fail-next-load.txt');
@@ -1213,6 +1222,13 @@ for await (const line of createInterface({ input: process.stdin })) {
             };
       recordUpdate(sessionId, sessionId, plan);
       send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Idle held turn') {
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Waiting for explicit cancellation.' },
+      });
       continue;
     }
     if (text === 'Long turn' || text === 'Sidebar performance turn') {
