@@ -88,9 +88,13 @@ export function createSidebarListingClock() {
     focusRefreshDelay(now: number): number {
       return SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - lastFullListing);
     },
-    /** A failed listing leaves the catalog uncovered, so the next focus tries again. */
-    listingFailed(): void {
-      lastFullListing = Number.NEGATIVE_INFINITY;
-    },
   };
+}
+
+/** Directories a superseded pass listed that the pass replacing it did not, so they need a new one. */
+export function uncoveredSidebarPaths(
+  superseded: readonly string[],
+  replacement: ReadonlySet<string>,
+): string[] {
+  return superseded.filter((path) => !replacement.has(path));
 }

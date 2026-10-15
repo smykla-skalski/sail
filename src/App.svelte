@@ -260,6 +260,7 @@
     createSidebarListingClock,
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
+    uncoveredSidebarPaths,
     unlistedSidebarPaths,
     type SidebarRefreshPaths,
   } from './lib/sidebar-inventory';
@@ -1735,6 +1736,7 @@
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
   let sidebarInventoryGeneration = 0;
+  let sidebarInventoryLatestPaths: ReadonlySet<string> = new Set();
   const sidebarInventoryRequests = new SvelteSet<Promise<unknown>>();
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -10943,10 +10945,17 @@
   async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;
     const generation = ++sidebarInventoryGeneration;
+    sidebarInventoryLatestPaths = new Set(paths);
     const request = Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
     sidebarInventoryRequests.add(request);
     const results = await request.finally(() => sidebarInventoryRequests.delete(request));
-    if (generation !== sidebarInventoryGeneration || disposed) return null;
+    if (disposed) return null;
+    if (generation !== sidebarInventoryGeneration) {
+      // A newer pass dropped these results; list what it did not cover.
+      const uncovered = uncoveredSidebarPaths(paths, sidebarInventoryLatestPaths);
+      if (uncovered.length > 0) scheduleSidebarInventoryRefresh(250, uncovered);
+      return null;
+    }
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
     for (const path of paths) if (!failed.has(path)) sidebarListedDirectories[path] = true;
     const listed = new Set(paths);
@@ -10996,7 +11005,6 @@
       const selected = sidebarListingClock.plan(directories, wanted, Date.now());
       void refreshSidebarOpenCodeThreads(selected).then(
         (failure) => {
-          if (failure) sidebarListingClock.listingFailed();
           reportSidebarInventoryFailure(failure);
           if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
             sidebarInventoryReadyKey = key;

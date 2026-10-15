@@ -6,6 +6,7 @@ import {
   createSidebarThreadLoader,
   mergeSidebarRefreshPaths,
   sidebarFocusRefreshDue,
+  uncoveredSidebarPaths,
   unlistedSidebarPaths,
   type SidebarRefreshPaths,
 } from '../src/lib/sidebar-inventory.ts';
@@ -294,10 +295,11 @@ void test('a full listing request lists the catalog and restarts the focus clock
   assert.equal(session.clock.focusRefreshDelay(10_000), 21_000);
 });
 
-void test('a failed listing lets the next focus try again', () => {
-  const session = listingSession();
-  session.list(new Set(profile), 1_000);
-  session.clock.listingFailed();
-
-  assert.equal(session.focus(2_000).length, 26);
+void test('a superseded pass leaves only the directories its replacement skipped', () => {
+  assert.deepEqual(uncoveredSidebarPaths(profile, new Set(['/elsewhere'])), profile);
+  assert.deepEqual(
+    uncoveredSidebarPaths(profile, new Set(profile.slice(0, 20))),
+    profile.slice(20),
+  );
+  assert.deepEqual(uncoveredSidebarPaths(['/a'], new Set(['/a'])), []);
 });
