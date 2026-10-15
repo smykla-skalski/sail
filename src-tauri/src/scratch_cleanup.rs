@@ -261,6 +261,7 @@ fn sweep_runtime_roots_in(
             ignore_idle_age,
             &open_files,
             &quarantined_open_files,
+            in_use,
             report,
         );
     }
@@ -273,10 +274,21 @@ fn reclaim_runtime_batch(
     now: SystemTime,
     open_files: &impl Fn(&Path) -> Option<bool>,
     quarantined_open_files: &impl Fn(&[PathBuf]) -> Vec<Option<bool>>,
+    in_use: &dyn Fn(&Path) -> bool,
     report: &mut dyn FnMut(&str, RuntimeRootEvent),
 ) {
     let mut hidden = Vec::new();
     for candidate in batch {
+        // Earlier batches took time since the scan; a gate may have started.
+        if in_use(&candidate.path) {
+            report(
+                &candidate.name,
+                RuntimeRootEvent::Kept {
+                    reason: "build in use",
+                },
+            );
+            continue;
+        }
         match quarantine_root(
             temp,
             &candidate.path,
@@ -1181,33 +1193,43 @@ impl OpenFileProbe {
     }
 
     /// Final check for roots already hidden in quarantine, one scan for all of
-    /// them. If the combined scan fails, each root gets its own, so one
-    /// unreadable root cannot keep the rest of a batch.
+    /// them. If the combined scan fails, the batch is halved until the failing
+    /// root stands alone, so one unreadable root cannot keep the rest.
     fn check_quarantined(&self, paths: &[PathBuf]) -> Vec<Option<bool>> {
-        use std::os::unix::ffi::OsStrExt;
-
         let canonical = paths
             .iter()
             .map(|path| fs::canonicalize(path).ok())
             .collect::<Vec<_>>();
+        let mut results = vec![None; paths.len()];
         let listed = canonical
             .iter()
-            .flatten()
-            .map(PathBuf::as_path)
+            .enumerate()
+            .filter_map(|(index, root)| root.as_deref().map(|root| (index, root)))
             .collect::<Vec<_>>();
-        if listed.len() < 2 {
-            return paths.iter().map(|path| self.check(path)).collect();
+        self.scan_quarantined(&listed, &mut results);
+        results
+    }
+
+    fn scan_quarantined(&self, roots: &[(usize, &Path)], results: &mut [Option<bool>]) {
+        use std::os::unix::ffi::OsStrExt;
+
+        match roots {
+            [] => {}
+            [(index, root)] => results[*index] = self.check(root),
+            _ => {
+                let paths = roots.iter().map(|(_, root)| *root).collect::<Vec<_>>();
+                if let Some(listing) = self.quarantine_listing(&paths) {
+                    for (index, root) in roots {
+                        results[*index] =
+                            Some(listing_names_root(&listing, root.as_os_str().as_bytes()));
+                    }
+                } else {
+                    let (first, second) = roots.split_at(roots.len() / 2);
+                    self.scan_quarantined(first, results);
+                    self.scan_quarantined(second, results);
+                }
+            }
         }
-        let Some(listing) = self.quarantine_listing(&listed) else {
-            return paths.iter().map(|path| self.check(path)).collect();
-        };
-        canonical
-            .iter()
-            .map(|root| {
-                root.as_ref()
-                    .map(|root| listing_names_root(&listing, root.as_os_str().as_bytes()))
-            })
-            .collect()
     }
 }
 
@@ -1977,6 +1999,84 @@ mod tests {
         assert_eq!(probe.reads.get(), 2);
         drop((linked, unlinked));
         assert_eq!(probe.check_quarantined(&roots), vec![Some(false); 4]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_batch_check_keeps_order_when_a_root_cannot_be_resolved() {
+        let temp = fixture();
+        let roots = [0, 1, 2].map(|index| {
+            let root = temp.join(format!("sail-cleanup-private-{index}/child"));
+            fs::create_dir_all(&root).unwrap();
+            root
+        });
+        let missing = temp.join("sail-cleanup-private-gone/child");
+        let held = fs::File::create(roots[2].join("held")).unwrap();
+        let paths = vec![
+            roots[0].clone(),
+            missing,
+            roots[1].clone(),
+            roots[2].clone(),
+        ];
+        let probe = OpenFileProbe::default();
+        assert_eq!(
+            probe.check_quarantined(&paths),
+            vec![Some(false), None, Some(false), Some(true)]
+        );
+        drop(held);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreadable_root_does_not_hide_the_roots_beside_it() {
+        let temp = fixture();
+        let roots = (0..5)
+            .map(|index| {
+                let root = temp.join(format!("sail-cleanup-private-{index}/child"));
+                fs::create_dir_all(root.join("sub")).unwrap();
+                root
+            })
+            .collect::<Vec<_>>();
+        let held = fs::File::create(roots[4].join("held")).unwrap();
+        fs::set_permissions(roots[1].join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = OpenFileProbe::default();
+        let results = probe.check_quarantined(&roots);
+        fs::set_permissions(roots[1].join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        drop(held);
+        assert_eq!(results[1], None);
+        assert_eq!(
+            [results[0], results[2], results[3], results[4]],
+            [Some(false), Some(false), Some(false), Some(true)]
+        );
+        assert!(probe.reads.get() < roots.len() as u32 * 2);
+    }
+
+    #[test]
+    fn runtime_sweep_rechecks_a_running_build_just_before_quarantine() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let busy = root.clone();
+        let asked = std::cell::Cell::new(0);
+        let mut kept = Vec::new();
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now(),
+            |_| Some(false),
+            each(|_| Some(false)),
+            &|path| {
+                asked.set(asked.get() + 1);
+                // The build starts after the first check, before the rename.
+                path == busy && asked.get() > 1
+            },
+            &mut |_, event| {
+                if let RuntimeRootEvent::Kept { reason } = event {
+                    kept.push(reason);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(kept, vec!["build in use"]);
+        assert!(root.exists());
     }
 
     #[cfg(target_os = "macos")]
