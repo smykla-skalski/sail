@@ -175,6 +175,20 @@ fn corruption(contents: &str, key: &str) -> Option<&'static str> {
     }
 }
 
+/// Like `sync_directory`, for callers that drop the old copy of a value only
+/// after the flush succeeds.
+fn flush_directory(directory: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    return fs::File::open(directory)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|error| format!("Cannot flush settings records: {error}"));
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
 pub(crate) fn sync_directory(directory: &Path) {
     #[cfg(unix)]
     if let Ok(handle) = fs::File::open(directory) {
@@ -377,8 +391,7 @@ pub(crate) fn write_batch(settings: &Path, entries: &[(&str, &str)]) -> Result<(
         let modified = is_marked(settings, key);
         stage(&directory, key, value, modified, Flush::Queued)?;
     }
-    sync_directory(&directory);
-    Ok(())
+    flush_directory(&directory)
 }
 
 pub(crate) fn remove(settings: &Path, key: &str) -> Result<(), String> {
