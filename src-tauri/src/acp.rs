@@ -144,6 +144,17 @@ impl NativeSubagentRegistry {
         Ok(self.0.get(session_id).is_some_and(Self::is_live))
     }
 
+    /// An explicit interaction wakes a settled child; a mere replayed spawn does not.
+    fn revive(&mut self, session_id: &str) -> bool {
+        self.0.get_mut(session_id).is_some_and(|entry| {
+            if !Self::is_live(entry) {
+                entry.outcome = "working".into();
+                entry.task_turn_id = None;
+            }
+            true
+        })
+    }
+
     fn cancellation_eligible(&self, session_id: &str) -> Option<bool> {
         self.0.get(session_id).map(|entry| {
             entry.can_cancel
@@ -4837,12 +4848,18 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
         return None;
     }
     let update = match activity {
-        "started" | "interacted" => json!({
-            "sessionUpdate":"subagent_spawned",
-            "subagentSessionId":child,
-            "name":name,
-            "task":name
-        }),
+        "started" | "interacted" => {
+            let mut spawned = json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":child,
+                "name":name,
+                "task":name
+            });
+            if activity == "interacted" {
+                spawned["revive"] = json!(true);
+            }
+            spawned
+        }
         "completed" | "interrupted" => json!({
             "sessionUpdate":"subagent_state_update",
             "subagentSessionId":child,
@@ -5094,6 +5111,17 @@ fn connection_for_session(
         .ok_or_else(|| "Agent session is not connected in this worktree.".to_string())
 }
 
+/// OpenCode attaches the child's own session ID to its MCP calls; other agents give none.
+fn task_provider_id<'a>(runtime: &Connection, child_id: &'a str) -> Option<&'a str> {
+    (runtime.agent == "opencode").then(|| {
+        runtime
+            .owner
+            .as_ref()
+            .and_then(|owner| child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:")))
+            .unwrap_or(child_id)
+    })
+}
+
 fn register_native_task_connections(
     runtime: &Connection,
     browser: &crate::browser_agent::BrowserManager,
@@ -5105,15 +5133,7 @@ fn register_native_task_connections(
         .task_connections();
     for _ in 0..children.len() {
         for (child_id, child) in &children {
-            let provider_id = (runtime.agent == "opencode").then(|| {
-                runtime
-                    .owner
-                    .as_ref()
-                    .and_then(|owner| {
-                        child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
-                    })
-                    .unwrap_or(child_id)
-            });
+            let provider_id = task_provider_id(runtime, child_id);
             browser.register_native_child(
                 &runtime.agent,
                 &child.directory,
@@ -5274,15 +5294,12 @@ fn record_native_subagent_update(
                     .is_some_and(|parent| parent.task_turn_id.is_some());
             let child_live = native.spawn(parent_id, child_id, directory.clone(), can_cancel)?;
             native.task_scope(child_id, agent == "opencode", live);
-            let provider_id = (agent == "opencode").then(|| {
-                runtime
-                    .owner
-                    .as_ref()
-                    .and_then(|owner| {
-                        child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
-                    })
-                    .unwrap_or(child_id)
-            });
+            let child_live = if update.get("revive").and_then(Value::as_bool) == Some(true) {
+                native.revive(child_id)
+            } else {
+                child_live
+            };
+            let provider_id = task_provider_id(runtime, child_id);
             let browser = app.state::<crate::browser_agent::BrowserManager>();
             // A replayed spawn of a settled child must not hold the parent's task identity.
             if child_live {
@@ -5333,6 +5350,15 @@ fn record_native_subagent_update(
                             .is_some_and(|parent| parent.task_turn_id.is_some())
                 });
                 native.task_scope(child_id, agent == "opencode", live);
+                // A resumed child must hold the task bridge again until it settles.
+                app.state::<crate::browser_agent::BrowserManager>()
+                    .register_native_child(
+                        agent,
+                        &directory,
+                        parent_id,
+                        child_id,
+                        task_provider_id(runtime, child_id),
+                    );
             }
             let generation = fence.generations.entry(directory.clone()).or_default();
             *generation = generation.saturating_add(1);
@@ -11844,6 +11870,50 @@ mod native_subagent_fence_tests {
             .spawn("parent", "child", directory.clone(), false)
             .unwrap());
         assert!(registry.spawn("other", "child", directory, false).is_err());
+    }
+
+    #[test]
+    fn interaction_revives_a_settled_child_but_a_replayed_spawn_does_not() {
+        let mut registry = NativeSubagentRegistry::default();
+        let directory = PathBuf::from("/repo");
+        registry
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap();
+        registry.update("parent", "child", "completed").unwrap();
+        assert!(!registry.spawn("parent", "child", directory, false).unwrap());
+        assert_eq!(registry.0["child"].outcome, "completed");
+        assert!(registry.revive("child"));
+        assert_eq!(registry.0["child"].outcome, "working");
+        registry.update("parent", "child", "completed").unwrap();
+        assert!(!NativeSubagentRegistry::is_live(&registry.0["child"]));
+        assert!(!registry.revive("unknown"));
+    }
+
+    #[test]
+    fn codex_interaction_is_marked_as_a_revival() {
+        let activity = |kind: &str| {
+            json!({
+                "method":"session/update",
+                "params":{"sessionId":"parent","update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":format!("activity-{kind}"),
+                    "subagent":true,
+                    "status":"completed",
+                    "input":{
+                        "activityKind":kind,
+                        "agentPath":"/root/child",
+                        "agentThreadId":"child-thread"
+                    }
+                }}
+            })
+        };
+        let interacted = codex_native_activity_update(&activity("interacted"), None).unwrap();
+        assert_eq!(
+            interacted.pointer("/params/update/revive"),
+            Some(&json!(true))
+        );
+        let started = codex_native_activity_update(&activity("started"), None).unwrap();
+        assert!(started.pointer("/params/update/revive").is_none());
     }
 
     #[test]
