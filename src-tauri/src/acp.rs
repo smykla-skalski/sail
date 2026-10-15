@@ -11439,12 +11439,20 @@ time.sleep(10)
         let roots = vec![owner.clone()];
         let granted = assigned_scratch_directory(&selected, &roots).unwrap();
         let access = CodexWorkspaceAccess::capture(&workspace, &[granted]).unwrap();
-        let config = access.profile_config().unwrap();
-        assert!(config.contains(selected.to_str().unwrap()));
-        assert!(!config.contains(sibling.to_str().unwrap()));
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let rules = config["configOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let selected_key = serde_json::to_string(selected.to_str().unwrap()).unwrap();
+        let sibling_key = serde_json::to_string(sibling.to_str().unwrap()).unwrap();
+        assert!(rules.contains(&selected_key));
+        assert!(!rules.contains(&sibling_key));
         #[cfg(target_os = "macos")]
         if let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") {
-            let config: Value = serde_json::from_str(&config).unwrap();
             let run = |path: &Path| {
                 let mut command = Command::new(&codex);
                 command
