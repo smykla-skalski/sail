@@ -17,7 +17,6 @@ const PRIVATE_MARKER_VALUE: &str = "sail-cleanup-private-v1\n";
 const PRIVATE_OWNER: &str = ".sail-cleanup-owner";
 
 pub(crate) fn sweep_on_startup(cache_directory: Option<&Path>) {
-    lower_thread_priority();
     let root = std::env::temp_dir();
     let now = SystemTime::now();
     let mut phases = serde_json::Map::new();
@@ -98,7 +97,6 @@ pub(crate) fn spawn_runtime_sweeper(
     std::thread::Builder::new()
         .name("sail-runtime-scratch-sweep".into())
         .spawn(move || {
-            lower_thread_priority();
             std::thread::sleep(RUNTIME_SWEEP_DELAY);
             let mut log = RuntimeSweepLog::default();
             loop {
@@ -963,15 +961,6 @@ fn inspect(path: &Path, device: u64, now: SystemTime) -> std::io::Result<Option<
     Ok(Some(bytes))
 }
 
-/// Runs the calling thread at background priority so disk-heavy maintenance
-/// yields to agents that are starting.
-pub(crate) fn lower_thread_priority() {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        nix::libc::pthread_set_qos_class_self_np(nix::libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     static INSPECT_WALKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -983,7 +972,7 @@ thread_local! {
     static STOP_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-const UNLINKED_CACHE_AGE: Duration = Duration::from_secs(20);
+const LISTING_CACHE_AGE: Duration = Duration::from_secs(20);
 
 fn lsof_binary() -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -1008,58 +997,50 @@ fn background_lsof() -> Command {
     command
 }
 
-// `lsof +L1` scans every process, so one sweep pass shares its result across
-// roots. A root's final check, made after it is hidden in quarantine, reads it
-// fresh.
-// When and under which stop epoch the scan was read, and its output.
-type UnlinkedScan = (std::time::Instant, u64, std::sync::Arc<Vec<u8>>);
+// Every lsof call scans all processes, and the old two or three calls per root
+// dominated a pass. One listing of all open files, shared across the roots of a
+// pass, answers the first check for each root: a root with a live user is
+// rejected without a call of its own. A root's final check, made after it is
+// hidden in quarantine, is the authority and always runs its own lsof, which
+// lists files under the root and every unlinked file in one scan.
+// When and under which stop epoch the listing was read, and its output.
+type OpenFileListing = (std::time::Instant, u64, std::sync::Arc<Vec<u8>>);
 
 #[derive(Default)]
 struct OpenFileProbe {
     reads: std::cell::Cell<u32>,
-    unlinked: std::cell::RefCell<Option<UnlinkedScan>>,
+    listing: std::cell::RefCell<Option<OpenFileListing>>,
+}
+
+fn listing_names_root(listing: &[u8], root: &[u8]) -> bool {
+    listing.split(|byte| *byte == b'\n').any(|line| {
+        line.strip_prefix(b"n").is_some_and(|name| {
+            name == root || (name.starts_with(root) && name.get(root.len()) == Some(&b'/'))
+        })
+    })
 }
 
 impl OpenFileProbe {
-    fn unlinked_open_files(&self, fresh: bool) -> Option<std::sync::Arc<Vec<u8>>> {
-        if !fresh {
-            let epoch = STOP_EPOCH.with(std::cell::Cell::get);
-            if let Some((read, read_epoch, output)) = self.unlinked.borrow().as_ref() {
-                if read.elapsed() < UNLINKED_CACHE_AGE && *read_epoch == epoch {
-                    return Some(output.clone());
-                }
+    fn open_file_listing(&self) -> Option<std::sync::Arc<Vec<u8>>> {
+        let epoch = STOP_EPOCH.with(std::cell::Cell::get);
+        if let Some((read, read_epoch, output)) = self.listing.borrow().as_ref() {
+            if read.elapsed() < LISTING_CACHE_AGE && *read_epoch == epoch {
+                return Some(output.clone());
             }
         }
         self.reads.set(self.reads.get() + 1);
-        let unlinked = background_lsof()
-            .args(["-nP", "-Fn", "+L1"])
-            .output()
-            .ok()?;
-        if !unlinked.stderr.is_empty() || !matches!(unlinked.status.code(), Some(0 | 1)) {
+        let listing = background_lsof().args(["-nP", "-Fn"]).output().ok()?;
+        if !listing.stderr.is_empty() || !matches!(listing.status.code(), Some(0 | 1)) {
             return None;
         }
-        let output = std::sync::Arc::new(unlinked.stdout);
-        *self.unlinked.borrow_mut() = Some((
-            std::time::Instant::now(),
-            STOP_EPOCH.with(std::cell::Cell::get),
-            output.clone(),
-        ));
+        let output = std::sync::Arc::new(listing.stdout);
+        *self.listing.borrow_mut() = Some((std::time::Instant::now(), epoch, output.clone()));
         Some(output)
     }
 
     fn check(&self, path: &Path) -> Option<bool> {
-        let output = background_lsof().arg("+D").arg(path).output().ok()?;
-        if !output.stderr.is_empty() {
-            return None;
-        }
-        if !output.stdout.is_empty() {
-            return Some(true);
-        }
-        if output.status.code() != Some(1) {
-            return None;
-        }
-        // +D walks directory entries and misses an unlinked file that is
-        // still open. +L1 lists those descriptors, including their last path.
+        use std::os::unix::ffi::OsStrExt;
+
         let quarantined = path
             .parent()
             .and_then(Path::file_name)
@@ -1068,18 +1049,25 @@ impl OpenFileProbe {
                     .to_string_lossy()
                     .starts_with("sail-cleanup-private-")
             });
-        let unlinked = self.unlinked_open_files(quarantined)?;
-        use std::os::unix::ffi::OsStrExt;
         // macOS lsof reports canonical paths even when TMPDIR begins with
         // /var, which is a symlink to /private/var.
         let canonical = fs::canonicalize(path).ok()?;
         let root = canonical.as_os_str().as_bytes();
-        let active = unlinked.split(|byte| *byte == b'\n').any(|line| {
-            line.strip_prefix(b"n").is_some_and(|name| {
-                name == root || (name.starts_with(root) && name.get(root.len()) == Some(&b'/'))
-            })
-        });
-        Some(active)
+        if !quarantined {
+            return Some(listing_names_root(&self.open_file_listing()?, root));
+        }
+        // +D misses an unlinked file that is still open, and +L1 lists those
+        // descriptors with their last path; selections combine as a union.
+        self.reads.set(self.reads.get() + 1);
+        let output = background_lsof()
+            .args(["-nP", "-Fn", "+L1", "+D"])
+            .arg(path)
+            .output()
+            .ok()?;
+        if !output.stderr.is_empty() || !matches!(output.status.code(), Some(0 | 1)) {
+            return None;
+        }
+        Some(listing_names_root(&output.stdout, root))
     }
 }
 
@@ -1748,7 +1736,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn one_pass_scans_unlinked_files_once_before_quarantine() {
+    fn one_pass_lists_open_files_once_before_quarantine() {
         let temp = fixture();
         let roots = (0..6)
             .map(|index| {
@@ -1762,14 +1750,14 @@ mod tests {
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, |path| probe.check(path)).unwrap();
         assert!(roots.iter().all(|root| !root.exists()));
-        // One shared scan for every root's first check, then one fresh scan
-        // per root after it is hidden in quarantine.
+        // One shared listing for every root's first check, then one lsof per
+        // root after it is hidden in quarantine.
         assert_eq!(probe.reads.get(), 1 + roots.len() as u32);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn stopping_a_process_discards_the_shared_unlinked_scan() {
+    fn stopping_a_process_discards_the_shared_listing() {
         let temp = fixture();
         let first = temp.join("sail-699-target.first");
         let second = temp.join("sail-699-target.second");
@@ -1786,6 +1774,25 @@ mod tests {
         assert_eq!(probe.check(&second), Some(true), "scan still shared");
         stop_root_processes(&first);
         assert_eq!(probe.check(&second), Some(false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_quarantine_check_sees_open_and_unlinked_files_under_the_root() {
+        let temp = fixture();
+        let private = temp.join("sail-cleanup-private-check");
+        let root = private.join("child");
+        fs::create_dir_all(&root).unwrap();
+        let probe = OpenFileProbe::default();
+        assert_eq!(probe.check(&root), Some(false));
+        let linked = fs::File::create(root.join("linked")).unwrap();
+        assert_eq!(probe.check(&root), Some(true));
+        drop(linked);
+        let unlinked = fs::File::create(root.join("unlinked")).unwrap();
+        fs::remove_file(root.join("unlinked")).unwrap();
+        assert_eq!(probe.check(&root), Some(true));
+        drop(unlinked);
+        assert_eq!(probe.check(&root), Some(false));
     }
 
     #[test]
