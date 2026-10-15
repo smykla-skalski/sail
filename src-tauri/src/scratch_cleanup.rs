@@ -189,8 +189,11 @@ fn reclaim_runtime_quarantines(
             &path,
             original,
             &metadata,
-            now,
-            QUARANTINE_GRACE,
+            &PrivateReclaim {
+                now,
+                min_age: QUARANTINE_GRACE,
+                idle_at: now + IDLE_AGE + Duration::from_secs(1),
+            },
             open_files,
         ) {
             PrivateOutcome::Removed(bytes) => report(original, RuntimeRootEvent::Removed { bytes }),
@@ -691,8 +694,11 @@ fn sweep_with(
                 &path,
                 original_name,
                 &metadata,
-                now,
-                IDLE_AGE,
+                &PrivateReclaim {
+                    now,
+                    min_age: IDLE_AGE,
+                    idle_at: now,
+                },
                 &open_files,
             ) {
                 freed += bytes;
@@ -717,6 +723,15 @@ fn sweep_with(
     Ok(freed)
 }
 
+// When a pass runs and how it judges a quarantine. `idle_at` is the time the
+// safety walk measures file ages against: the startup sweep keeps files
+// younger than two hours, while a dead owner's root has no user at all.
+struct PrivateReclaim {
+    now: SystemTime,
+    min_age: Duration,
+    idle_at: SystemTime,
+}
+
 // What a pass found in a `sail-cleanup-private-*` directory.
 enum PrivateOutcome {
     // Not ours, too fresh to be abandoned, or unreadable: left untouched.
@@ -738,8 +753,7 @@ fn reclaim_private_quarantine(
     path: &Path,
     original_name: &str,
     metadata: &fs::Metadata,
-    now: SystemTime,
-    min_age: Duration,
+    when: &PrivateReclaim,
     open_files: &impl Fn(&Path) -> Option<bool>,
 ) -> PrivateOutcome {
     if fs::read_to_string(path.join(PRIVATE_MARKER))
@@ -752,7 +766,7 @@ fn reclaim_private_quarantine(
     let Ok(modified) = metadata.modified() else {
         return PrivateOutcome::Skipped;
     };
-    if now.duration_since(modified).unwrap_or_default() < min_age {
+    if when.now.duration_since(modified).unwrap_or_default() < when.min_age {
         return PrivateOutcome::Skipped;
     }
     let Ok(root) = private_child(path) else {
@@ -770,12 +784,12 @@ fn reclaim_private_quarantine(
         return PrivateOutcome::Skipped;
     }
     let original = temp.join(original_name);
-    let safe = inspect(&root, metadata.dev(), now).is_ok_and(|result| result.is_some())
+    let safe = inspect(&root, metadata.dev(), when.idle_at).is_ok_and(|result| result.is_some())
         && (marker_owner_dead(&root)
             || (!root.join(MARKER).exists() && owner_dead(&path.join(PRIVATE_OWNER))))
         && open_files(&root) == Some(false);
     if safe {
-        let bytes = inspect(&root, metadata.dev(), now)
+        let bytes = inspect(&root, metadata.dev(), when.idle_at)
             .ok()
             .flatten()
             .unwrap_or(0);
@@ -2004,6 +2018,79 @@ mod tests {
         assert!(private.exists());
         let events = sweep_after_grace(&temp, |_| Some(false));
         assert_eq!(events, vec![(name.clone(), "removed".to_string())]);
+        assert!(!private.exists());
+        assert!(!temp.join(name).exists());
+    }
+
+    fn reclaim_quarantines_after_grace(
+        temp: &Path,
+        open_files: impl Fn(&Path) -> Option<bool>,
+    ) -> Vec<(String, bool)> {
+        let mut events = Vec::new();
+        reclaim_runtime_quarantines(
+            temp,
+            SystemTime::now() + QUARANTINE_GRACE + Duration::from_secs(1),
+            unsafe { nix::libc::geteuid() },
+            &open_files,
+            &mut |name, event| {
+                events.push((
+                    name.to_string(),
+                    matches!(event, RuntimeRootEvent::Removed { bytes } if bytes > 0),
+                ))
+            },
+        )
+        .unwrap();
+        events
+    }
+
+    #[test]
+    fn the_quarantine_scan_itself_deletes_a_killed_removal() {
+        let temp = fixture();
+        let (name, private) = killed_removal(&temp, &format!("{} 1", i32::MAX));
+        let events = reclaim_quarantines_after_grace(&temp, |_| Some(false));
+        assert_eq!(events, vec![(name.clone(), true)]);
+        assert!(!private.exists());
+        assert!(!temp.join(name).exists(), "never exposed under its name");
+    }
+
+    #[test]
+    fn the_quarantine_scan_restores_a_live_owner_without_deleting() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&owner_identity().unwrap()));
+        let name = root.file_name().unwrap().to_str().unwrap().to_string();
+        quarantine_root(
+            &temp,
+            &root,
+            &name,
+            fs::metadata(&root).unwrap().dev(),
+            &|_| Some(false),
+        )
+        .ok()
+        .unwrap();
+        assert!(reclaim_quarantines_after_grace(&temp, |_| Some(false)).is_empty());
+        assert!(root.join("build/artifact").exists());
+    }
+
+    #[test]
+    fn a_killed_removal_goes_even_when_the_main_scan_would_skip_its_root() {
+        let temp = fixture();
+        let (name, private) = killed_removal(&temp, &format!("{} 1", i32::MAX));
+        let mut events = Vec::new();
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now() + QUARANTINE_GRACE + Duration::from_secs(1),
+            |_| Some(false),
+            each(|_| Some(false)),
+            &|_| true,
+            &mut |reported, event| {
+                events.push((
+                    reported.to_string(),
+                    matches!(event, RuntimeRootEvent::Removed { .. }),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(events, vec![(name.clone(), true)]);
         assert!(!private.exists());
         assert!(!temp.join(name).exists());
     }
