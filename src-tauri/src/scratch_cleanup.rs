@@ -793,7 +793,14 @@ fn reclaim_private_quarantine(
             .ok()
             .flatten()
             .unwrap_or(0);
-        if fs::remove_dir_all(&root).is_ok() {
+        // A read-only directory the killed removal had not reached blocks
+        // deletion, as in `finish_quarantined`.
+        let mut removed = fs::remove_dir_all(&root);
+        if removed.is_err() {
+            make_directories_writable(&root);
+            removed = fs::remove_dir_all(&root);
+        }
+        if removed.is_ok() {
             remove_private_parent(path);
             return PrivateOutcome::Removed(bytes);
         }
@@ -2093,6 +2100,23 @@ mod tests {
         assert_eq!(events, vec![(name.clone(), true)]);
         assert!(!private.exists());
         assert!(!temp.join(name).exists());
+    }
+
+    #[test]
+    fn a_killed_removal_with_a_read_only_directory_is_still_reclaimed() {
+        let temp = fixture();
+        let (name, private) = killed_removal(&temp, &format!("{} 1", i32::MAX));
+        // The quarantine child sits unlisted in a 0300 parent; find it as
+        // the recovery code does.
+        let child = private_child(&private).unwrap().unwrap();
+        fs::set_permissions(
+            child.join("build/deps/inner"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        let events = reclaim_quarantines_after_grace(&temp, |_| Some(false));
+        assert_eq!(events, vec![(name, true)]);
+        assert!(!private.exists());
     }
 
     #[test]
