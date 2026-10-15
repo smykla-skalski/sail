@@ -1768,7 +1768,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_spawn",
-        "Start an agent using an explicit role and task-risk model route, or a legacy provider selection. A new worktree is used by default; an explicit existing target shares its files. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
+        "Start an agent using an explicit role and task-risk model route, or a legacy provider selection. A new worktree is used by default; an explicit existing target shares its files. For an implementation worker, pass shipIssue with repository and number to assign its canonical Ship checkpoint and local claim before its prompt starts. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
         "role,risk,prompt",
     ),
     (
@@ -2282,6 +2282,7 @@ pub fn run_mcp_stdio() {
                             "role":{"type":"string","enum":["exploration","implementation","debugging","review","ci-triage"]},
                             "risk":{"type":"string","enum":["low","medium","high"]},
                             "prompt":{"type":"string"},
+                            "shipIssue":{"type":"object","properties":{"repository":{"type":"string","pattern":"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},"number":{"type":"integer","minimum":1}},"required":["repository","number"],"additionalProperties":false},
                             "receiptId":{"type":"string","format":"uuid"},
                             "accessKey":{"type":"string","format":"uuid"},
                             "target":{"oneOf":[
