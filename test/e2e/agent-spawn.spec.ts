@@ -391,7 +391,7 @@ describe('provider selected agent spawn', () => {
         const response = await callMcp(config, sessionId, {
           provider: 'codex',
           prompt,
-          target: { kind: 'existing', path },
+          ...(prompt === 'Agent error interrupted' ? {} : { target: { kind: 'existing', path } }),
         });
         const launch = z
           .object({ receiptId: z.string(), accessKey: z.string() })

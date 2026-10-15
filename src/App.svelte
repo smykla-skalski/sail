@@ -6626,7 +6626,7 @@
               if (shippingReceipt) {
                 updateSpawnReceipt(shippingReceipt.receiptId, {
                   state: interrupted ? 'interrupted' : 'failed',
-                  error: interrupted ? null : describe(cause),
+                  error: describe(cause),
                 });
                 spawnOutput.delete(shippingReceipt.receiptId);
                 if (
@@ -8640,7 +8640,7 @@
           if (receiptId) {
             updateSpawnReceipt(receiptId, {
               state: interrupted ? 'interrupted' : 'failed',
-              error: interrupted ? null : describe(cause),
+              error: describe(cause),
             });
             spawnOutput.delete(receiptId);
             if (
