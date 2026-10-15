@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -673,6 +674,66 @@ await test('fixture process stops skip pids 0, 1 and negative ones from the list
   });
   assert.equal(done, true);
   assert.deepEqual(sent, [[4242, 'SIGTERM']]);
+});
+
+await test('releasing a run in a registry that became read-only does not throw', (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  const handle = registerRun(registry, 'locked');
+  chmodSync(registry, 0o555);
+  try {
+    assert.doesNotThrow(() => {
+      handle.setBinary('/x/Sail E2E 0123abcd.app/Contents/MacOS/sail');
+      handle.release();
+    });
+  } finally {
+    chmodSync(registry, 0o755);
+  }
+});
+
+const failingKill = (code: string) => () => {
+  throw Object.assign(new Error(`kill ${code}`), { code });
+};
+
+await test('a permission error on a group that only has zombies left is not fatal', () => {
+  assert.doesNotThrow(() => signalGroup(4242, 'SIGTERM', failingKill('EPERM')));
+  assert.throws(() => signalGroup(4242, 'SIGTERM', failingKill('EINVAL')), /EINVAL/);
+});
+
+await test('stopping an app never signals the runner or its shell', async () => {
+  const binary = '/x/Sail E2E 0123abcd.app/Contents/MacOS/sail';
+  const sent: Array<[number, string]> = [];
+  const { stopApp } = nativeApp({
+    checkout,
+    kill: noSignals(sent),
+    identity: () => 'same',
+    listing: (columns: string) =>
+      columns === 'pid=,command='
+        ? `100 ${binary}`
+        : `${process.pid} 100\n${process.ppid} 100\n200 100`,
+  });
+  await stopApp(binary);
+  assert.deepEqual(
+    sent.map(([pid]) => pid),
+    [200, 100, 200, 100],
+  );
+});
+
+await test('a partial record write is removed with its run and when it is old', async (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  recordWith(registry, 'dead', {});
+  writeFileSync(join(registry, 'dead.json.tmp'), '{"id":"dead"');
+  writeFileSync(join(registry, 'fresh.json.tmp'), '{"id":');
+  writeFileSync(join(registry, 'stale.json.tmp'), '{"id":');
+  const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+  utimesSync(join(registry, 'stale.json.tmp'), longAgo, longAgo);
+  await reap(registry, {
+    stopApp: async () => undefined,
+    appProcesses: () => [],
+    owns: () => false,
+  });
+  assert.deepEqual(readdirSync(registry).toSorted(), ['fresh.json.tmp']);
 });
 
 await test('the registry folder can be chosen and must be absolute', () => {

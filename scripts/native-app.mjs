@@ -6,7 +6,7 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { e2eContextService, e2eIdentity } from './e2e-identity.mjs';
 import { buildIdentifierKey } from './native-app-data.mjs';
-import { signalablePid } from './native-signal-guard.mjs';
+import { isOwnProcess, signalablePid } from './native-signal-guard.mjs';
 
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 
@@ -138,7 +138,10 @@ export function nativeApp({
       .map((line) => line.trim().split(/\s+/).map(Number));
     const descendants = (parents, seen = new Set(parents)) => {
       const next = tree
-        .filter(([pid, parent]) => signalablePid(pid) && parents.has(parent) && !seen.has(pid))
+        .filter(
+          ([pid, parent]) =>
+            signalablePid(pid) && !isOwnProcess(pid) && parents.has(parent) && !seen.has(pid),
+        )
         .map(([pid]) => pid);
       if (next.length === 0) return [];
       for (const pid of next) seen.add(pid);
@@ -150,7 +153,12 @@ export function nativeApp({
     }));
     const signalOwned = (signal) => {
       for (const { pid, identity } of owned) {
-        if (signalablePid(pid) && identity && readIdentity(pid) === identity) {
+        if (
+          signalablePid(pid) &&
+          !isOwnProcess(pid) &&
+          identity &&
+          readIdentity(pid) === identity
+        ) {
           try {
             kill(pid, signal);
           } catch (error) {

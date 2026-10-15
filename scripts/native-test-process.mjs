@@ -24,7 +24,7 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal, on
       process.kill(-child.pid, value);
       return true;
     } catch (error) {
-      if (error.code !== 'ESRCH') throw error;
+      if (error.code !== 'ESRCH' && error.code !== 'EPERM') throw error;
       return false;
     }
   };

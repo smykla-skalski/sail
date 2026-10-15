@@ -16,6 +16,7 @@ import { userTemporaryDirectory } from './native-app-data.mjs';
 import { isOwnProcess, signalablePid } from './native-signal-guard.mjs';
 
 const recordName = /^[A-Za-z0-9._-]+\.json$/;
+const partialName = /^[A-Za-z0-9._-]+\.json\.tmp$/;
 const corruptGraceMs = 2 * 60 * 60 * 1000;
 
 /**
@@ -79,8 +80,12 @@ export function registerRun(registry, id) {
       },
     }),
     release() {
-      rmSync(path, { force: true });
-      rmSync(`${path}.tmp`, { force: true });
+      try {
+        rmSync(path, { force: true });
+        rmSync(`${path}.tmp`, { force: true });
+      } catch (error) {
+        process.stderr.write(`Run registry cleanup failed: ${error.message}\n`);
+      }
     },
   };
 }
@@ -124,7 +129,7 @@ export function signalGroup(pgid, signal, kill = (pid, name) => process.kill(pid
   try {
     kill(-pgid, signal);
   } catch (error) {
-    if (error.code !== 'ESRCH') throw error;
+    if (error.code !== 'ESRCH' && error.code !== 'EPERM') throw error;
   }
 }
 
@@ -213,6 +218,17 @@ export async function reapDeadRuns(
     if (error.code === 'ENOENT') return { reaped: [], kept: [], failed: [] };
     throw error;
   }
+  const clearStalePartials = () => {
+    for (const name of readdirSync(registry).filter((entry) => partialName.test(entry))) {
+      const path = join(registry, name);
+      try {
+        if (now - statSync(path).mtimeMs > corruptGraceMs) rmSync(path, { force: true });
+      } catch {
+        continue;
+      }
+    }
+  };
+  clearStalePartials();
   const reapOne = async (name) => {
     const path = join(registry, name);
     try {
@@ -230,6 +246,7 @@ export async function reapDeadRuns(
       const appGone = !record.binary || appProcesses(record.binary).length === 0;
       if (!groups.every(Boolean) || !appGone) return { outcome: 'failed', id: record.id };
       rmSync(path, { force: true });
+      rmSync(`${path}.tmp`, { force: true });
       return { outcome: 'reaped', id: record.id };
     } catch (error) {
       return error.code === 'ENOENT' ? null : { outcome: 'failed', id: path };
