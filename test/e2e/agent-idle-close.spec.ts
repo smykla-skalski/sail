@@ -484,6 +484,51 @@ describe('idle session close', () => {
   }
 
   for (const provider of ['codex', 'claude'] as const) {
+    it(`removes a loaded or restored ${provider} thread from activity immediately on delete`, async () => {
+      const directory = realpathSync(repository);
+      await pauseIdleClose();
+      const [loaded, restored] = await newSessions(provider, directory, 2);
+      await finishTurns(provider, directory, [loaded, restored]);
+      await closeIdleThreads(restored);
+      await browser.tauri.execute(
+        async ({ core }, agent, path, session) => {
+          const reservation = await core.invoke<{ restoreToken: string }>(
+            'acp_begin_session_restore',
+            { agent, cwd: path, sessionId: session },
+          );
+          await core.invoke('acp_resume_session', {
+            params: {
+              agent,
+              cwd: path,
+              sessionId: session,
+              restoreToken: reservation.restoreToken,
+            },
+          });
+          await core.invoke('acp_end_session_restore', {
+            agent,
+            directory: path,
+            sessionId: session,
+            restoreToken: reservation.restoreToken,
+          });
+        },
+        provider,
+        directory,
+        restored,
+      );
+      for (const id of [loaded, restored]) {
+        expect(await attached(provider, directory)).toContain(id);
+        await browser.tauri.execute(
+          async ({ core }, agent, path, sessionId) => {
+            await core.invoke('acp_forget_session', { agent, directory: path, sessionId });
+          },
+          provider,
+          directory,
+          id,
+        );
+        expect(await attached(provider, directory)).not.toContain(id);
+      }
+    });
+
     it(`drops a closed ${provider} thread's idle state when it is deleted, also during a resume`, async () => {
       const directory = realpathSync(repository);
       await pauseIdleClose();

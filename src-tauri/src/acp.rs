@@ -7655,35 +7655,20 @@ pub async fn acp_forget_session(
                 return Err(error.to_string());
             }
         }
-        let restoring = match runtime
+        if let Err(error) = runtime
             .restores
             .lock()
             .map(|mut claims| claims.remove(&session_id))
         {
-            Ok(claim) => claim.is_some(),
-            Err(error) => {
-                runtime
-                    .prompt_state
-                    .lock()
-                    .map_err(|cause| cause.to_string())?
-                    .finish_forget(&session_id, false);
-                return Err(error.to_string());
-            }
-        };
+            runtime
+                .prompt_state
+                .lock()
+                .map_err(|cause| cause.to_string())?
+                .finish_forget(&session_id, false);
+            return Err(error.to_string());
+        }
         runtime.restore_ready.notify_all();
-        // A restore reservation registered the thread; a deleted thread must not stay registered.
-        let cleared = runtime
-            .idle
-            .lock()
-            .map(|mut idle| idle.forget(&session_id))
-            .map_err(|error| error.to_string())
-            .and_then(|()| {
-                if restoring {
-                    unregister_session(&runtime, &session_id)
-                } else {
-                    Ok(())
-                }
-            });
+        let cleared = forget_registered_session(&runtime, &session_id);
         if let Err(error) = cleared {
             runtime
                 .prompt_state
@@ -7731,6 +7716,19 @@ pub async fn acp_forget_session(
             .lock()
             .map_err(|error| error.to_string())?
             .finish_forget(&session_id, true);
+        if runtime.supports_session_close() {
+            let closing = Arc::clone(&runtime);
+            let closing_session = session_id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                close_deleted_session(&closing, &closing_session, || {
+                    closing.request(
+                        "session/close",
+                        json!({"sessionId":closing_session}),
+                        Duration::from_secs(30),
+                    )
+                });
+            });
+        }
     }
     Ok(())
 }
@@ -8177,6 +8175,28 @@ fn unregister_if_deleted(runtime: &Connection, session_id: &str) -> Result<bool,
         unregister_session(runtime, session_id)?;
     }
     Ok(forgotten)
+}
+
+fn forget_registered_session(runtime: &Connection, session_id: &str) -> Result<(), String> {
+    runtime
+        .idle
+        .lock()
+        .map_err(|error| error.to_string())?
+        .forget(session_id);
+    unregister_session(runtime, session_id)
+}
+
+fn close_deleted_session(
+    runtime: &Connection,
+    session_id: &str,
+    close: impl FnOnce() -> Result<Value, String>,
+) {
+    if let Err(error) = close() {
+        crate::diagnostics::record(
+            "deleted_session_close_failed",
+            json!({"agent":runtime.agent,"sessionId":session_id,"error":error}),
+        );
+    }
 }
 
 fn unregister_session(runtime: &Connection, session_id: &str) -> Result<(), String> {
@@ -13900,6 +13920,45 @@ mod idle_close_tests {
             .unwrap()
             .is_none());
         assert!(!runtime.idle.lock().unwrap().is_closed("ses_ui_loaded"));
+    }
+
+    #[test]
+    fn deleting_loaded_or_just_restored_threads_unregisters_before_close() {
+        for agent in ["codex", "claude"] {
+            for restored in [false, true] {
+                let session = format!("ses_loaded_delete_{agent}_{restored}");
+                let runtime = closed_runtime(agent, &session);
+                if restored {
+                    let mut claim = runtime.begin_attaching_restore(&session).unwrap().unwrap();
+                    claim.resumed = true;
+                    drop(claim);
+                    let token = runtime.begin_restore(&session).unwrap()["restoreToken"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    runtime.release_restore(&session, &token).unwrap();
+                } else {
+                    attach(&runtime, &session);
+                }
+                forget_registered_session(&runtime, &session).unwrap();
+                close_deleted_session(&runtime, &session, || {
+                    assert!(!runtime
+                        .session_profiles
+                        .lock()
+                        .unwrap()
+                        .contains_key(&session));
+                    assert!(!runtime
+                        .session_directories
+                        .lock()
+                        .unwrap()
+                        .contains_key(&session));
+                    Err("close failed".into())
+                });
+                let idle = runtime.idle.lock().unwrap();
+                assert!(!idle.is_closed(&session));
+                assert!(!idle.is_resuming(&session));
+            }
+        }
     }
 
     #[test]
