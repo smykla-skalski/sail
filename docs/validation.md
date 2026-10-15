@@ -38,13 +38,14 @@ npm run build:e2e   # once, as build-slot npm run build:e2e on a shared machine
 npm run measure:footprint -- --app "path/to/Sail E2E <id>.app"
 ```
 
-Without `--app` the command builds the app itself, which needs 20 GiB free. `--help` lists the profile size, sample times, window, tolerance and `--json` result file.
+Without `--app` the command builds the app itself, which needs 20 GiB free. `--help` lists the profile size, sample times, windows, tolerance and `--json` result file.
 
-- A snapshot at 10 minutes and one at 2 hours after launch each cover the five minutes before them. Child process count and total RSS are medians of the readings taken every 10 seconds; ACP session listings and settings file writes are rates per minute over the window.
+- A snapshot at 10 minutes and one at 2 hours after launch each cover the five minutes before them. Child process count is the median of the readings taken every 10 seconds; ACP session listings and settings file writes are rates per minute over the window.
+- Total RSS is judged over two long windows instead of those snapshots, because the footprint cycles between an active phase with child processes (about 90 MB) and an idle phase without them (about 46 MB). The early window starts at the first sample point (10 minutes) and the late window ends at the second (2 hours); each is 40 minutes wide (`--rss-window-minutes`, shortened so the two never overlap). Within each window the median RSS is taken per phase, active (the app has child processes) and idle (none), and each phase is compared across the windows. A phase needs at least 3 readings in both windows to count. The report prints both windows, the readings and median of each phase, and the change.
 - Child processes are the descendants of the app; RSS is the app plus those descendants. WebKit's WebContent and Networking helpers are launched by launchd, not by the app, so they are outside both numbers.
 - Session listings are counted by the scripted ACP agent (`SAIL_E2E_ACP_LIST_LOG`). Settings writes are counted by polling `settings.json` and `records/` for a replaced file every 250 ms, so a burst of writes between two polls counts once.
 - Startup maintenance is `elapsedMs` of the `startup_maintenance_finished` event in the app's `sail.log`. The profile exercises the `$TMPDIR` sweep; the worktree storage and Git overlay phases have no state to restore on a fresh profile.
-- The result passes when the 2-hour child count and RSS are each within 10% of the 10-minute value (`--tolerance`, in either direction) and startup maintenance finishes in under 30 seconds. The command exits 1 on failure and 130 when cancelled.
+- The result passes when the 2-hour child count is within 10% of the 10-minute value (`--tolerance`, in either direction), the median RSS of every compared phase is within 10% across the two windows, at least one phase was compared, and startup maintenance finishes in under 30 seconds. A footprint that grows steadily moves both phases and fails; a cycle without growth passes whichever phase a window ends in. The command exits 1 on failure and 130 when cancelled.
 
 ### Reference run, 2026-10-15
 
@@ -60,7 +61,7 @@ macOS 26.6.2, Apple M4 Max, 36 GiB. App built from `9c9a63df` (`npm run build:e2
 - Child processes passed (+0.0%), RSS failed (+24.1%, limit ±10%), startup maintenance passed at 10.7 s (`scratchSweep` 10,535 ms, `worktreeStorage` 101 ms, `gitOverlay` 51 ms), and all 32 stale roots were removed.
 - Over the 2 hours the app made 864 session listings and 7 settings writes (about 7 listings per minute on average; none fell in the first window).
 - The footprint is not flat, it cycles. The app's children dropped from 3 to 0 at 10.7, 35.7, 75.6 and 98.1 minutes and came back at 21.2, 41.6, 84.6 and 113.6 minutes. With 0 children the median RSS is 46.2 MB (34% of readings); with 3 children the median is 90.5 MB. Medians of the active phases in minutes 12–40, 40–80 and 80–120 are 89.8, 77.8 and 95.5 MB, so the sample difference comes from where each window lands in the cycle, not from growth.
-- Both 5-minute windows landed in an active phase: RSS ranged 75.8–82.8 MB in the first and 97.0–108.7 MB in the second. A 5-minute window cannot average a cycle that lasts tens of minutes, so the RSS check is sensitive to timing. Repeat the run, or lengthen `--first-minutes` and `--window-minutes`, before reading a single failure as a regression.
+- Both 5-minute windows landed in an active phase: RSS ranged 75.8–82.8 MB in the first and 97.0–108.7 MB in the second. A 5-minute window cannot average a cycle that lasts tens of minutes, so that run's single-sample RSS check was sensitive to timing. The command now compares per-phase medians over 40-minute windows, which that run's data passes (its active-phase medians of 89.8 MB in minutes 12–40 and 95.5 MB in minutes 80–120 differ by 6%).
 
 CI runs the frontend and Rust checks on Ubuntu, macOS, and Windows. The desktop WDIO suite requires a graphical runner and is a release check on each supported platform until hosted graphical runners are configured.
 

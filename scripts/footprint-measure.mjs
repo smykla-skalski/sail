@@ -5,6 +5,7 @@ export const defaults = {
   firstMinutes: 10,
   secondMinutes: 120,
   windowMinutes: 5,
+  rssWindowMinutes: 40,
   intervalSeconds: 10,
   tolerance: 0.1,
   maintenanceLimitSeconds: 30,
@@ -17,6 +18,7 @@ const numeric = {
   '--first-minutes': ['firstMinutes', 'number', 0],
   '--second-minutes': ['secondMinutes', 'number', 0],
   '--window-minutes': ['windowMinutes', 'number', 0],
+  '--rss-window-minutes': ['rssWindowMinutes', 'number', 0],
   '--interval-seconds': ['intervalSeconds', 'number', 0],
   '--tolerance': ['tolerance', 'number', 0],
   '--maintenance-limit-seconds': ['maintenanceLimitSeconds', 'number', 0],
@@ -26,6 +28,8 @@ const text = { '--app': 'app', '--json': 'json' };
 export const usage = `Usage: npm run measure:footprint -- [options]
 
 Launches a private Sail on a generated profile, samples it twice and checks that it stays flat.
+Children are judged from the two samples. RSS is judged from two long windows, one after each sample
+point, compared per phase (with and without child processes) because the footprint cycles.
 
   --app <path>                      Private "Sail E2E" bundle from "npm run build:e2e" (built when omitted)
   --json <file>                     Also write the result as JSON
@@ -35,8 +39,9 @@ Launches a private Sail on a generated profile, samples it twice and checks that
   --first-minutes <m>               First sample after launch (default ${defaults.firstMinutes})
   --second-minutes <m>              Second sample after launch (default ${defaults.secondMinutes})
   --window-minutes <m>              Trailing window each sample covers (default ${defaults.windowMinutes})
+  --rss-window-minutes <m>          Width of each RSS comparison window, shortened to fit (default ${defaults.rssWindowMinutes})
   --interval-seconds <s>            Process sampling interval (default ${defaults.intervalSeconds})
-  --tolerance <ratio>               Allowed drift of children and RSS between samples (default ${defaults.tolerance})
+  --tolerance <ratio>               Allowed drift of children between samples and of RSS between windows (default ${defaults.tolerance})
   --maintenance-limit-seconds <s>   Startup maintenance limit (default ${defaults.maintenanceLimitSeconds})
 `;
 
@@ -65,8 +70,15 @@ export function parseOptions(argv) {
     } else throw new Error(`Unknown option ${flag}`);
   }
   if (options.tolerance > 1) throw new Error('--tolerance is a ratio between 0 and 1');
-  if (options.worktrees < 1 || options.intervalSeconds <= 0 || options.windowMinutes <= 0)
-    throw new Error('--worktrees, --interval-seconds and --window-minutes must be positive');
+  if (
+    options.worktrees < 1 ||
+    options.intervalSeconds <= 0 ||
+    options.windowMinutes <= 0 ||
+    options.rssWindowMinutes <= 0
+  )
+    throw new Error(
+      '--worktrees, --interval-seconds, --window-minutes and --rss-window-minutes must be positive',
+    );
   if (options.secondMinutes <= options.firstMinutes)
     throw new Error('--second-minutes must be later than --first-minutes');
   if (options.windowMinutes > options.firstMinutes)
@@ -152,6 +164,61 @@ function drift(first, second, tolerance) {
   return { first, second, delta, ratio, pass: Math.abs(ratio) <= tolerance };
 }
 
+/** A phase needs this many readings in both windows to be compared. */
+export const minimumPhaseReadings = 3;
+
+const phaseNames = [
+  ['active', (sample) => sample.children > 0],
+  ['idle', (sample) => sample.children === 0],
+];
+
+/**
+ * Two non-overlapping windows of the same width, one right after the first sample point and one
+ * ending at the second. Medians are taken per phase, because the app alternates between running
+ * with child processes and idling without them and the two phases differ in size by about 2x.
+ */
+export function rssWindows({ samples, launchedAt, options }) {
+  const half = (options.secondMinutes - options.firstMinutes) / 2;
+  const widthMinutes = Math.min(options.rssWindowMinutes, half);
+  const width = widthMinutes * 60_000;
+  const early = { from: options.firstMinutes * 60_000 };
+  early.to = early.from + width;
+  const late = { to: options.secondMinutes * 60_000 };
+  late.from = late.to - width;
+  const phases = phaseNames.map(([name, belongs]) => {
+    const readings = (window) =>
+      samples.filter(
+        (sample) => belongs(sample) && inWindow(sample.time - launchedAt, window.to, width),
+      );
+    const summary = (window) => {
+      const found = readings(window);
+      return { readings: found.length, rssBytes: median(found.map((sample) => sample.rssBytes)) };
+    };
+    return { name, early: summary(early), late: summary(late) };
+  });
+  return { widthMinutes, early, late, phases };
+}
+
+function judgeRss(windows, tolerance) {
+  const phases = windows.phases.map((phase) => {
+    const compared =
+      phase.early.readings >= minimumPhaseReadings && phase.late.readings >= minimumPhaseReadings;
+    return {
+      ...phase,
+      compared,
+      ...(compared
+        ? drift(phase.early.rssBytes, phase.late.rssBytes, tolerance)
+        : { delta: null, ratio: null, pass: true }),
+    };
+  });
+  const comparedCount = phases.filter((phase) => phase.compared).length;
+  return {
+    windows: { ...windows, phases },
+    compared: comparedCount,
+    pass: comparedCount > 0 && phases.every((phase) => phase.pass),
+  };
+}
+
 /** The details of the latest `startup_maintenance_finished` event at or after `since`, or null. */
 export function startupMaintenance(log, since = 0) {
   let finished = null;
@@ -180,9 +247,9 @@ function parseLine(line) {
   }
 }
 
-export function evaluate({ first, second, maintenance, options }) {
+export function evaluate({ first, second, samples, launchedAt, maintenance, options }) {
   const children = drift(first.children, second.children, options.tolerance);
-  const rss = drift(first.rssBytes, second.rssBytes, options.tolerance);
+  const rss = judgeRss(rssWindows({ samples, launchedAt, options }), options.tolerance);
   const limitMs = options.maintenanceLimitSeconds * 1000;
   const elapsedMs = maintenance?.elapsedMs ?? null;
   const startup = { elapsedMs, limitMs, pass: elapsedMs !== null && elapsedMs < limitMs };
@@ -197,6 +264,18 @@ const mark = (pass) => (pass ? 'PASS' : 'FAIL');
 const gap = (a, b, scale = 1) => (a === null || b === null ? null : (b - a) / scale);
 const minutes = (ms) => `${fixed(ms / 60_000)} min`;
 
+function table(header, rows) {
+  const widths = header.map((cell, column) =>
+    Math.max(cell.length, ...rows.map((row) => row[column].length)),
+  );
+  return [header, ...rows].map((cells) =>
+    cells
+      .map((cell, column) => cell.padEnd(widths[column]))
+      .join('  ')
+      .trimEnd(),
+  );
+}
+
 export function formatReport({ first, second, verdict, maintenance, options, launchedAt }) {
   const rows = [
     [
@@ -204,12 +283,6 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
       fixed(first.children, 0),
       fixed(second.children, 0),
       signed(gap(first.children, second.children), 0),
-    ],
-    [
-      'Total RSS',
-      megabytes(first.rssBytes),
-      megabytes(second.rssBytes),
-      `${signed(gap(first.rssBytes, second.rssBytes, 1024 * 1024))} MB`,
     ],
     [
       'ACP session listings / min',
@@ -230,16 +303,19 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
     `At ${minutes(second.at - launchedAt)}`,
     'Difference',
   ];
-  const widths = header.map((cell, column) =>
-    Math.max(cell.length, ...rows.map((row) => row[column].length)),
-  );
-  const line = (cells) =>
-    cells
-      .map((cell, column) => cell.padEnd(widths[column]))
-      .join('  ')
-      .trimEnd();
   const percent = (check) => (check.ratio === null ? 'n/a' : `${signed(check.ratio * 100)}%`);
   const limit = `limit ±${options.tolerance * 100}%`;
+  const { windows } = verdict.rss;
+  const span = (window) => `${fixed(window.from / 60_000)}-${fixed(window.to / 60_000)} min`;
+  const phaseRows = windows.phases.map((phase) => [
+    phase.name,
+    `${megabytes(phase.early.rssBytes)} (${phase.early.readings})`,
+    `${megabytes(phase.late.rssBytes)} (${phase.late.readings})`,
+    phase.compared
+      ? `${signed(gap(phase.early.rssBytes, phase.late.rssBytes, 1024 * 1024))} MB`
+      : 'not compared',
+    phase.compared ? percent(phase) : 'n/a',
+  ]);
   const phases = Object.entries(maintenance ?? {})
     .filter(([name]) => name.endsWith('Ms') && name !== 'elapsedMs')
     .map(([name, value]) => `${name.slice(0, -2)} ${value} ms`)
@@ -248,14 +324,22 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
     verdict.startup.elapsedMs === null
       ? 'did not finish'
       : `${(verdict.startup.elapsedMs / 1000).toFixed(1)} s`;
+  const rssDetail = verdict.rss.compared
+    ? `${verdict.rss.windows.phases
+        .filter((phase) => phase.compared)
+        .map((phase) => `${phase.name} ${percent(phase)}`)
+        .join(', ')} (${limit})`
+    : 'no phase had enough readings in both windows';
   return [
-    line(header),
-    ...rows.map(line),
+    ...table(header, rows),
     '',
-    `Each sample covers the ${options.windowMinutes} minutes before it; counts and RSS are medians of ${first.readings} and ${second.readings} readings.`,
+    `Child counts and rates are medians over the ${options.windowMinutes} minutes before each sample (${first.readings} and ${second.readings} readings).`,
+    '',
+    `Total RSS: median per phase over two ${fixed(windows.widthMinutes)}-minute windows (readings in brackets); active means the app has child processes.`,
+    ...table(['Phase', span(windows.early), span(windows.late), 'Difference', 'Change'], phaseRows),
     '',
     `${mark(verdict.children.pass)}  child processes ${percent(verdict.children)} (${limit})`,
-    `${mark(verdict.rss.pass)}  total RSS ${percent(verdict.rss)} (${limit})`,
+    `${mark(verdict.rss.pass)}  total RSS ${rssDetail}`,
     `${mark(verdict.startup.pass)}  startup maintenance ${elapsed} (limit ${verdict.startup.limitMs / 1000} s)${phases ? `; ${phases}` : ''}`,
     '',
     verdict.pass ? 'RESULT: PASS' : 'RESULT: FAIL',

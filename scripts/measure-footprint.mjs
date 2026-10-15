@@ -328,7 +328,7 @@ async function main() {
     const staleLeft = readdirSync(env.TMPDIR).filter((name) =>
       name.startsWith('sail-footprint-stale-'),
     ).length;
-    const verdict = evaluate({ first, second, maintenance, options });
+    const verdict = evaluate({ first, second, samples, launchedAt, maintenance, options });
     const totals = {
       listings: readTimes(env.SAIL_E2E_ACP_LIST_LOG).length,
       settingsWrites: writes.times.length,
