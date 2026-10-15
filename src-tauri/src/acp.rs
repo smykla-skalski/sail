@@ -122,7 +122,7 @@ impl NativeSubagentRegistry {
         session_id: &str,
         directory: PathBuf,
         can_cancel: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if let Some(entry) = self.0.get_mut(session_id) {
             if entry.parent_session_id != parent_session_id || entry.directory != directory {
                 return Err("Native child is already bound to another parent or directory.".into());
@@ -141,7 +141,7 @@ impl NativeSubagentRegistry {
                 },
             );
         }
-        Ok(())
+        Ok(self.0.get(session_id).is_some_and(Self::is_live))
     }
 
     fn cancellation_eligible(&self, session_id: &str) -> Option<bool> {
@@ -5123,6 +5123,17 @@ fn register_native_task_connections(
             );
         }
     }
+    // Settled ancestors only bridge registration of live descendants.
+    for (child_id, child) in children
+        .iter()
+        .filter(|(_, child)| !NativeSubagentRegistry::is_live(child))
+    {
+        browser.prune_native_children(
+            &runtime.agent,
+            &child.directory,
+            std::slice::from_ref(child_id),
+        );
+    }
     Ok(())
 }
 
@@ -5261,7 +5272,7 @@ fn record_native_subagent_update(
                     .0
                     .get(parent_id)
                     .is_some_and(|parent| parent.task_turn_id.is_some());
-            native.spawn(parent_id, child_id, directory.clone(), can_cancel)?;
+            let child_live = native.spawn(parent_id, child_id, directory.clone(), can_cancel)?;
             native.task_scope(child_id, agent == "opencode", live);
             let provider_id = (agent == "opencode").then(|| {
                 runtime
@@ -5272,8 +5283,13 @@ fn record_native_subagent_update(
                     })
                     .unwrap_or(child_id)
             });
-            app.state::<crate::browser_agent::BrowserManager>()
-                .register_native_child(agent, &directory, parent_id, child_id, provider_id);
+            let browser = app.state::<crate::browser_agent::BrowserManager>();
+            // A replayed spawn of a settled child must not hold the parent's task identity.
+            if child_live {
+                browser.register_native_child(agent, &directory, parent_id, child_id, provider_id);
+            } else {
+                browser.prune_native_children(agent, &directory, &[child_id.to_string()]);
+            }
             let generation = fence.generations.entry(directory).or_default();
             *generation = generation.saturating_add(1);
             Ok(())
@@ -11805,6 +11821,29 @@ mod native_subagent_fence_tests {
         let children = native.lock().unwrap();
         assert!(children.0["child"].task_turn_id.is_none());
         assert_eq!(children.0["child"].outcome, "unknown");
+    }
+
+    #[test]
+    fn replayed_spawn_reports_whether_the_child_is_still_live() {
+        let mut registry = NativeSubagentRegistry::default();
+        let directory = PathBuf::from("/repo");
+        assert!(registry
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap());
+        assert!(registry
+            .spawn("parent", "child", directory.clone(), true)
+            .unwrap());
+        for outcome in ["completed", "failed", "cancelled"] {
+            registry.update("parent", "child", outcome).unwrap();
+            assert!(!registry
+                .spawn("parent", "child", directory.clone(), false)
+                .unwrap());
+        }
+        registry.update("parent", "child", "working").unwrap();
+        assert!(registry
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap());
+        assert!(registry.spawn("other", "child", directory, false).is_err());
     }
 
     #[test]
