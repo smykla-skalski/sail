@@ -91,10 +91,28 @@ export function createSidebarListingClock() {
   };
 }
 
-/** Directories a superseded pass listed that the pass replacing it did not, so they need a new one. */
-export function uncoveredSidebarPaths(
-  superseded: readonly string[],
-  replacement: ReadonlySet<string>,
-): string[] {
-  return superseded.filter((path) => !replacement.has(path));
+/** Drops a removed directory from the waiting request; a request for everything stays as it is. */
+export function withoutSidebarRefreshPath(
+  waiting: SidebarRefreshPaths | undefined,
+  path: string,
+): SidebarRefreshPaths | undefined {
+  if (!waiting?.has(path)) return waiting;
+  return new Set([...waiting].filter((entry) => entry !== path));
+}
+
+/** Tells which listing pass owns each directory, so overlapping passes never overwrite newer data. */
+export function createSidebarPassOwnership() {
+  let generation = 0;
+  const newest = new Map<string, number>();
+  return {
+    begin(paths: readonly string[]): number {
+      generation += 1;
+      for (const path of paths) newest.set(path, generation);
+      return generation;
+    },
+    /** Directories of a finished pass that no newer pass has listed since. */
+    owned(paths: readonly string[], pass: number): string[] {
+      return paths.filter((path) => newest.get(path) === pass);
+    },
+  };
 }

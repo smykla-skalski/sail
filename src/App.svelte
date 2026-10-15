@@ -258,10 +258,11 @@
   import ProjectSidebar from './ProjectSidebar.svelte';
   import {
     createSidebarListingClock,
+    createSidebarPassOwnership,
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
-    uncoveredSidebarPaths,
     unlistedSidebarPaths,
+    withoutSidebarRefreshPath,
     type SidebarRefreshPaths,
   } from './lib/sidebar-inventory';
   import {
@@ -1735,8 +1736,7 @@
   let disposed = false;
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
-  let sidebarInventoryGeneration = 0;
-  let sidebarInventoryLatestPaths: ReadonlySet<string> = new Set();
+  const sidebarPassOwnership = createSidebarPassOwnership();
   const sidebarInventoryRequests = new SvelteSet<Promise<unknown>>();
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -10253,6 +10253,7 @@
   async function removeMissingWorktreeFromGui(repository: string, path: string): Promise<void> {
     if (directory === path) await loadProject(repository);
     saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
+    sidebarInventoryWaiting = withoutSidebarRefreshPath(sidebarInventoryWaiting, path);
     const removedThreads = agentThreads.filter((thread) => thread.directory === path);
     const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);
     agentThreads = agentThreads.filter((thread) => thread.directory !== path);
@@ -10389,6 +10390,7 @@
         },
       });
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
+      sidebarInventoryWaiting = withoutSidebarRefreshPath(sidebarInventoryWaiting, path);
       const removedThreads = agentThreads.filter((thread) => thread.directory === path);
       const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);
       agentThreads = agentThreads.filter((thread) => thread.directory !== path);
@@ -10944,21 +10946,23 @@
 
   async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;
-    const generation = ++sidebarInventoryGeneration;
-    sidebarInventoryLatestPaths = new Set(paths);
+    const pass = sidebarPassOwnership.begin(paths);
     const request = Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
     sidebarInventoryRequests.add(request);
-    const results = await request.finally(() => sidebarInventoryRequests.delete(request));
+    const settled = await request.finally(() => sidebarInventoryRequests.delete(request));
     if (disposed) return null;
-    if (generation !== sidebarInventoryGeneration) {
-      // A newer pass dropped these results; list what it did not cover.
-      const uncovered = uncoveredSidebarPaths(paths, sidebarInventoryLatestPaths);
-      if (uncovered.length > 0) scheduleSidebarInventoryRefresh(250, uncovered);
-      return null;
-    }
-    const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
-    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories[path] = true;
-    const listed = new Set(paths);
+    // A newer pass that listed a directory owns its result; the rest of this pass still applies.
+    const ownedPaths = new Set(sidebarPassOwnership.owned(paths, pass));
+    const owned = paths.flatMap((path, index) =>
+      ownedPaths.has(path) ? [{ path, result: settled[index] }] : [],
+    );
+    if (owned.length === 0) return null;
+    const results = owned.map((entry) => entry.result);
+    const failed = new Set(
+      owned.filter((entry) => entry.result?.status === 'rejected').map((entry) => entry.path),
+    );
+    for (const { path } of owned) if (!failed.has(path)) sidebarListedDirectories[path] = true;
+    const listed = new Set(owned.map((entry) => entry.path));
     const retained = sidebarOpenCodeThreads.filter(
       (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
     );
@@ -10967,14 +10971,14 @@
     );
     sidebarOpenCodeThreads = [
       ...results
-        .flatMap((result) => (result.status === 'fulfilled' ? result.value : []))
+        .flatMap((result) => (result?.status === 'fulfilled' ? result.value : []))
         .map((thread) => {
           const saved = renamed.get(threadKey(thread));
           return saved ? Object.assign({}, thread, { title: saved.title, renamed: true }) : thread;
         }),
       ...retained,
     ];
-    const failure = results.find((result) => result.status === 'rejected');
+    const failure = results.find((result) => result?.status === 'rejected');
     return failure?.status === 'rejected'
       ? `Could not list OpenCode sessions: ${describe(failure.reason)}`
       : null;

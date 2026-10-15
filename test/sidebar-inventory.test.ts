@@ -3,11 +3,12 @@ import test from 'node:test';
 import type { AgentThread } from '../src/lib/acp.ts';
 import {
   createSidebarListingClock,
+  createSidebarPassOwnership,
   createSidebarThreadLoader,
   mergeSidebarRefreshPaths,
   sidebarFocusRefreshDue,
-  uncoveredSidebarPaths,
   unlistedSidebarPaths,
+  withoutSidebarRefreshPath,
   type SidebarRefreshPaths,
 } from '../src/lib/sidebar-inventory.ts';
 
@@ -295,11 +296,34 @@ void test('a full listing request lists the catalog and restarts the focus clock
   assert.equal(session.clock.focusRefreshDelay(10_000), 21_000);
 });
 
-void test('a superseded pass leaves only the directories its replacement skipped', () => {
-  assert.deepEqual(uncoveredSidebarPaths(profile, new Set(['/elsewhere'])), profile);
+void test('a removed directory leaves the queued request', () => {
+  const queued = new Set(['/a', '/b']);
+  assert.deepEqual([...(withoutSidebarRefreshPath(queued, '/a') ?? [])], ['/b']);
+  assert.equal(withoutSidebarRefreshPath(queued, '/c'), queued);
+  assert.equal(withoutSidebarRefreshPath(null, '/a'), null);
+  assert.equal(withoutSidebarRefreshPath(undefined, '/a'), undefined);
+});
+
+void test('an outside thread during the startup pass keeps the startup results', () => {
+  const passes = createSidebarPassOwnership();
+  const startup = passes.begin(profile);
+  const outside = passes.begin(['/elsewhere']);
+
+  // The older pass finishes after the newer one started and still applies all 26 directories.
+  assert.deepEqual(passes.owned(profile, startup), profile);
+  assert.deepEqual(passes.owned(['/elsewhere'], outside), ['/elsewhere']);
+});
+
+void test('a newer pass owns the directories it listed again', () => {
+  const passes = createSidebarPassOwnership();
+  const first = passes.begin(profile);
+  const second = passes.begin([profile[3]]);
+
   assert.deepEqual(
-    uncoveredSidebarPaths(profile, new Set(profile.slice(0, 20))),
-    profile.slice(20),
+    passes.owned(profile, first),
+    profile.filter((path) => path !== profile[3]),
   );
-  assert.deepEqual(uncoveredSidebarPaths(['/a'], new Set(['/a'])), []);
+  assert.deepEqual(passes.owned([profile[3]], second), [profile[3]]);
+  // Finishing in either order leaves one owner per directory and never loops.
+  assert.deepEqual(passes.owned([profile[3]], first), []);
 });
