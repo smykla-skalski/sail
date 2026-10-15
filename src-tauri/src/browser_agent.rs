@@ -1744,7 +1744,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "validation_gate",
-        "Start one fresh Ship It validation pass in this worktree using a selected available agent and model. Returns its actual provider, model, and launch receipt. Run passes in order and wait for each result.",
+        "Start one fresh Ship It validation pass in this worktree using a selected available agent and model. Returns its actual provider, model, and launch receipt. Run passes in order and wait for each result. Pass revision with the commit SHA the pass must review: the request is rejected before launch unless this worktree is clean and at that commit, and the receipt records the commit and worktree reviewed.",
         "gate,prompt",
     ),
     (
@@ -2268,6 +2268,7 @@ pub fn run_mcp_stdio() {
                         "properties":{
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "prompt":{"type":"string"},
+                            "revision":{"type":"string","pattern":"^[0-9a-fA-F]{7,64}$"},
                         },
                         "required":["gate","prompt"]
                     }});

@@ -75,7 +75,7 @@ export function validationInstructions(
     `Selected agent and model pool:\n${pool}`,
     currentModel ? `Current implementation model: ${currentModel}.` : '',
     'Before each gate, check current availability of the selected pool and choose a selected available model. A validation session must be fresh, but its model may match the implementation model.',
-    'In Sail, use the validation_gate tool for each pass in order, with the gate and prompt. Wait for its receipt before starting the next pass. The tool selects the configured route when present and starts a fresh session. If the tool is unavailable or cannot start a fresh session, pause the gate. Never launch an unselected agent or model as a substitute. Report actual route metadata when available.',
+    'In Sail, use the validation_gate tool for each pass in order, with the gate, the prompt and the revision (commit SHA) the pass must review; the tool rejects a request whose revision is not the clean head of this worktree. Wait for its receipt before starting the next pass. The tool selects the configured route when present and starts a fresh session. If the tool is unavailable or cannot start a fresh session, pause the gate. Never launch an unselected agent or model as a substitute. Report actual route metadata when available.',
   ]
     .filter(Boolean)
     .join('\n');

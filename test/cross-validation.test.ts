@@ -53,4 +53,5 @@ void test('configured pool instructions require fresh sessions and allow the imp
   assert.match(instructions, /fresh/);
   assert.match(instructions, /may match the implementation model/);
   assert.match(instructions, /Report actual route metadata/);
+  assert.match(instructions, /revision \(commit SHA\) the pass must review/);
 });
