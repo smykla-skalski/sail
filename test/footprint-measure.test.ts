@@ -173,13 +173,10 @@ const cycling =
 
 const verdictFor = (
   samples: ReturnType<typeof series>,
-  overrides: { first?: [number | null, number]; elapsed?: number | null; tolerance?: number } = {},
+  overrides: { elapsed?: number | null; tolerance?: number } = {},
 ) => {
-  const [children, rssMb] = overrides.first ?? [3, 90];
   const elapsed = overrides.elapsed === undefined ? 1000 : overrides.elapsed;
   return evaluate({
-    first: snap(children, rssMb * MB, 10 * minute),
-    second: snap(children, rssMb * MB, 120 * minute),
     samples,
     launchedAt: 0,
     maintenance: elapsed === null ? null : { elapsedMs: elapsed },
@@ -196,6 +193,40 @@ await test('a cycling footprint without growth passes whatever the cycle phase a
   assert.equal(active.compared, true);
   assert.equal(idle.compared, true);
   assert.ok(Math.abs(idle.ratio) < 0.001);
+});
+
+await test('a flat cycle passes however its phase is shifted against the windows', () => {
+  for (const shift of [0, 5, 10, 15, 20, 25, 30, 35]) {
+    const samples = series((at) => cycling(() => 90)((at + shift) % 120));
+    const verdict = verdictFor(samples);
+    assert.equal(verdict.children.pass, true, `children, shift ${shift}`);
+    assert.equal(verdict.rss.pass, true, `rss, shift ${shift}`);
+    assert.equal(verdict.pass, true, `shift ${shift}`);
+  }
+});
+
+await test('a short idle blip cannot decide a phase', () => {
+  const samples = series((at) =>
+    at > 12 && at < 12.5
+      ? { children: 0, rssMb: 70 }
+      : at < 60
+        ? { children: 3, rssMb: 90 }
+        : { children: 0, rssMb: 46 },
+  );
+  const idle = verdictFor(samples).rss.windows.phases.find((phase) => phase.name === 'idle');
+  assert.ok(idle && idle.early.readings > 0 && idle.early.readings < 24);
+  assert.equal(idle?.compared, false);
+});
+
+await test('windows that share no phase compare the whole windows, so a flat series still passes', () => {
+  const samples = series((at) => ({ children: at < 60 ? 3 : 0, rssMb: 60 }));
+  const verdict = verdictFor(samples);
+  assert.equal(verdict.rss.pass, true);
+  assert.deepEqual(
+    verdict.rss.windows.phases.filter((phase) => phase.compared).map((phase) => phase.name),
+    ['all'],
+  );
+  assert.equal(verdict.children.pass, false);
 });
 
 await test('the old single-sample comparison failed that same cycle', () => {
@@ -263,7 +294,7 @@ await test('windows count only readings after launch inside their span', () => {
 
 await test('a phase with too few readings in either window is skipped, and no phase at all fails', () => {
   const idleOnly = series(() => ({ children: 0, rssMb: 46 }));
-  const verdict = verdictFor(idleOnly, { first: [0, 46] });
+  const verdict = verdictFor(idleOnly);
   assert.equal(verdict.rss.windows.phases[0].compared, false);
   assert.equal(verdict.rss.windows.phases[1].compared, true);
   assert.equal(verdict.rss.pass, true);
@@ -273,36 +304,23 @@ await test('a phase with too few readings in either window is skipped, and no ph
   assert.equal(none.pass, false);
 });
 
+const kids = (early: number, late: number) =>
+  series((at) => ({ children: at < 60 ? early : late, rssMb: 90 }));
+
 await test('the verdict applies the child and startup thresholds', () => {
-  const flat = series(() => ({ children: 3, rssMb: 90 }));
   const cases = [
-    { name: 'flat', first: [10, 90], elapsed: 29_999, pass: true },
-    { name: 'children grew', second: 12, elapsed: 1000, pass: false },
-    { name: 'children shrank', second: 8, elapsed: 1000, pass: false },
-    { name: 'slow startup', elapsed: 30_000, pass: false },
-    { name: 'no maintenance', elapsed: null, pass: false },
-    { name: 'no readings', first: [null, 90], elapsed: 1000, pass: false },
-    { name: 'idle from zero', first: [0, 90], second: 0, elapsed: 1, pass: true },
-    { name: 'zero to one', first: [0, 90], second: 1, elapsed: 1, pass: false },
-  ] as {
-    name: string;
-    first?: [number | null, number];
-    second?: number;
-    elapsed: number | null;
-    pass: boolean;
-  }[];
-  for (const item of cases) {
-    const first = item.first ?? [10, 90];
-    const verdict = evaluate({
-      first: snap(first[0], first[1] * MB, 10 * minute),
-      second: snap(item.second ?? first[0], first[1] * MB, 120 * minute),
-      samples: flat,
-      launchedAt: 0,
-      maintenance: item.elapsed === null ? null : { elapsedMs: item.elapsed },
-      options: defaults,
-    });
-    assert.equal(verdict.pass, item.pass, item.name);
-  }
+    { name: 'flat', samples: kids(10, 10), elapsed: 29_999, pass: true },
+    { name: 'children grew', samples: kids(10, 12), elapsed: 1000, pass: false },
+    { name: 'children shrank', samples: kids(10, 8), elapsed: 1000, pass: false },
+    { name: 'children within tolerance', samples: kids(10, 11), elapsed: 1000, pass: true },
+    { name: 'slow startup', samples: kids(3, 3), elapsed: 30_000, pass: false },
+    { name: 'no maintenance', samples: kids(3, 3), elapsed: null, pass: false },
+    { name: 'no readings', samples: [], elapsed: 1000, pass: false },
+    { name: 'idle from zero', samples: kids(0, 0), elapsed: 1, pass: true },
+    { name: 'zero to one', samples: kids(0, 1), elapsed: 1, pass: false },
+  ];
+  for (const item of cases)
+    assert.equal(verdictFor(item.samples, { elapsed: item.elapsed }).pass, item.pass, item.name);
 });
 
 await test('the tolerance is configurable for memory windows', () => {
@@ -350,8 +368,6 @@ await test('the report prints the windows, the phases, the difference and the ve
   const maintenance = { elapsedMs: 21_500, scratchSweepMs: 21_400 };
   const samples = series((at) => ({ children: 3, rssMb: at < 60 ? 150 : 156 }));
   const verdict = evaluate({
-    first,
-    second,
     samples,
     launchedAt: 0,
     maintenance,
@@ -366,7 +382,7 @@ await test('the report prints the windows, the phases, the difference and the ve
     launchedAt: 0,
   });
   assert.match(report, /At 10\.0 min\s+At 120\.0 min\s+Difference/);
-  assert.match(report, /Child processes\s+3\s+3\s+\+0/);
+  assert.match(report, /Child processes \(active phase\): 3 in the first window, 3 in the last/);
   assert.match(report, /ACP session listings \/ min\s+1\.2\s+0\.2\s+-1\.0/);
   assert.match(report, /two 40\.0-minute windows/);
   assert.match(report, /Phase\s+10\.0-50\.0 min\s+80\.0-120\.0 min\s+Difference\s+Change/);
@@ -382,8 +398,6 @@ await test('a failing report names the failed threshold', () => {
   const first = snap(3, 100, 10 * minute);
   const second = snap(9, 100, 120 * minute);
   const verdict = evaluate({
-    first,
-    second,
     samples: [],
     launchedAt: 0,
     maintenance: null,
@@ -397,8 +411,8 @@ await test('a failing report names the failed threshold', () => {
     options: defaults,
     launchedAt: 0,
   });
-  assert.match(report, /FAIL\s+child processes \+200\.0%/);
-  assert.match(report, /FAIL\s+total RSS no phase had enough readings in both windows/);
+  assert.match(report, /FAIL\s+child processes n\/a/);
+  assert.match(report, /FAIL\s+total RSS no phase had 24 readings in both windows/);
   assert.match(report, /FAIL\s+startup maintenance did not finish/);
   assert.match(report, /RESULT: FAIL$/);
 });

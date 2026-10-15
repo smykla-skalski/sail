@@ -28,7 +28,7 @@ const text = { '--app': 'app', '--json': 'json' };
 export const usage = `Usage: npm run measure:footprint -- [options]
 
 Launches a private Sail on a generated profile, samples it twice and checks that it stays flat.
-Children are judged from the two samples. RSS is judged from two long windows, one after each sample
+Children and RSS are judged from two long windows, one after each sample
 point, compared per phase (with and without child processes) because the footprint cycles.
 
   --app <path>                      Private "Sail E2E" bundle from "npm run build:e2e" (built when omitted)
@@ -164,8 +164,9 @@ function drift(first, second, tolerance) {
   return { first, second, delta, ratio, pass: Math.abs(ratio) <= tolerance };
 }
 
-/** A phase needs this many readings in both windows to be compared. */
+/** A phase needs this many readings, and this share of a window's expected readings, to count. */
 export const minimumPhaseReadings = 3;
+export const minimumPhaseShare = 0.1;
 
 const phaseNames = [
   ['active', (sample) => sample.children > 0],
@@ -185,37 +186,59 @@ export function rssWindows({ samples, launchedAt, options }) {
   early.to = early.from + width;
   const late = { to: options.secondMinutes * 60_000 };
   late.from = late.to - width;
-  const phases = phaseNames.map(([name, belongs]) => {
-    const readings = (window) =>
-      samples.filter(
+  const expected = width / (options.intervalSeconds * 1000);
+  const minimum = Math.max(minimumPhaseReadings, Math.ceil(expected * minimumPhaseShare));
+  const summarize = (belongs) => {
+    const summary = (window) => {
+      const found = samples.filter(
         (sample) => belongs(sample) && inWindow(sample.time - launchedAt, window.to, width),
       );
-    const summary = (window) => {
-      const found = readings(window);
-      return { readings: found.length, rssBytes: median(found.map((sample) => sample.rssBytes)) };
+      return {
+        readings: found.length,
+        rssBytes: median(found.map((sample) => sample.rssBytes)),
+        children: median(found.map((sample) => sample.children)),
+      };
     };
-    return { name, early: summary(early), late: summary(late) };
-  });
-  return { widthMinutes, early, late, phases };
+    return { early: summary(early), late: summary(late) };
+  };
+  const phases = [];
+  for (const [name, belongs] of phaseNames) phases.push({ name, ...summarize(belongs) });
+  return {
+    widthMinutes,
+    minimumReadings: minimum,
+    early,
+    late,
+    phases,
+    all: summarize(() => true),
+  };
 }
 
+const enough = (phase, minimum) =>
+  phase.early.readings >= minimum && phase.late.readings >= minimum;
+
+const skipped = (phase) => ({ ...phase, compared: false, delta: null, ratio: null, pass: true });
+
 function judgeRss(windows, tolerance) {
-  const phases = windows.phases.map((phase) => {
-    const compared =
-      phase.early.readings >= minimumPhaseReadings && phase.late.readings >= minimumPhaseReadings;
-    return {
-      ...phase,
-      compared,
-      ...(compared
-        ? drift(phase.early.rssBytes, phase.late.rssBytes, tolerance)
-        : { delta: null, ratio: null, pass: true }),
-    };
+  const { minimumReadings } = windows;
+  const compare = (phase) => ({
+    ...phase,
+    compared: true,
+    ...drift(phase.early.rssBytes, phase.late.rssBytes, tolerance),
   });
-  const comparedCount = phases.filter((phase) => phase.compared).length;
+  const phases = [];
+  for (const phase of windows.phases)
+    phases.push(enough(phase, minimumReadings) ? compare(phase) : skipped(phase));
+  const comparable = phases.some((phase) => phase.compared);
+  // Nothing in common between the windows (a cycle longer than a window): compare whole windows.
+  const overall =
+    !comparable && enough(windows.all, minimumReadings)
+      ? compare({ name: 'all', ...windows.all })
+      : null;
+  const judged = overall ? [overall] : phases;
   return {
-    windows: { ...windows, phases },
-    compared: comparedCount,
-    pass: comparedCount > 0 && phases.every((phase) => phase.pass),
+    windows: { ...windows, phases: overall ? [...phases, overall] : phases },
+    compared: judged.filter((phase) => phase.compared).length,
+    pass: judged.some((phase) => phase.compared) && judged.every((phase) => phase.pass),
   };
 }
 
@@ -247,9 +270,22 @@ function parseLine(line) {
   }
 }
 
-export function evaluate({ first, second, samples, launchedAt, maintenance, options }) {
-  const children = drift(first.children, second.children, options.tolerance);
-  const rss = judgeRss(rssWindows({ samples, launchedAt, options }), options.tolerance);
+/** Child counts are compared where the app has children: an idle reading is always 0. */
+function judgeChildren(windows, tolerance) {
+  const active = windows.phases.find((phase) => phase.name === 'active');
+  const minimum = windows.minimumReadings;
+  const [basis, phase] = enough(active, minimum)
+    ? ['active phase', active]
+    : ['all readings', windows.all];
+  return enough(phase, minimum)
+    ? { ...drift(phase.early.children, phase.late.children, tolerance), basis }
+    : { ...drift(null, null, tolerance), basis: 'no readings' };
+}
+
+export function evaluate({ samples, launchedAt, maintenance, options }) {
+  const windows = rssWindows({ samples, launchedAt, options });
+  const rss = judgeRss(windows, options.tolerance);
+  const children = judgeChildren(windows, options.tolerance);
   const limitMs = options.maintenanceLimitSeconds * 1000;
   const elapsedMs = maintenance?.elapsedMs ?? null;
   const startup = { elapsedMs, limitMs, pass: elapsedMs !== null && elapsedMs < limitMs };
@@ -278,12 +314,6 @@ function table(header, rows) {
 
 export function formatReport({ first, second, verdict, maintenance, options, launchedAt }) {
   const rows = [
-    [
-      'Child processes',
-      fixed(first.children, 0),
-      fixed(second.children, 0),
-      signed(gap(first.children, second.children), 0),
-    ],
     [
       'ACP session listings / min',
       fixed(first.listingsPerMinute),
@@ -329,14 +359,15 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
         .filter((phase) => phase.compared)
         .map((phase) => `${phase.name} ${percent(phase)}`)
         .join(', ')} (${limit})`
-    : 'no phase had enough readings in both windows';
+    : `no phase had ${windows.minimumReadings} readings in both windows`;
   return [
     ...table(header, rows),
     '',
-    `Child counts and rates are medians over the ${options.windowMinutes} minutes before each sample (${first.readings} and ${second.readings} readings).`,
+    `Rates are medians over the ${options.windowMinutes} minutes before each sample (${first.readings} and ${second.readings} readings).`,
     '',
     `Total RSS: median per phase over two ${fixed(windows.widthMinutes)}-minute windows (readings in brackets); active means the app has child processes.`,
     ...table(['Phase', span(windows.early), span(windows.late), 'Difference', 'Change'], phaseRows),
+    `Child processes (${verdict.children.basis}): ${fixed(verdict.children.first, 0)} in the first window, ${fixed(verdict.children.second, 0)} in the last.`,
     '',
     `${mark(verdict.children.pass)}  child processes ${percent(verdict.children)} (${limit})`,
     `${mark(verdict.rss.pass)}  total RSS ${rssDetail}`,
