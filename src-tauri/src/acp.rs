@@ -1893,16 +1893,33 @@ impl Connection {
         if idle && requests_idle && subagents.active_in(&self.worktree).is_empty() {
             let child_id = self.child.lock().map_err(|error| error.to_string())?.id();
             let _pause = PausedAgent::new(child_id)?;
+            #[cfg(unix)]
+            let scratch = self
+                .runtime_scratch
+                .lock()
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            let owned_temp = scratch.as_ref().map(|scratch| scratch.path().join("tmp"));
+            #[cfg(not(unix))]
+            let owned_temp: Option<PathBuf> = None;
             if runtime_has_live_children(
                 child_id,
-                self._storage_lease
-                    .as_ref()
-                    .map(|lease| lease.temp_directory()),
+                owned_temp.as_deref().or_else(|| {
+                    self._storage_lease
+                        .as_ref()
+                        .map(|lease| lease.temp_directory())
+                }),
             ) {
                 return Ok(());
             }
             if let Some(lease) = &self._storage_lease {
                 lease.clear_turn_temp()?;
+            }
+            #[cfg(unix)]
+            if let Some(scratch) = scratch.as_ref() {
+                scratch
+                    .clear_turn_temp()
+                    .map_err(|error| error.to_string())?;
             }
             temp_gate.pending = false;
         }
@@ -1916,7 +1933,7 @@ impl Connection {
         {
             return false;
         }
-        let timeout = if self.lists_only() {
+        let earliest_timeout = if self.profile == CapabilityProfile::Explore {
             timeout.min(OPENCODE_LISTING_IDLE_TIMEOUT)
         } else {
             timeout
@@ -1925,7 +1942,8 @@ impl Connection {
             .last_activity
             .lock()
             .map_or(Duration::ZERO, |last| last.elapsed());
-        if silent < timeout || self.capabilities.lock().is_ok_and(|value| value.is_null()) {
+        if silent < earliest_timeout || self.capabilities.lock().is_ok_and(|value| value.is_null())
+        {
             return false;
         }
         // A prompt being dispatched holds this lock; leave it alone.
@@ -1937,7 +1955,20 @@ impl Connection {
             self.touch();
             return false;
         }
+        let Ok(profiles) = self.session_profiles.lock() else {
+            return false;
+        };
+        let timeout = if self.profile == CapabilityProfile::Explore && profiles.is_empty() {
+            earliest_timeout
+        } else {
+            timeout
+        };
+        if silent < timeout {
+            return false;
+        }
+        // Commit the decision while session registration is excluded.
         self.idle_exit.store(true, Ordering::Release);
+        drop(profiles);
         drop(_dispatch);
         if let Err(error) = self.terminate() {
             self.idle_exit.store(false, Ordering::Release);
@@ -1952,15 +1983,6 @@ impl Connection {
             json!({"agent":self.agent,"idleSeconds":silent.as_secs()}),
         );
         true
-    }
-
-    /// The shared sidebar agent holds no session, only its listing requests.
-    fn lists_only(&self) -> bool {
-        self.profile == CapabilityProfile::Explore
-            && self
-                .session_profiles
-                .lock()
-                .is_ok_and(|profiles| profiles.is_empty())
     }
 
     fn has_pending_work(&self) -> bool {
@@ -2405,6 +2427,8 @@ fn runtime_environment(
     runtime_scratch: Option<&Path>,
     shared_build_directory: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
+    let owned_temp = runtime_scratch.map(|scratch| scratch.join("tmp"));
+    let temp_directory = owned_temp.as_deref().unwrap_or(temp_directory);
     let mut environment = crate::acp_terminal::terminal_environment(data_directory, temp_directory);
     let shared_download_cache = data_directory
         .parent()
@@ -5229,11 +5253,12 @@ fn register_native_task_connections(
     runtime: &Connection,
     browser: &crate::browser_agent::BrowserManager,
 ) -> Result<(), String> {
-    let children = runtime
+    // Keep settlement serialized with browser registration and ancestor pruning.
+    let native = runtime
         .native_subagents
         .lock()
-        .map_err(|error| error.to_string())?
-        .task_connections();
+        .map_err(|error| error.to_string())?;
+    let children = native.task_connections();
     for _ in 0..children.len() {
         for (child_id, child) in &children {
             let provider_id = task_provider_id(runtime, child_id);
@@ -5334,17 +5359,21 @@ fn register_session_detached(
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".to_string())?;
+    let mut profiles = runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if runtime.idle_exit.load(Ordering::Acquire) {
+        return Err(IDLE_EXIT_ERROR.into());
+    }
     let mut directories = runtime
         .session_directories
         .lock()
         .map_err(|error| error.to_string())?;
     bind_session_directory(&mut directories, session_id, directory)?;
     drop(directories);
-    runtime
-        .session_profiles
-        .lock()
-        .map_err(|error| error.to_string())?
-        .insert(session_id.to_string(), profile);
+    profiles.insert(session_id.to_string(), profile);
+    drop(profiles);
     Ok(runtime)
 }
 
@@ -8128,7 +8157,17 @@ fn restore_session_blocking(
                     },
                 )?;
             register_native_task_connections(&runtime, browser)?;
+            browser.clear_unattributed_native_activity(
+                &agent,
+                &canonical_directory(&cwd),
+                &session_id,
+            );
             let result = runtime.request(method, params, Duration::from_secs(60));
+            browser.clear_unattributed_native_activity(
+                &agent,
+                &canonical_directory(&cwd),
+                &session_id,
+            );
             if result.is_err() {
                 if let Some(token) = minted_token {
                     let mut tokens = runtime
@@ -8803,6 +8842,10 @@ pub async fn acp_prompt(
                 turn_id: turn_id.clone(),
             },
             || {
+                if let Some(directory) = directory.as_ref() {
+                    app.state::<crate::browser_agent::BrowserManager>()
+                        .clear_unattributed_native_activity(&agent, directory, &session_id);
+                }
                 if !runtime.stopped.load(Ordering::Acquire) {
                     if let Some(directory) = directory.as_ref() {
                     let _ = crate::settings::clear_interrupted_turn(
@@ -10066,9 +10109,16 @@ time.sleep(10)
         );
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
 
+        let owned = crate::scratch_cleanup::OwnedRuntimeScratch::create().unwrap();
+        let owned_artifact = owned.path().join("tmp/artifact");
+        let build_artifact = owned.path().join("build/artifact");
+        std::fs::write(&owned_artifact, "retain").unwrap();
+        std::fs::write(&build_artifact, "retain").unwrap();
+        *runtime.runtime_scratch.lock().unwrap() = Some(owned);
         runtime.record_process_cleanup("session", false).unwrap();
         runtime.clear_idle_temp(false).unwrap();
         assert!(artifact.exists());
+        assert!(owned_artifact.exists());
         assert!(
             crate::worktree_storage::cleanup_status(&scratch.join("cache"))
                 .iter()
@@ -10078,6 +10128,8 @@ time.sleep(10)
         runtime.record_process_cleanup("session", true).unwrap();
         runtime.clear_idle_temp(false).unwrap();
         assert!(!artifact.exists());
+        assert!(!owned_artifact.exists());
+        assert!(build_artifact.exists());
         runtime.stop_child().unwrap();
         drop(runtime);
         std::fs::remove_dir_all(scratch).unwrap();
@@ -10436,6 +10488,87 @@ time.sleep(10)
 
     #[cfg(unix)]
     #[test]
+    fn session_registered_at_idle_decision_keeps_listing_agent_alive() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key(
+                "opencode",
+                CapabilityProfile::Explore,
+                Path::new("/worktree"),
+            ),
+            Arc::clone(&runtime),
+        );
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(600), || {
+            register_session(
+                &manager,
+                "opencode",
+                CapabilityProfile::Explore,
+                "registered-at-boundary",
+                PathBuf::from("/worktree"),
+            )
+            .unwrap();
+            false
+        }));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_rejects_an_agent_committed_to_idle_exit() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        runtime.idle_exit.store(true, Ordering::Release);
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key(
+                "opencode",
+                CapabilityProfile::Explore,
+                Path::new("/worktree"),
+            ),
+            Arc::clone(&runtime),
+        );
+
+        let error = register_session(
+            &manager,
+            "opencode",
+            CapabilityProfile::Explore,
+            "too-late",
+            PathBuf::from("/worktree"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, IDLE_EXIT_ERROR);
+        assert!(runtime.session_profiles.lock().unwrap().is_empty());
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_claim_keeps_listing_agent_alive_until_release() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let token = runtime.begin_restore("restoring").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(600), || false));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.release_restore("restoring", &token).unwrap();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        assert!(runtime.exit_if_idle(Duration::from_secs(600), || false));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn listing_only_agent_follows_a_shorter_configured_limit() {
         let runtime = idle_runtime("opencode", None);
         runtime.session_profiles.lock().unwrap().clear();
@@ -10640,6 +10773,20 @@ time.sleep(10)
     }
 
     #[test]
+    fn runtime_temp_environment_ignores_long_storage_paths() {
+        let data = Path::new("/private/tmp").join("terminal-worktrees".repeat(16));
+        let legacy = data.join("turn-temp/run-long");
+        let scratch = Path::new("/private/tmp/sail-runtime-fixture");
+        let environment = runtime_environment(&data, &legacy, Some(scratch), None);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert!(environment.contains(&(name, scratch.join("tmp"))));
+        }
+        assert!(environment.contains(&("GOTMPDIR", scratch.join("tmp/go-tmp"))));
+        let fallback = runtime_environment(&data, &legacy, None, None);
+        assert!(fallback.contains(&("TMPDIR", legacy)));
+    }
+
+    #[test]
     fn runtime_keys_and_build_caches_are_private_per_worktree() {
         let scratch = scratch("runtime-cache");
         let first = scratch.join("first");
@@ -10696,7 +10843,13 @@ time.sleep(10)
             path(&first_environment, "CARGO_TARGET_DIR"),
             first_scratch.join("build/cargo-target")
         );
-        assert_eq!(path(&first_environment, "TMPDIR"), first_temp);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert_eq!(path(&first_environment, name), first_scratch.join("tmp"));
+        }
+        assert_eq!(
+            path(&first_environment, "GOTMPDIR"),
+            first_scratch.join("tmp/go-tmp")
+        );
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),

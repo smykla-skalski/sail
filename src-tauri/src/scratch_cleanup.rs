@@ -78,15 +78,42 @@ pub(crate) fn sweep_runtime_roots(
     report: &mut dyn FnMut(&str, RuntimeRootEvent),
 ) {
     let probe = OpenFileProbe::default();
-    if let Err(error) = sweep_runtime_roots_in(
-        &std::env::temp_dir(),
-        SystemTime::now(),
-        |path| probe.check(path),
-        |paths| probe.check_quarantined(paths),
-        in_use,
-        report,
-    ) {
-        eprintln!("Sail runtime scratch cleanup unavailable: {error}");
+    let processes = System::new_all();
+    let mut roots = vec![runtime_temporary_root()];
+    let inherited = std::env::temp_dir();
+    if !roots.contains(&inherited) {
+        roots.push(inherited);
+    }
+    for root in roots {
+        if let Err(error) = sweep_runtime_roots_in(
+            &root,
+            SystemTime::now(),
+            |path| {
+                if runtime_temp_in_use(path, &processes) {
+                    Some(true)
+                } else {
+                    probe.check(path)
+                }
+            },
+            |paths| {
+                probe
+                    .check_quarantined(paths)
+                    .into_iter()
+                    .zip(paths)
+                    .map(|(open, path)| {
+                        if runtime_temp_in_use(path, &processes) {
+                            Some(true)
+                        } else {
+                            open
+                        }
+                    })
+                    .collect()
+            },
+            &|path| in_use(path) || runtime_temp_in_use(path, &processes),
+            report,
+        ) {
+            eprintln!("Sail runtime scratch cleanup unavailable: {error}");
+        }
     }
 }
 
@@ -479,6 +506,38 @@ fn process_start_time(pid: u32) -> Option<u64> {
     Some(system.process(Pid::from_u32(pid))?.start_time())
 }
 
+fn runtime_temp_in_use(root: &Path, processes: &System) -> bool {
+    let original = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(private_quarantine_name)
+        .and_then(|name| root.parent().map(|parent| parent.join(name)));
+    let temp = original.as_deref().unwrap_or(root).join("tmp");
+    let session = fs::read_to_string(root.join(MARKER))
+        .ok()
+        .and_then(|owner| owner.split_whitespace().next()?.parse::<u32>().ok())
+        .map(Pid::from_u32);
+    processes.processes().values().any(|process| {
+        !matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ) && (session.is_some_and(|session| process.session_id() == Some(session))
+            || crate::worktree_storage::process_uses_temp(process, &temp))
+    })
+}
+
+fn runtime_temporary_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        // Canonical fixture paths must not inherit a nested agent TMPDIR.
+        PathBuf::from("/private/tmp")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
 pub(crate) struct OwnedRuntimeScratch {
     path: PathBuf,
     identity: crate::WorktreeDirectoryIdentity,
@@ -488,13 +547,15 @@ pub(crate) struct OwnedRuntimeScratch {
 
 impl OwnedRuntimeScratch {
     pub(crate) fn create() -> std::io::Result<Self> {
-        Self::create_in(&std::env::temp_dir())
+        Self::create_in(&runtime_temporary_root())
     }
 
     fn create_in(temp: &Path) -> std::io::Result<Self> {
         let path = temp.join(format!("sail-runtime-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path)?;
-        if let Err(error) = fs::create_dir_all(path.join("build/go-tmp")) {
+        if let Err(error) = fs::create_dir_all(path.join("tmp/go-tmp"))
+            .and_then(|_| fs::create_dir_all(path.join("build/go-tmp")))
+        {
             let _ = fs::remove_dir_all(&path);
             return Err(error);
         }
@@ -517,6 +578,25 @@ impl OwnedRuntimeScratch {
         Ok(())
     }
 
+    pub(crate) fn clear_turn_temp(&self) -> std::io::Result<()> {
+        if crate::worktree_directory_identity(&self.path)? != self.identity {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let temp = self.path.join("tmp");
+        if !fs::symlink_metadata(&temp)?.is_dir() {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        for entry in fs::read_dir(&temp)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        fs::create_dir(temp.join("go-tmp"))
+    }
+
     pub(crate) fn cleanup_now(&mut self) -> std::io::Result<()> {
         if self.cleaned {
             return Ok(());
@@ -535,6 +615,9 @@ impl OwnedRuntimeScratch {
         };
         if identity != self.identity {
             return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        if runtime_temp_in_use(&self.path, &System::new_all()) {
+            return Err(std::io::ErrorKind::WouldBlock.into());
         }
         let result = if let Some(owner) = self.owner.as_deref() {
             remove_owned_runtime_root(&self.path, owner)
@@ -675,6 +758,7 @@ fn sweep_with(
 ) -> std::io::Result<u64> {
     let mut freed = 0;
     let owner = unsafe { nix::libc::geteuid() };
+    let processes = System::new_all();
     for entry in fs::read_dir(temp)? {
         let Ok(entry) = entry else {
             continue;
@@ -686,6 +770,11 @@ fn sweep_with(
             continue;
         };
         if !metadata.is_dir() || metadata.uid() != owner || !candidate_name(&name, &path) {
+            continue;
+        }
+        let runtime = name.starts_with(RUNTIME_PREFIX)
+            || private_quarantine_name(&name).is_some_and(|name| name.starts_with(RUNTIME_PREFIX));
+        if runtime && runtime_temp_in_use(&path, &processes) {
             continue;
         }
         if let Some(original_name) = private_quarantine_name(&name) {
@@ -1397,6 +1486,66 @@ mod tests {
     fn cargo_artifacts(path: &Path) {
         fs::create_dir_all(path.join("debug").join(".fingerprint")).unwrap();
         fs::write(path.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+    }
+
+    #[test]
+    fn runtime_temp_survives_live_session_consumers() {
+        use std::os::unix::process::CommandExt;
+        let temp = fixture();
+        let mut scratch = OwnedRuntimeScratch::create_in(&temp).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").env("TMPDIR", scratch.path().join("tmp"));
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        fs::write(scratch.path().join(MARKER), format!("{} 0", child.id())).unwrap();
+        let swept = sweep(
+            &temp,
+            SystemTime::now() + IDLE_AGE + Duration::from_secs(1),
+            |_| Some(false),
+        )
+        .unwrap();
+        let retained = scratch.cleanup_now();
+        let exists = scratch.path().exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(swept, 0);
+        assert_eq!(retained.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(exists);
+        scratch.cleanup_now().unwrap();
+        assert!(!scratch.path().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_temp_fixture_paths_are_short_and_owned() {
+        let mut first = OwnedRuntimeScratch::create().unwrap();
+        let second = OwnedRuntimeScratch::create().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.path().parent(), Some(Path::new("/private/tmp")));
+        let project = first.path().join("tmp/project");
+        fs::create_dir_all(&project).unwrap();
+        let encoded = project
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .replace("/", "-");
+        fs::write(
+            first.path().join("tmp").join(format!("{encoded}.jsonl")),
+            b"fixture",
+        )
+        .unwrap();
+        let first_path = first.path().to_path_buf();
+        first.cleanup_now().unwrap();
+        assert!(!first_path.exists());
+        assert!(second.path().join("tmp/go-tmp").is_dir());
     }
 
     #[test]
