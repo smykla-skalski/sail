@@ -2421,11 +2421,11 @@ fn ship_it_checkpoint_directory(data_home: Option<&Path>, home: Option<&Path>) -
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&directory).ok()?;
-    std::fs::symlink_metadata(&directory)
+    let is_directory = std::fs::symlink_metadata(&directory)
         .ok()?
         .file_type()
-        .is_dir()
-        .then_some(directory)
+        .is_dir();
+    (is_directory && WritableDirectory::capture(&directory).is_ok()).then_some(directory)
 }
 
 fn agent_path(
