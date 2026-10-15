@@ -94,25 +94,40 @@ fn emit(message: &str, key: Option<&str>, file: &Path, reason: &str) {
     let _ = (key, file, reason);
 }
 
+/// The fixed record key whose hash names `file`.
+fn fixed_key(file: &Path) -> Option<String> {
+    let name = file.file_name()?.to_str()?;
+    RECORD_KEYS
+        .iter()
+        .find(|key| file_name(key) == name)
+        .map(|key| (*key).to_string())
+}
+
 /// Names the key a corrupt record belongs to when the file still says so or its
 /// name matches a fixed record key.
 fn key_hint(contents: Option<&str>, file: &Path) -> Option<String> {
-    let saved = contents
+    contents
         .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-        .and_then(|value| value.get("key")?.as_str().map(str::to_string));
-    saved.or_else(|| {
-        let name = file.file_name()?.to_str()?;
-        RECORD_KEYS
-            .iter()
-            .find(|key| file_name(key) == name)
-            .map(|key| (*key).to_string())
-    })
+        .and_then(|value| value.get("key")?.as_str().map(str::to_string))
+        .or_else(|| fixed_key(file))
+}
+
+/// A key read from a damaged file is untrusted; keep it short and on one line.
+fn bounded(key: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut shown: String = key.chars().take(LIMIT).collect();
+    if key.chars().count() > LIMIT {
+        shown.push('…');
+    }
+    shown
 }
 
 /// A corrupt record reads as absent; log it once per launch and keep the file so
 /// it can be inspected. The next save of its key replaces it.
 fn report_corrupt(file: &Path, key: Option<&str>, reason: &str) {
     // A full read cannot always name the key; report again once a read by key can.
+    let key = key.map(bounded);
+    let key = key.as_deref();
     let named = key.is_some();
     let report = REPORTED
         .lock()
@@ -127,9 +142,9 @@ fn report_corrupt(file: &Path, key: Option<&str>, reason: &str) {
     if report {
         emit(
             &format!(
-                "Corrupt settings record ignored: key {} file {}: {reason}",
-                key.unwrap_or("unknown"),
-                file.display()
+                "Corrupt settings record ignored: key {} file {:?}: {reason}",
+                key.map_or_else(|| "unknown".to_string(), |key| format!("{key:?}")),
+                file.display().to_string()
             ),
             key,
             file,
@@ -216,7 +231,11 @@ pub(crate) fn read_all(settings: &Path) -> Result<Records, String> {
             {
                 records.insert(key, value);
             }
-            Some((key, _)) => report_corrupt(&path, Some(&key), "named for a different key"),
+            Some(_) => report_corrupt(
+                &path,
+                fixed_key(&path).as_deref(),
+                "named for a different key",
+            ),
             None => report_corrupt(
                 &path,
                 key_hint(Some(&contents), &path).as_deref(),
@@ -475,6 +494,39 @@ mod tests {
         assert_eq!(reports.len(), 2, "{reports:?}");
         assert!(reports[0].contains("key unknown"), "{}", reports[0]);
         assert!(reports[1].contains(key), "{}", reports[1]);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_hostile_key_in_a_corrupt_record_is_logged_on_one_bounded_line() {
+        let path = scratch("hostile");
+        let key = "sai-ship-runs";
+        write(&path, key, "[old]").unwrap();
+        let file = directory(&path).join(file_name(key));
+        let claimed = format!("evil\nFAKE LOG LINE\u{1b}[31m{}", "k".repeat(20_000));
+        let contents = serde_json::json!({"key": claimed, "value": 5}).to_string();
+        fs::write(&file, contents).unwrap();
+        take_reports();
+        assert!(read_all(&path).unwrap().is_empty());
+        let reports = take_reports();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(!reports[0].contains('\n') && !reports[0].contains('\u{1b}'));
+        assert!(reports[0].len() < 1_000, "{}", reports[0].len());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_record_filed_under_another_keys_name_is_reported_for_that_name() {
+        let path = scratch("misfiled");
+        write(&path, "sai-ship-runs", "[old]").unwrap();
+        let file = directory(&path).join(file_name("sai-ship-runs"));
+        fs::write(&file, br#"{"key":"sai-acp-plans","value":"[1]"}"#).unwrap();
+        take_reports();
+        assert!(read_all(&path).unwrap().is_empty());
+        assert_eq!(read(&path, "sai-ship-runs").unwrap(), None);
+        let reports = take_reports();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains("sai-ship-runs"), "{}", reports[0]);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
