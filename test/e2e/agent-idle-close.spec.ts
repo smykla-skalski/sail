@@ -533,6 +533,29 @@ describe('idle session close', () => {
       );
     });
 
+    it(`deletes a loaded ${provider} thread even when its agent close fails`, async () => {
+      const directory = realpathSync(repository);
+      await pauseIdleClose();
+      const [id] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [id]);
+      const failedClose = join(directory, 'idle-failed-close.log');
+      writeFileSync(join(directory, 'idle-fail-next-close.txt'), 'fail');
+      await browser.tauri.execute(
+        async ({ core }, agent, path, sessionId) => {
+          await core.invoke('acp_forget_session', { agent, directory: path, sessionId });
+        },
+        provider,
+        directory,
+        id,
+      );
+      expect(await attached(provider, directory)).not.toContain(id);
+      await browser.waitUntil(
+        async () => existsSync(failedClose) && readFileSync(failedClose, 'utf8').includes(id),
+        { timeout: 10_000, interval: 100, timeoutMsg: 'the close failure was never injected' },
+      );
+      expect(await attached(provider, directory)).not.toContain(id);
+    });
+
     it(`drops a closed ${provider} thread's idle state when it is deleted, also during a resume`, async () => {
       const directory = realpathSync(repository);
       await pauseIdleClose();
