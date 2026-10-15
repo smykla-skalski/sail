@@ -1916,6 +1916,11 @@ impl Connection {
         {
             return false;
         }
+        let timeout = if self.lists_only() {
+            timeout.min(OPENCODE_LISTING_IDLE_TIMEOUT)
+        } else {
+            timeout
+        };
         let silent = self
             .last_activity
             .lock()
@@ -1946,6 +1951,15 @@ impl Connection {
             json!({"agent":self.agent,"idleSeconds":silent.as_secs()}),
         );
         true
+    }
+
+    /// The shared sidebar agent holds no session, only its listing requests.
+    fn lists_only(&self) -> bool {
+        self.profile == CapabilityProfile::Explore
+            && self
+                .session_profiles
+                .lock()
+                .is_ok_and(|profiles| profiles.is_empty())
     }
 
     fn has_pending_work(&self) -> bool {
@@ -8855,6 +8869,10 @@ const IDLE_EXIT_ERROR: &str = "Agent session is not connected in this worktree."
 
 const OPENCODE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// A listing-only agent has no session to resume, so it leaves well before a working agent does;
+/// the next listing starts it again.
+const OPENCODE_LISTING_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Idle limit for OpenCode agents; `SAIL_OPENCODE_IDLE_TIMEOUT_SECS=0` keeps them until app exit.
 fn opencode_idle_timeout() -> Option<Duration> {
     match std::env::var("SAIL_OPENCODE_IDLE_TIMEOUT_SECS")
@@ -10176,6 +10194,32 @@ time.sleep(10)
             IDLE_EXIT_ERROR,
             "a request racing the idle exit must be recoverable by reattaching"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_only_agent_exits_before_the_idle_limit_of_a_working_agent() {
+        let listing = idle_runtime("opencode", None);
+        listing.session_profiles.lock().unwrap().clear();
+        *listing.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let working = idle_runtime("opencode", None);
+        *working.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+
+        assert!(listing.exit_if_idle(Duration::from_secs(600), || false));
+        assert!(!working.exit_if_idle(Duration::from_secs(600), || false));
+        assert!(working.alive.load(Ordering::Acquire));
+        working.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_only_agent_follows_a_shorter_configured_limit() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(40);
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(60), || false));
+        assert!(runtime.exit_if_idle(Duration::from_secs(30), || false));
     }
 
     #[cfg(unix)]
