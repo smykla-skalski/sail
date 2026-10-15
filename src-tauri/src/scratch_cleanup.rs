@@ -1568,24 +1568,31 @@ mod tests {
         std::thread::sleep(Duration::from_secs(300));
     }
 
-    // Matches a fixture app that `open` leaves running with PPID 1.
+    // Matches a fixture app that `open` leaves running with PPID 1. A parallel
+    // test can fork while the copied binary is still open for writing, and the
+    // exec then fails with "Text file busy"; the helper is gone, so start it again.
     fn spawn_orphan(binary: &Path) -> i32 {
-        let output = Command::new("/bin/sh")
-            .args([
-                "-c",
-                "\"$0\" scratch_cleanup::tests::fixture_sleeper --ignored --exact >/dev/null 2>&1 & echo $!",
-            ])
-            .arg(binary)
-            .output()
-            .unwrap();
-        let pid = String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(alive(pid), "fixture helper did not start");
-        pid
+        const ATTEMPTS: u32 = 5;
+        for _ in 0..ATTEMPTS {
+            let output = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "\"$0\" scratch_cleanup::tests::fixture_sleeper --ignored --exact >/dev/null 2>&1 & echo $!",
+                ])
+                .arg(binary)
+                .output()
+                .unwrap();
+            let pid = String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            if alive(pid) {
+                return pid;
+            }
+        }
+        panic!("fixture helper did not start in {ATTEMPTS} attempts");
     }
 
     fn alive(pid: i32) -> bool {
