@@ -11447,8 +11447,12 @@ time.sleep(10)
             .filter_map(Value::as_str)
             .collect::<Vec<_>>()
             .join("\n");
-        let selected_key = serde_json::to_string(selected.to_str().unwrap()).unwrap();
-        let sibling_key = serde_json::to_string(sibling.to_str().unwrap()).unwrap();
+        let selected_key =
+            serde_json::to_string(dunce::canonicalize(&selected).unwrap().to_str().unwrap())
+                .unwrap();
+        let sibling_key =
+            serde_json::to_string(dunce::canonicalize(&sibling).unwrap().to_str().unwrap())
+                .unwrap();
         assert!(rules.contains(&selected_key));
         assert!(!rules.contains(&sibling_key));
         #[cfg(target_os = "macos")]
