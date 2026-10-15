@@ -10,7 +10,9 @@ to version 2.0.0 and preserve it across Codex process restarts and ACP forks.
 
 The distribution is licensed under Apache-2.0; see `LICENSE`. Sail changed
 the upstream distribution to select launch-provided permission profiles and to
-keep the selected profile through session lifecycle operations.
+keep the selected profile through session lifecycle operations. The advertised
+`workspace-write` mode selects the same trusted filesystem profile as `agent`
+while retaining its own approval policy.
 Sail stores the generated JavaScript as `dist/index.js.txt`, then stages it as
 `index.mjs` in the connection's private temporary directory at launch.
 
@@ -27,4 +29,4 @@ cp dist/index.js /path/to/sail/vendor/codex-acp/dist/index.js.txt
 ```
 
 The committed bundle's SHA-256 is
-`a9750334c121173e93d85966cded27bb1974ec8e8635a73082851704f5e55cbe`.
+`125e6e752f105d5b7564a9d637e44f9202fb6e8899666c5b22eb491ab3def60f`.
