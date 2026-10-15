@@ -27,7 +27,7 @@ const text = { '--app': 'app', '--json': 'json' };
 
 export const usage = `Usage: npm run measure:footprint -- [options]
 
-Launches a private Sail on a generated profile, samples it twice and checks that it stays flat.
+Launches a private Sail on a generated profile, samples it twice and checks for memory growth.
 Children and RSS are judged from two long windows, one after each sample
 point, compared per phase (with and without child processes) because the footprint cycles.
 
@@ -41,7 +41,7 @@ point, compared per phase (with and without child processes) because the footpri
   --window-minutes <m>              Trailing window each sample covers (default ${defaults.windowMinutes})
   --rss-window-minutes <m>          Width of each RSS comparison window, shortened to fit (default ${defaults.rssWindowMinutes})
   --interval-seconds <s>            Process sampling interval (default ${defaults.intervalSeconds})
-  --tolerance <ratio>               Allowed drift of children between samples and of RSS between windows (default ${defaults.tolerance})
+  --tolerance <ratio>               Allowed child-count drift and positive RSS growth between windows (default ${defaults.tolerance})
   --maintenance-limit-seconds <s>   Startup maintenance limit (default ${defaults.maintenanceLimitSeconds})
 `;
 
@@ -222,11 +222,15 @@ const skipped = (phase) => ({ ...phase, compared: false, delta: null, ratio: nul
 
 function judgeRss(windows, tolerance) {
   const { minimumReadings } = windows;
-  const compare = (phase) => ({
-    ...phase,
-    compared: true,
-    ...drift(phase.early.rssBytes, phase.late.rssBytes, tolerance),
-  });
+  const compare = (phase) => {
+    const change = drift(phase.early.rssBytes, phase.late.rssBytes, tolerance);
+    return {
+      ...phase,
+      compared: true,
+      ...change,
+      pass: change.ratio !== null && (change.ratio <= 0 || change.ratio < tolerance),
+    };
+  };
   const phases = [];
   for (const phase of windows.phases)
     phases.push(enough(phase, minimumReadings) ? compare(phase) : skipped(phase));
@@ -337,6 +341,8 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
   ];
   const percent = (check) => (check.ratio === null ? 'n/a' : `${signed(check.ratio * 100)}%`);
   const limit = `limit ±${options.tolerance * 100}%`;
+  const rssLimit =
+    options.tolerance === 0 ? 'no positive growth' : `growth <${options.tolerance * 100}%`;
   const { windows } = verdict.rss;
   const span = (window) => `${fixed(window.from / 60_000)}-${fixed(window.to / 60_000)} min`;
   const phaseRows = windows.phases.map((phase) => [
@@ -360,7 +366,7 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
     ? `${verdict.rss.windows.phases
         .filter((phase) => phase.compared)
         .map((phase) => `${phase.name} ${percent(phase)}`)
-        .join(', ')} (${limit})`
+        .join(', ')} (${rssLimit})`
     : `no phase had ${windows.minimumReadings} readings in both windows`;
   const nativePhases = windows.phases.filter(
     (phase) => phase.early.appFootprintBytes != null && phase.late.appFootprintBytes != null,
