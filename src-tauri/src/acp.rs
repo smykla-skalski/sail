@@ -5183,11 +5183,12 @@ fn register_native_task_connections(
     runtime: &Connection,
     browser: &crate::browser_agent::BrowserManager,
 ) -> Result<(), String> {
-    let children = runtime
+    // Keep settlement serialized with browser registration and ancestor pruning.
+    let native = runtime
         .native_subagents
         .lock()
-        .map_err(|error| error.to_string())?
-        .task_connections();
+        .map_err(|error| error.to_string())?;
+    let children = native.task_connections();
     for _ in 0..children.len() {
         for (child_id, child) in &children {
             let provider_id = task_provider_id(runtime, child_id);
@@ -8073,7 +8074,17 @@ fn restore_session_blocking(
                     },
                 )?;
             register_native_task_connections(&runtime, browser)?;
+            browser.clear_unattributed_native_activity(
+                &agent,
+                &canonical_directory(&cwd),
+                &session_id,
+            );
             let result = runtime.request(method, params, Duration::from_secs(60));
+            browser.clear_unattributed_native_activity(
+                &agent,
+                &canonical_directory(&cwd),
+                &session_id,
+            );
             if result.is_err() {
                 if let Some(token) = minted_token {
                     let mut tokens = runtime
@@ -8748,6 +8759,10 @@ pub async fn acp_prompt(
                 turn_id: turn_id.clone(),
             },
             || {
+                if let Some(directory) = directory.as_ref() {
+                    app.state::<crate::browser_agent::BrowserManager>()
+                        .clear_unattributed_native_activity(&agent, directory, &session_id);
+                }
                 if !runtime.stopped.load(Ordering::Acquire) {
                     if let Some(directory) = directory.as_ref() {
                     let _ = crate::settings::clear_interrupted_turn(
