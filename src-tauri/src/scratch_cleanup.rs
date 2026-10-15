@@ -78,15 +78,22 @@ pub(crate) fn sweep_runtime_roots(
     report: &mut dyn FnMut(&str, RuntimeRootEvent),
 ) {
     let probe = OpenFileProbe::default();
-    if let Err(error) = sweep_runtime_roots_in(
-        &std::env::temp_dir(),
-        SystemTime::now(),
-        |path| probe.check(path),
-        |paths| probe.check_quarantined(paths),
-        in_use,
-        report,
-    ) {
-        eprintln!("Sail runtime scratch cleanup unavailable: {error}");
+    let mut roots = vec![runtime_temporary_root()];
+    let inherited = std::env::temp_dir();
+    if !roots.contains(&inherited) {
+        roots.push(inherited);
+    }
+    for root in roots {
+        if let Err(error) = sweep_runtime_roots_in(
+            &root,
+            SystemTime::now(),
+            |path| probe.check(path),
+            |paths| probe.check_quarantined(paths),
+            in_use,
+            report,
+        ) {
+            eprintln!("Sail runtime scratch cleanup unavailable: {error}");
+        }
     }
 }
 
@@ -479,6 +486,18 @@ fn process_start_time(pid: u32) -> Option<u64> {
     Some(system.process(Pid::from_u32(pid))?.start_time())
 }
 
+fn runtime_temporary_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        // Canonical fixture paths must not inherit a nested agent TMPDIR.
+        PathBuf::from("/private/tmp")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
 pub(crate) struct OwnedRuntimeScratch {
     path: PathBuf,
     identity: crate::WorktreeDirectoryIdentity,
@@ -488,13 +507,15 @@ pub(crate) struct OwnedRuntimeScratch {
 
 impl OwnedRuntimeScratch {
     pub(crate) fn create() -> std::io::Result<Self> {
-        Self::create_in(&std::env::temp_dir())
+        Self::create_in(&runtime_temporary_root())
     }
 
     fn create_in(temp: &Path) -> std::io::Result<Self> {
         let path = temp.join(format!("sail-runtime-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path)?;
-        if let Err(error) = fs::create_dir_all(path.join("build/go-tmp")) {
+        if let Err(error) = fs::create_dir_all(path.join("tmp/go-tmp"))
+            .and_then(|_| fs::create_dir_all(path.join("build/go-tmp")))
+        {
             let _ = fs::remove_dir_all(&path);
             return Err(error);
         }
@@ -1397,6 +1418,31 @@ mod tests {
     fn cargo_artifacts(path: &Path) {
         fs::create_dir_all(path.join("debug").join(".fingerprint")).unwrap();
         fs::write(path.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_temp_fixture_paths_are_short_and_owned() {
+        let mut first = OwnedRuntimeScratch::create().unwrap();
+        let second = OwnedRuntimeScratch::create().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.path().parent(), Some(Path::new("/private/tmp")));
+        let project = first.path().join("tmp/project");
+        fs::create_dir_all(&project).unwrap();
+        let encoded = project
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .replace("/", "-");
+        fs::write(
+            first.path().join("tmp").join(format!("{encoded}.jsonl")),
+            b"fixture",
+        )
+        .unwrap();
+        let first_path = first.path().to_path_buf();
+        first.cleanup_now().unwrap();
+        assert!(!first_path.exists());
+        assert!(second.path().join("tmp/go-tmp").is_dir());
     }
 
     #[test]

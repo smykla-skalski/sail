@@ -2387,6 +2387,8 @@ fn runtime_environment(
     runtime_scratch: Option<&Path>,
     shared_build_directory: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
+    let owned_temp = runtime_scratch.map(|scratch| scratch.join("tmp"));
+    let temp_directory = owned_temp.as_deref().unwrap_or(temp_directory);
     let mut environment = crate::acp_terminal::terminal_environment(data_directory, temp_directory);
     let shared_download_cache = data_directory
         .parent()
@@ -10488,6 +10490,20 @@ time.sleep(10)
     }
 
     #[test]
+    fn runtime_temp_environment_ignores_long_storage_paths() {
+        let data = Path::new("/private/tmp").join("terminal-worktrees".repeat(16));
+        let legacy = data.join("turn-temp/run-long");
+        let scratch = Path::new("/private/tmp/sail-runtime-fixture");
+        let environment = runtime_environment(&data, &legacy, Some(scratch), None);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert!(environment.contains(&(name, scratch.join("tmp"))));
+        }
+        assert!(environment.contains(&("GOTMPDIR", scratch.join("tmp/go-tmp"))));
+        let fallback = runtime_environment(&data, &legacy, None, None);
+        assert!(fallback.contains(&("TMPDIR", legacy)));
+    }
+
+    #[test]
     fn runtime_keys_and_build_caches_are_private_per_worktree() {
         let scratch = scratch("runtime-cache");
         let first = scratch.join("first");
@@ -10544,7 +10560,13 @@ time.sleep(10)
             path(&first_environment, "CARGO_TARGET_DIR"),
             first_scratch.join("build/cargo-target")
         );
-        assert_eq!(path(&first_environment, "TMPDIR"), first_temp);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert_eq!(path(&first_environment, name), first_scratch.join("tmp"));
+        }
+        assert_eq!(
+            path(&first_environment, "GOTMPDIR"),
+            first_scratch.join("tmp/go-tmp")
+        );
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
