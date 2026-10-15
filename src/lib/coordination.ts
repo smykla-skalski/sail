@@ -1,8 +1,56 @@
 import type { AgentThread } from './acp';
+import type { SpawnReceipt } from './agent-results';
 import type { AttentionMap, ThreadStatus } from './attention';
 import type { ProjectCatalog, WorktreeOrigin } from './projects';
 import { worktreeAncestry } from './projects.ts';
 import { threadKey } from './recent-threads.ts';
+
+export type CoordinationThread = {
+  id: string;
+  directory: string;
+  title: string;
+  agent: string;
+};
+
+export function projectReceiptThreads(
+  receipts: SpawnReceipt[],
+  project: string,
+): CoordinationThread[] {
+  const threads = new Map<string, CoordinationThread>();
+  for (const receipt of receipts) {
+    if (receipt.project !== project || !receipt.targetId || !receipt.targetDirectory) continue;
+    threads.set(receipt.targetId, {
+      id: receipt.targetId,
+      directory: receipt.targetDirectory,
+      title: receipt.name || 'Assigned worker',
+      agent: receipt.provider,
+    });
+  }
+  return [...threads.values()];
+}
+
+export function coordinationTarget(
+  threads: CoordinationThread[],
+  receipts: SpawnReceipt[],
+  project: string,
+  targetId: string,
+): CoordinationThread {
+  const target = threads.find((thread) => thread.id === targetId);
+  if (!target) throw new Error('Target thread is not in this project.');
+  const receipt = receipts
+    .filter(
+      (item) =>
+        item.project === project &&
+        item.targetId === targetId &&
+        item.targetDirectory === target.directory,
+    )
+    .toSorted((a, b) => b.updated - a.updated)[0];
+  if (receipt && (receipt.state === 'interrupted' || receipt.state === 'unavailable'))
+    throw new Error(
+      `Target worker is ${receipt.state}. Inspect agent_result with its original receiptId and accessKey, then use agent_spawn to launch a replacement worker.`,
+    );
+  return target;
+}
 
 export function coordinationSourceThread(
   threads: AgentThread[],

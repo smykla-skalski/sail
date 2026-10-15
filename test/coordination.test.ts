@@ -3,12 +3,84 @@ import test from 'node:test';
 import {
   coordinationKey,
   coordinationSourceThread,
+  coordinationTarget,
   coordinationMessageForText,
   coordinationPrompt,
   enqueueCoordinationMessage,
   loadCoordinationMessages,
   projectWorktreeInfo,
+  projectReceiptThreads,
 } from '../src/lib/coordination.ts';
+import type { SpawnReceipt } from '../src/lib/agent-results.ts';
+
+function ownedReceipt(overrides: Partial<SpawnReceipt> = {}): SpawnReceipt {
+  return {
+    receiptId: 'receipt',
+    accessKey: 'secret',
+    requestId: 'request',
+    project: '/repo',
+    sourceId: 'acp:codex:parent',
+    sourceDirectory: '/repo',
+    targetId: 'acp:codex:sail-owned:receipt:session',
+    targetDirectory: '/scratch/worker',
+    turnId: 'turn',
+    worktreeId: 'worker',
+    provider: 'codex',
+    prompt: null,
+    state: 'working',
+    created: 1,
+    updated: 2,
+    result: null,
+    error: null,
+    ...overrides,
+  };
+}
+
+await test('returned owned IDs resolve without sidebar or worktree catalog entries', () => {
+  const receipt = ownedReceipt();
+  const threads = projectReceiptThreads([receipt], '/repo');
+  assert.equal(threads.length, 1);
+  assert.equal(
+    coordinationTarget(threads, [receipt], '/repo', receipt.targetId!).directory,
+    '/scratch/worker',
+  );
+});
+
+await test('owned IDs remain scoped to their receipt project', () => {
+  const receipt = ownedReceipt();
+  const threads = projectReceiptThreads([receipt], '/other');
+  assert.deepEqual(threads, []);
+  assert.throws(
+    () => coordinationTarget(threads, [receipt], '/other', receipt.targetId!),
+    /not in this project/,
+  );
+  assert.deepEqual(projectReceiptThreads([ownedReceipt({ targetId: null })], '/repo'), []);
+});
+
+await Promise.all(
+  (['interrupted', 'unavailable'] as const).map((state) =>
+    test(`${state} owned ID reports lifecycle restriction and replacement action`, () => {
+      const receipt = ownedReceipt({ state });
+      const threads = projectReceiptThreads([receipt], '/repo');
+      assert.throws(
+        () => coordinationTarget(threads, [receipt], '/repo', receipt.targetId!),
+        new RegExp(`Target worker is ${state}.*agent_result.*agent_spawn`),
+      );
+    }),
+  ),
+);
+
+await test('latest receipt state controls messaging while unrelated project states do not', () => {
+  const old = ownedReceipt({ state: 'interrupted', updated: 1 });
+  const current = ownedReceipt({ updated: 2 });
+  const foreign = ownedReceipt({ project: '/other', state: 'unavailable', updated: 3 });
+  const receipts = [current, foreign, old];
+  const threads = projectReceiptThreads(receipts, '/repo');
+  assert.equal(
+    coordinationTarget(threads, receipts, '/repo', current.targetId!).id,
+    current.targetId,
+  );
+});
 
 await test('worktree discovery stays in the source project and marks stale entries', () => {
   const threads = [
