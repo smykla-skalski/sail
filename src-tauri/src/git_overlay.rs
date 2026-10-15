@@ -1652,17 +1652,21 @@ impl GitOverlay {
             self.apply(command);
             return;
         }
-        let overlay_git_dir = git_config_path(&self.git_dir);
-        let forwarded = command
-            .get_envs()
-            .any(|(name, value)| name == "GIT_DIR" && value == Some(overlay_git_dir.as_os_str()));
+        const ROUTING: [&str; 4] = [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+        ];
+        let forwarded = command.get_envs().any(|(name, value)| {
+            ROUTING.iter().any(|key| name == *key)
+                && value.is_some_and(|value| {
+                    let value = Path::new(value);
+                    value.starts_with(&self.git_dir) || value == self.worktree
+                })
+        });
         if forwarded {
-            for key in [
-                "GIT_DIR",
-                "GIT_COMMON_DIR",
-                "GIT_WORK_TREE",
-                "GIT_INDEX_FILE",
-            ] {
+            for key in ROUTING {
                 command.env_remove(key);
             }
         }
@@ -2593,8 +2597,9 @@ mod tests {
     fn toplevel_from(overlay: &GitOverlay, directory: &Path, forwarded: bool) -> PathBuf {
         let mut command = git_command();
         if forwarded {
-            command.env("GIT_DIR", git_config_path(&overlay.git_dir));
+            command.env("GIT_DIR", overlay.git_dir.join(""));
             command.env("GIT_WORK_TREE", git_config_path(&overlay.worktree));
+            command.env("GIT_INDEX_FILE", overlay.git_dir.join("index"));
         }
         overlay.apply_for_directory(&mut command, directory);
         let result = output(
@@ -2604,6 +2609,28 @@ mod tests {
         )
         .unwrap();
         dunce::canonicalize(String::from_utf8(result.stdout).unwrap().trim()).unwrap()
+    }
+
+    #[test]
+    fn forwarded_overlay_routing_is_dropped_for_a_foreign_directory() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        for (name, value) in [
+            ("GIT_DIR", overlay.git_dir.join("")),
+            ("GIT_COMMON_DIR", overlay.git_dir.clone()),
+            ("GIT_WORK_TREE", overlay.worktree.clone()),
+            ("GIT_INDEX_FILE", overlay.git_dir.join("index")),
+        ] {
+            let mut command = Command::new("git");
+            command.env(name, value);
+            overlay.apply_for_directory(&mut command, &fixture.main);
+            assert!(
+                command.get_envs().all(|(_, value)| value.is_none()),
+                "{name} must not survive in a foreign directory"
+            );
+        }
     }
 
     #[test]
