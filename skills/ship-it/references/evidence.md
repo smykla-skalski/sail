@@ -2,8 +2,6 @@
 
 Keep one portable evidence record per committed task revision. Claude Code, Codex, OpenCode, Copilot CLI and Sail read and write this contract directly; do not translate it into conversation state or a harness-specific format.
 
-In Sail mode, use Sail's local claim for ownership and keep portable comment-backed claim fields null. Do not write a GitHub claim comment.
-
 ## Location and identity
 
 Store records under `${XDG_DATA_HOME:-$HOME/.local/share}/sai/ship-it/evidence/<checkpoint-id>/`. Create directories and files with owner-only permissions. A record is named `<revision>.json`, where `revision` is the full hexadecimal commit SHA it proves. Never put evidence in the repository, plugin cache or system temporary directory.
@@ -33,7 +31,8 @@ Write UTF-8 JSON and preserve unknown fields. Every result includes its producer
       "mechanism": "inline",
       "executionId": "opaque execution identifier",
       "modelResolution": "resolved",
-      "contextIsolationRequired": false,
+      "independence": "not-applicable",
+      "degradationReasons": [],
       "timestamp": "RFC 3339 UTC timestamp"
     }
   ],
@@ -119,9 +118,9 @@ Write UTF-8 JSON and preserve unknown fields. Every result includes its producer
 
 A CI result also has `ciTriage` with unique `failureIds` from the checkpoint and a bounded `resolution` or null. On failure, keep the result failed and attach every observation for that job and revision. On a passing authorized rerun or provider recovery, set the result passed and record the matching resolution. After a source-changing fix, mark each old observation `superseded-by-revision`; the replacement revision starts with pending CI and no copied pass. This preserves failure, recurrence and resolution history without embedding logs in evidence.
 
-`roleRoutes` follows the portable role contract. It records requested and actual provider, model and variant, source revision, mechanism, execution identity, resolution and whether a fresh context is required for every role invocation. Every route in a record has `sourceRevision` equal to the record revision. A result produced by a routed role references its route's `executionId` in `outputReference`. Preserve repeated role records for retries. Review and testing must each use a fresh subagent execution; a different provider or model is optional.
+`roleRoutes` follows the portable role contract. It records requested and actual provider, model and variant, source revision, mechanism, execution identity, resolution and independence for every role invocation. Every route in a record has `sourceRevision` equal to the record revision. A result produced by a routed role references its route's `executionId` in `outputReference`. Preserve repeated role records for retries. Every review and testing route must use a fresh subagent execution; provider and model may match implementation.
 
-`routeDiagnostics` records rejected route candidates and does not satisfy or block a gate. Pre-dispatch diagnostics have no execution metadata; post-dispatch diagnostics preserve returned route metadata for outputs rejected by route checks. Only accepted dispatched executions belong in `roleRoutes`.
+`routeDiagnostics` records rejected route candidates and does not satisfy or block a gate. Pre-dispatch diagnostics have no execution metadata; post-dispatch diagnostics preserve returned route metadata for outputs rejected because they reused context or ran inline. Only accepted dispatched executions belong in `roleRoutes`; a later fresh subagent route can complete the gate while preserving rejection history.
 
 `claim` is null when claims are disabled and for Jira or description tasks. With claims enabled for a GitHub issue, it contains the current claim's `issueUrl`, `commentUrl`, `holderId`, `acquiredAt` and latest verified `renewedAt`. Create or update evidence only while that claim is active, unexpired and matches the checkpoint. Claim renewal changes `renewedAt` in the current record without invalidating revision-bound results. Another holder, comment or acquisition time blocks ordinary evidence writes; an audited takeover follows the claim contract's rebind procedure and reruns every required result. Releasing the same claim after verified merge preserves the completed delivery evidence.
 
@@ -139,7 +138,7 @@ A record becomes complete at the merge gate only when all of these are true:
 
 - It contains every required result and no duplicate result ID.
 - It contains valid role routes for every invoked exploration, implementation, review, testing and CI-triage role.
-- Every review and testing route identifies a fresh subagent execution. The provider and model may match implementation, and unresolved model metadata is allowed when the execution identity is known. Inline review and testing routes are invalid.
+- Every review and testing route uses a fresh subagent execution, is non-inline and does not reuse the implementation or another gate's context. Provider and model may match implementation, including for the legacy `inline-review` gate ID.
 - Every required result has `status: passed`, or `status: untested` under the partial-pass rule, and the exact record revision.
 - Every selected review reference records its required passing verdict.
 - Every selected manual-test reference records its required passing verdict.
@@ -154,11 +153,11 @@ Missing, pending, failed, blocked or stale required evidence makes the record no
 After each successful commit, history rewrite, merge from the default branch or code-changing review/CI fix:
 
 1. Atomically mark the previous current record `stale`, set `invalidatedAt`, and set `invalidatedByRevision` to the new full SHA.
-2. Create the new revision's record with `status: collecting`; copy the required result identities, but set their statuses to `pending` and replace their source revisions, timestamps and output references. Carry still-active exploration and implementation routes with `sourceRevision` rebound to the new revision. Drop old review, testing and CI-triage routes; record fresh routes when those gates rerun.
+2. Create the new revision's record with `status: collecting`; copy required identities as `pending`. Carry still-active exploration and implementation routes with `sourceRevision` rebound to the new revision. Assess the local gate manifests under [validation-reuse.md](validation-reuse.md). Only verified unchanged results gain a current-head attestation with original revision, input fingerprint and output digest. Retain their original route execution identity with explicit carry-forward provenance; never claim a new worker ran. Replace affected review/testing routes when a permitted gate dispatches. Drop prior CI-triage routes.
 3. Point the task checkpoint's evidence fields at the new record only after that record is valid and durable.
-4. Validate every required result against the new revision under the convergence contract. Do not copy a pass from the stale record.
+4. Validate every required result against the new revision under the convergence contract. Do not copy a pass from the stale record without a verified helper validity decision and current-head provenance.
 
-After the bounded mode's single routine fix pass, do not dispatch another broad adversarial review or manual-test run. Re-attest their pending results against the new revision only after the diff since the checkpoint's `reviewedRevision` matches the recorded findings, focused reproductions pass and the final full quality gate passes, or after every remaining finding has become a follow-up issue under the limit rule. Use provider `ship-it-convergence`, model null, and a bounded output reference that names the prior evidence revision, the finding dispositions and the focused commands. This is fresh evidence for the fixed revision, not a copied verdict. A default-branch merge that leaves the branch files unchanged is re-attested the same way, naming the first-parent comparison. Security, data-loss or destructive-concurrency triggers instead require the second and final review cycle, which a spent fix pass does not prevent; an unresolved acceptance criterion blocks delivery. Required CI and hosted-review results always come from their actual current-head providers.
+After the bounded mode's single routine fix pass, do not dispatch another broad adversarial review or manual-test run. Re-attest their pending results only after the diff since `reviewedRevision` addresses recorded findings and affected reproductions pass, or after every remaining finding has become a follow-up issue under the limit rule. Use provider `ship-it-convergence` with finding dispositions and focused commands. Preserve unaffected criterion provenance; missing, failed or unverifiable evidence stays unsatisfied. Default-branch integration requires helper assessment of source, dependencies, invocation, runtime and policy, naming the first-parent comparison in its provenance. Severe triggers require the permitted second review cycle; an unresolved acceptance criterion blocks delivery. Required CI and hosted-review results always come from actual providers on the policy-required revision.
 
 Validate a complete next document before replacing a record. Write to a same-directory owner-only temporary file, flush and sync it, preserve the current valid record as `<revision>.json.bak`, then atomically rename the temporary file. A failed write leaves the previous record authoritative.
 

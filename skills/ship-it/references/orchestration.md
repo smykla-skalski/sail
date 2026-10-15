@@ -14,8 +14,6 @@ Create or resume the umbrella's durable checkpoint before building or dispatchin
 
 ## Dispatch and supervise
 
-In Sail, apply the entry's Native capacity rule: its separate agent and validation queues own native session admission and release. Workers submit selected `validation_gate` requests directly; no coordinator lease-message exchange is required. Fill eligible issue slots within Sail's configured limits and observe launch receipts. Do not infer a shared Sail session budget from Codex's native-child setting. The shared-budget accounting below applies to hosts that expose one shared budget.
-
 Use the runtime's available agent capacity, not a fixed three-worker cap. Count the coordinator, every issue worker and every nested gate against the same runtime budget; account for other consumers when the host exposes them. An explicit user concurrency limit remains binding. Report the effective budget and reservation before dispatch. Reserve at least one slot for selected nested gates: in a four-slot runtime, run at most two issue workers plus one gate. A reserved slot is available to ready gates, never to another issue worker. When no selected gate needs a subagent, no gate reservation is needed. If even one issue worker plus its required gate cannot fit, pause with the exact missing capability. Do not change host limits or permissions from the skill. Start every eligible child in its own fresh worker and worktree, from the repository's freshly fetched default branch. Give it a prompt under 2 KB containing only its child URL, repository, worktree, branch, dependency contracts and the path to [worker-rules.md](worker-rules.md); never repeat the rules or fork coordinator history. Persist its dispatch ID, then follow [worker-events.md](worker-events.md). Require fresh subagents for selected review and manual-test gates. The coordinator never authorizes another review cycle or fix pass: each worker's budget is its own checkpoint under the shared convergence policy, and a worker at the limit delivers with follow-up issues or reports its blocker.
 
 Run this scheduling loop in every harness, including Codex:
@@ -35,12 +33,18 @@ A worker sends exactly one final hand-back containing its checkpoint path and te
 
 After every graph mutation, dispatch, worker update, gate result, PR change, CI result, review-thread change, merge or issue-state change, atomically update the matching child and the parent's `nextAction`. Mark the parent blocked with the exact child and recovery action when coordination cannot continue. Complete the parent checkpoint only after every child and the umbrella are verified closed; its outcome records the umbrella URL and the children's final PR heads and merge commits.
 
+Workers inherit the original user authorization record and its scope, limits, consumed allowances and revocations from the checkpoint. The coordinator forwards verified authority; it never widens it. A replacement worker reads [authorization.md](authorization.md) and continues already authorized work without requesting the same permission. Internal limits trigger focused acceptance triage, not new optional hunts.
+
 ## Agent availability and pause
 
 Check that a worker can launch before dispatch. In Sail, check that fresh review and manual-test subagents can launch before treating a worker as runnable. If any required agent tool or session is unavailable, pause the run and report the exact unavailable capability and affected issues. Do not implement a child in the parent, run either gate inline, or treat automated tests as a manual-test substitute. Resume only when the required agent is available; keep completed children recorded.
 
-The review's Code and Findings Adversaries remain sequential. In Sail, every native gate dispatch uses `validation_gate` and its receipt remains mandatory; the coordinator-dispatched fallback never substitutes a generic gate for that receipt. Use that fallback only when Sail can bind the gate to the child task, worktree and revision; otherwise pause that child with the unavailable routing capability. Local claim ownership, checkpoint controls, permissions and merge-owner rules remain those in the Sail mode entry. The manual-test adversary starts after a clean review. This gate ordering applies within each worker; independent workers may run concurrently up to the pool limit.
+The review's Code and Findings Adversaries remain sequential. The manual-test adversary starts after a clean review. This gate ordering applies within each worker; independent workers may run concurrently up to the pool limit.
 
 ## Finish
 
 After all children are verified complete, close the umbrella with a completion comment if GitHub has not closed it. Report its link, each child issue and PR, gate verdicts, CI, merge/closure status, and any remaining blocker. A partly merged umbrella is in progress, never complete.
+
+## Sail overrides
+
+In Sail, apply the entry's Native capacity rule: separate agent and validation queues own native session admission and release. Workers submit `validation_gate` requests directly; no coordinator lease-message exchange is required. The portable shared-budget ledger applies only to hosts exposing one shared budget. Every native gate uses `validation_gate` and its receipt remains mandatory; the coordinator-dispatched fallback cannot substitute a generic gate for that receipt. Preserve local claims, native checkpoint controls, permissions and merge ownership.

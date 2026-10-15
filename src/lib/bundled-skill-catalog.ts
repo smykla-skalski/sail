@@ -7,6 +7,13 @@ export type BundledSkillName = (typeof bundledSkillNames)[number];
 // Must match the include_str! lists in src-tauri/src/browser_agent.rs and the files under skills/.
 export const bundledSkillReferences = {
   'ship-it': [
+    'authorization.md',
+    'telemetry-v2.schema.json',
+    'validation-reuse.md',
+    'scripts/checkpoint_state.py',
+    'scripts/convergence.py',
+    'scripts/delivery_benchmark.py',
+    'scripts/validation_reuse.py',
     'inputs.md',
     'explore.md',
     'branch.md',

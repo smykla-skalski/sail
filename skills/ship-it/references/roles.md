@@ -1,16 +1,16 @@
 # Portable workflow role routing
 
-[roles.json](roles.json) is authoritative for role IDs, route fields, context-isolation rules and harness mechanisms. Resolve routes before dispatching work and store them in the current revision's evidence record.
+[roles.json](roles.json) is authoritative for role IDs, route fields, independence rules and harness mechanisms. Resolve routes before dispatching work and store them in the current revision's evidence record.
 
 ## Roles
 
-| Role             | Responsibility                                           | Isolation                                            |
-| :--------------- | :------------------------------------------------------- | :--------------------------------------------------- |
-| `exploration`    | Repository discovery, constraints and implementation map | May use the primary execution                        |
-| `implementation` | Product changes, behavior tests and local checks         | Owns the implementation execution identity           |
-| `review`         | Adversarial review passes and finding verification       | Fresh subagent for every pass and retry              |
-| `testing`        | Real-surface adversarial testing and reproductions       | Fresh subagent for every pass and reproduction rerun |
-| `ci-triage`      | Failed hosted-check diagnosis and fix recommendation     | Use a fresh execution when a subagent is available   |
+| Role             | Responsibility                                           | Isolation                                          |
+| :--------------- | :------------------------------------------------------- | :------------------------------------------------- |
+| `exploration`    | Repository discovery, constraints and implementation map | May use the primary execution                      |
+| `implementation` | Product changes, behavior tests and local checks         | Owns the implementation execution identity         |
+| `review`         | Adversarial review passes and finding verification       | Fresh subagent execution for every pass            |
+| `testing`        | Real-surface adversarial testing and reproductions       | Fresh subagent execution for every attempt         |
+| `ci-triage`      | Failed hosted-check diagnosis and fix recommendation     | Use a fresh execution when a subagent is available |
 
 The review role covers each Code or Findings Adversary invocation. Create a route record for every invocation; repeated role IDs are valid when `executionId` differs. Testing and CI triage retries use new records rather than overwriting history. CI triage is invoked only for a hosted-check failure; successful CI needs no triage route.
 
@@ -23,7 +23,7 @@ Exploration and implementation record the already-running execution because thei
 1. A configured native role worker.
 2. An installed skill that accepts the selectors and exposes every actual worker route, including retries.
 3. A fresh generic subagent with the role mandate prepended.
-4. Never use inline execution for review or testing. If a fresh subagent cannot launch, block that gate.
+4. Apply adapter fallback only to the roles listed by that adapter's `fallback_roles`. `context_isolation.adapter_fallback_roles_excluded` takes precedence for review and testing: do not use inline execution for either role. Both require fresh subagent contexts.
 
 Harness adapters map the portable selector, not role names, to their available provider, model, variant and subagent controls. `session-provider` accepts `default` or the active provider; any other request is unsupported.
 
@@ -37,7 +37,7 @@ Harness adapters map the portable selector, not role names, to their available p
 
 For each non-default request, pass the selector through its mapped control and compare returned worker metadata with the request before accepting the route. Never silently ignore, substitute or normalize an unsupported selector. Reject it before dispatch, append the request and reason to non-gating `routeDiagnostics`, try the next mechanism, and block with the exact unsupported selector when none can satisfy it. Rejected candidates never enter `roleRoutes`.
 
-Never invent an actual selector. If the harness cannot expose the concrete provider, model and variant, set `modelResolution: unresolved`. Review and testing can proceed when the fresh execution identity is known; using a different model is optional.
+Never invent an actual selector. If the harness cannot expose the concrete provider, model and variant, set `modelResolution: unresolved`; unresolved model metadata does not block a gate when the fresh execution identity is established. Review and testing are blocked when the harness cannot establish a fresh subagent execution.
 
 ## Route evidence
 
@@ -56,19 +56,20 @@ Every committed revision's evidence record has `roleRoutes`, an append-only arra
   "mechanism": "generic-subagent",
   "executionId": "opaque execution identifier",
   "modelResolution": "resolved",
-  "contextIsolationRequired": true,
+  "independence": "independent",
+  "degradationReasons": [],
   "timestamp": "RFC 3339 UTC timestamp"
 }
 ```
 
-`sourceRevision` is the committed revision whose work or verdict the route supports. Bind pre-commit exploration and implementation routes to the resulting first commit. After a source-changing fix, carry those still-active route selections into the new revision record with the new `sourceRevision`; the old evidence record preserves their prior binding. Never carry a review, testing or CI-triage route forward because its output must be rerun for the new revision.
+`sourceRevision` is the committed revision whose work or verdict the route supports. Bind pre-commit exploration and implementation routes to the resulting first commit. Carry still-active build selections to a new revision, retaining the original record. Never carry a review, testing or CI-triage route forward as a fresh execution. A helper-verified reusable review/test result retains its actual execution identity with original revision, input/output digests and explicit current-head attestation under [validation-reuse.md](validation-reuse.md). Changed inputs require focused verification or a permitted fresh gate; CI follows live revision policy.
 
 Identifiers must not contain prompts, URLs, repository paths, credentials or conversation content. Preserve old route records when a role is retried for one revision. The result produced by a role names the matching `executionId` in its bounded output reference.
 
-A diagnostic contains `role`, the full requested selector, `stage: pre-dispatch|post-dispatch`, a contract reason and `timestamp`. A post-dispatch diagnostic also records the returned `actual`, `executionId` and `modelResolution` when available. Reasons cover unsupported selectors, unavailable mechanisms or metadata, and rejection for reused context or inline execution. Diagnostics explain fallback selection but never participate in context-isolation or completion checks because the candidate output was not accepted for the gate.
+A diagnostic contains `role`, the full requested selector, `stage: pre-dispatch|post-dispatch`, a contract reason and `timestamp`. A post-dispatch diagnostic also records the returned `actual`, `executionId` and `modelResolution` when available. Reasons cover unsupported selectors, unavailable mechanisms or metadata, reused context or inline execution. Diagnostics explain fallback selection but never participate in context-isolation or completion checks because the candidate output was not accepted for the gate.
 
-## Fresh review and testing sessions
+## Context isolation policy
 
-Each review and testing route must identify a fresh execution. Start a new subagent for every pass, retry, or reproduction rerun. The provider and model may match the implementation execution. Keep the actual provider and model when available; unresolved model metadata does not invalidate a route whose fresh execution identity is known. Never run these gates inline.
+Every review and testing pass runs in a fresh subagent context. Reject a route when its execution identity reuses the implementation context or another gate execution, or when its mechanism is `inline`. Each adversarial review pass and every tester retry uses a distinct execution. A different provider or model is not required; unresolved model metadata does not block a route when its execution identity is known. This applies to the one-pass `inline-review` gate too: its legacy gate ID does not authorize current-context or inline execution. If no fresh subagent route is available, block the gate and name the missing route as the next action.
 
 No role contract pins a provider or commercial model identifier. Repositories and harnesses choose concrete selectors at runtime.

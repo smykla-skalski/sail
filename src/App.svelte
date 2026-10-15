@@ -184,6 +184,10 @@
     workerStateSettled,
   } from './lib/issue-shipping';
   import type { ShipItIssue } from './lib/implementation-models';
+  import {
+    parseSpawnShipIssue,
+    requireSpawnShipIssueAvailable,
+  } from './lib/spawn-ship-assignment.ts';
   import { checkState } from './lib/pull-request-checks.ts';
   import {
     ciFailurePrompt,
@@ -7311,10 +7315,14 @@
       const owner = shipOwner(shipRuns, request.directory, sourceId);
       const requestedRevision = request.arguments.revision;
       // Reject a wrong target before the Ship issue stage or events change.
-      if (requestedRevision !== undefined && requestedRevision !== null && requestedRevision !== '')
+      if (
+        owner ||
+        (requestedRevision !== undefined && requestedRevision !== null && requestedRevision !== '')
+      )
         requireGateTargetCommit(
           requestedRevision,
           await invoke<string | null>('working_tree_commit', { path: request.directory }),
+          Boolean(owner),
         );
       try {
         if (owner) {
@@ -7667,7 +7675,9 @@
               owner.issue,
               {
                 ...issueEvidenceChanges,
-                blockedReason: report.verdict === 'BLOCKED' ? report.reason : null,
+                blockedReason: ['BLOCKED', 'FAILED'].includes(report.verdict)
+                  ? report.reason
+                  : null,
                 events: appendShipEvent(
                   owner.issue.events,
                   `${validation.gate}: ${report.verdict}`,
@@ -7708,26 +7718,32 @@
       throw new Error('Choose a Ship It validation gate.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
-    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
+    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, FAILED, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, FAILED, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
     const scratchDirectory =
       typeof request.arguments.scratchDirectory === 'string'
         ? request.arguments.scratchDirectory
         : undefined;
     if (request.arguments.scratchDirectory !== undefined && !scratchDirectory?.trim())
       throw new Error('Assigned scratch directory must be a nonempty path.');
+
     const requestedCommit = request.arguments.revision;
-    if (requestedCommit !== undefined && requestedCommit !== null && requestedCommit !== '')
+    const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
+    if (
+      gateOwner ||
+      (requestedCommit !== undefined && requestedCommit !== null && requestedCommit !== '')
+    )
       requireGateTargetCommit(
         requestedCommit,
         await invoke<string | null>('working_tree_commit', { path: request.directory }),
+        Boolean(gateOwner),
       );
     await recoverImplementationModels(request.directory);
     const activeModels = await activeImplementationModels(request.directory, sourceId);
     if (!activeModels)
       throw new Error('Implementation activity is still unresolved. Wait for the turn to finish.');
-    const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
     if (scratchDirectory !== undefined && !gateOwner?.issue.receiptId)
       throw new Error('Assigned scratch requires an active Ship worker.');
+
     const routeRisk = gateOwner?.issue.validationPolicy?.risk ?? 'medium';
     const routeRole = gate === 'test-adversary' ? 'testing' : 'review';
     const configuredGateRoute = modelRouting.routes.find(
@@ -7909,7 +7925,7 @@
           invoke<string | null>('working_tree_commit', { path: request.directory }),
         ]);
         // Recheck after queueing: HEAD may have moved while the gate waited for capacity.
-        const commit = requireGateTargetCommit(requestedCommit, headCommit);
+        const commit = requireGateTargetCommit(requestedCommit, headCommit, Boolean(gateOwner));
         updateSpawnReceipt(receiptId, {
           validation: {
             gate: gate as import('./lib/ship-progress').GateName,
@@ -8013,6 +8029,7 @@
     const target = request.arguments.target;
     const suppliedReceiptId = request.arguments.receiptId;
     const suppliedAccessKey = request.arguments.accessKey;
+    const shipIssue = parseSpawnShipIssue(request.arguments.shipIssue, role);
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (
       (suppliedReceiptId !== undefined || suppliedAccessKey !== undefined) &&
@@ -8059,6 +8076,11 @@
     const path = existing ? selectedTarget?.path : null;
     if (existing && typeof path !== 'string')
       throw new Error('Existing worktree path is required.');
+
+    if (shipIssue) {
+      await assertShipItIssueRepository(request.directory, shipIssue);
+      requireSpawnShipIssueAvailable(shipRuns, project, shipIssue);
+    }
 
     const routeSelection = routed
       ? selectModelRoute(modelRouting, {
@@ -8315,6 +8337,7 @@
           onPressureQueue(limit, reason);
           if (limit === null) updateSpawnReceipt(receiptId, { state: 'working' });
         },
+        shipIssue,
       );
       activeSpawnRequests.delete(receiptId);
       return {
@@ -8352,6 +8375,7 @@
     nativeGeneration?: number,
     promptAuthorization?: DirectShipAuthorization,
     onPromptQueue?: (limit: number | null, reason: string | null) => void,
+    shipIssue?: ShipItIssue,
   ) {
     const receipt = receiptId
       ? spawnReceipts.find((item) => item.receiptId === receiptId)
@@ -8359,6 +8383,7 @@
     const runOwner =
       receiptId &&
       (validation ||
+        shipIssue ||
         receipt?.requestId.startsWith('ship:') ||
         receipt?.requestId.startsWith('handoff:'))
         ? receiptId
@@ -8476,6 +8501,25 @@
       }
       if (receiptId)
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      if (shipIssue) {
+        if (!receipt) throw new Error('Ship assignment requires a launch receipt.');
+        requireSpawnShipIssueAvailable(shipRuns, receipt.project, shipIssue, created.path);
+        promptAuthorization = await adoptDirectShipRunWithAuthorization(
+          shipIssue,
+          created.path,
+          `acp:${source.agent}:${session.sessionId}`,
+          requestedModel ?? reportedModel,
+          true,
+        );
+        if (!promptAuthorization) throw new Error('Ship worker assignment was not saved.');
+        const owner = shipOwner(shipRuns, created.path, `acp:${source.agent}:${session.sessionId}`);
+        if (!owner) throw new Error('Ship worker assignment is unavailable.');
+        await updateShipIssue(owner.run, owner.issue, {
+          receiptId: receipt.receiptId,
+          workerState: 'starting',
+          workerUpdatedAt: Date.now(),
+        });
+      }
       if (receiptId) await saveShipRuns();
       await invoke('record_turn_snapshot', {
         path: created.path,
@@ -8629,6 +8673,14 @@
       };
     } catch (cause) {
       await acp.cancel(source.agent, created.path, session.sessionId, null).catch(() => undefined);
+      if (shipIssue) {
+        const owner = shipOwner(shipRuns, created.path, `acp:${source.agent}:${session.sessionId}`);
+        if (owner)
+          await updateShipIssue(owner.run, owner.issue, {
+            state: 'failed',
+            error: describe(cause),
+          }).catch(() => undefined);
+      }
       if (runOwner) {
         let cleanupError: unknown;
         if (dispatchedTurnId)

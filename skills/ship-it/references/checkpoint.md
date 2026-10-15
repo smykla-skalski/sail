@@ -2,8 +2,6 @@
 
 Use one portable JSON checkpoint as the source of truth for a task across Claude Code, Codex, OpenCode, Copilot CLI and Sail. It is both resumable workflow state and the task context supplied to review and test gates.
 
-In Sail mode, keep the portable `claim` null. Sail keeps ownership in its local claim store; do not create or update a GitHub claim comment.
-
 ## Location and identity
 
 Resolve the data root once as `${XDG_DATA_HOME:-$HOME/.local/share}/sai/ship-it/checkpoints/`. Create it with owner-only permissions. Never store checkpoints in a repository, plugin cache or system temporary directory.
@@ -50,7 +48,14 @@ Write UTF-8 JSON with these fields. Preserve unknown fields so a newer harness c
   "delivery": {
     "pullRequestUrl": "URL or null",
     "pullRequestHead": "full commit SHA or null",
-    "mergeCommit": "full commit SHA or null"
+    "pullRequestState": "open|closed-unmerged|merged|null",
+    "mergeCommit": "full commit SHA or null",
+    "mergedAt": "RFC 3339 UTC timestamp or null",
+    "reconciliation": {
+      "status": "matched|unreachable",
+      "checkedAt": "RFC 3339 UTC timestamp",
+      "error": "failure text or null"
+    }
   },
   "evidence": {
     "revision": "full commit SHA or null",
@@ -60,10 +65,11 @@ Write UTF-8 JSON with these fields. Preserve unknown fields so a newer harness c
   },
   "gateVerdicts": [],
   "claim": null,
+  "authorization": { "grants": [] },
   "bookkeeping": {
     "claims": false,
     "evidence": false,
-    "telemetry": false,
+    "telemetry": true,
     "policySource": "bundled default|repository path|explicit user request"
   },
   "risk": {
@@ -83,6 +89,9 @@ Write UTF-8 JSON with these fields. Preserve unknown fields so a newer harness c
     "reviewCycles": 0,
     "fixPasses": 0,
     "fullQualityGateRuns": 0,
+    "broadTestRuns": 0,
+    "reservations": [],
+    "reassessment": null,
     "reviewedRevision": null,
     "findings": [],
     "followUpIssues": []
@@ -99,9 +108,11 @@ Write UTF-8 JSON with these fields. Preserve unknown fields so a newer harness c
 
 For a single change, a delivered `outcome` is an object with `result: merged`, `pullRequestUrl`, `pullRequestHead`, `mergeCommit`, `sourceState` (`closed`, `unchanged` or `not-applicable`), `branchCleanup` (`deleted`, `preserved` or `not-applicable`) and `completedAt`. A terminal undelivered outcome has `result: cancelled|failed`, null delivery fields, the unchanged source state, `branchCleanup: not-applicable`, a non-empty `reason` and `completedAt`. For orchestration it has `result: coordinated`, `umbrellaUrl`, each child's final PR head and merge commit, `sourceState: closed` and `completedAt`. Use JSON `null`, never an empty string, for unknown optional values. Timestamps use `Z`; commit IDs are full hexadecimal SHAs.
 
+`delivery` records authoritative PR facts independently from workflow compliance and cleanup. `pullRequestState: merged` with its head, merge commit and `mergedAt` remains delivered while the workflow is active or blocked on a separate audit. Reconciliation failure changes only `reconciliation`; it never clears or downgrades confirmed delivery facts.
+
 `orchestration` is null for a single change. For an approved plan or umbrella, it is an object with `umbrellaUrl` and a `children` array. Every child records `issueUrl`, dependency issue URLs, status, worker identity, worktree, branch, revision, `evidenceRevision`, `evidenceRecordPath`, `evidenceStatus`, gated head, PR URL, unresolved-thread count, merge commit, issue state and next action. Unknown optional values are null. This state supplements rather than replaces live GitHub and worker reconciliation.
 
-`bookkeeping` is resolved from `.sai/ship-it-bookkeeping.json` or the current user's explicit request; the bundled default disables claims, revision evidence and telemetry. The checkpoint itself is mandatory in every mode. When claims are disabled, `claim` stays null and no claim comment is created. When evidence is disabled, `gateVerdicts` records each selected gate's ID, status, exact revision, provider, timestamp and bounded summary directly, and evidence status is `disabled`. When telemetry is disabled, no telemetry file or event is created.
+`bookkeeping` is resolved from `.sai/ship-it-bookkeeping.json` or the current user's explicit request. The bundled default disables claims and revision evidence and enables local telemetry. A repository policy may disable telemetry. The checkpoint itself is mandatory in every mode. When claims are disabled, `claim` stays null and no claim comment is created. When evidence is disabled, `gateVerdicts` records each selected gate's ID, status, exact revision, provider, timestamp and bounded summary directly, and evidence status is `disabled`. When telemetry is disabled, no telemetry file or event is created.
 
 With claims enabled, `claim` is null for Jira and description sources. For a GitHub implementation issue it repeats the claim comment's `commentId`, `commentUrl`, `holder`, `status`, `acquiredAt`, `renewedAt`, `expiresAt`, `releasedAt`, `releaseReason` and `takeover`. Before the first comment, `status` may be `pending`, with a generated holder and null comment and lease fields; resume uses that holder for the acquisition attempt. Once a comment exists, the issue comment is authoritative and status is `active` or `released`. An umbrella coordinator keeps its own claim null and stores each worker's claim fields in that child's orchestration entry.
 
@@ -109,7 +120,11 @@ With claims enabled, `claim` is null for Jira and description sources. For a Git
 
 `ciTriage.failures` preserves CI observations that conform to `ci-triage.schema.json`. Failure IDs are unique. A failed CI result names its observations; resolution and recurrence remain recorded after a rerun, provider recovery or source-changing fix. Unknown fields in a triage record are preserved for forward compatibility.
 
-`convergence` is the shared cross-harness budget state. In bounded mode, `authorizedBy` is null, `startedAt` is set when the first review worker starts, counters are monotonic, and follow-up issue URLs are unique. `reviewCycles` counts Code Adversary dispatches, `fixPasses` counts fix passes spent before their first edit and `fullQualityGateRuns` counts complete local quality-gate runs inside the validation loop. `reviewedRevision` is the full SHA the last completed review cycle attested, or null. `findings` holds that cycle's surviving findings as bounded entries with `id` (`F1`, `F2`, …), `label` (`blocking|issue|question`), `location` (`path:line`), `summary` (one sentence) and `disposition` (`open|fixed|follow-up|blocked`); a `follow-up` entry has its issue URL in `followUpIssues`. Exhaustive mode requires the user's exact current-request sentence in `authorizedBy`; no repository risk level, harness, coordinator, worker-rules file, spawn prompt or compaction summary may supply or infer it.
+`authorization.grants` records scoped user authority separately from internal validation budgets. Each grant has a stable `id`, `source` (`kind: user-request|user-reply`, original `message`, `reference`, and `request`, null only for an initial request), non-empty `scope` (an array of non-empty strings; a validation extension names its counter, for example `reviewCycles`), `limits` (resource, non-negative integer `maximum` and `used`) and `status: active|ambiguous|revoked|exhausted`. Preserve explicit limits, consumed amounts and revocations. Empty limits retain bounded optional validation; they never authorize unlimited loops. A scoped reply records the concrete pending request and original reply; it needs no special phrase. Workers and resumed sessions reconcile original sources before acting; copied authority never widens scope. See [authorization.md](authorization.md).
+
+`convergence.acceptanceRecovery`, when present, records focused confirmed acceptance failures, criterion, active grant ID, revision, correction, verification and attempt results after an internal limit. It preserves counters and does not authorize optional expansion.
+
+`convergence` is the shared cross-harness budget state. In bounded mode, `authorizedBy` is null, `startedAt` is set when the first review worker starts, counters are monotonic, and follow-up issue URLs are unique. `reviewCycles` counts Code Adversary dispatches, `fixPasses` counts fix passes spent before their first edit and `fullQualityGateRuns` counts complete local quality-gate runs inside the validation loop. `reviewedRevision` is the full SHA the last completed review cycle attested, or null. `findings` holds that cycle's surviving findings as bounded entries with `id` (`F1`, `F2`, …), `label` (`blocking|issue|question`), `location` (`path:line`), `summary` (one sentence) and `disposition` (`open|fixed|follow-up|blocked`); a `follow-up` entry has its issue URL in `followUpIssues`. Exhaustive mode requires an original user request or a clear approval of a concrete bounded pending request recorded in `authorization.grants` and referenced by `authorizedBy`. No repository risk level, harness, coordinator, worker-rules file, spawn prompt or compaction summary may create or widen it; a verified original grant remains valid across resume.
 
 Validate these invariants in addition to field presence and types:
 
@@ -117,39 +132,58 @@ Validate these invariants in addition to field presence and types:
 - `status: blocked` has a non-empty `blocker` and actionable `nextAction`; other statuses have a null blocker.
 - `phase: complete` and a non-null `outcome` occur together with `status: completed|cancelled|failed`; active and blocked states have a null outcome. Completed means delivered, cancelled means explicitly cancelled, and failed means a terminal failure ended the run.
 - A merge commit requires a PR URL and PR head. A completed single-change outcome repeats the matching delivery values.
+- A matched merged delivery has `pullRequestState: merged`, a non-null `mergedAt` and a null reconciliation error. Open and closed-unmerged PRs have no merge facts. A later unreachable observation preserves the last confirmed PR state and merge facts.
 - Evidence is `disabled` when bookkeeping evidence is off. When enabled, it is `missing` before the first task commit; otherwise its revision and record path identify the current revision's valid evidence record, and `complete` requires the exact workflow revision.
 - With claims enabled, an active GitHub implementation checkpoint has exactly one claim comment for its holder. Repository or GitHub writes require `status: active`, an unexpired `expiresAt`, and values reconciled with the authoritative issue comment. A completed checkpoint with a claim has released it with reason `merged`. With claims disabled, `claim` remains null and writes need no claim lease.
 - Before validation, risk has a level, a diff class, a policy source and unique required gates. A lower level than an earlier revision, matching rule or resumed checkpoint requires non-null explicit override authorization; a null level recorded before the first commit is not a floor.
 - Before validation, `releasePolicy` is non-null, normalized from repository instructions and live forge policy, and has a successful reconciliation timestamp. A material policy change invalidates hosted-review and CI evidence.
-- Before validation, convergence mode and counters conform to `convergence-policy.json`. Review, test, CI and hosted feedback update the same counters; bounded mode never exceeds two review cycles, one fix pass, one full local quality gate inside the validation loop or 90 elapsed minutes. `reviewedRevision` is non-null only when `reviewCycles` is positive; a `blocked` finding occurs only with `status: blocked`; every `follow-up` finding has a URL in `followUpIssues`.
+- Before validation, convergence mode and counters conform to `convergence-policy.json`. Review, test, CI and hosted feedback update the same counters; bounded optional validation never exceeds two review cycles, one fix pass, one full local quality gate inside the validation loop or 90 elapsed minutes. Focused acceptance recovery follows active scoped authority without resetting those counters. `reviewedRevision` is non-null only when `reviewCycles` is positive; a `blocked` finding occurs only with `status: blocked`; every `follow-up` finding has a URL in `followUpIssues`.
 - Every CI triage failure has a unique identity derived from revision, workflow, job and attempt. A resolved failure has a resolution; an open failure does not. Rerun authorization never exceeds its recorded limit.
 - An orchestration checkpoint has one child entry for every native subissue; each dependency names another recorded child. With evidence enabled, a completed child has `evidenceStatus: complete` and its evidence revision equals its gated PR head. With evidence disabled, its evidence status is `disabled` and its checkpoint gate verdicts all pass on the gated PR head.
 - `createdAt` never changes and is not later than `updatedAt`.
 
 ## Safe writes
 
-Validate the complete next document before replacing state. Write it to a same-directory temporary file with owner-only permissions, flush and sync it, preserve the current valid file as `<checkpoint-id>.json.bak`, then atomically rename the temporary file over the checkpoint. Never update state before its associated operation succeeds. A failed write leaves the previous checkpoint authoritative.
+Validate the complete next document before replacing state. Write it to a same-directory temporary file with owner-only permissions, flush and sync it, preserve the current valid file as `<checkpoint-id>.json.bak`, then atomically rename the temporary file over the checkpoint. Never record successful completion before its operation succeeds. Allowance reservations intentionally persist before work starts; failed/interrupted attempts retain consumption. A failed write leaves the previous checkpoint authoritative.
 
-Use `python3 <skill-dir>/scripts/bookkeeping.py policy --repository <root>` once during resolve, adding `--enable claims,evidence,telemetry` only for features the current user explicitly enabled. Use `bookkeeping.py transition` for every checkpoint phase or status transition so each transition is one validated call; pass the complete outcome object through `--outcome-json` for a terminal transition. Never write an ad-hoc state helper. Optional claim, evidence and telemetry operations run only when the returned policy enables them.
+Use `python3 <skill-dir>/scripts/bookkeeping.py policy --repository <root>` once during resolve, adding `--enable claims,evidence,telemetry` only for features the current user explicitly enabled. Use `bookkeeping.py transition` for every checkpoint phase or status transition so each transition is one validated call; pass the complete outcome object through `--outcome-json` for a terminal transition. Never write an ad-hoc state helper and never hand-edit the checkpoint JSON: every write below takes the checkpoint lock, validates the whole document and replaces it atomically. Claim and evidence operations run only when enabled. Telemetry runs by default and is skipped only when the returned policy disables it.
+
+```text
+bookkeeping.py create --repository ROOT --identity IDENTITY --source-json SOURCE --title T --objective O --criteria-json ARRAY [--source-url U] [--default-branch B] [--branch B] [--enable FEATURES] [--grant-json GRANT]... [--checkpoint-dir DIR]
+bookkeeping.py set-risk --checkpoint FILE --risk-json OBJECT
+bookkeeping.py set-release-policy --checkpoint FILE --policy-json OBJECT
+bookkeeping.py record-gate --checkpoint FILE --verdict-json OBJECT
+bookkeeping.py set-findings --checkpoint FILE --dispositions-json OBJECT
+bookkeeping.py attest-review --checkpoint FILE --revision SHA --summary TEXT [--gate GATE] [--command TEXT]...
+```
+
+- `create` takes the canonical source object (`{sourceType, repository, issue}`, `{sourceType, site, key}` or `{sourceType, repository, objective, acceptanceCriteria}`), derives `task.canonicalSource`, the checkpoint ID and the file name, defaults `--checkpoint-dir` to the data root above and writes owner-only at phase `resolve`. An existing file for the same source is reported with `created: false` and left untouched; another source at that name stops. Claims stay `null`: their protocol writes them.
+- `set-risk` takes `level`, `diffClass`, `policySource`, `matchedRules`, `requiredGates` and optional `overrideAuthorization`; a level below the recorded one needs the override, which later calls keep.
+- `set-release-policy` takes exactly the normalized object and enums from the release contract and rejects anything else. A material change (anything but `resolvedAt`) marks passed `ci` and `hosted-review` verdicts `stale`.
+- `record-gate` takes `gate`, `status` (`passed|failed|blocked`), `revision` (the current workflow revision), `provider`, `summary` (at most 500 characters) and optional `timestamp`, `model`, `url`; it replaces a verdict with the same gate, revision and provider. It is refused while evidence is enabled, because the evidence record owns verdicts.
+- `set-findings` maps finding IDs to `open|fixed|blocked` or `{"disposition":"follow-up","followUpIssue":URL}`, which also appends the URL to `followUpIssues`; `blocked` needs a blocked workflow, and any unresolved finding marks a re-attestation `stale`.
+- `attest-review` records the `ship-it-convergence` re-attestation for the current revision from the stored findings, and is refused unless the completed review failed with findings that are all `fixed` or `follow-up`; a clean review is carried to a new head by `assess` and `reserve`.
 
 ## Creation and resume
 
-On a fresh task, create the checkpoint with `phase: resolve`, `status: active`, no revision, and task resolution as `nextAction`. Then advance to `explore` only after the source and acceptance criteria are complete.
+On a fresh task, run `bookkeeping.py create` to write the checkpoint with `phase: resolve`, `status: active`, no revision, and task resolution as `nextAction`. Then advance to `explore` only after the source and acceptance criteria are complete.
 
-When the file exists, migrate only the known legacy shapes before validating current required fields. A schema v1 checkpoint that has every previously required field may lack any subset of `risk`, `claim`, `ciTriage` and `convergence`, including only one of those fields, and may also lack `releasePolicy`, `bookkeeping`, `gateVerdicts` or `hostedReviewDecision` because they were added in successive ship-it versions. This preserves the older migration case including only `ciTriage` among the newer optional fields. A previously valid terminal single-change outcome may lack `branchCleanup`; add `branchCleanup: not-applicable` so its recorded delivery remains reportable without inventing cleanup. Validate that legacy document, add a null claim or release policy when absent, add empty `gateVerdicts`, and add `hostedReviewDecision: null` for resolution after resume. Legacy runs used mandatory bookkeeping, so when `bookkeeping` is absent add claims enabled only for a GitHub implementation source, evidence and telemetry enabled, and `policySource: legacy compatibility`; do not silently apply the new default-off policy to in-progress state. Add the risk object with `level`, `diffClass` and `policySource` null and empty `matchedRules` and `requiredGates` when absent, add `diffClass: null` to a risk object that lacks it, add `ciTriage: {"failures": []}` when absent, and add bounded convergence with null start and zero counters when absent. For a convergence object written before `reviewedRevision` and `findings` existed, add `reviewedRevision: null` and `findings: []` only when `reviewCycles` is zero. When `reviewCycles` is positive, reconstruct both fields only from unambiguous revision-bound review evidence; if that evidence lacks the attested revision or structured surviving findings, stop with the checkpoint path and the action to rerun review rather than inventing empty review state. Preserve every other field, then write atomically with `overrideAuthorization` null. This migration adds unknown state; it never selects or lowers risk, invents ownership, invents a CI observation, spends validation budget or invents release requirements. Missing any other required field remains invalid. Do not silently repair or replace invalid state.
+When the file exists, migrate only the known legacy shapes before validating current required fields. A schema v1 checkpoint that has every previously required field may lack any subset of `risk`, `claim`, `ciTriage` and `convergence`, including only one of those fields, and may also lack `releasePolicy`, `bookkeeping`, `gateVerdicts` or `hostedReviewDecision` because they were added in successive ship-it versions. This preserves the older migration case including only `ciTriage` among the newer optional fields. A previously valid terminal single-change outcome may lack `branchCleanup`; add `branchCleanup: not-applicable` so its recorded delivery remains reportable without inventing cleanup. Validate that legacy document, add a null claim or release policy when absent, add empty `gateVerdicts`, and add `hostedReviewDecision: null` for resolution after resume. Legacy runs used mandatory bookkeeping, so when `bookkeeping` is absent add claims enabled only for a GitHub implementation source, evidence and telemetry enabled, and `policySource: legacy compatibility`; do not silently apply the new default-off policy to in-progress state. Add `authorization: {"grants": []}` when absent without inventing a grant; recover the original user source before action. Add the risk object with `level`, `diffClass` and `policySource` null and empty `matchedRules` and `requiredGates` when absent, add `diffClass: null` to a risk object that lacks it, add `ciTriage: {"failures": []}` when absent, and add bounded convergence with null start and zero counters when absent. For a convergence object written before `reviewedRevision` and `findings` existed, add `reviewedRevision: null` and `findings: []` only when `reviewCycles` is zero. When `reviewCycles` is positive, reconstruct both fields only from unambiguous revision-bound review evidence; if that evidence lacks the attested revision or structured surviving findings, stop with the checkpoint path and the action to rerun review rather than inventing empty review state. Preserve every other field, then write atomically with `overrideAuthorization` null. This migration adds unknown state; it never selects or lowers risk, invents ownership, invents a CI observation, spends validation budget or invents release requirements. Missing any other required field remains invalid. Do not silently repair or replace invalid state.
 
 1. Recompute the ID from `task.canonicalSource`; it must match both `checkpointId` and the filename.
 2. Compare the resolved task source and repository identity with the checkpoint. They must match exactly after normalization.
 3. Reconcile Git before edits: current repository identity, default branch, task branch, `HEAD`, dirty files and ancestry.
-4. For GitHub work, reread the issue, linked PR and PR head. When claims are enabled, also reread the claim comment and reconcile it with checkpoint ownership. For Jira, reread its status without mutating it.
-5. Update stale but unambiguous facts atomically, then continue from `workflow.nextAction` rather than replaying completed phases.
+4. For GitHub work, resolve the checkpoint's stored PR URL before using issue links, then read that exact PR with `gh pr view <url> --json url,state,headRefOid,mergeCommit,mergedAt`. Pass the successful object to `bookkeeping.py reconcile-delivery --pull-request-json`; on a remote read failure pass its bounded error to `--failure`, preserve confirmed facts, report the failure and stop before planning or delivery work. When claims are enabled, also reread the claim comment and reconcile it with checkpoint ownership. For Jira, reread its status without mutating it.
+5. Route the helper result before planning: `merged` advances directly to completion verification without push, merge, local validation or hosted validation; `open` resumes the recorded PR at its authoritative head; `closed-unmerged` stops with reopening or replacement as the recovery action. An identity mismatch or conflict with confirmed merge facts stops without changing the checkpoint.
+6. Reread the source issue separately from the PR. Issue closure never follows from `pullRequestState`; apply and verify the resolved closure policy during completion.
+7. Update other stale but unambiguous facts atomically, then continue from `workflow.nextAction` rather than replaying completed phases.
 
 Safe reconciliation cases:
 
 - `HEAD` equals the recorded revision: continue after external-state checks.
 - `HEAD` descends from the recorded revision and every intervening commit belongs to this task: inspect it, update the revision, and invalidate review or test evidence from the older revision.
 - The current evidence record matches `HEAD`: validate it and continue collecting only the results still pending for that revision.
-- GitHub already shows the recorded PR merged: advance to completion verification using its actual head and merge commit.
+- GitHub already shows the recorded PR merged: preserve delivery, record its actual head, merge commit and `mergedAt`, then advance directly to completion verification even when compliance or cleanup remains blocked.
 - The issue is closed and its linked PR is merged: finalize only after verifying the merge contains the task revision.
 
 ## Recovery stops
@@ -159,7 +193,7 @@ Stop before repository changes and report the checkpoint path plus exactly one r
 - Invalid JSON, missing required fields, bad enums or an ID mismatch: restore the `.bak` after inspecting it, or move the invalid file aside and explicitly restart the task.
 - Different canonical source or repository identity: open the task in the matching repository, or explicitly start a distinct task; never rewrite identity in place.
 - Recorded revision descends from the current `HEAD`, histories diverge, unrelated dirty files overlap, or intervening commits cannot be attributed: switch to the recorded task branch/worktree or reconcile the Git history manually.
-- Open PR branch or head conflicts with the checkpoint: inspect the PR and choose the authoritative branch before resuming.
+- A different PR URL conflicts with the stored identity: inspect the issue and choose the authoritative PR before resuming. A matching open PR uses its remote head; a matching closed-unmerged PR needs an explicit reopen or replacement decision.
 - With claims enabled, a missing, expired, conflicting or mismatched GitHub claim follows the claim contract's reconciliation or audited takeover flow; never rewrite ownership in the checkpoint alone. With claims disabled, any non-null claim is invalid.
 - Missing, invalid or mismatched evidence: restore its `.bak` after inspection, or rerun the required evidence for the current revision; never advance with an older record.
 - Closed issue without a verifiable merged PR, or merged PR that does not contain the recorded revision: inspect the external state and correct it before completion.
@@ -168,3 +202,7 @@ Stop before repository changes and report the checkpoint path plus exactly one r
 - `status: cancelled|failed`: report the recorded reason and released claim, then stop. Resume only on an explicit restart instruction; atomically clear the terminal outcome, set status active, and follow audited claim takeover before any repository or GitHub write.
 
 Never infer success from an advanced phase name. Revision, PR, issue and merge facts must agree before advancing or finalizing.
+
+Validation reservations use `bookkeeping.py reserve` and `finish` under the same checkpoint lock as transitions. Do not manually change counters. `reservations` preserves request, ordinal, status and immutable completed result; `broadTestRuns` counts broad passes. Legacy checkpoints gain empty receipts without resetting any counter. A spent review lacking historical attestation requires evidence recovery. See [convergence.md](convergence.md) for receipt reconciliation and reassessment.
+
+Structured reservations retain `inputManifest`, its captured `inputSnapshot`, the canonical input fingerprint and completed `outputArtifact` path/digest. `convergence.validityDecisions` records each current-head assessment and changed dimensions without spending a gate allowance. Verified unchanged results retain their original receipt and current-head gate provenance; invalidated verdicts become stale. See [validation-reuse.md](validation-reuse.md). Never replace missing criterion evidence with a blanket passing attestation.

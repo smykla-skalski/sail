@@ -114,7 +114,7 @@ void test('Vite loads bundled-skills.ts with each skill on its own core', async 
 void test('the bundled ship-it records which upstream release it matches', () => {
   assert.match(
     shipItCore,
-    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.36 with Sail mode/,
+    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.68 with Sail mode/,
   );
 });
 
@@ -126,7 +126,7 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   assert.match(prompt, /`task_checkpoint_update`/);
   assert.match(prompt, /`task_evidence_record`/);
   assert.match(prompt, /`validation_gate`/);
-  assert.match(prompt, /Available references: inputs\.md, .*scripts\/test_telemetry\.py\./);
+  assert.match(prompt, /Available references: .*inputs\.md, .*scripts\/test_telemetry\.py\./);
   assert.match(prompt, /publish\.md/);
   assert.match(prompt, /scripts\/bookkeeping\.py/);
   assert.doesNotMatch(prompt, /# Durable ship-it checkpoint/);
@@ -271,4 +271,25 @@ void test('Sail native gate admission needs no phase-forbidden or inactive-turn 
     read('ship-it', 'references/worker-rules.md'),
     /Do not send coordinator lease messages/,
   );
+});
+
+void test('adversarial cores carry arguments and updated base failure semantics', () => {
+  for (const name of ['adversarial-review', 'adversarial-test']) {
+    assert.match(read(name, 'SKILL.md'), /\$ARGUMENTS/);
+    const workflow = read(name, 'references/workflow.md');
+    assert.match(workflow, /opencode.*`subagent`.*`task`/);
+    assert.match(workflow, /Gate failure: base ref/);
+    assert.match(workflow, /No (?:review|test) performed:/);
+    assert.doesNotMatch(workflow, /`\$ARGUMENTS`/);
+  }
+});
+
+void test('bundled adversarial prompts retain invocation selectors for workflow fallback', () => {
+  for (const name of ['adversarial-review', 'adversarial-test']) {
+    const invocation = `/${name} https://github.com/example/project/pull/42 --base origin/topic --context acceptance.txt`;
+    const prompt = resolveSkillPrompt(mergeSkills([], bundled), invocation);
+    assert.ok(prompt.startsWith(invocation));
+    assert.match(prompt, /Invocation arguments: `\$ARGUMENTS`/);
+    assert.match(prompt, /take the same values from the user's request/);
+  }
 });

@@ -1,6 +1,6 @@
 # Expiring GitHub work claims
 
-Use this contract only when checkpoint bookkeeping policy enables claims outside Sail. In Sail mode, Sail owns a local claim and the portable checkpoint keeps `claim: null`; never write a GitHub claim comment. Claims default off; then create no issue comment and keep `claim: null`. When enabled outside Sail, use one visible issue comment as a portable lease for GitHub-backed work. Jira tickets and plain task descriptions do not create claims.
+Use this contract only when checkpoint bookkeeping policy enables claims. Claims default off; then create no issue comment and keep `claim: null`. When enabled, use one visible issue comment as a portable lease for GitHub-backed work. Jira tickets and plain task descriptions do not create claims.
 
 ## Comment format
 
@@ -68,3 +68,7 @@ When takeover adopts an existing committed revision, atomically rebind its evide
 Release only the current holder's comment. Set `status` to `released`, set `releasedAt`, copy it to `renewedAt`, set `expiresAt` to the same time, and set `releaseReason` to `merged`, `cancelled`, `terminal failure` or `lost acquisition race`. Reread the comment before recording the release in the checkpoint.
 
 Release after merge verification, explicit cancellation, or a failure that ends the run and cannot resume. A temporary wait or recoverable blocker keeps the claim only while the holder can renew it; otherwise let it expire. Failure to release after a verified merge does not undo delivery, but it must be reported with the comment URL and exact cleanup action.
+
+## Sail overrides
+
+In Sail mode, Sail owns the local claim and portable `claim` stays null. Never create, renew, release or take over a GitHub claim comment.

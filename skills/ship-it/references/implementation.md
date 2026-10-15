@@ -2,11 +2,11 @@
 
 Follow repository patterns and implement the smallest complete behavior. Add or extend behavior-focused tests; avoid tests that only mirror implementation details.
 
-Resolve and record the implementation role before the first source edit. Its actual route and execution identity are the baseline for review and test route records.
+Resolve and record the implementation role before the first source edit. Its execution identity is the baseline for ensuring review and testing use fresh subagent contexts.
 
 For GitHub work with claims enabled, verify the checkpoint's claim immediately before the first source edit. Renew it only immediately before a repository or GitHub write when due, never on a timer. A failed renewal stops that write and later edits until claim reconciliation succeeds.
 
-Before an initial commit, run the focused formatter, checks and tests needed to keep the revision sound. During the convergence contract's single fix pass, run focused tests for changed behavior and reproduced failures. Run the complete repository quality gate once against the final candidate revision before delivery. Fix root causes. Never add a lint or type suppression, bypass hooks, or use `--no-verify`.
+Before an initial commit, run the focused formatter, checks and tests needed to keep the revision sound. During the convergence contract's single fix pass, run focused tests for changed behavior and reproduced failures. Reserve `quality` with `bookkeeping.py reserve` before the validation-loop gate; run only on `dispatch: true`, then finish the receipt. Run the complete repository quality gate once against the final candidate revision before delivery. Fix root causes. Never add a lint or type suppression, bypass hooks, or use `--no-verify`.
 
 Keep commits focused and sign them. Commit titles use `<type>(<scope>): <description>`, require a scope, stay within 50 characters and contain no PR reference or AI attribution. Wrap body lines at 72 characters.
 

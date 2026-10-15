@@ -1,0 +1,128 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  parseSpawnShipIssue,
+  requireSpawnShipIssueAvailable,
+} from '../src/lib/spawn-ship-assignment.ts';
+import { adoptRegisteredDirectShipRun, type ShipRun } from '../src/lib/issue-shipping.ts';
+import {
+  loadShipRuns,
+  serializeShipRuns,
+  shipOwner,
+  shipCheckpointOwner,
+} from '../src/lib/ship-progress.ts';
+
+void test('Ship spawn assignment is explicit and limited to implementation workers', () => {
+  assert.equal(parseSpawnShipIssue(undefined, 'implementation'), undefined);
+  assert.deepEqual(
+    parseSpawnShipIssue({ repository: 'Owner/Repo', number: 789 }, 'implementation'),
+    {
+      repository: 'owner/repo',
+      number: 789,
+    },
+  );
+  for (const role of [undefined, 'review', 'testing', 'exploration'])
+    assert.throws(
+      () => parseSpawnShipIssue({ repository: 'a/b', number: 1 }, role),
+      /implementation/,
+    );
+  for (const value of [
+    null,
+    [],
+    {},
+    { repository: '../a/b', number: 1 },
+    { repository: 'a/b', number: '1' },
+    { repository: 'a/b', number: 0 },
+    { repository: 'a/b', number: 1.5 },
+    { repository: 'a/b', number: Number.MAX_SAFE_INTEGER + 1 },
+    { repository: 'a/b', number: 1, threadId: 'unrelated' },
+  ])
+    assert.throws(
+      () => parseSpawnShipIssue(value, 'implementation'),
+      /repository and positive issue/,
+    );
+});
+
+const input = {
+  id: 'spawned',
+  project: '/repo',
+  directory: '/repo/worker',
+  branch: 'fix/789',
+  repository: 'a/b',
+  number: 789,
+  provider: 'codex' as const,
+  threadId: 'acp:codex:worker',
+  approvedAt: 100,
+};
+
+void test('persisted spawned assignment grants all worker controls only to its thread and worktree', async () => {
+  let runs: ShipRun[] = [];
+  let saved = '';
+  await adoptRegisteredDirectShipRun(
+    Promise.resolve([
+      { path: input.directory, branch: input.branch, present: true, generation: null },
+    ]),
+    input,
+    () => runs,
+    (value) => {
+      runs = value;
+    },
+    async () => {
+      saved = serializeShipRuns(runs, []);
+    },
+  );
+  const restored = loadShipRuns(saved);
+  const owner = shipOwner(restored, input.directory, input.threadId);
+  assert.equal(owner?.issue.number, 789);
+  assert.ok(owner?.issue.checkpoint);
+  assert.equal(owner?.issue.validationPolicyRequired, true);
+  assert.equal(shipCheckpointOwner(restored, input.directory, input.threadId)?.issue, owner?.issue);
+  for (const [directory, threadId] of [
+    [input.project, input.threadId],
+    [input.directory, 'acp:codex:coordinator'],
+    [input.directory, 'acp:codex:unrelated'],
+  ]) {
+    assert.equal(shipOwner(restored, directory, threadId), undefined);
+    assert.equal(shipCheckpointOwner(restored, directory, threadId), undefined);
+  }
+  assert.throws(
+    () =>
+      requireSpawnShipIssueAvailable(restored, input.project, { repository: 'A/B', number: 789 }),
+    /already has a tracked assignment/,
+  );
+  assert.throws(
+    () =>
+      requireSpawnShipIssueAvailable(
+        restored,
+        input.project,
+        { repository: 'a/b', number: 790 },
+        input.directory,
+      ),
+    /worktree already has a Ship assignment/,
+  );
+  assert.doesNotThrow(() =>
+    requireSpawnShipIssueAvailable(restored, input.project, { repository: 'a/b', number: 790 }),
+  );
+});
+
+void test('failed assignment persistence leaves no accessible worker checkpoint', async () => {
+  let runs: ShipRun[] = [];
+  await assert.rejects(
+    adoptRegisteredDirectShipRun(
+      Promise.resolve([
+        { path: input.directory, branch: input.branch, present: true, generation: null },
+      ]),
+      input,
+      () => runs,
+      (value) => {
+        runs = value;
+      },
+      async () => {
+        throw new Error('storage unavailable');
+      },
+    ),
+    /storage unavailable/,
+  );
+  assert.equal(shipOwner(runs, input.directory, input.threadId), undefined);
+  assert.equal(shipCheckpointOwner(runs, input.directory, input.threadId), undefined);
+});

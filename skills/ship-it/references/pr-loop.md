@@ -1,6 +1,6 @@
 # ship-it PR loop: open, wait, fix, merge
 
-Resume the draft PR created in the publish step and take its current head to merge. Never poll in the foreground. Follow [worker-events.md](worker-events.md): persist one dispatch ID and 30-minute deadline per PR waiter, wake on hosted-state changes, and accept events once. A fallback waiter reads hosted status at most once per ten minutes.
+Resume a reconciled open PR at its current head. A merge skips this loop, push, merge and revalidation; other results stop under checkpoint recovery. Apply [worker-events.md](worker-events.md) with one waiter keyed by PR and head SHA and a 30-minute deadline.
 
 Load the resolved release policy from the checkpoint and reconcile it with live GitHub policy before the first push and immediately before merge. A missing, stale, ambiguous or unsatisfied release policy blocks this loop with the exact required human action.
 
@@ -13,11 +13,11 @@ Do not rewrite history after validation begins. If the unpublished branch still 
 ## History rules after the first push
 
 - Never force-push and never rebase.
-- When the default branch moves or the PR conflicts, `git fetch origin` and `git merge origin/<default>` with a signed merge commit (`git merge -S`). In conflicts keep both sides' entries (changelogs, lists, version tables), then rerun the quality gates. A merge that leaves the reviewed files unchanged triggers no review; re-attest the merged revision under the convergence contract's default-branch-merge rule.
+- On a moved default branch or conflict, `git fetch origin` and `git merge origin/<default>` with a signed merge commit (`git merge -S`). Preserve both sides' entries. Assess local manifests under [validation-reuse.md](validation-reuse.md); carry verified results and verify affected criteria under the convergence contract.
 
 ## Draft PR compatibility
 
-The normal path already has a draft PR from [publish.md](publish.md). On resume from an older checkpoint without one, use that phase now: local checks are the only validation due before draft creation. Review and manual-test results are due before ready-for-review, and CI remains due before merge.
+Legacy checkpoints without a PR use [publish.md](publish.md) after local checks; review/test remain due before ready and CI before merge.
 
 Create or update the PR body with `## Motivation`, `## Implementation information`, a changelog line (`> Changelog: type(scope): desc` or `> Changelog: skip`), gate verdicts for the current head, any unsettled review `question:` findings, each criterion recorded as `untested` by a `PASS (partial)` verdict under `## Untested criteria`, plus the source link:
 
@@ -27,7 +27,7 @@ Create or update the PR body with `## Motivation`, `## Implementation informatio
 | Jira ticket      | The Jira key, as a link to the ticket, in the body (and in the title when the repository's convention puts it there). Never `Closes`                                                 |
 | Task description | No issue reference                                                                                                                                                                   |
 
-Follow the repository's own PR template or conventions when it documents them. Capture the PR number.
+Follow the repository's own PR template or conventions when it documents them.
 
 Read the created PR body back from GitHub. For `PASS (partial)`, verify that `## Untested criteria` contains every criterion and environmental blocker from the verdict before treating PR creation as complete. A missing or altered entry returns to PR-body correction; it does not invalidate the already-valid revision result.
 
@@ -45,14 +45,14 @@ If the request mechanism itself fails, use the matching GitHub REST reviewer or 
 
 ## Wait for hosted gates
 
-Use one blocking background waiter that returns when checks, reviews, threads or the deadline change. Do not list agents between waits, and do not issue a status read more than once per ten minutes. In Sail, consume worker events instead of reading terminal panes. On each returned change inspect:
+Consume a hosted-state event instead of reading terminal panes or listing agents. On each check, review or thread change inspect:
 
 - `gh pr checks <n>` when `ci` is selected.
 - Reviews and outstanding requests when `hosted-review` is selected: `gh api repos/<owner>/<repo>/pulls/<n>/reviews` plus the PR's requested reviewers and teams.
 - Required unresolved, non-outdated review threads via GraphQL `repository.pullRequest.reviewThreads` (`isResolved`, `isOutdated`, comments), filtered by the resolved release policy.
 - Every named policy or platform-required check on the exact PR head when `ci` is selected.
 
-If selected CI fails, read [ci-triage.md](ci-triage.md) before retrieving logs. Deduplicate the revision/workflow/job/attempt, bound and redact failing sections, classify the failure with evidence, then route only code failures back to implementation. A code failure is an unresolved acceptance failure under the shared convergence policy and consumes its remaining fix/cycle budget. Never rerun CI without the repository policy or explicit approval required there.
+If selected CI fails, read [ci-triage.md](ci-triage.md) before retrieving logs. Deduplicate the revision/workflow/job/attempt, bound and redact failing sections, classify the failure with evidence, then route only code failures back to implementation. A code failure is an unresolved acceptance failure under the shared convergence policy and consumes its remaining fix budget; after an internal limit, triage focused recovery under active scoped authorization. Never rerun CI without the repository policy or explicit approval required there.
 If any selected reviewer or check remains unsatisfied for roughly 30 minutes, including a continuously requested reviewer or pending check, block with that exact requirement and the human action that satisfies it; never silently skip it.
 
 ## Ready gate
@@ -61,29 +61,24 @@ Mark the PR ready only when local checks, review, the single broad manual-test p
 
 Before diagnosing a failed hosted check, resolve and record a fresh CI-triage role. Its output identifies the matching route execution in the evidence record or checkpoint verdict.
 
-Record every selected hosted gate against the current PR head in its evidence record when evidence is enabled, otherwise in checkpoint `gateVerdicts`, including provider, timestamp and job URL. A code-changing fix creates results pending for the new revision; recompute risk and validate it according to the shared convergence policy before returning to the PR loop. Never reset its counters for CI or hosted feedback.
+Record selected hosted results in enabled evidence or checkpoint `gateVerdicts`, bound to PR head, provider, timestamp and job URL. Source changes require a helper validity decision for local results and live policy reconciliation for hosted results; recompute risk and revalidate affected inputs. Never reset shared counters.
 
 ## Address required reviewer feedback
 
-When `hosted-review` is selected, handle every unresolved thread from a required reviewer. In Sail mode, never post a reply comment. Resolve an actionable thread after the code fix when a reply is unnecessary; hand any thread requiring a written response to the user.
+When `hosted-review` is selected, handle every unresolved thread from a required reviewer:
 
-- Valid, actionable: fix it, commit (signed, conventional), push, then resolve the thread. Outside Sail, reply with what changed first.
+- Valid, actionable: fix it, commit (signed, conventional), push, reply with what changed, resolve the thread.
 - Questionable: use the codebase to decide; ask only when necessary.
-- Invalid: outside Sail, reply with a concise rationale and resolve the thread. In Sail mode, hand it to the user.
+- Invalid: reply with a concise rationale and resolve the thread.
 
-Outside Sail, reply with REST or `gh`; when REST is rate-limited, use GraphQL:
+Reply and resolve with REST or `gh`; when REST is rate-limited, use GraphQL:
 
 ```bash
 gh api graphql -f query='mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}' -f id=<thread-id> -f body='<reply>'
-```
-
-Resolve with REST or `gh`; when REST is rate-limited, use GraphQL:
-
-```bash
 gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -f id=<thread-id>
 ```
 
-Then return to waiting. After the single fix pass, turn later non-blocking suggestions into follow-up issues. Required feedback that cannot be resolved inside the remaining cycle or time budget is a hard stop.
+Then return to waiting. After the single fix pass, turn later non-blocking suggestions into follow-up issues. Required feedback that survives an internal limit enters focused acceptance triage under [authorization.md](authorization.md). Existing scoped task authority covers necessary corrections; explicit user limits and mandatory controls still bind. Stop for an unresolved blocker, not to ask for the same permission again.
 
 ## Merge
 
@@ -95,8 +90,12 @@ Merge only when all of these hold:
 - When `hosted-review` is selected, every resolved reviewer requirement is satisfied for the current policy. A `review` accepts a submitted no-comment review; an `approval` requires an effective approval.
 - When `hosted-review` is selected, every required reviewer's blocking comment is fixed or answered, and its thread is resolved.
 
-Merge only through the checkpoint's resolved mechanism. In Sail mode, never post a GitHub comment; leave a `bot-comment` merge to the user. Outside Sail, for `bot-comment`, post its exact inert comment and wait for the bot; do not fall back to `gh pr merge`. For `github`, pass the resolved `merge|squash|rebase` strategy to `gh pr merge` and request remote-branch deletion only when policy says `delete`. If either mechanism reports that the default branch moved, merge `origin/<default>` (signed), push, rerun every selected gate and retry the same mechanism.
+Merge only through the checkpoint's resolved mechanism. For `bot-comment`, post its exact inert comment and wait for the bot; do not fall back to `gh pr merge`. For `github`, pass the resolved `merge|squash|rebase` strategy to `gh pr merge` and request remote-branch deletion only when policy says `delete`. If either mechanism reports that the default branch moved, merge `origin/<default>` (signed), assess local input validity, push, satisfy the selected local gates and current-head hosted requirements, then retry the same mechanism.
 
 Never force-merge or use admin overrides. If branch protection requires extra approvals or admin action, report the exact required action and stop. Confirm the PR shows as merged before reporting. Delete a still-present remote branch only when resolved cleanup policy is `delete`; preserve it when policy says `preserve`.
 
 After GitHub confirms the merge, record the PR head and merge commit but leave the checkpoint active until completion verifies the source issue and final repository state.
+
+## Sail overrides
+
+In Sail mode, never post GitHub comments or review replies. Resolve actionable threads after fixing the code when a reply is unnecessary; hand threads requiring a written response to the user. Hand a `bot-comment` merge to the user. Follow the entry's merge-owner rule and consume worker events instead of reading terminal panes.

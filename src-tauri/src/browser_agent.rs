@@ -1521,6 +1521,34 @@ macro_rules! ship_it_file {
 
 // Must match src/lib/bundled-skill-catalog.ts and the files under skills/ship-it.
 const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
+    (
+        "authorization.md",
+        ship_it_file!("references/authorization.md"),
+    ),
+    (
+        "telemetry-v2.schema.json",
+        ship_it_file!("references/telemetry-v2.schema.json"),
+    ),
+    (
+        "validation-reuse.md",
+        ship_it_file!("references/validation-reuse.md"),
+    ),
+    (
+        "scripts/checkpoint_state.py",
+        ship_it_file!("scripts/checkpoint_state.py"),
+    ),
+    (
+        "scripts/convergence.py",
+        ship_it_file!("scripts/convergence.py"),
+    ),
+    (
+        "scripts/delivery_benchmark.py",
+        ship_it_file!("scripts/delivery_benchmark.py"),
+    ),
+    (
+        "scripts/validation_reuse.py",
+        ship_it_file!("scripts/validation_reuse.py"),
+    ),
     ("inputs.md", ship_it_file!("references/inputs.md")),
     ("explore.md", ship_it_file!("references/explore.md")),
     ("branch.md", ship_it_file!("references/branch.md")),
@@ -1768,7 +1796,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_spawn",
-        "Start an agent using an explicit role and task-risk model route, or a legacy provider selection. A new worktree is used by default; an explicit existing target shares its files. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
+        "Start an agent using an explicit role and task-risk model route, or a legacy provider selection. A new worktree is used by default; an explicit existing target shares its files. For an implementation worker, pass shipIssue with repository and number to assign its canonical Ship checkpoint and local claim before its prompt starts. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
         "role,risk,prompt",
     ),
     (
@@ -2282,6 +2310,7 @@ pub fn run_mcp_stdio() {
                             "role":{"type":"string","enum":["exploration","implementation","debugging","review","ci-triage"]},
                             "risk":{"type":"string","enum":["low","medium","high"]},
                             "prompt":{"type":"string"},
+                            "shipIssue":{"type":"object","properties":{"repository":{"type":"string","pattern":"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},"number":{"type":"integer","minimum":1}},"required":["repository","number"],"additionalProperties":false},
                             "receiptId":{"type":"string","format":"uuid"},
                             "accessKey":{"type":"string","format":"uuid"},
                             "target":{"oneOf":[
@@ -2321,7 +2350,7 @@ pub fn run_mcp_stdio() {
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
                             "status":{"type":"string","enum":["running","blocked"]},
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
-                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED"]},
+                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED","FAILED"]},
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
                             "untestedCriteria":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string","minLength":1,"maxLength":2000},"blocker":{"type":"string","minLength":1,"maxLength":2000}},"required":["criterion","blocker"],"additionalProperties":false},"maxItems":100},

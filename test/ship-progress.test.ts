@@ -3,6 +3,8 @@ import test from 'node:test';
 import { readyShipIssues } from '../src/lib/issue-shipping.ts';
 import { migrateShipArchive } from '../src/lib/ship-archive.ts';
 import {
+  shipBlock,
+  shipPullRequestReady,
   appendShipEvent,
   beginLatestRefresh,
   ciStatus,
@@ -1807,6 +1809,7 @@ for (const [name, report] of [
   ['invalid stage', { stage: 'merged', status: 'running' }],
   ['mixed report', { stage: 'testing', status: 'running', verdict: 'PASS' }],
   ['failing without evidence', { verdict: 'FAIL', reason: '  ' }],
+  ['gate failure without reason', { verdict: 'FAILED', reason: '  ' }],
   ['unknown verdict', { verdict: 'SUCCESS' }],
 ] as const) {
   void test(`rejects ${name}`, () => assert.throws(() => parseShipReport(report)));
@@ -1939,6 +1942,20 @@ void test('a gate targeting the worktree head records the full commit', () => {
 void test('a gate without a requested revision records the head when the worktree is clean', () => {
   assert.equal(requireGateTargetCommit(undefined, head), head);
   assert.equal(requireGateTargetCommit('', null), undefined);
+});
+
+void test('Ship gates require an explicit target revision before starting', () => {
+  for (const requested of [undefined, null, '']) {
+    for (const commit of [head, null]) {
+      assert.throws(
+        () => requireGateTargetCommit(requested, commit, true),
+        /Ship validation gates require a target revision/,
+      );
+      assert.equal(requireGateTargetCommit(requested, commit), commit ?? undefined);
+    }
+  }
+  assert.equal(requireGateTargetCommit('dfcc5f1a', head, true), head);
+  assert.throws(() => requireGateTargetCommit('1f34a371', head, true), /not the head/);
 });
 
 void test('a gate aimed at another commit is rejected before it starts', () => {
@@ -2166,7 +2183,7 @@ type FixtureIssue = ReturnType<typeof fixture>['issues'][number];
 
 function stateGate(
   gate: 'code-adversary' | 'findings-adversary' | 'test-adversary',
-  verdict: 'CLEAN' | 'NEEDS_FIXES' | 'PASS' | 'FAIL' | 'BLOCKED',
+  verdict: 'CLEAN' | 'NEEDS_FIXES' | 'PASS' | 'FAIL' | 'BLOCKED' | 'FAILED',
   updated: number,
   reason?: string,
 ) {
@@ -2623,4 +2640,17 @@ void test('reads the message of error-like objects when matching a gone worker',
 void test('waits ten minutes before failing work in a vanished repository', () => {
   assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 9 * 60_000), false);
   assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 10 * 60_000), true);
+});
+
+void test('FAILED gate verdicts block shipping with the gate failure reason', () => {
+  for (const gate of ['code-adversary', 'findings-adversary', 'test-adversary'] as const) {
+    const reason = "Gate failure: base ref 'origin/missing' does not resolve";
+    const { issue, run } = runningIssue({ gates: [stateGate(gate, 'FAILED', 10, reason)] });
+    assert.equal(parseShipReport({ gate, verdict: 'FAILED', reason }).verdict, 'FAILED');
+    validateGateVerdict(gate, 'FAILED');
+    assert.equal(gateVerdictPassed(gate, 'FAILED'), false);
+    assert.equal(shipIssuePresentation(run, issue).label, 'Needs input');
+    assert.equal(shipBlock(issue), reason);
+    assert.equal(shipPullRequestReady(issue), false);
+  }
 });
