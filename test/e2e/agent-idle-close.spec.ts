@@ -106,6 +106,22 @@ async function attached(provider: Provider, directory: string) {
   );
 }
 
+// Closes the thread through the idle sweep, then stops further sweeps from closing it again.
+async function closeIdleThread(id: string) {
+  const closes = closeCount(id);
+  await browser.tauri.execute(async ({ core }) => {
+    await core.invoke('acp_set_idle_close_timeout', { seconds: 2 });
+  });
+  await browser.waitUntil(async () => closeCount(id) > closes, {
+    timeout: 20_000,
+    interval: 500,
+    timeoutMsg: 'the finished thread was never closed',
+  });
+  await browser.tauri.execute(async ({ core }) => {
+    await core.invoke('acp_set_idle_close_timeout', { seconds: 3600 });
+  });
+}
+
 describe('idle session close', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-idle-close-'));
 
@@ -318,6 +334,108 @@ describe('idle session close', () => {
         id,
       );
       expect(retried.stopReason).toBe('end_turn');
+      expect(await attached(provider, directory)).toContain(id);
+    });
+  }
+
+  for (const provider of ['codex', 'claude'] as const) {
+    it(`restores a closed ${provider} thread from the UI without racing config changes, and keeps it closed when the resume fails`, async () => {
+      const directory = realpathSync(repository);
+      const [id] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [id]);
+      await closeIdleThread(id);
+      expect(await attached(provider, directory)).not.toContain(id);
+
+      const slowResume = join(directory, 'idle-slow-resume.txt');
+      writeFileSync(slowResume, 'slow');
+      const racing = await browser.tauri.execute(
+        async ({ core }, agent, path, session) => {
+          const reservation = await core.invoke<{ restoreToken: string }>(
+            'acp_begin_session_restore',
+            { agent, cwd: path, sessionId: session },
+          );
+          const resume = core.invoke('acp_resume_session', {
+            params: {
+              agent,
+              cwd: path,
+              sessionId: session,
+              restoreToken: reservation.restoreToken,
+            },
+          });
+          // The agent is still loading the thread when this config change arrives.
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          const config = core
+            .invoke('acp_set_config', {
+              agent,
+              directory: path,
+              sessionId: session,
+              configId: 'effort',
+              value: 'high',
+            })
+            .then(
+              () => 'applied',
+              (error) => String(error),
+            );
+          const outcome = await Promise.all([
+            resume.then(
+              () => 'resumed',
+              (error) => String(error),
+            ),
+            config,
+          ]);
+          await core.invoke('acp_end_session_restore', {
+            agent,
+            directory: path,
+            sessionId: session,
+            restoreToken: reservation.restoreToken,
+          });
+          return outcome;
+        },
+        provider,
+        directory,
+        id,
+      );
+      rmSync(slowResume, { force: true });
+      expect(racing).toEqual(['resumed', 'applied']);
+      expect(await attached(provider, directory)).toContain(id);
+
+      await closeIdleThread(id);
+      writeFileSync(join(directory, 'idle-fail-next-resume.txt'), 'fail');
+      const failed = await browser.tauri.execute(
+        async ({ core }, agent, path, session) => {
+          const reservation = await core.invoke<{ restoreToken: string }>(
+            'acp_begin_session_restore',
+            { agent, cwd: path, sessionId: session },
+          );
+          const outcome = await core
+            .invoke('acp_resume_session', {
+              params: {
+                agent,
+                cwd: path,
+                sessionId: session,
+                restoreToken: reservation.restoreToken,
+              },
+            })
+            .then(
+              () => 'resumed',
+              (error) => String(error),
+            );
+          await core.invoke('acp_end_session_restore', {
+            agent,
+            directory: path,
+            sessionId: session,
+            restoreToken: reservation.restoreToken,
+          });
+          return outcome;
+        },
+        provider,
+        directory,
+        id,
+      );
+      expect(failed).toContain('Injected resume failure');
+
+      const retried = await setConfig(provider, directory, id, 'effort', 'low');
+      expect(retried.find((option) => option.id === 'effort')?.currentValue).toBe('low');
       expect(await attached(provider, directory)).toContain(id);
     });
   }

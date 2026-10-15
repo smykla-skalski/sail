@@ -747,6 +747,20 @@ impl Drop for OwnedTempDir {
     }
 }
 
+struct EndResume<'a> {
+    runtime: &'a Connection,
+    session_id: String,
+    resumed: bool,
+}
+
+impl Drop for EndResume<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut idle) = self.runtime.idle.lock() {
+            idle.end_resume(&self.session_id, self.resumed, Instant::now());
+        }
+    }
+}
+
 struct RestoreClaim {
     token: String,
     expires: Instant,
@@ -5136,6 +5150,24 @@ fn register_session(
     session_id: &str,
     directory: PathBuf,
 ) -> Result<Arc<Connection>, String> {
+    let runtime = register_session_detached(manager, agent, profile, session_id, directory)?;
+    runtime
+        .idle
+        .lock()
+        .map_err(|error| error.to_string())?
+        .mark_attached(session_id, Instant::now());
+    Ok(runtime)
+}
+
+/// Registers a session without reopening an idle-closed thread. A restore marks it attached only
+/// once the agent has loaded it, so a failed resume leaves the thread closed for the next retry.
+fn register_session_detached(
+    manager: &AgentManager,
+    agent: &str,
+    profile: CapabilityProfile,
+    session_id: &str,
+    directory: PathBuf,
+) -> Result<Arc<Connection>, String> {
     let owner = session_owner(session_id);
     let key = connection_key_for_owner(agent, profile, &directory, owner);
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
@@ -5179,11 +5211,6 @@ fn register_session(
         .lock()
         .map_err(|error| error.to_string())?
         .insert(session_id.to_string(), profile);
-    runtime
-        .idle
-        .lock()
-        .map_err(|error| error.to_string())?
-        .mark_attached(session_id, Instant::now());
     Ok(runtime)
 }
 
@@ -5358,26 +5385,10 @@ impl Connection {
         }
     }
 
-    /// Resumes an idle-closed session once. A caller that finds a close or another resume in flight
-    /// waits for it; `None` means the session was already loaded when the wait ended. A failed
-    /// resume leaves the session closed so the next caller retries it.
-    fn reattach_closed<T>(
-        &self,
-        session_id: &str,
-        resume: impl FnOnce() -> Result<T, String>,
-    ) -> Result<Option<T>, String> {
-        struct EndResume<'a> {
-            runtime: &'a Connection,
-            session_id: &'a str,
-            resumed: bool,
-        }
-        impl Drop for EndResume<'_> {
-            fn drop(&mut self) {
-                if let Ok(mut idle) = self.runtime.idle.lock() {
-                    idle.end_resume(self.session_id, self.resumed, Instant::now());
-                }
-            }
-        }
+    /// Claims the resume of an idle-closed session. A caller that finds a close or another resume in
+    /// flight waits for it; `None` means the session was already loaded when the wait ended. Dropping
+    /// the guard without `resumed` leaves the session closed so the next caller retries it.
+    fn acquire_resume(&self, session_id: &str) -> Result<Option<EndResume<'_>>, String> {
         // A close ends within its 30 second request and a resume within 60.
         let deadline = Instant::now() + Duration::from_secs(100);
         loop {
@@ -5388,7 +5399,13 @@ impl Connection {
                 .claim_resume(session_id);
             match claim {
                 crate::acp_idle::ResumeClaim::Open => return Ok(None),
-                crate::acp_idle::ResumeClaim::Claimed => break,
+                crate::acp_idle::ResumeClaim::Claimed => {
+                    return Ok(Some(EndResume {
+                        runtime: self,
+                        session_id: session_id.to_string(),
+                        resumed: false,
+                    }));
+                }
                 crate::acp_idle::ResumeClaim::Wait if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -5397,14 +5414,33 @@ impl Connection {
                 }
             }
         }
-        let mut end = EndResume {
-            runtime: self,
-            session_id,
-            resumed: false,
+    }
+
+    /// Resumes an idle-closed session once; `None` means it was already loaded.
+    fn reattach_closed<T>(
+        &self,
+        session_id: &str,
+        resume: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let Some(mut end) = self.acquire_resume(session_id)? else {
+            return Ok(None);
         };
         let resumed = resume()?;
         end.resumed = true;
         Ok(Some(resumed))
+    }
+
+    /// Starts a restore that reloads the thread in the agent. An idle-closed thread stays closed,
+    /// and other callers keep waiting, until the guard is marked resumed; a loaded one is touched.
+    fn begin_attaching_restore(&self, session_id: &str) -> Result<Option<EndResume<'_>>, String> {
+        let claim = self.acquire_resume(session_id)?;
+        if claim.is_none() {
+            self.idle
+                .lock()
+                .map_err(|error| error.to_string())?
+                .mark_attached(session_id, Instant::now());
+        }
+        Ok(claim)
     }
 
     fn supports_session_close(&self) -> bool {
@@ -5504,14 +5540,14 @@ impl Connection {
                 self.touch_session(session_id);
                 return Ok(false);
             }
-            let expired = self
-                .idle
-                .lock()
-                .map_err(|error| error.to_string())?
-                .expired(session_id, Instant::now(), idle);
-            if !expired {
+            let mut idle_sessions = self.idle.lock().map_err(|error| error.to_string())?;
+            // A closed thread a restore registered but has not resumed yet is already closed.
+            if idle_sessions.is_closed(session_id)
+                || !idle_sessions.expired(session_id, Instant::now(), idle)
+            {
                 return Ok(false);
             }
+            drop(idle_sessions);
             let mut profiles = self
                 .session_profiles
                 .lock()
@@ -5686,7 +5722,7 @@ async fn reattach_idle_closed(
         runtime.reattach_closed(&session_id, || {
             let previous = runtime.cached_config_options(&session_id);
             let resumed =
-                restore_session_blocking(app, &manager, &browser, params, "session/resume")?;
+                restore_session_blocking(app, &manager, &browser, params, "session/resume", true)?;
             runtime.replay_config(&session_id, previous.as_ref(), &resumed);
             Ok(())
         })
@@ -7561,8 +7597,17 @@ pub async fn acp_begin_session_restore(
             &cwd,
             &session_id,
             manager_generation,
-            || register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
+            || {
+                register_session_detached(
+                    &manager,
+                    &agent,
+                    profile,
+                    &session_id,
+                    PathBuf::from(&cwd),
+                )
+            },
         )?;
+        runtime.touch_session(&session_id);
         let result = runtime.begin_restore(&session_id)?;
         if let Err(error) = manager.with_current_forget_generation(
             &agent,
@@ -7765,7 +7810,7 @@ async fn restore_session(
     let manager = manager.inner().clone();
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        restore_session_blocking(app, &manager, &browser, params, method)
+        restore_session_blocking(app, &manager, &browser, params, method, false)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -7777,6 +7822,7 @@ fn restore_session_blocking(
     browser: &crate::browser_agent::BrowserManager,
     params: RestoreSessionCommand,
     method: &'static str,
+    resume_claimed: bool,
 ) -> Result<Value, String> {
     let RestoreSessionCommand {
         agent,
@@ -7806,9 +7852,23 @@ fn restore_session_blocking(
             &cwd,
             &session_id,
             manager_generation,
-            || register_session(manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
+            || {
+                register_session_detached(
+                    manager,
+                    &agent,
+                    profile,
+                    &session_id,
+                    PathBuf::from(&cwd),
+                )
+            },
         )?;
         with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
+            // A reattach already holds the claim for the thread it resumes.
+            let mut resume = if resume_claimed {
+                None
+            } else {
+                runtime.begin_attaching_restore(&session_id)?
+            };
             // Forget must not finish while this restore mints a browser token.
             let (forget_generation, params, minted_token) = manager
                 .with_current_forget_generation(
@@ -7908,7 +7968,7 @@ fn restore_session_blocking(
                 manager_generation,
                 forget_generation,
             )?;
-            manager.with_current_forget_generation(
+            let restored = manager.with_current_forget_generation(
                 &agent,
                 &cwd,
                 &session_id,
@@ -7917,7 +7977,11 @@ fn restore_session_blocking(
                     runtime.remember_session_ui(&session_id, &result)?;
                     Ok(result)
                 },
-            )
+            )?;
+            if let Some(resume) = &mut resume {
+                resume.resumed = true;
+            }
+            Ok(restored)
         })
     }
 }
@@ -13368,6 +13432,69 @@ mod idle_close_tests {
             assert!(!runtime.idle.lock().unwrap().is_closed(&session));
             assert_eq!(runtime.reattach_closed(&session, || Ok(())), Ok(None));
         }
+    }
+
+    #[test]
+    fn ui_restore_keeps_a_closed_thread_closed_until_its_resume_succeeds() {
+        for agent in ["codex", "claude"] {
+            let session = format!("ses_ui_restore_{agent}");
+            let runtime = closed_runtime(agent, &session);
+            let waiting_done = Arc::new(AtomicBool::new(false));
+            let mut claim = runtime.begin_attaching_restore(&session).unwrap();
+            assert!(claim.is_some(), "{agent}: the restore claims the resume");
+            {
+                let idle = runtime.idle.lock().unwrap();
+                assert!(idle.is_closed(&session), "{agent}: closed while resuming");
+                assert!(idle.is_resuming(&session), "{agent}: claim held");
+            }
+            let waiter = {
+                let (runtime, session, done) = (
+                    Arc::clone(&runtime),
+                    session.clone(),
+                    Arc::clone(&waiting_done),
+                );
+                std::thread::spawn(move || {
+                    let result = runtime.reattach_closed(&session, || Ok(()));
+                    done.store(true, Ordering::SeqCst);
+                    result
+                })
+            };
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(
+                !waiting_done.load(Ordering::SeqCst),
+                "{agent}: a call-driven reattach must wait for the UI resume"
+            );
+            claim.as_mut().unwrap().resumed = true;
+            drop(claim);
+            assert_eq!(waiter.join().unwrap(), Ok(None), "{agent}");
+            assert!(!runtime.idle.lock().unwrap().is_closed(&session));
+        }
+    }
+
+    #[test]
+    fn failed_ui_restore_leaves_a_closed_thread_closed() {
+        for agent in ["codex", "claude"] {
+            let session = format!("ses_ui_failed_{agent}");
+            let runtime = closed_runtime(agent, &session);
+            drop(runtime.begin_attaching_restore(&session).unwrap());
+            {
+                let idle = runtime.idle.lock().unwrap();
+                assert!(idle.is_closed(&session), "{agent}: closed marker kept");
+                assert!(!idle.is_resuming(&session), "{agent}: claim released");
+            }
+            let retried = runtime.reattach_closed(&session, || Ok(()));
+            assert_eq!(retried, Ok(Some(())), "{agent}: the next call resumes it");
+        }
+    }
+
+    #[test]
+    fn ui_restore_of_a_loaded_thread_takes_no_claim() {
+        let runtime = runtime("ses_ui_loaded");
+        assert!(runtime
+            .begin_attaching_restore("ses_ui_loaded")
+            .unwrap()
+            .is_none());
+        assert!(!runtime.idle.lock().unwrap().is_closed("ses_ui_loaded"));
     }
 
     #[test]
