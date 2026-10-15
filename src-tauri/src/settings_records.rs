@@ -5,7 +5,7 @@
 //! writes one file instead of re-encoding every setting.
 
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -70,19 +70,28 @@ fn parse(contents: &str) -> Option<(String, String)> {
     ))
 }
 
-/// Record files already reported as corrupt in this launch.
-static REPORTED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+/// Record files already reported as corrupt in this launch, and whether the
+/// report named the key.
+static REPORTED: Mutex<BTreeMap<PathBuf, bool>> = Mutex::new(BTreeMap::new());
 
 #[cfg(test)]
 thread_local! {
     static REPORTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn emit(message: &str) {
+fn emit(message: &str, key: Option<&str>, file: &Path, reason: &str) {
     #[cfg(test)]
     REPORTS.with(|reports| reports.borrow_mut().push(message.to_string()));
     #[cfg(not(test))]
-    eprintln!("{message}");
+    {
+        eprintln!("{message}");
+        crate::diagnostics::record(
+            "corrupt_settings_record",
+            serde_json::json!({"key": key, "file": file.display().to_string(), "reason": reason}),
+        );
+    }
+    #[cfg(test)]
+    let _ = (key, file, reason);
 }
 
 /// Names the key a corrupt record belongs to when the file still says so or its
@@ -103,16 +112,29 @@ fn key_hint(contents: Option<&str>, file: &Path) -> Option<String> {
 /// A corrupt record reads as absent; log it once per launch and keep the file so
 /// it can be inspected. The next save of its key replaces it.
 fn report_corrupt(file: &Path, key: Option<&str>, reason: &str) {
-    let first = REPORTED
+    // A full read cannot always name the key; report again once a read by key can.
+    let named = key.is_some();
+    let report = REPORTED
         .lock()
-        .map(|mut reported| reported.insert(file.to_path_buf()))
+        .map(|mut reported| match reported.get(file) {
+            Some(&was_named) if was_named || !named => false,
+            _ => {
+                reported.insert(file.to_path_buf(), named);
+                true
+            }
+        })
         .unwrap_or(true);
-    if first {
-        emit(&format!(
-            "Corrupt settings record ignored: key {} file {}: {reason}",
-            key.unwrap_or("unknown"),
-            file.display()
-        ));
+    if report {
+        emit(
+            &format!(
+                "Corrupt settings record ignored: key {} file {}: {reason}",
+                key.unwrap_or("unknown"),
+                file.display()
+            ),
+            key,
+            file,
+            reason,
+        );
     }
 }
 
@@ -156,7 +178,10 @@ pub(crate) fn read(settings: &Path, key: &str) -> Result<Option<String>, String>
             Ok(contents.as_deref().and_then(parse).map(|(_, value)| value))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("Cannot read settings record: {error}")),
+        Err(error) => {
+            report_corrupt(&file, Some(key), &format!("unreadable: {error}"));
+            Ok(None)
+        }
     }
 }
 
@@ -413,6 +438,43 @@ mod tests {
         assert_eq!(read(&path, "sai-acp-plans").unwrap(), None);
         assert_eq!(read_all(&path).unwrap().len(), 1);
         assert!(take_reports().is_empty());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_record_reads_as_absent_and_is_logged() {
+        let path = scratch("unreadable");
+        let key = "sai-ship-runs";
+        write(&path, key, "[old]").unwrap();
+        let file = directory(&path).join(file_name(key));
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        take_reports();
+        assert_eq!(read(&path, key).unwrap(), None);
+        assert_eq!(read(&path, key).unwrap(), None);
+        assert!(read_all(&path).unwrap().is_empty());
+        let reports = take_reports();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains(key), "{}", reports[0]);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_prefixed_key_is_named_once_a_read_by_key_knows_it() {
+        let path = scratch("prefixed");
+        let key = "sai-session:ses_1";
+        write(&path, key, "[old]").unwrap();
+        let file = directory(&path).join(file_name(key));
+        fs::write(&file, b"").unwrap();
+        take_reports();
+        assert!(read_all(&path).unwrap().is_empty());
+        assert_eq!(read(&path, key).unwrap(), None);
+        assert_eq!(read(&path, key).unwrap(), None);
+        assert!(read_all(&path).unwrap().is_empty());
+        let reports = take_reports();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(reports[0].contains("key unknown"), "{}", reports[0]);
+        assert!(reports[1].contains(key), "{}", reports[1]);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
