@@ -2384,7 +2384,8 @@ fn runtime_environment(
     environment
 }
 
-fn configured_tool_paths(
+/// Directories Sail may put ahead of the inherited PATH, whether or not they exist yet.
+fn configured_tool_candidates(
     home: Option<&Path>,
     local_app_data: Option<&Path>,
     windows: bool,
@@ -2400,7 +2401,18 @@ fn configured_tool_paths(
     if let Some(home) = home {
         paths.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
     }
-    paths.into_iter().filter(|path| path.is_dir()).collect()
+    paths
+}
+
+fn configured_tool_paths(
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> Vec<PathBuf> {
+    configured_tool_candidates(home, local_app_data, windows)
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
@@ -2412,14 +2424,30 @@ fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
         .then_some(directory)
 }
 
-/// Identity of the tool environment every agent-owned surface of a worktree shares.
+/// Identity of the tool environment every agent-owned surface of a worktree shares. It hashes
+/// the candidate tool directories, not only the existing ones, so creating `~/.local/bin`
+/// mid-gate does not change the identity of a worktree.
 pub(crate) fn tool_environment_id(data_directory: &Path) -> String {
     let home =
         std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    environment_id_for(
+        data_directory,
+        home.as_deref(),
+        local_app_data.as_deref(),
+        cfg!(windows),
+    )
+}
+
+fn environment_id_for(
+    data_directory: &Path,
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+    windows: bool,
+) -> String {
     crate::acp_terminal::environment_identity(
         data_directory,
-        &configured_tool_paths(home.as_deref(), local_app_data.as_deref(), cfg!(windows)),
+        &configured_tool_candidates(home, local_app_data, windows),
     )
 }
 
@@ -10392,6 +10420,23 @@ time.sleep(10)
             );
         }
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn environment_id_ignores_tool_directories_created_later() {
+        let root = scratch("environment-id-late-tools");
+        let data = root.join("agent-data");
+        let before = environment_id_for(&data, Some(&root), None, false);
+
+        std::fs::create_dir_all(root.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(root.join(".cargo/bin")).unwrap();
+
+        assert_eq!(before, environment_id_for(&data, Some(&root), None, false));
+        assert_ne!(
+            before,
+            environment_id_for(&root.join("other-data"), Some(&root), None, false)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
