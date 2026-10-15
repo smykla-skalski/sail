@@ -1938,6 +1938,7 @@ impl Connection {
             return false;
         }
         self.idle_exit.store(true, Ordering::Release);
+        drop(_dispatch);
         if let Err(error) = self.terminate() {
             self.idle_exit.store(false, Ordering::Release);
             crate::diagnostics::record(
@@ -2034,6 +2035,12 @@ impl Connection {
         result
     }
 
+    fn reusable(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+            && !self.stopped.load(Ordering::Acquire)
+            && !self.idle_exit.load(Ordering::Acquire)
+    }
+
     fn touch(&self) {
         if let Ok(mut last) = self.last_activity.lock() {
             *last = Instant::now();
@@ -2112,6 +2119,16 @@ impl Connection {
             self.validate_codex_workspace(params.get("cwd").and_then(Value::as_str))?;
         }
 
+        let listing_dispatch = (method == "session/list")
+            .then(|| {
+                self.prompt_dispatch
+                    .lock()
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        if self.idle_exit.load(Ordering::Acquire) {
+            return Err(IDLE_EXIT_ERROR.into());
+        }
         if !self.alive.load(Ordering::Acquire) {
             return Err("Agent process stopped. Reopen the thread to reconnect.".into());
         }
@@ -2151,6 +2168,7 @@ impl Connection {
             return Err(error);
         }
         after_write();
+        drop(listing_dispatch);
         let response = receiver.recv_timeout(timeout).map_err(|_| {
             crate::diagnostics::record(
                 "acp_request_timeout",
@@ -6220,7 +6238,7 @@ fn initialized_capabilities(
         .lock()
         .map_err(|error| error.to_string())?
         .get(key)
-        .filter(|existing| existing.alive.load(Ordering::Acquire))
+        .filter(|existing| existing.reusable())
         .cloned();
     let Some(existing) = existing else {
         return Ok(None);
@@ -6264,7 +6282,7 @@ fn connect_blocking_inner(
         .lock()
         .map_err(|error| error.to_string())?
         .get(&key)
-        .is_some_and(|existing| existing.alive.load(Ordering::Acquire));
+        .is_some_and(|existing| existing.reusable());
     // Probe before taking the agent lock; a live connection needs no availability check.
     let mut availability = if live {
         None
@@ -6278,7 +6296,7 @@ fn connect_blocking_inner(
         .get(&key)
         .cloned();
     if let Some(existing) = existing {
-        if existing.alive.load(Ordering::Acquire) {
+        if existing.reusable() {
             existing.validate_codex_workspace(None)?;
             drop(_startup);
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -7857,6 +7875,29 @@ pub async fn acp_resume_session(
     restore_session(manager, app, browser, params, "session/resume").await
 }
 
+fn shared_listing_connection(
+    manager: &AgentManager,
+    agent: &str,
+    profile: CapabilityProfile,
+) -> Result<Option<Arc<Connection>>, String> {
+    Ok(manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .values()
+        .find(|runtime| {
+            runtime.agent == agent
+                && runtime.profile == profile
+                && runtime.owner.is_none()
+                && runtime.reusable()
+                && runtime
+                    .capabilities
+                    .lock()
+                    .is_ok_and(|capabilities| !capabilities.is_null())
+        })
+        .cloned())
+}
+
 /// OpenCode lists any directory's sessions from one agent, so the sidebar shares a single explore
 /// agent instead of starting one per repository and worktree.
 fn listing_connection(
@@ -7873,23 +7914,7 @@ fn listing_connection(
         None
     };
     if shared {
-        let existing = manager
-            .0
-            .lock()
-            .map_err(|error| error.to_string())?
-            .values()
-            .find(|runtime| {
-                runtime.agent == agent
-                    && runtime.profile == profile
-                    && runtime.owner.is_none()
-                    && runtime.alive.load(Ordering::Acquire)
-                    && !runtime.stopped.load(Ordering::Acquire)
-                    && runtime
-                        .capabilities
-                        .lock()
-                        .is_ok_and(|capabilities| !capabilities.is_null())
-            })
-            .cloned();
+        let existing = shared_listing_connection(manager, agent, profile)?;
         if let Some(runtime) = existing {
             runtime.touch();
             let capabilities = runtime
@@ -7934,7 +7959,7 @@ pub async fn acp_list_sessions(
             let result = runtime.request("session/list", params, Duration::from_secs(30));
             // The shared agent may exit (idle, worktree removal) between lookup and request;
             // the next lookup respawns it.
-            if result.is_err() && attempts < 2 && !runtime.alive.load(Ordering::Acquire) {
+            if result.is_err() && attempts < 2 && !runtime.reusable() {
                 continue;
             }
             return result;
@@ -10295,6 +10320,103 @@ time.sleep(10)
             IDLE_EXIT_ERROR,
             "a request racing the idle exit must be recoverable by reattaching"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_at_idle_shutdown_boundary_skips_the_terminating_agent() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        let manager = AgentManager::default();
+        let key = super::connection_key("opencode", CapabilityProfile::Explore, &runtime.worktree);
+        manager
+            .0
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&runtime));
+        // Hold cleanup open after retirement has committed, without a timing-dependent sleep.
+        let child = runtime.child.lock().unwrap();
+        let retiring = Arc::clone(&runtime);
+        let shutdown =
+            std::thread::spawn(move || retiring.exit_if_idle(Duration::from_secs(30), || false));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.idle_exit.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(runtime.idle_exit.load(Ordering::Acquire));
+        let request_runtime = Arc::clone(&runtime);
+        let (finished, result) = mpsc::channel();
+        let request = std::thread::spawn(move || {
+            let started = Instant::now();
+            let selected =
+                super::shared_listing_connection(&manager, "opencode", CapabilityProfile::Explore)
+                    .unwrap();
+            let initialized = super::initialized_capabilities(&manager, &key).unwrap();
+            let response =
+                request_runtime.request("session/list", json!({}), Duration::from_secs(30));
+            finished
+                .send((
+                    selected.is_none(),
+                    initialized.is_none(),
+                    response,
+                    started.elapsed(),
+                ))
+                .unwrap();
+        });
+        let boundary = result.recv_timeout(Duration::from_secs(1));
+        drop(child);
+        assert!(shutdown.join().unwrap());
+        request.join().unwrap();
+        let (skipped, uninitialized, response, elapsed) =
+            boundary.expect("listing must not wait for shutdown");
+        assert!(skipped && uninitialized);
+        assert_eq!(response.unwrap_err(), IDLE_EXIT_ERROR);
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(runtime.child.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(runtime.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_dispatch_returns_each_response_once() {
+        let runtime = idle_runtime("opencode", None);
+        let mut requests = Vec::new();
+        for index in 0..8 {
+            let runtime = Arc::clone(&runtime);
+            requests.push(std::thread::spawn(move || {
+                runtime
+                    .request_response_around_write(
+                        "session/list",
+                        json!({"cursor":index}),
+                        Duration::from_secs(1),
+                        |message| {
+                            let id = message["id"].as_u64().unwrap();
+                            let sender = runtime.pending.lock().unwrap().remove(&id).unwrap();
+                            let message = json!({"result":{"cursor":message["params"]["cursor"]}});
+                            sender
+                                .send(PendingResponse {
+                                    message,
+                                    generation: 0,
+                                })
+                                .unwrap();
+                            Ok(())
+                        },
+                        || {},
+                    )
+                    .unwrap()
+                    .message["result"]["cursor"]
+                    .as_u64()
+                    .unwrap()
+            }));
+        }
+        let mut results: Vec<_> = requests
+            .into_iter()
+            .map(|request| request.join().unwrap())
+            .collect();
+        results.sort_unstable();
+        assert_eq!(results, (0..8).collect::<Vec<_>>());
+        assert!(runtime.pending.lock().unwrap().is_empty());
+        runtime.terminate().unwrap();
     }
 
     #[cfg(unix)]
