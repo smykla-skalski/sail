@@ -52,7 +52,13 @@ export function registerRun(registry, id) {
     groups: [],
   };
   writeRecord(path, record);
-  const save = () => writeRecord(path, record);
+  const save = () => {
+    try {
+      writeRecord(path, record);
+    } catch (error) {
+      process.stderr.write(`Run registry update failed: ${error.message}\n`);
+    }
+  };
   return {
     path,
     record,

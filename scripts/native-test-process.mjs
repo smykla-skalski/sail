@@ -63,9 +63,9 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal, on
 
 // `open -n` leaves the fixture app running with PPID 1 when a run fails before
 // it learns the listening pid, so match processes by their executable path.
-export async function stopProcessesUnder(directory, { timeout = 5000 } = {}) {
+export async function stopProcessesUnder(directory, { timeout = 5000, ...system } = {}) {
   try {
-    return await stopMatching(directory, timeout);
+    return await stopMatching(directory, timeout, system);
   } catch (error) {
     // Cleanup must reach the caller's scratch removal even when `ps` is denied.
     console.error('Fixture process cleanup failed:', error);
@@ -80,7 +80,13 @@ function alias(root) {
   return /^\/(var|tmp|etc)(\/|$)/.test(root) ? [root, `/private${root}`] : [root];
 }
 
-async function stopMatching(directory, timeout) {
+const listProcesses = () => execFileSync('ps', ['-axo', 'pid=,comm='], { encoding: 'utf8' });
+
+async function stopMatching(
+  directory,
+  timeout,
+  { list = listProcesses, kill = (pid, signal) => process.kill(pid, signal) },
+) {
   const roots = new Set([directory]);
   try {
     roots.add(realpathSync(directory));
@@ -91,7 +97,7 @@ async function stopMatching(directory, timeout) {
     .flatMap(alias)
     .map((root) => (root.endsWith('/') ? root : `${root}/`));
   const running = () =>
-    execFileSync('ps', ['-axo', 'pid=,comm='], { encoding: 'utf8' })
+    list()
       .split('\n')
       .flatMap((line) => {
         const match = /^\s*(\d+)\s+(.+)$/.exec(line);
@@ -113,7 +119,7 @@ async function stopMatching(directory, timeout) {
     if (pids.length === 0 || signals.length === 0) return pids.length === 0;
     for (const pid of pids) {
       try {
-        process.kill(pid, signals[0]);
+        kill(pid, signals[0]);
       } catch {
         /* Already exited. */
       }

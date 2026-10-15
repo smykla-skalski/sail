@@ -26,7 +26,7 @@ import {
   runRegistryDirectory,
   signalGroup,
 } from '../scripts/native-run-registry.mjs';
-import { runOwnedCommand } from '../scripts/native-test-process.mjs';
+import { runOwnedCommand, stopProcessesUnder } from '../scripts/native-test-process.mjs';
 
 const registryModule = new URL('../scripts/native-run-registry.mjs', import.meta.url).href;
 const processModule = new URL('../scripts/native-test-process.mjs', import.meta.url).href;
@@ -531,9 +531,23 @@ await test('a well-formed record is acted on, so the guards above are not blanke
 });
 
 await test('the signal guard accepts only ordinary process ids', () => {
-  for (const pid of [0, 1, -1, -2, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 60, '5', null])
+  for (const pid of [
+    0,
+    1,
+    -1,
+    -2,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    2 ** 31,
+    2 ** 33,
+    2 ** 60,
+    '5',
+    null,
+  ])
     assert.equal(signalablePid(pid), false, String(pid));
-  for (const pid of [2, 4242, 2 ** 22]) assert.equal(signalablePid(pid), true, String(pid));
+  for (const pid of [2, 4242, 2 ** 22, 2 ** 31 - 1])
+    assert.equal(signalablePid(pid), true, String(pid));
   assert.equal(isOwnProcess(process.pid), true);
   assert.equal(isOwnProcess(process.ppid), true);
   assert.equal(isOwnProcess(process.pid + 100_000), false);
@@ -606,6 +620,59 @@ await test('an app whose identity changes before the signal is not signalled', a
   });
   await stopApp(binary);
   assert.deepEqual(sent, []);
+});
+
+await test('a registry that vanishes after registration does not fail the run', (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  const handle = registerRun(registry, 'vanishing');
+  rmSync(registry, { recursive: true, force: true });
+  assert.doesNotThrow(() => {
+    handle.setBinary('/x/Sail E2E 0123abcd.app/Contents/MacOS/sail');
+    handle.groupHooks().onStart(4242);
+    handle.release();
+  });
+});
+
+await test('a record with a pid beyond 32 bits is reported, not treated as a runner', async (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  recordWith(registry, 'huge', { runner: { pid: 2 ** 33, started: null } });
+  const sent: Array<[number, string]> = [];
+  const result = await reap(registry, {
+    stopApp: async () => undefined,
+    appProcesses: () => [],
+    kill: noSignals(sent),
+  });
+  assert.deepEqual(sent, []);
+  assert.equal(result.failed.length, 1);
+});
+
+await test('fixture process stops skip pids 0, 1 and negative ones from the listing', async () => {
+  const sent: Array<[number, string]> = [];
+  const directory = '/x/run/Sail E2E 0123abcd.app';
+  const path = `${directory}/Contents/MacOS/sail`;
+  let stopped = false;
+  const done = await stopProcessesUnder(directory, {
+    timeout: 50,
+    list: () =>
+      stopped
+        ? ''
+        : [
+            `0 ${path}`,
+            `1 ${path}`,
+            `-1 ${path}`,
+            `${process.pid} ${path}`,
+            `4242 ${path}`,
+            `4243 /other/bin`,
+          ].join('\n'),
+    kill: (pid: number, signal: string) => {
+      sent.push([pid, signal]);
+      stopped = true;
+    },
+  });
+  assert.equal(done, true);
+  assert.deepEqual(sent, [[4242, 'SIGTERM']]);
 });
 
 await test('the registry folder can be chosen and must be absolute', () => {
