@@ -45,6 +45,7 @@ void test('no configured pool still requires a fresh validation subagent session
   const instructions = validationInstructions(empty, 'gpt-5.6-luna');
   assert.match(instructions, /validation_gate to start a fresh subagent session/);
   assert.match(instructions, /a different model is optional/);
+  assert.match(instructions, /Pass revision \(commit SHA\)/);
   assert.doesNotMatch(instructions, /Do not call validation_gate/);
 });
 

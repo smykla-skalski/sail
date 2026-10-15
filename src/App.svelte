@@ -4418,7 +4418,7 @@
       await acp.connect(run.provider, created.path, 'build', { owner: receiptId });
       ensureClaimHeld();
       const gateExecution =
-        'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
+        'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry, passing revision with the exact commit SHA to review. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
       const gateReporting =
         'Each validation session reports its own gate verdict through ship_progress; do not report review or test verdicts from this implementation session.';
       const target = shippingTarget;
@@ -7308,6 +7308,13 @@
     }
     if (request.name === 'validation_gate') {
       const owner = shipOwner(shipRuns, request.directory, sourceId);
+      const requestedRevision = request.arguments.revision;
+      // Reject a wrong target before the Ship issue stage or events change.
+      if (requestedRevision !== undefined && requestedRevision !== null && requestedRevision !== '')
+        requireGateTargetCommit(
+          requestedRevision,
+          await invoke<string | null>('working_tree_commit', { path: request.directory }),
+        );
       try {
         if (owner) {
           const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);

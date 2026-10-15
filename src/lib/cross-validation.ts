@@ -62,7 +62,7 @@ export function validationInstructions(
     return [
       'No validation model pool is configured.',
       currentModel ? `Implementation model: ${currentModel}.` : '',
-      'For every review and test attempt, use validation_gate to start a fresh subagent session. Use the assigned Ship worker provider and model by default when available; a different model is optional.',
+      'For every review and test attempt, use validation_gate to start a fresh subagent session. Use the assigned Ship worker provider and model by default when available; a different model is optional. Pass revision (commit SHA) with the gate so the tool rejects a worktree that is not clean at that commit.',
       'If the provider cannot start a fresh session, pause and report the missing capability. Unresolved model metadata does not block a gate when its fresh execution identity is known.',
     ]
       .filter(Boolean)
