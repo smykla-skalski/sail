@@ -1820,6 +1820,45 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_record_moves_temp_symlinks_aside_without_touching_targets() {
+        for dangling in [false, true] {
+            let path = scratch_settings("record-temp-symlink");
+            save_setting_at(&path, "sai-ship-runs".into(), Some("[1]".into())).unwrap();
+            let [file] = record_files(&path).try_into().unwrap();
+            let temporary = file.with_extension("json.tmp");
+            let target = path.parent().unwrap().join("symlink-target");
+            if !dangling {
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("note"), b"keep").unwrap();
+            }
+            std::os::unix::fs::symlink(&target, &temporary).unwrap();
+
+            save_setting_at(&path, "sai-ship-runs".into(), Some("[2]".into())).unwrap();
+
+            assert_eq!(read_settings(&path).unwrap()["sai-ship-runs"], "[2]");
+            assert!(std::fs::symlink_metadata(&temporary).is_err());
+            let aside = record_files(&path)
+                .into_iter()
+                .find(|entry| {
+                    std::fs::symlink_metadata(entry)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                })
+                .unwrap();
+            assert_eq!(std::fs::read_link(aside).unwrap(), target);
+            if dangling {
+                assert!(std::fs::symlink_metadata(&target).is_err());
+            } else {
+                assert_eq!(std::fs::read(target.join("note")).unwrap(), b"keep");
+                assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+            }
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn deleting_a_record_key_removes_its_corrupt_record() {
         let path = scratch_settings("delete-corrupt");

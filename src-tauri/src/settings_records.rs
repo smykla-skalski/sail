@@ -328,10 +328,11 @@ fn ensure_directory(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Moves a directory sitting where a record file belongs to a sibling name, so
-/// the record can be written; its contents are kept, never deleted.
-fn move_directory_aside(path: &Path, key: &str) -> Result<(), String> {
-    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+/// Keeps directories and symlinks out of record writes without following them.
+fn move_obstruction_aside(path: &Path, key: &str) -> Result<(), String> {
+    if !fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() || metadata.file_type().is_symlink())
+    {
         return Ok(());
     }
     let name = path
@@ -344,20 +345,20 @@ fn move_directory_aside(path: &Path, key: &str) -> Result<(), String> {
             continue;
         }
         fs::rename(path, &aside)
-            .map_err(|error| format!("Cannot move aside settings record folder: {error}"))?;
+            .map_err(|error| format!("Cannot move aside settings record obstruction: {error}"))?;
         forget_report(path);
         emit(
             &format!(
-                "Settings record path was a directory; moved to {:?}",
+                "Settings record path was a directory or symlink; moved to {:?}",
                 aside.display().to_string()
             ),
             Some(&bounded(key)),
             path,
-            "path is a directory",
+            "path is a directory or symlink",
         );
         return Ok(());
     }
-    Err("Cannot move aside settings record folder: no free name".to_string())
+    Err("Cannot move aside settings record obstruction: no free name".to_string())
 }
 
 /// Replaces one record file atomically; the caller flushes the directory.
@@ -376,7 +377,7 @@ fn stage(
     }
     let contents = serde_json::to_vec(&record)
         .map_err(|error| format!("Cannot encode settings record: {error}"))?;
-    move_directory_aside(&temporary, key)?;
+    move_obstruction_aside(&temporary, key)?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -392,7 +393,7 @@ fn stage(
         .map_err(|error| format!("Cannot write settings record: {error}"))?;
     drop(file);
     let target = directory.join(name);
-    move_directory_aside(&target, key)?;
+    move_obstruction_aside(&target, key)?;
     fs::rename(&temporary, &target)
         .map_err(|error| format!("Cannot save settings record: {error}"))?;
     forget_report(&target);
@@ -434,7 +435,7 @@ pub(crate) fn remove(settings: &Path, key: &str) -> Result<(), String> {
     let directory = directory(settings);
     let file = directory.join(file_name(key));
     if fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
-        move_directory_aside(&file, key)?;
+        move_obstruction_aside(&file, key)?;
         sync_directory(&directory);
         return Ok(());
     }
