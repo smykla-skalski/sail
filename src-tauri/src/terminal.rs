@@ -1217,6 +1217,10 @@ fn spawn(
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);
         }
+        command.env(
+            crate::acp_terminal::ENVIRONMENT_ID_VARIABLE,
+            crate::acp::tool_environment_id(&data_directory),
+        );
         if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(&cache_directory, &worktree)?
         {
             command.env("GIT_DIR", &overlay.git_dir);

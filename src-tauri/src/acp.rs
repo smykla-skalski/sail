@@ -687,6 +687,10 @@ struct Connection {
     #[cfg(unix)]
     shared_build_directory: Option<PathBuf>,
     codex_workspace_access: Option<CodexWorkspaceAccess>,
+    /// PATH and identity given to the agent; terminal commands reuse them so a gate sees
+    /// one environment on every surface.
+    runtime_path: std::ffi::OsString,
+    environment_id: String,
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
@@ -2406,6 +2410,17 @@ fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
         .file_type()
         .is_dir()
         .then_some(directory)
+}
+
+/// Identity of the tool environment every agent-owned surface of a worktree shares.
+pub(crate) fn tool_environment_id(data_directory: &Path) -> String {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    crate::acp_terminal::environment_identity(
+        data_directory,
+        &configured_tool_paths(home.as_deref(), local_app_data.as_deref(), cfg!(windows)),
+    )
 }
 
 fn agent_path(
@@ -6307,9 +6322,12 @@ fn connect_blocking_inner(
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
     prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
+    let runtime_path = agent_path(paths, data_directory.join("bin"), &original_path)?;
+    command.env("PATH", &runtime_path);
+    let environment_id = tool_environment_id(&data_directory);
     command.env(
-        "PATH",
-        agent_path(paths, data_directory.join("bin"), &original_path)?,
+        crate::acp_terminal::ENVIRONMENT_ID_VARIABLE,
+        &environment_id,
     );
     #[cfg(unix)]
     let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
@@ -6451,6 +6469,8 @@ fn connect_blocking_inner(
         #[cfg(unix)]
         shared_build_directory,
         codex_workspace_access,
+        runtime_path,
+        environment_id,
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
@@ -6750,6 +6770,8 @@ fn connect_blocking_inner(
                                             directory,
                                             scratch_owner,
                                             build_directory: build_directory.as_deref(),
+                                            runtime_path: Some(runtime.runtime_path.as_os_str()),
+                                            environment_id: Some(runtime.environment_id.as_str()),
                                         },
                                     )
                                 };
@@ -10005,6 +10027,8 @@ time.sleep(10)
             #[cfg(unix)]
             shared_build_directory: build_directory,
             codex_workspace_access: None,
+            runtime_path: std::ffi::OsString::new(),
+            environment_id: String::new(),
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
@@ -10592,6 +10616,8 @@ time.sleep(10)
                 #[cfg(unix)]
                 shared_build_directory: None,
                 codex_workspace_access: None,
+                runtime_path: std::ffi::OsString::new(),
+                environment_id: String::new(),
                 _storage_lease: None,
                 child: Mutex::new(child),
                 scratch_owner: None,
@@ -11998,6 +12024,8 @@ mod native_subagent_fence_tests {
             #[cfg(unix)]
             shared_build_directory: None,
             codex_workspace_access: None,
+            runtime_path: std::ffi::OsString::new(),
+            environment_id: String::new(),
             _storage_lease: None,
             child: Mutex::new(child),
             scratch_owner: None,
