@@ -515,18 +515,20 @@ describe('idle session close', () => {
         directory,
         restored,
       );
-      for (const id of [loaded, restored]) {
-        expect(await attached(provider, directory)).toContain(id);
-        await browser.tauri.execute(
-          async ({ core }, agent, path, sessionId) => {
-            await core.invoke('acp_forget_session', { agent, directory: path, sessionId });
-          },
-          provider,
-          directory,
-          id,
-        );
-        expect(await attached(provider, directory)).not.toContain(id);
-      }
+      await Promise.all(
+        [loaded, restored].map(async (id) => {
+          expect(await attached(provider, directory)).toContain(id);
+          await browser.tauri.execute(
+            async ({ core }, agent, path, sessionId) => {
+              await core.invoke('acp_forget_session', { agent, directory: path, sessionId });
+            },
+            provider,
+            directory,
+            id,
+          );
+          expect(await attached(provider, directory)).not.toContain(id);
+        }),
+      );
     });
 
     it(`drops a closed ${provider} thread's idle state when it is deleted, also during a resume`, async () => {
