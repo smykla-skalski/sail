@@ -262,7 +262,6 @@
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
     unlistedSidebarPaths,
-    withoutSidebarRefreshPath,
     type SidebarRefreshPaths,
   } from './lib/sidebar-inventory';
   import {
@@ -1742,6 +1741,8 @@
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
   let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
+  // Directories outside the catalog that a thread asked to list; any other path must be in it.
+  const sidebarInventoryOutside = new SvelteSet<string>();
   const sidebarListingClock = createSidebarListingClock();
   let sidebarInventoryDeferred = false;
   let sidebarFocusPending = false;
@@ -10253,7 +10254,6 @@
   async function removeMissingWorktreeFromGui(repository: string, path: string): Promise<void> {
     if (directory === path) await loadProject(repository);
     saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
-    sidebarInventoryWaiting = withoutSidebarRefreshPath(sidebarInventoryWaiting, path);
     const removedThreads = agentThreads.filter((thread) => thread.directory === path);
     const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);
     agentThreads = agentThreads.filter((thread) => thread.directory !== path);
@@ -10390,7 +10390,6 @@
         },
       });
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
-      sidebarInventoryWaiting = withoutSidebarRefreshPath(sidebarInventoryWaiting, path);
       const removedThreads = agentThreads.filter((thread) => thread.directory === path);
       const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);
       agentThreads = agentThreads.filter((thread) => thread.directory !== path);
@@ -11006,7 +11005,13 @@
       const directories: string[] = JSON.parse(sidebarDirectoryKey);
       const wanted = sidebarInventoryWaiting;
       sidebarInventoryWaiting = undefined;
-      const selected = sidebarListingClock.plan(directories, wanted, Date.now());
+      const selected = sidebarListingClock.plan(
+        directories,
+        wanted,
+        Date.now(),
+        sidebarInventoryOutside,
+      );
+      sidebarInventoryOutside.clear();
       void refreshSidebarOpenCodeThreads(selected).then(
         (failure) => {
           reportSidebarInventoryFailure(failure);
@@ -12495,6 +12500,8 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
+      if (!(JSON.parse(sidebarDirectoryKey) as string[]).includes(thread.directory))
+        sidebarInventoryOutside.add(thread.directory);
       scheduleSidebarInventoryRefresh(250, [thread.directory]);
       return;
     }

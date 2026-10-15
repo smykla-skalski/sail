@@ -70,6 +70,7 @@ export function createSidebarListingClock() {
       directories: readonly string[],
       wanted: SidebarRefreshPaths | undefined,
       now: number,
+      outside: ReadonlySet<string> = new Set(),
     ): string[] {
       // An empty request has nothing to narrow it, so it lists the whole catalog.
       if (!wanted || wanted.size === 0) {
@@ -78,8 +79,9 @@ export function createSidebarListingClock() {
       }
       if (directories.length > 0 && directories.every((path) => wanted.has(path)))
         lastFullListing = now;
-      // A directory outside the catalog still gets its own listing, never the whole catalog.
-      return [...wanted];
+      // A directory outside the catalog gets its own listing only when a thread asked for it; a
+      // directory that left the catalog while queued is dropped.
+      return [...wanted].filter((path) => directories.includes(path) || outside.has(path));
     },
     focusRefreshDue(now: number): boolean {
       return sidebarFocusRefreshDue(lastFullListing, now);
@@ -89,15 +91,6 @@ export function createSidebarListingClock() {
       return SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - lastFullListing);
     },
   };
-}
-
-/** Drops a removed directory from the waiting request; a request for everything stays as it is. */
-export function withoutSidebarRefreshPath(
-  waiting: SidebarRefreshPaths | undefined,
-  path: string,
-): SidebarRefreshPaths | undefined {
-  if (!waiting?.has(path)) return waiting;
-  return new Set([...waiting].filter((entry) => entry !== path));
 }
 
 /** Tells which listing pass owns each directory, so overlapping passes never overwrite newer data. */

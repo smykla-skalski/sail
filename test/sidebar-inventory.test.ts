@@ -8,7 +8,6 @@ import {
   mergeSidebarRefreshPaths,
   sidebarFocusRefreshDue,
   unlistedSidebarPaths,
-  withoutSidebarRefreshPath,
   type SidebarRefreshPaths,
 } from '../src/lib/sidebar-inventory.ts';
 
@@ -230,7 +229,9 @@ function listingSession() {
       return listings;
     },
     list(wanted: SidebarRefreshPaths | undefined, now: number, directories = profile) {
-      const paths = clock.plan(directories, wanted, now);
+      // A requested path outside the catalog stands for a thread created there.
+      const outside = new Set([...(wanted ?? [])].filter((path) => !directories.includes(path)));
+      const paths = clock.plan(directories, wanted, now, outside);
       listings += paths.length;
       return paths;
     },
@@ -296,12 +297,17 @@ void test('a full listing request lists the catalog and restarts the focus clock
   assert.equal(session.clock.focusRefreshDelay(10_000), 21_000);
 });
 
-void test('a removed directory leaves the queued request', () => {
-  const queued = new Set(['/a', '/b']);
-  assert.deepEqual([...(withoutSidebarRefreshPath(queued, '/a') ?? [])], ['/b']);
-  assert.equal(withoutSidebarRefreshPath(queued, '/c'), queued);
-  assert.equal(withoutSidebarRefreshPath(null, '/a'), null);
-  assert.equal(withoutSidebarRefreshPath(undefined, '/a'), undefined);
+void test('a directory that left the catalog while queued is not listed', () => {
+  const clock = createSidebarListingClock();
+  const remaining = profile.filter((path) => path !== profile[5]);
+
+  assert.deepEqual(clock.plan(remaining, new Set([profile[5], profile[6]]), 1_000), [profile[6]]);
+  assert.deepEqual(clock.plan(remaining, new Set([profile[5]]), 2_000), []);
+  // A thread's own outside directory is still listed.
+  assert.deepEqual(
+    clock.plan(remaining, new Set(['/elsewhere', profile[5]]), 3_000, new Set(['/elsewhere'])),
+    ['/elsewhere'],
+  );
 });
 
 void test('an outside thread during the startup pass keeps the startup results', () => {
