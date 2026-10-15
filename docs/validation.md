@@ -29,6 +29,23 @@ On macOS, set `SAIL_E2E_CONFIG_DIR` to a private directory strictly inside the a
 
 Settings > Agents > Concurrent jobs caps active agent turns, embedded browser tabs, Ship validation gates, and E2E test runs separately. Validation gates queue against the same machine-pressure and workspace-disk policy as other Sail work, hold capacity until their owned session ends, and resume automatically when capacity returns. The WebdriverIO runner reads the E2E limit before launching workers and queues concurrent invocations in launch order. `SAIL_E2E_JOB_LIMIT` overrides the saved E2E limit for an isolated runner; `SAIL_E2E_LIMIT_DIR` selects a private queue directory when independent test environments must not share slots.
 
+## Idle and startup footprint
+
+On macOS, `npm run measure:footprint` checks that a long-running Sail stays flat and starts its maintenance quickly. It launches a private app (the same isolation as `test:native`, plus a private `HOME`) on a generated profile: one repository with 26 linked worktrees, 32 abandoned `sail-*` scratch roots older than two hours, and 1,000 unrelated temporary entries. It makes no change to running Sail instances or the real profile, and it removes its app, data and scratch when it ends, including on Ctrl-C.
+
+```sh
+npm run build:e2e   # once, as build-slot npm run build:e2e on a shared machine
+npm run measure:footprint -- --app "path/to/Sail E2E <id>.app"
+```
+
+Without `--app` the command builds the app itself, which needs 20 GiB free. `--help` lists the profile size, sample times, window, tolerance and `--json` result file.
+
+- A snapshot at 10 minutes and one at 2 hours after launch each cover the five minutes before them. Child process count and total RSS are medians of the readings taken every 10 seconds; ACP session listings and settings file writes are rates per minute over the window.
+- Child processes are the descendants of the app; RSS is the app plus those descendants. WebKit's WebContent and Networking helpers are launched by launchd, not by the app, so they are outside both numbers.
+- Session listings are counted by the scripted ACP agent (`SAIL_E2E_ACP_LIST_LOG`). Settings writes are counted by polling `settings.json` and `records/` for a replaced file every 250 ms, so a burst of writes between two polls counts once.
+- Startup maintenance is `elapsedMs` of the `startup_maintenance_finished` event in the app's `sail.log`. The profile exercises the `$TMPDIR` sweep; the worktree storage and Git overlay phases have no state to restore on a fresh profile.
+- The result passes when the 2-hour child count and RSS are each within 10% of the 10-minute value (`--tolerance`, in either direction) and startup maintenance finishes in under 30 seconds. The command exits 1 on failure and 130 when cancelled.
+
 CI runs the frontend and Rust checks on Ubuntu, macOS, and Windows. The desktop WDIO suite requires a graphical runner and is a release check on each supported platform until hosted graphical runners are configured.
 
 ## Credentialed release smoke
