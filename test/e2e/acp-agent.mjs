@@ -440,7 +440,9 @@ for await (const line of createInterface({ input: process.stdin })) {
           sessionCapabilities: {
             resume: {},
             subagents: {},
-            ...(agent === 'codex' ? { close: {} } : {}),
+            ...(agent === 'codex' || agent === 'claude' || agent === 'opencode'
+              ? { close: {} }
+              : {}),
             ...(agent === 'opencode' ? { list: {} } : {}),
           },
         },

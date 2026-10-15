@@ -4716,7 +4716,9 @@ fn register_session(
 }
 
 /// Agents whose adapter turns `session/close` into releasing the loaded thread and its MCP servers.
-const IDLE_CLOSE_AGENTS: &[&str] = &["codex"];
+/// OpenCode advertises close but keeps the session's MCP servers until the agent exits, and a
+/// resumed session then starts them again, so its idle agent exit is the release path instead.
+const IDLE_CLOSE_AGENTS: &[&str] = &["claude", "codex"];
 
 impl Connection {
     fn touch_session(&self, session_id: &str) {
@@ -11835,12 +11837,20 @@ mod idle_close_tests {
     }
 
     #[test]
-    fn close_support_requires_a_codex_adapter_that_advertises_it() {
-        let runtime = runtime("ses_caps");
-        assert!(!runtime.supports_session_close());
-        *runtime.capabilities.lock().unwrap() =
-            json!({"agentCapabilities":{"sessionCapabilities":{"close":{}}}});
-        assert!(runtime.supports_session_close());
+    fn close_support_requires_a_releasing_adapter_that_advertises_it() {
+        let advertised = json!({"agentCapabilities":{"sessionCapabilities":{"close":{}}}});
+        for (agent, closes) in [("claude", true), ("codex", true), ("opencode", false)] {
+            let runtime = super::session_config_tests::test_runtime(
+                agent,
+                CapabilityProfile::Build,
+                &std::env::temp_dir(),
+                "ses_caps",
+                None,
+            );
+            assert!(!runtime.supports_session_close(), "{agent} without close");
+            *runtime.capabilities.lock().unwrap() = advertised.clone();
+            assert_eq!(runtime.supports_session_close(), closes, "{agent}");
+        }
     }
 
     #[test]

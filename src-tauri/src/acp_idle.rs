@@ -1,5 +1,6 @@
-//! Idle-thread bookkeeping. A Codex app-server keeps one set of MCP servers for every thread it
-//! has loaded, so a finished thread nobody is looking at is closed after an idle timeout.
+//! Idle-thread bookkeeping. A Codex app-server or Claude adapter keeps one set of MCP servers for
+//! every thread it has loaded, so a finished thread nobody is looking at is closed after an idle
+//! timeout.
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
