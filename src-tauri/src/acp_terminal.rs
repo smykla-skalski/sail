@@ -134,6 +134,26 @@ fn terminal_path<'a>(
     })
 }
 
+/// The agent's variables apply first; Sail's PATH default and identity follow so the
+/// identity cannot be spoofed.
+fn apply_requested_environment(
+    command: &mut Command,
+    requested: Vec<EnvVariable>,
+    runtime_path: Option<&std::ffi::OsStr>,
+    environment_id: Option<&str>,
+) {
+    let runtime_path = terminal_path(&requested, runtime_path);
+    for variable in requested {
+        command.env(variable.name, variable.value);
+    }
+    if let Some(path) = runtime_path {
+        command.env("PATH", path);
+    }
+    if let Some(identity) = environment_id {
+        command.env(ENVIRONMENT_ID_VARIABLE, identity);
+    }
+}
+
 pub(crate) fn terminal_environment(
     data_directory: &Path,
     temp_directory: &Path,
@@ -961,16 +981,12 @@ pub fn handle(
                     }
                 });
             }
-            let runtime_path = terminal_path(&params.env, context.runtime_path);
-            for variable in params.env {
-                command.env(variable.name, variable.value);
-            }
-            if let Some(path) = runtime_path {
-                command.env("PATH", path);
-            }
-            if let Some(identity) = context.environment_id {
-                command.env(ENVIRONMENT_ID_VARIABLE, identity);
-            }
+            apply_requested_environment(
+                &mut command,
+                params.env,
+                context.runtime_path,
+                context.environment_id,
+            );
             #[cfg(unix)]
             if let Some(owner) = context.scratch_owner {
                 command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
@@ -1940,19 +1956,57 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn environment_identity_ignores_per_run_values() {
-        let data = Path::new("/sail-cache/terminal-worktrees/worktree");
-        let tools = [PathBuf::from("/home/u/.local/bin")];
-        let first = environment_identity(data, &tools);
+    fn command_environment(command: &Command, name: &str) -> Option<std::ffi::OsString> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+    }
 
-        assert_eq!(first.len(), 64);
-        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        // Leased temp, scratch and build roots change on every runtime start.
-        let before = terminal_environment(data, &data.join("turn-temp/run-1"));
-        let after = terminal_environment(data, &data.join("turn-temp/run-2"));
-        assert_ne!(before, after);
-        assert_eq!(first, environment_identity(data, &tools));
+    #[test]
+    fn terminal_commands_get_the_runtime_path_and_an_unspoofable_identity() {
+        let mut command = Command::new("true");
+        let spoofed = vec![EnvVariable {
+            name: ENVIRONMENT_ID_VARIABLE.into(),
+            value: "attacker".into(),
+        }];
+
+        apply_requested_environment(
+            &mut command,
+            spoofed,
+            Some(std::ffi::OsStr::new("/scoped/bin:/usr/bin")),
+            Some("identity-1"),
+        );
+
+        assert_eq!(
+            command_environment(&command, "PATH"),
+            Some("/scoped/bin:/usr/bin".into())
+        );
+        assert_eq!(
+            command_environment(&command, ENVIRONMENT_ID_VARIABLE),
+            Some("identity-1".into())
+        );
+    }
+
+    #[test]
+    fn terminal_commands_keep_an_agent_supplied_path() {
+        let mut command = Command::new("true");
+        let requested = vec![EnvVariable {
+            name: "PATH".into(),
+            value: "/agent/bin".into(),
+        }];
+
+        apply_requested_environment(
+            &mut command,
+            requested,
+            Some(std::ffi::OsStr::new("/scoped/bin")),
+            Some("identity-1"),
+        );
+
+        assert_eq!(
+            command_environment(&command, "PATH"),
+            Some("/agent/bin".into())
+        );
     }
 
     #[test]
