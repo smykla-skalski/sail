@@ -133,10 +133,19 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
       }
       if (!gateMetadataSchema.safeParse(receipt.validation).success) delete receipt.validation;
     }
-    return receipts;
+    return receipts.map(withInterruptionReason);
   } catch {
     return [];
   }
+}
+
+function withInterruptionReason(receipt: SpawnReceipt): SpawnReceipt {
+  if (receipt.state !== 'interrupted' || receipt.error?.trim()) return receipt;
+  return {
+    ...receipt,
+    error:
+      'Worker interrupted without a recorded cause. Cancellation is unconfirmed; inspect its thread and task checkpoint before retrying.',
+  };
 }
 
 export function saveBoundedReceipt(
@@ -145,9 +154,9 @@ export function saveBoundedReceipt(
   protectedIds: ReadonlySet<string> = new Set(),
 ): SpawnReceipt[] {
   const bounded = {
-    ...receipt,
+    ...withInterruptionReason(receipt),
     result: receipt.result?.slice(-16_000) ?? null,
-    error: receipt.error?.slice(0, 2_000) ?? null,
+    error: withInterruptionReason(receipt).error?.slice(0, 2_000) ?? null,
     activity: receipt.activity?.slice(0, 200),
   };
   let ordinary = 0;

@@ -750,3 +750,25 @@ void test('unavailable ordinary receipts remain settled while Ship workers recov
     true,
   );
 });
+
+for (const error of [null, '', '  ']) {
+  void test(`interrupted receipt retains recovery guidance when cause is ${JSON.stringify(error)}`, () => {
+    const interrupted = { ...receipt, state: 'interrupted' as const, result: null, error };
+    const saved = saveBoundedReceipt([], interrupted)[0];
+    assert.match(saved.error!, /Cancellation is unconfirmed/);
+    assert.match(boundedSpawnOutput(saved), /inspect its thread and task checkpoint/);
+    const restored = loadSpawnReceipts(JSON.stringify([interrupted]))[0];
+    assert.equal(restored.error, saved.error);
+  });
+}
+
+void test('interrupted receipts preserve the recorded cause and partial worker result', () => {
+  const interrupted = {
+    ...receipt,
+    state: 'interrupted' as const,
+    result: 'Partial hand-back',
+    error: 'Provider ended the worker turn with stop reason cancelled.',
+  };
+  assert.deepEqual(loadSpawnReceipts(JSON.stringify([interrupted])), [interrupted]);
+  assert.equal(saveBoundedReceipt([], interrupted)[0].error, interrupted.error);
+});

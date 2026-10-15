@@ -8406,6 +8406,58 @@ pub struct AcpPromptParams {
 const TASK_REPORT_GUIDANCE: &str = "Sail Tasks: For this turn, read sail_tasks_read and report your work with sail_tasks_report before finishing. Use stable task IDs and honest pending/in_progress/done/blocked/skipped states; set focus to current in_progress work or null. Pass the read turnId and expectedRevision, and reread after stale errors. A report is accepted only when the tool succeeds. If there are no tasks, report tasks: [] and focus: null.";
 const TASK_REPORT_CORRECTION: &str = "Sail did not receive a successful task report for this turn. Read sail_tasks_read, then call sail_tasks_report once with the actual task state and focus (or tasks: [] and focus: null if there is no work). Do not perform more work or repeat the user request. This is the only corrective request.";
 
+fn prompt_completion_error(
+    error: Option<&String>,
+    explicitly_cancelled: bool,
+    cancelled_result: bool,
+    reported_interruption: bool,
+) -> Option<String> {
+    if let Some(error) = error.filter(|error| !error.trim().is_empty()) {
+        return Some(error.clone());
+    }
+    if explicitly_cancelled {
+        Some("Worker cancelled by an explicit stop request.".into())
+    } else if cancelled_result {
+        Some("Provider ended the worker turn with stop reason cancelled.".into())
+    } else if reported_interruption {
+        Some("Provider reported that the worker turn was interrupted; inspect its thread and task checkpoint before retrying.".into())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod prompt_completion_error_tests {
+    use super::prompt_completion_error;
+
+    #[test]
+    fn interruption_causes_survive_successful_provider_responses() {
+        assert!(prompt_completion_error(None, true, false, false)
+            .unwrap()
+            .contains("explicit stop request"));
+        assert!(prompt_completion_error(None, false, true, false)
+            .unwrap()
+            .contains("stop reason cancelled"));
+        assert!(prompt_completion_error(None, false, false, true)
+            .unwrap()
+            .contains("Provider reported"));
+        assert_eq!(prompt_completion_error(None, false, false, false), None);
+    }
+
+    #[test]
+    fn provider_error_is_preserved_over_cancellation_fallback() {
+        assert_eq!(
+            prompt_completion_error(
+                Some(&"transport closed during cancellation".into()),
+                true,
+                true,
+                true
+            ),
+            Some("transport closed during cancellation".into())
+        );
+    }
+}
+
 fn task_report_correction_eligible(response: &Value, cancelled: bool, interrupted: bool) -> bool {
     !cancelled
         && !interrupted
@@ -8848,13 +8900,24 @@ pub async fn acp_prompt(
             dispatch_phase.load(Ordering::Acquire),
         );
         let notify = !explicitly_cancelled && !interrupted;
+        let completion_error = prompt_completion_error(
+            result.as_ref().err(),
+            explicitly_cancelled,
+            cancelled_result,
+            reported_interruption && result.is_ok(),
+        );
+        if interrupted {
+            if let (Ok(Value::Object(payload)), Some(reason)) = (&mut result, &completion_error) {
+                payload.insert("sailInterruptionReason".into(), Value::String(reason.clone()));
+            }
+        }
         let completion_evidence = crate::settings::AcpTurnEvidence {
             agent: agent.clone(),
             directory: directory.clone(),
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             status: evidence_status.into(),
-            error: result.as_ref().err().cloned(),
+            error: completion_error.clone(),
             updated_at: 0,
             post_turn_pending: evidence_status == "done" && notify,
         };
@@ -8927,7 +8990,7 @@ pub async fn acp_prompt(
             PromptOutcome {
                 status,
                 notify,
-                error: result.as_ref().err().cloned(),
+                error: completion_error.clone(),
                 turn_id: turn_id.clone(),
             },
             || {
@@ -8973,7 +9036,7 @@ pub async fn acp_prompt(
             worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
             message: json!({"method":"sail/prompt_finished","params":{
                 "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
-                "error":result.as_ref().err(),
+                "error":completion_error,
                 "gitPromotionError":promotion_error,
                 "sailCapabilityProfile":runtime.profile.as_str()
             }}),

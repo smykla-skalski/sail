@@ -382,6 +382,44 @@ describe('provider selected agent spawn', () => {
       state: 'completed',
       result: expect.stringContaining('Clipboard received: Clipboard fixture delegate'),
     });
+    const interruptedLaunches = await Promise.all(
+      [
+        ['Agent interrupted', 'stop reason cancelled'],
+        ['Agent text interrupted', 'Provider reported'],
+        ['Agent error interrupted', 'Step interrupted'],
+      ].map(async ([prompt, reason]) => {
+        const response = await callMcp(config, sessionId, {
+          provider: 'codex',
+          prompt,
+          target: { kind: 'existing', path },
+        });
+        const launch = z
+          .object({ receiptId: z.string(), accessKey: z.string() })
+          .parse(JSON.parse(response.content[0].text));
+        const waited = await callMcp(
+          config,
+          sessionId,
+          { ...launch, timeoutMs: 10_000 },
+          'agent_wait',
+        );
+        expect(JSON.parse(waited.content[0].text)).toMatchObject({
+          state: 'interrupted',
+          error: expect.stringContaining(reason),
+        });
+        return { launch, reason };
+      }),
+    );
+    await browser.refresh();
+    await expect($('.agent-launches button')).toBeEnabled();
+    await Promise.all(
+      interruptedLaunches.map(async ({ launch, reason }) => {
+        const interruptedResult = await callMcp(config, sessionId, launch, 'agent_result');
+        expect(JSON.parse(interruptedResult.content[0].text)).toMatchObject({
+          state: 'interrupted',
+          error: expect.stringContaining(reason),
+        });
+      }),
+    );
     const rawRestored = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
     const restored = z.array(agentThread).parse(JSON.parse(rawRestored ?? '[]'));
     expect(

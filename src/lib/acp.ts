@@ -118,6 +118,7 @@ export interface InterruptedAgentTurn {
 export interface AcpPromptOutcome {
   stopReason: string;
   sailInterrupted?: boolean;
+  sailInterruptionReason?: string;
 }
 
 export interface AcpTurnEvidence {
