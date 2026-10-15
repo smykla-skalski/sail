@@ -6031,11 +6031,39 @@ fn agent_availability(
         .collect()
 }
 
+fn assigned_scratch_directory(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("Assigned scratch directory must be absolute.".into());
+    }
+    let assigned = WritableDirectory::capture(path)?;
+    for root in roots {
+        let root = dunce::canonicalize(root).map_err(|error| error.to_string())?;
+        if assigned.path != root && assigned.path.starts_with(&root) {
+            let mut current = path.to_path_buf();
+            while dunce::canonicalize(&current).ok().as_ref() != Some(&root) {
+                if std::fs::symlink_metadata(&current)
+                    .map_err(|error| error.to_string())?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err("Assigned scratch directory must not traverse symlinks.".into());
+                }
+                if !current.pop() {
+                    break;
+                }
+            }
+            return Ok(assigned.path);
+        }
+    }
+    Err("Assigned scratch directory is outside its owner's private scratch space.".into())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpBuildLease {
     owner: String,
     revision: String,
+    scratch_directory: Option<PathBuf>,
 }
 
 #[tauri::command]
@@ -6058,9 +6086,13 @@ pub async fn acp_connect(
             profile,
             Path::new(&directory),
             owner.as_deref(),
-            build_lease
-                .as_ref()
-                .map(|lease| (lease.owner.as_str(), lease.revision.as_str())),
+            build_lease.as_ref().map(|lease| {
+                (
+                    lease.owner.as_str(),
+                    lease.revision.as_str(),
+                    lease.scratch_directory.as_deref(),
+                )
+            }),
         )
     })
     .await
@@ -6132,12 +6164,12 @@ fn connect_blocking_with_build_lease(
     profile: CapabilityProfile,
     directory: &Path,
     owner: Option<&str>,
-    build_lease: Option<(&str, &str)>,
+    build_lease: Option<(&str, &str, Option<&Path>)>,
 ) -> Result<Value, String> {
     if owner.is_some_and(|owner| Uuid::parse_str(owner).is_err()) {
         return Err("Invalid agent run owner ID.".into());
     }
-    if build_lease.is_some_and(|(build_owner, revision)| {
+    if build_lease.is_some_and(|(build_owner, revision, _)| {
         owner.is_none() || Uuid::parse_str(build_owner).is_err() || revision.is_empty()
     }) {
         return Err("Invalid shared build target lease.".into());
@@ -6216,7 +6248,7 @@ fn connect_blocking_inner(
     profile: CapabilityProfile,
     worktree: &Path,
     owner: Option<&str>,
-    build_lease: Option<(&str, &str)>,
+    build_lease: Option<(&str, &str, Option<&Path>)>,
 ) -> Result<Value, String> {
     #[cfg(not(unix))]
     let _ = build_lease;
@@ -6296,7 +6328,7 @@ fn connect_blocking_inner(
         return Err("Reef canary is supported only on macOS and Linux.".into());
     }
     #[cfg(unix)]
-    let shared_build_directory = build_lease.and_then(|(build_owner, revision)| {
+    let shared_build_directory = build_lease.and_then(|(build_owner, revision, _)| {
         let parent = manager
             .0
             .lock()
@@ -6329,6 +6361,38 @@ fn connect_blocking_inner(
     });
     #[cfg(not(unix))]
     let shared_build_directory: Option<PathBuf> = None;
+    let assigned_scratch = if let Some((build_owner, _, Some(path))) = build_lease {
+        let parent = manager
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .find(|runtime| {
+                runtime.worktree == worktree
+                    && runtime.owner.as_deref() == Some(build_owner)
+                    && runtime.alive.load(Ordering::Acquire)
+            })
+            .cloned()
+            .ok_or("Assigned scratch owner is no longer running.")?;
+        parent.validate_codex_workspace(None)?;
+        let mut roots = Vec::new();
+        if let Some(lease) = parent._storage_lease.as_ref() {
+            roots.push(lease.temp_directory().to_path_buf());
+        }
+        #[cfg(unix)]
+        if let Some(root) = parent
+            .runtime_scratch
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_ref()
+        {
+            roots.push(root.path().to_path_buf());
+        }
+        Some(assigned_scratch_directory(path, &roots)?)
+    } else {
+        None
+    };
+
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     let home =
         std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
@@ -6441,6 +6505,9 @@ fn connect_blocking_inner(
         if let Some(build) = shared_build_directory.as_ref() {
             std::fs::create_dir_all(build).map_err(|error| error.to_string())?;
             writable.push(build.clone());
+        }
+        if let Some(scratch) = assigned_scratch.as_ref() {
+            writable.push(scratch.clone());
         }
         let access = CodexWorkspaceAccess::capture(worktree, &writable)?;
         command.env(
@@ -11356,6 +11423,69 @@ time.sleep(10)
                 .unwrap_err()
                 .contains("symlink"));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn assigned_scratch_grants_only_the_selected_subtree() {
+        let root = dunce::canonicalize(scratch("assigned-scratch")).unwrap();
+        let owner = root.join("owner");
+        let selected = owner.join("task/review");
+        let sibling = owner.join("other-task");
+        let workspace = root.join("workspace");
+        for path in [&selected, &sibling, &workspace] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let roots = vec![owner.clone()];
+        let granted = assigned_scratch_directory(&selected, &roots).unwrap();
+        let access = CodexWorkspaceAccess::capture(&workspace, &[granted]).unwrap();
+        let config = access.profile_config().unwrap();
+        assert!(config.contains(selected.to_str().unwrap()));
+        assert!(!config.contains(sibling.to_str().unwrap()));
+        #[cfg(target_os = "macos")]
+        if let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") {
+            let config: Value = serde_json::from_str(&config).unwrap();
+            let run = |path: &Path| {
+                let mut command = Command::new(&codex);
+                command
+                    .args(["sandbox", "-P", "sail-agent", "-C"])
+                    .arg(&workspace);
+                for value in config["configOverrides"].as_array().unwrap() {
+                    command.arg("-c").arg(value.as_str().unwrap());
+                }
+                command
+                    .args(["--", "mkdir", "-p"])
+                    .arg(path)
+                    .output()
+                    .unwrap()
+            };
+            let evidence = selected.join("review-worker/evidence");
+            let allowed = run(&evidence);
+            assert!(
+                allowed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&allowed.stderr)
+            );
+            assert!(evidence.is_dir());
+            assert!(!run(&sibling.join("evidence")).status.success());
+            assert!(!sibling.join("evidence").exists());
+        }
+        assert!(assigned_scratch_directory(&owner, &roots).is_err());
+        assert!(assigned_scratch_directory(&workspace, &roots).is_err());
+        assert!(assigned_scratch_directory(Path::new("task/review"), &roots).is_err());
+        assert!(assigned_scratch_directory(&owner.join("missing"), &roots).is_err());
+        #[cfg(unix)]
+        {
+            let alias = owner.join("alias");
+            std::os::unix::fs::symlink(&selected, &alias).unwrap();
+            assert!(assigned_scratch_directory(&alias, &roots).is_err());
+            let escape = owner.join("escape");
+            std::os::unix::fs::symlink(&workspace, &escape).unwrap();
+            assert!(assigned_scratch_directory(&escape, &roots).is_err());
+        }
+        std::fs::rename(&selected, owner.join("previous")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        assert!(access.validate(None).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

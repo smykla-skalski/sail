@@ -2303,6 +2303,7 @@ pub fn run_mcp_stdio() {
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "prompt":{"type":"string"},
                             "revision":{"type":"string","pattern":"^[0-9a-fA-F]{7,64}$"},
+                            "scratchDirectory":{"type":"string","minLength":1,"description":"Existing private scratch subtree owned by the assigned Ship worker; grants this validator write access only inside that subtree."},
                         },
                         "required":["gate","prompt"]
                     }});

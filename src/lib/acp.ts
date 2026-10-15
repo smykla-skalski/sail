@@ -1133,6 +1133,7 @@ async function limitedConnect(
     owner?: string;
     buildOwner?: string;
     buildRevision?: string;
+    scratchDirectory?: string;
   },
 ): Promise<Record<string, unknown>> {
   if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
@@ -1146,7 +1147,11 @@ async function limitedConnect(
         owner: options?.owner,
         buildLease:
           options?.buildOwner && options?.buildRevision
-            ? { owner: options.buildOwner, revision: options.buildRevision }
+            ? {
+                owner: options.buildOwner,
+                revision: options.buildRevision,
+                scratchDirectory: options.scratchDirectory,
+              }
             : undefined,
       });
       connectedAgents.set(connection, agent);

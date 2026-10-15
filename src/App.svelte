@@ -7709,6 +7709,12 @@
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
     const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
+    const scratchDirectory =
+      typeof request.arguments.scratchDirectory === 'string'
+        ? request.arguments.scratchDirectory
+        : undefined;
+    if (request.arguments.scratchDirectory !== undefined && !scratchDirectory?.trim())
+      throw new Error('Assigned scratch directory must be a nonempty path.');
     const requestedCommit = request.arguments.revision;
     if (requestedCommit !== undefined && requestedCommit !== null && requestedCommit !== '')
       requireGateTargetCommit(
@@ -7720,6 +7726,8 @@
     if (!activeModels)
       throw new Error('Implementation activity is still unresolved. Wait for the turn to finish.');
     const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
+    if (scratchDirectory !== undefined && !gateOwner?.issue.receiptId)
+      throw new Error('Assigned scratch requires an active Ship worker.');
     const routeRisk = gateOwner?.issue.validationPolicy?.risk ?? 'medium';
     const routeRole = gate === 'test-adversary' ? 'testing' : 'review';
     const configuredGateRoute = modelRouting.routes.find(
@@ -7920,7 +7928,11 @@
           await acp.connect(choice.agent, request.directory, 'review', {
             owner: receiptId,
             ...(gateOwner?.issue.receiptId
-              ? { buildOwner: gateOwner.issue.receiptId, buildRevision: revision }
+              ? {
+                  buildOwner: gateOwner.issue.receiptId,
+                  buildRevision: revision,
+                  scratchDirectory,
+                }
               : {}),
           });
         } catch (cause) {
