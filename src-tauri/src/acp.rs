@@ -5748,7 +5748,14 @@ async fn connection_for_session_reattaching(
     // A closed session may still look connected while its resume runs, so ask for the reattach
     // first; it is a no-op for a loaded session.
     reattach_idle_closed(app, manager, browser, agent, session_id, directory).await?;
-    let runtime = connection_for_session(manager, agent, session_id, directory)?;
+    let runtime = match connection_for_session(manager, agent, session_id, directory) {
+        Ok(runtime) => runtime,
+        // The sweeper may have started closing the thread between the check and the lookup.
+        Err(_) => {
+            reattach_idle_closed(app, manager, browser, agent, session_id, directory).await?;
+            connection_for_session(manager, agent, session_id, directory)?
+        }
+    };
     runtime.touch_session(session_id);
     Ok(runtime)
 }

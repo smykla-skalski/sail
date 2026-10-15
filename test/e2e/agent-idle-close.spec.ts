@@ -229,6 +229,7 @@ describe('idle session close', () => {
       writeFileSync(slowResume, 'slow');
       const concurrent = await browser.tauri.execute(
         async ({ core }, agent, path, session) => {
+          // A thread allows one turn at a time, so the second concurrent command is a config change.
           const outcomes = await Promise.allSettled([
             core.invoke('acp_set_config', {
               agent,
@@ -237,34 +238,39 @@ describe('idle session close', () => {
               configId: 'effort',
               value: 'high',
             }),
-            ...['idle-race-1', 'idle-race-2'].map((turnId) =>
-              core.invoke<{ stopReason?: string }>('acp_prompt', {
-                params: {
-                  agent,
-                  directory: path,
-                  sessionId: session,
-                  text: 'Task reporting fixture: done',
-                  turnId,
-                  imagePaths: [],
-                },
-              }),
-            ),
+            core.invoke<{ stopReason?: string }>('acp_prompt', {
+              params: {
+                agent,
+                directory: path,
+                sessionId: session,
+                text: 'Task reporting fixture: done',
+                turnId: 'idle-race',
+                imagePaths: [],
+              },
+            }),
+            core.invoke('acp_set_config', {
+              agent,
+              directory: path,
+              sessionId: session,
+              configId: 'mode',
+              value: 'plan',
+            }),
           ]);
-          const [config, first, second] = outcomes.map((outcome) =>
+          const [effort, prompt, mode] = outcomes.map((outcome) =>
             outcome.status === 'fulfilled'
               ? { value: outcome.value }
               : { error: String(outcome.reason) },
           );
-          return { config, first, second };
+          return { effort, prompt, mode };
         },
         provider,
         directory,
         id,
       );
       rmSync(slowResume, { force: true });
-      expect(concurrent.config).not.toHaveProperty('error');
-      expect(concurrent.first).not.toHaveProperty('error');
-      expect(concurrent.second).not.toHaveProperty('error');
+      expect(concurrent.effort).not.toHaveProperty('error');
+      expect(concurrent.prompt).not.toHaveProperty('error');
+      expect(concurrent.mode).not.toHaveProperty('error');
       expect(await attached(provider, directory)).toContain(id);
 
       const closes = closeCount(id);
