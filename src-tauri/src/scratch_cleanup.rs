@@ -756,11 +756,10 @@ fn reclaim_private_quarantine(
     when: &PrivateReclaim,
     open_files: &impl Fn(&Path) -> Option<bool>,
 ) -> PrivateOutcome {
-    if fs::read_to_string(path.join(PRIVATE_MARKER))
-        .ok()
-        .as_deref()
-        != Some(PRIVATE_MARKER_VALUE)
-    {
+    let marker = fs::read_to_string(path.join(PRIVATE_MARKER)).ok();
+    // A kill between creating the marker and writing it leaves it empty.
+    let unwritten = marker.as_deref() == Some("");
+    if marker.as_deref() != Some(PRIVATE_MARKER_VALUE) && !unwritten {
         return PrivateOutcome::Skipped;
     }
     let Ok(modified) = metadata.modified() else {
@@ -772,6 +771,9 @@ fn reclaim_private_quarantine(
     let Ok(root) = private_child(path) else {
         return PrivateOutcome::Skipped;
     };
+    if unwritten && root.is_some() {
+        return PrivateOutcome::Skipped;
+    }
     let Some(old_root) = root else {
         remove_private_parent(path);
         return PrivateOutcome::Skipped;
@@ -793,6 +795,16 @@ fn reclaim_private_quarantine(
             .ok()
             .flatten()
             .unwrap_or(0);
+        // Keep the verified owner outside the tree being removed, so a kill
+        // that deletes the root marker first cannot strand the partial tree.
+        if root.join(MARKER).exists() {
+            match save_private_owner(&root, path) {
+                Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                    return PrivateOutcome::Kept;
+                }
+                _ => {}
+            }
+        }
         // A read-only directory the killed removal had not reached blocks
         // deletion, as in `finish_quarantined`.
         let mut removed = fs::remove_dir_all(&root);
@@ -2117,6 +2129,72 @@ mod tests {
         let events = reclaim_quarantines_after_grace(&temp, |_| Some(false));
         assert_eq!(events, vec![(name, true)]);
         assert!(!private.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_reclaim_that_fails_midway_leaves_a_quarantine_a_later_pass_finishes() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let name = root.file_name().unwrap().to_str().unwrap().to_string();
+        for dir in 0..6 {
+            let deep = root.join(format!("build/deps/d{dir}/deep"));
+            fs::create_dir_all(&deep).unwrap();
+            for file in 0..10 {
+                fs::write(deep.join(format!("f{file}.o")), "object").unwrap();
+            }
+        }
+        // Killed between the rename and the saved owner.
+        let hidden = quarantine_root(
+            &temp,
+            &root,
+            &name,
+            fs::metadata(&root).unwrap().dev(),
+            &|_| Some(false),
+        )
+        .ok()
+        .unwrap();
+        let locked = hidden.quarantine.join("build/deps/d4/deep/f4.o");
+        let flag = |flag: &str, path: &Path| {
+            Command::new("/usr/bin/chflags")
+                .args(["-R", flag])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(flag("uchg", &locked));
+        // The first reclaim deletes the root marker, then fails on the file.
+        let first = reclaim_quarantines_after_grace(&temp, |_| Some(false));
+        assert_eq!(first, vec![(name.clone(), false)]);
+        fs::set_permissions(&hidden.private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(flag("nouchg", &hidden.private));
+        fs::set_permissions(&hidden.private, fs::Permissions::from_mode(0o300)).unwrap();
+        let events = reclaim_quarantines_after_grace(&temp, |_| Some(false));
+        assert_eq!(events, vec![(name, true)]);
+        assert!(!hidden.private.exists());
+    }
+
+    #[test]
+    fn a_parent_killed_before_its_marker_was_written_is_removed() {
+        let temp = fixture();
+        let name = format!("sail-runtime-{}", uuid::Uuid::new_v4());
+        let empty = temp.join(format!(
+            "sail-cleanup-private-{}-{name}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&empty).unwrap();
+        fs::write(empty.join(PRIVATE_MARKER), "").unwrap();
+        // An empty marker beside a child is not proof of a finished rename.
+        let busy = temp.join(format!(
+            "sail-cleanup-private-{}-{name}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(busy.join("child")).unwrap();
+        fs::write(busy.join(PRIVATE_MARKER), "").unwrap();
+        assert!(reclaim_quarantines_after_grace(&temp, |_| Some(false)).is_empty());
+        assert!(!empty.exists());
+        assert!(busy.join("child").exists());
     }
 
     #[test]
