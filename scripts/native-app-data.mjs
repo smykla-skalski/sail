@@ -1,12 +1,11 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const identifierPattern = /^dev\.smykla\.sail\.e2e\.([a-f0-9]{32})$/;
-const productNamePattern = /Sail E2E ([a-f0-9]{8})\.app\//g;
-const appPathPattern = /^(\/.*?Sail E2E [a-f0-9]{8}\.app)\/Contents\/MacOS\//gm;
+const bundleMarkerPattern = /(Sail E2E ([a-f0-9]{8})\.app)\/Contents\/MacOS\//g;
 export const buildIdentifierKey = 'SailE2EBuildIdentifier';
 
 export function isRunIdentifier(name) {
@@ -48,12 +47,37 @@ export function listProcessCommands() {
   return result.stdout;
 }
 
+function isBundleDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * A run's app is launched from `Sail E2E <first 8 id characters>.app`, so a process whose command
- * carries that bundle path proves the run is still in progress.
+ * A run's app is launched from `Sail E2E <first 8 id characters>.app`. A command line proves the
+ * app runs only when it starts with the path of an existing bundle, which is the executable. A
+ * process that merely mentions the path, such as `tail -f <bundle>/...`, has a different command in
+ * front of it, so the text before the bundle name is no existing directory. Returns the live app
+ * paths with their tokens.
  */
-export function liveRunTokens(processCommands) {
-  return new Set([...processCommands.matchAll(productNamePattern)].map((match) => match[1]));
+export function liveApps(processCommands, isBundle = isBundleDirectory) {
+  const apps = new Map();
+  for (const line of processCommands.split('\n')) {
+    const command = line.trimStart();
+    for (const match of command.matchAll(bundleMarkerPattern)) {
+      const app = command.slice(0, match.index + match[1].length);
+      if (!app.startsWith('/') || !isBundle(app)) continue;
+      apps.set(app, match[2]);
+      break;
+    }
+  }
+  return apps;
+}
+
+export function liveRunTokens(processCommands, isBundle = isBundleDirectory) {
+  return new Set(liveApps(processCommands, isBundle).values());
 }
 
 export function isRunLive(identifier, live) {
@@ -81,10 +105,10 @@ export function bundleIdentifiers(app) {
  * runner, or an unreadable plist) leaves `unresolved` set, because any folder could be its own.
  */
 export function liveProtection(processCommands, readBundleIdentifiers = bundleIdentifiers) {
-  const apps = new Set([...processCommands.matchAll(appPathPattern)].map((match) => match[1]));
-  const read = [...apps].map((app) => readBundleIdentifiers(app));
+  const apps = liveApps(processCommands);
+  const read = [...apps.keys()].map((app) => readBundleIdentifiers(app));
   return {
-    tokens: liveRunTokens(processCommands),
+    tokens: new Set(apps.values()),
     identifiers: new Set(read.flat()),
     unresolved: read.some((identifiers) => identifiers.length < 2),
   };

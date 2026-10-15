@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -18,7 +26,6 @@ import {
 
 const identifier = (prefix: string) =>
   `dev.smykla.sail.e2e.${prefix}${'0'.repeat(32 - prefix.length)}`;
-const appPath = (id: string) => `/tmp/run/Sail E2E ${id.slice(-32, -24)}.app/Contents/MacOS/sail`;
 
 function fixture(context: test.TestContext) {
   const base = mkdtempSync(join(tmpdir(), 'sail-app-data-test-'));
@@ -30,9 +37,17 @@ function fixture(context: test.TestContext) {
   const populate = (name: string) => {
     for (const root of roots) mkdirSync(join(root, name, 'nested'), { recursive: true });
   };
+  // The executable of a run's app: a real file in a bundle, as `ps` reports a running app.
+  const appPath = (id: string) => {
+    const macos = join(base, 'run', `Sail E2E ${id.slice(-32, -24)}.app`, 'Contents', 'MacOS');
+    mkdirSync(macos, { recursive: true });
+    return join(macos, 'sail');
+  };
   return {
+    base,
     roots,
     populate,
+    appPath,
     remaining: (name: string) => roots.filter((r) => existsSync(join(r, name))),
   };
 }
@@ -61,7 +76,8 @@ await test('only generated run identifiers are recognised', () => {
     assert.equal(isRunIdentifier(other), false, other);
 });
 
-await test('a process started from the run app marks that run live', () => {
+await test('a process started from the run app marks that run live', (context) => {
+  const { appPath } = fixture(context);
   const live = identifier('abcdef01');
   const processes = [
     '/usr/bin/some-tool --flag',
@@ -74,7 +90,7 @@ await test('a process started from the run app marks that run live', () => {
 });
 
 await test('a sweep removes dead runs, keeps live runs and ignores other folders', (context) => {
-  const { roots, populate, remaining } = fixture(context);
+  const { roots, populate, remaining, appPath } = fixture(context);
   const dead = identifier('d1');
   const live = identifier('a1');
   const current = identifier('c1');
@@ -103,12 +119,12 @@ await test('a run that starts while the process table is read is kept', (context
 });
 
 await test('a sweep follows a real process until it exits', async (context) => {
-  const { roots, populate, remaining } = fixture(context);
+  const { roots, populate, remaining, appPath } = fixture(context);
   const run = identifier('b2');
   populate(run);
-  const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', appPath(run)], {
-    stdio: 'ignore',
-  });
+  const executable = appPath(run);
+  symlinkSync(process.execPath, executable);
+  const holder = spawn(executable, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   context.after(() => holder.kill('SIGKILL'));
   await delay(200);
 
@@ -120,6 +136,50 @@ await test('a sweep follows a real process until it exits', async (context) => {
   await exited;
   assert.equal(sweepRunData(roots, listProcessCommands).removed.length, roots.length);
   assert.deepEqual(remaining(run), []);
+});
+
+await test('a process that only mentions the bundle path does not keep a run live', async (context) => {
+  const { roots, populate, remaining, appPath } = fixture(context);
+  const lookAlike = identifier('a7');
+  const real = identifier('b7');
+  populate(lookAlike);
+  populate(real);
+  const mentioned = appPath(lookAlike);
+  writeFileSync(mentioned, '');
+  const executable = appPath(real);
+  symlinkSync(process.execPath, executable);
+  const spawned = [
+    spawn('tail', ['-f', mentioned], { stdio: 'ignore' }),
+    spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', mentioned], { stdio: 'ignore' }),
+    spawn(executable, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }),
+  ];
+  context.after(() => spawned.forEach((child) => child.kill('SIGKILL')));
+  await delay(300);
+
+  const commands = listProcessCommands();
+  assert.ok(commands.includes(`tail -f ${mentioned}`));
+  assert.deepEqual([...liveRunTokens(commands)], [real.slice(-32, -24)]);
+  assert.equal(sweepRunData(roots, listProcessCommands).removed.length, roots.length);
+  assert.deepEqual(remaining(lookAlike), []);
+  assert.deepEqual(remaining(real), roots);
+});
+
+const liveTokens = (commands: string[]) => [...liveRunTokens(commands.join('\n'))];
+
+await test('commands that do not start with an existing bundle are not live apps', (context) => {
+  const { appPath } = fixture(context);
+  const id = identifier('c7');
+  const app = appPath(id);
+  const token = id.slice(-32, -24);
+
+  assert.deepEqual(liveTokens([`${app} --flag`]), [token]);
+  assert.deepEqual(liveTokens([`  ${app}`]), [token]);
+  assert.deepEqual(
+    liveTokens([`/usr/bin/tail -f ${app}`, `tail -f ${app}`, `zsh -c "tail ${app}"`]),
+    [],
+  );
+  assert.deepEqual(liveTokens([`/nowhere/Sail E2E ${token}.app/Contents/MacOS/sail`]), []);
+  assert.deepEqual(liveTokens([`Sail E2E ${token}.app/Contents/MacOS/sail`]), []);
 });
 
 await test('finishing a run removes only its own folders', async (context) => {
@@ -164,7 +224,7 @@ await test(
 );
 
 await test('build identity folders stay while a live app was built with them', async (context) => {
-  const { roots, populate, remaining } = fixture(context);
+  const { roots, populate, remaining, appPath } = fixture(context);
   const build = identifier('b5');
   const live = identifier('a5');
   const other = identifier('c5');
@@ -184,7 +244,7 @@ await test('build identity folders stay while a live app was built with them', a
 });
 
 await test('an app that does not record its build keeps unverifiable folders', async (context) => {
-  const { roots, populate, remaining } = fixture(context);
+  const { roots, populate, remaining, appPath } = fixture(context);
   const legacy = identifier('a6');
   const deadRun = identifier('d6');
   const buildOnly = identifier('b6');
