@@ -1916,7 +1916,7 @@ impl Connection {
         {
             return false;
         }
-        let timeout = if self.lists_only() {
+        let earliest_timeout = if self.profile == CapabilityProfile::Explore {
             timeout.min(OPENCODE_LISTING_IDLE_TIMEOUT)
         } else {
             timeout
@@ -1925,7 +1925,8 @@ impl Connection {
             .last_activity
             .lock()
             .map_or(Duration::ZERO, |last| last.elapsed());
-        if silent < timeout || self.capabilities.lock().is_ok_and(|value| value.is_null()) {
+        if silent < earliest_timeout || self.capabilities.lock().is_ok_and(|value| value.is_null())
+        {
             return false;
         }
         // A prompt being dispatched holds this lock; leave it alone.
@@ -1937,7 +1938,21 @@ impl Connection {
             self.touch();
             return false;
         }
+        let Ok(profiles) = self.session_profiles.lock() else {
+            return false;
+        };
+        let timeout = if self.profile == CapabilityProfile::Explore && profiles.is_empty() {
+            earliest_timeout
+        } else {
+            timeout
+        };
+        if silent < timeout {
+            return false;
+        }
+        // Commit the decision while session registration is excluded.
         self.idle_exit.store(true, Ordering::Release);
+        drop(profiles);
+        drop(_dispatch);
         if let Err(error) = self.terminate() {
             self.idle_exit.store(false, Ordering::Release);
             crate::diagnostics::record(
@@ -1951,15 +1966,6 @@ impl Connection {
             json!({"agent":self.agent,"idleSeconds":silent.as_secs()}),
         );
         true
-    }
-
-    /// The shared sidebar agent holds no session, only its listing requests.
-    fn lists_only(&self) -> bool {
-        self.profile == CapabilityProfile::Explore
-            && self
-                .session_profiles
-                .lock()
-                .is_ok_and(|profiles| profiles.is_empty())
     }
 
     fn has_pending_work(&self) -> bool {
@@ -5316,17 +5322,21 @@ fn register_session_detached(
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".to_string())?;
+    let mut profiles = runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if runtime.idle_exit.load(Ordering::Acquire) {
+        return Err(IDLE_EXIT_ERROR.into());
+    }
     let mut directories = runtime
         .session_directories
         .lock()
         .map_err(|error| error.to_string())?;
     bind_session_directory(&mut directories, session_id, directory)?;
     drop(directories);
-    runtime
-        .session_profiles
-        .lock()
-        .map_err(|error| error.to_string())?
-        .insert(session_id.to_string(), profile);
+    profiles.insert(session_id.to_string(), profile);
+    drop(profiles);
     Ok(runtime)
 }
 
@@ -10310,6 +10320,87 @@ time.sleep(10)
         assert!(!working.exit_if_idle(Duration::from_secs(600), || false));
         assert!(working.alive.load(Ordering::Acquire));
         working.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_registered_at_idle_decision_keeps_listing_agent_alive() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key(
+                "opencode",
+                CapabilityProfile::Explore,
+                Path::new("/worktree"),
+            ),
+            Arc::clone(&runtime),
+        );
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(600), || {
+            register_session(
+                &manager,
+                "opencode",
+                CapabilityProfile::Explore,
+                "registered-at-boundary",
+                PathBuf::from("/worktree"),
+            )
+            .unwrap();
+            false
+        }));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_rejects_an_agent_committed_to_idle_exit() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        runtime.idle_exit.store(true, Ordering::Release);
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key(
+                "opencode",
+                CapabilityProfile::Explore,
+                Path::new("/worktree"),
+            ),
+            Arc::clone(&runtime),
+        );
+
+        let error = register_session(
+            &manager,
+            "opencode",
+            CapabilityProfile::Explore,
+            "too-late",
+            PathBuf::from("/worktree"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, IDLE_EXIT_ERROR);
+        assert!(runtime.session_profiles.lock().unwrap().is_empty());
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_claim_keeps_listing_agent_alive_until_release() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let token = runtime.begin_restore("restoring").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(600), || false));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.release_restore("restoring", &token).unwrap();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        assert!(runtime.exit_if_idle(Duration::from_secs(600), || false));
     }
 
     #[cfg(unix)]
