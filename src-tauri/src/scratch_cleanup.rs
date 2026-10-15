@@ -60,6 +60,9 @@ pub(crate) fn sweep_on_startup(cache_directory: Option<&Path>) {
 
 const RUNTIME_PREFIX: &str = "sail-runtime-";
 const UNMARKED_GRACE: Duration = Duration::from_secs(10 * 60);
+// A quarantine untouched this long belongs to a removal that died, not one
+// still deleting a large tree in another thread or Sail.
+const QUARANTINE_GRACE: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) enum RuntimeRootEvent {
     Removed { bytes: u64 },
@@ -152,6 +155,57 @@ impl RuntimeSweepLog {
     }
 }
 
+// A Sail killed while deleting a runtime root leaves its quarantine behind.
+// Reclaim it here, so it does not wait for a restart and the startup sweep's
+// two hour idle rule. A root whose owner still runs goes back under its name.
+fn reclaim_runtime_quarantines(
+    temp: &Path,
+    now: SystemTime,
+    euid: u32,
+    open_files: &impl Fn(&Path) -> Option<bool>,
+    report: &mut dyn FnMut(&str, RuntimeRootEvent),
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(temp)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(original) = private_quarantine_name(name) else {
+            continue;
+        };
+        if !original.strip_prefix(RUNTIME_PREFIX).is_some_and(|id| {
+            uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
+        }) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.uid() != euid {
+            continue;
+        }
+        match reclaim_private_quarantine(
+            temp,
+            &path,
+            original,
+            &metadata,
+            now,
+            QUARANTINE_GRACE,
+            open_files,
+        ) {
+            PrivateOutcome::Removed(bytes) => report(original, RuntimeRootEvent::Removed { bytes }),
+            PrivateOutcome::Kept => report(
+                original,
+                RuntimeRootEvent::Kept {
+                    reason: "quarantine in use",
+                },
+            ),
+            PrivateOutcome::Skipped | PrivateOutcome::Restored => {}
+        }
+    }
+    Ok(())
+}
+
 // Roots hidden in quarantine per final open-file check. One lsof call
 // answers a whole batch, so a pass costs a few scans instead of one per root.
 const RUNTIME_RECLAIM_BATCH: usize = 100;
@@ -172,6 +226,7 @@ fn sweep_runtime_roots_in(
     report: &mut dyn FnMut(&str, RuntimeRootEvent),
 ) -> std::io::Result<()> {
     let euid = unsafe { nix::libc::geteuid() };
+    reclaim_runtime_quarantines(temp, now, euid, &open_files, report)?;
     let ignore_idle_age = now + IDLE_AGE + Duration::from_secs(1);
     let mut candidates = Vec::new();
     for entry in fs::read_dir(temp)? {
@@ -631,51 +686,16 @@ fn sweep_with(
             continue;
         }
         if let Some(original_name) = private_quarantine_name(&name) {
-            if fs::read_to_string(path.join(PRIVATE_MARKER))
-                .ok()
-                .as_deref()
-                != Some(PRIVATE_MARKER_VALUE)
-            {
-                continue;
-            }
-            if now.duration_since(metadata.modified()?).unwrap_or_default() < IDLE_AGE {
-                continue;
-            }
-            let Ok(root) = private_child(&path) else {
-                continue;
-            };
-            let Some(old_root) = root else {
-                remove_private_parent(&path);
-                continue;
-            };
-            // A process may have seen the old child name during recovery's
-            // brief directory listing. Rename it after hiding the parent so
-            // only the new, unlisted path is used for the safety check.
-            let root = path.join(uuid::Uuid::new_v4().to_string());
-            if fs::rename(&old_root, &root).is_err() {
-                continue;
-            }
-            let original = temp.join(original_name);
-            let safe = inspect(&root, metadata.dev(), now).is_ok_and(|result| result.is_some())
-                && (marker_owner_dead(&root)
-                    || (!root.join(MARKER).exists() && owner_dead(&path.join(PRIVATE_OWNER))))
-                && open_files(&root) == Some(false);
-            if safe {
-                let bytes = inspect(&root, metadata.dev(), now)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                if fs::remove_dir_all(&root).is_ok() {
-                    freed += bytes;
-                    remove_private_parent(&path);
-                }
-            } else if !original.exists() {
-                if restore_owner_marker(&root, &path).is_ok() {
-                    restore(&root, &original);
-                }
-                if !root.exists() {
-                    remove_private_parent(&path);
-                }
+            if let PrivateOutcome::Removed(bytes) = reclaim_private_quarantine(
+                temp,
+                &path,
+                original_name,
+                &metadata,
+                now,
+                IDLE_AGE,
+                &open_files,
+            ) {
+                freed += bytes;
             }
             continue;
         }
@@ -695,6 +715,84 @@ fn sweep_with(
         }
     }
     Ok(freed)
+}
+
+// What a pass found in a `sail-cleanup-private-*` directory.
+enum PrivateOutcome {
+    // Not ours, too fresh to be abandoned, or unreadable: left untouched.
+    Skipped,
+    Removed(u64),
+    // The root is back under its original name, where its next check applies.
+    Restored,
+    // The root has a live owner or open files, or deletion failed.
+    Kept,
+}
+
+// Recovers a quarantine left by a Sail that died while removing a root. The
+// root goes back under its original name unless its owner has exited and
+// nothing holds a file in it, in which case it is deleted. `min_age` is how
+// long the directory must sit untouched, so a removal still running in
+// another thread or Sail is not raced.
+fn reclaim_private_quarantine(
+    temp: &Path,
+    path: &Path,
+    original_name: &str,
+    metadata: &fs::Metadata,
+    now: SystemTime,
+    min_age: Duration,
+    open_files: &impl Fn(&Path) -> Option<bool>,
+) -> PrivateOutcome {
+    if fs::read_to_string(path.join(PRIVATE_MARKER))
+        .ok()
+        .as_deref()
+        != Some(PRIVATE_MARKER_VALUE)
+    {
+        return PrivateOutcome::Skipped;
+    }
+    let Ok(modified) = metadata.modified() else {
+        return PrivateOutcome::Skipped;
+    };
+    if now.duration_since(modified).unwrap_or_default() < min_age {
+        return PrivateOutcome::Skipped;
+    }
+    let Ok(root) = private_child(path) else {
+        return PrivateOutcome::Skipped;
+    };
+    let Some(old_root) = root else {
+        remove_private_parent(path);
+        return PrivateOutcome::Skipped;
+    };
+    // A process may have seen the old child name during recovery's
+    // brief directory listing. Rename it after hiding the parent so
+    // only the new, unlisted path is used for the safety check.
+    let root = path.join(uuid::Uuid::new_v4().to_string());
+    if fs::rename(&old_root, &root).is_err() {
+        return PrivateOutcome::Skipped;
+    }
+    let original = temp.join(original_name);
+    let safe = inspect(&root, metadata.dev(), now).is_ok_and(|result| result.is_some())
+        && (marker_owner_dead(&root)
+            || (!root.join(MARKER).exists() && owner_dead(&path.join(PRIVATE_OWNER))))
+        && open_files(&root) == Some(false);
+    if safe {
+        let bytes = inspect(&root, metadata.dev(), now)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        if fs::remove_dir_all(&root).is_ok() {
+            remove_private_parent(path);
+            return PrivateOutcome::Removed(bytes);
+        }
+    } else if !original.exists() {
+        if restore_owner_marker(&root, path).is_ok() {
+            restore(&root, &original);
+        }
+        if !root.exists() {
+            remove_private_parent(path);
+            return PrivateOutcome::Restored;
+        }
+    }
+    PrivateOutcome::Kept
 }
 
 // Quarantines a verified dead-owner root and deletes it. The caller has
@@ -1836,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_sweep_leaves_a_private_quarantine_to_its_owner() {
+    fn runtime_sweep_leaves_a_fresh_private_quarantine_to_its_remover() {
         let temp = fixture();
         let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
         let name = root.file_name().unwrap().to_str().unwrap();
@@ -1848,6 +1946,124 @@ mod tests {
         fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).unwrap();
         runtime_sweep(&temp, |_| Some(false));
         assert!(private.exists());
+    }
+
+    // The state a Sail killed inside `remove_dir_all` leaves: the root hidden
+    // under a private parent, its marker kept only as the saved owner, and
+    // part of the tree already deleted.
+    fn killed_removal(temp: &Path, owner: &str) -> (String, PathBuf) {
+        let root = runtime_root(temp, Some(owner));
+        let name = root.file_name().unwrap().to_str().unwrap().to_string();
+        fs::create_dir_all(root.join("build/deps/inner")).unwrap();
+        fs::write(root.join("build/deps/inner/object"), "build output").unwrap();
+        let hidden = quarantine_root(
+            temp,
+            &root,
+            &name,
+            fs::metadata(&root).unwrap().dev(),
+            &|_| Some(false),
+        )
+        .ok()
+        .unwrap();
+        save_private_owner(&hidden.quarantine, &hidden.private).unwrap();
+        fs::remove_file(hidden.quarantine.join(MARKER)).unwrap();
+        fs::remove_dir_all(hidden.quarantine.join("build/go-tmp")).unwrap();
+        fs::remove_file(hidden.quarantine.join("build/artifact")).unwrap();
+        (name, hidden.private)
+    }
+
+    fn sweep_after_grace(
+        temp: &Path,
+        open_files: impl Fn(&Path) -> Option<bool>,
+    ) -> Vec<(String, String)> {
+        let mut events = Vec::new();
+        sweep_runtime_roots_in(
+            temp,
+            SystemTime::now() + QUARANTINE_GRACE + Duration::from_secs(1),
+            &open_files,
+            each(&open_files),
+            &|_| false,
+            &mut |name, event| {
+                events.push((
+                    name.to_string(),
+                    match event {
+                        RuntimeRootEvent::Removed { .. } => "removed".to_string(),
+                        RuntimeRootEvent::Kept { reason } => format!("kept: {reason}"),
+                    },
+                ));
+            },
+        )
+        .unwrap();
+        events
+    }
+
+    #[test]
+    fn runtime_sweep_reclaims_a_quarantine_left_by_a_killed_removal() {
+        let temp = fixture();
+        let (name, private) = killed_removal(&temp, &format!("{} 1", i32::MAX));
+        assert!(private.exists());
+        let events = sweep_after_grace(&temp, |_| Some(false));
+        assert_eq!(events, vec![(name.clone(), "removed".to_string())]);
+        assert!(!private.exists());
+        assert!(!temp.join(name).exists());
+    }
+
+    #[test]
+    fn runtime_sweep_waits_out_the_grace_before_taking_a_quarantine() {
+        let temp = fixture();
+        let (_, private) = killed_removal(&temp, &format!("{} 1", i32::MAX));
+        assert!(runtime_sweep(&temp, |_| Some(false)).is_empty());
+        assert!(private.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_restores_a_quarantine_whose_owner_is_alive() {
+        let temp = fixture();
+        let owner = owner_identity().unwrap();
+        let root = runtime_root(&temp, Some(&owner));
+        let name = root.file_name().unwrap().to_str().unwrap().to_string();
+        let hidden = quarantine_root(
+            &temp,
+            &root,
+            &name,
+            fs::metadata(&root).unwrap().dev(),
+            &|_| Some(false),
+        )
+        .ok()
+        .unwrap();
+        let events = sweep_after_grace(&temp, |_| Some(false));
+        assert_eq!(events, vec![(name, "kept: owner running".to_string())]);
+        assert!(root.join("build/artifact").exists());
+        assert!(!hidden.private.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_keeps_a_quarantine_with_an_open_file() {
+        let temp = fixture();
+        let (name, private) = killed_removal(&temp, &format!("{} 1", i32::MAX));
+        let events = sweep_after_grace(&temp, |_| Some(true));
+        assert_eq!(events, vec![(name.clone(), "kept: open files".to_string())]);
+        assert!(temp.join(name).join("build/deps/inner/object").exists());
+        assert!(!private.exists());
+    }
+
+    #[test]
+    fn runtime_sweep_leaves_a_quarantine_of_another_kind_of_root() {
+        let temp = fixture();
+        let root = temp.join("sail-339-target.old");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        let hidden = quarantine_root(
+            &temp,
+            &root,
+            "sail-339-target.old",
+            fs::metadata(&root).unwrap().dev(),
+            &|_| Some(false),
+        )
+        .ok()
+        .unwrap();
+        assert!(sweep_after_grace(&temp, |_| Some(false)).is_empty());
+        assert!(hidden.quarantine.exists());
     }
 
     #[test]
