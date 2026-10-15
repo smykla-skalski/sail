@@ -13,6 +13,11 @@ the upstream distribution to select launch-provided permission profiles and to
 keep the selected profile through session lifecycle operations. The advertised
 `workspace-write` mode selects the same trusted filesystem profile as `agent`
 while retaining its own approval policy.
+For Sail permission profiles, turns inherit the globally configured approval
+reviewer instead of applying the ACP mode reviewer preset. The mode approval
+policy and explicit filesystem profile remain enforced. Legacy adapter sessions
+retain their mode reviewer presets.
+
 Sail stores the generated JavaScript as `dist/index.js.txt`, then stages it as
 `index.mjs` in the connection's private temporary directory at launch.
 
@@ -29,4 +34,4 @@ cp dist/index.js /path/to/sail/vendor/codex-acp/dist/index.js.txt
 ```
 
 The committed bundle's SHA-256 is
-`125e6e752f105d5b7564a9d637e44f9202fb6e8899666c5b22eb491ab3def60f`.
+`6f9ff3d56a417b16eb8de8f7d809b7801bce9f9aa9248f50f6071e2cf0779b82`.

@@ -494,7 +494,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     send({ id: message.id, result: {} });
   } else if (message.method === 'session/list') {
     if (process.env.SAIL_E2E_ACP_LIST_LOG)
-      appendFileSync(process.env.SAIL_E2E_ACP_LIST_LOG, `${Date.now()}\n`);
+      appendFileSync(
+        process.env.SAIL_E2E_ACP_LIST_LOG,
+        `${Date.now()} ${message.params.cwd ?? ''}\n`,
+      );
     const pageSize = 2;
     const cwd = message.params.cwd;
     if (agent === 'opencode' && existsSync(join(cwd, '.acp-session-list-error'))) {

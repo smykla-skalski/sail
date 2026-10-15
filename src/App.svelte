@@ -267,6 +267,7 @@
     createSidebarPassOwnership,
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
+    sidebarRefreshOnWindowEvent,
     unlistedSidebarPaths,
     type SidebarRefreshPaths,
   } from './lib/sidebar-inventory';
@@ -2630,8 +2631,8 @@
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
-    window.addEventListener('focus', refreshSidebarOnFocus);
-    document.addEventListener('visibilitychange', refreshSidebarOnFocus);
+    window.addEventListener('focus', refreshSidebarOnWindowEvent);
+    document.addEventListener('visibilitychange', refreshSidebarOnWindowEvent);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
       if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading)
@@ -2654,8 +2655,8 @@
       clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
-      window.removeEventListener('focus', refreshSidebarOnFocus);
-      document.removeEventListener('visibilitychange', refreshSidebarOnFocus);
+      window.removeEventListener('focus', refreshSidebarOnWindowEvent);
+      document.removeEventListener('visibilitychange', refreshSidebarOnWindowEvent);
       clearTimeout(sidebarInventoryTimer);
       clearTimeout(sidebarFocusTimer);
       clearInterval(diffPollTimer);
@@ -11056,6 +11057,11 @@
     }, delay);
   }
 
+  function refreshSidebarOnWindowEvent(event: Event) {
+    if (sidebarRefreshOnWindowEvent(event.type, document.visibilityState, document.hasFocus()))
+      refreshSidebarOnFocus();
+  }
+
   // OpenCode sessions made outside Sail appear when the window regains focus, not by polling.
   function refreshSidebarOnFocus() {
     clearTimeout(sidebarFocusTimer);
@@ -11072,10 +11078,9 @@
     const now = Date.now();
     if (!sidebarListingClock.focusRefreshDue(now)) {
       // Focus stays put after this event, so check again once the last listing is old enough.
-      sidebarFocusTimer = setTimeout(
-        refreshSidebarOnFocus,
-        sidebarListingClock.focusRefreshDelay(now),
-      );
+      sidebarFocusTimer = setTimeout(() => {
+        if (document.hasFocus()) refreshSidebarOnFocus();
+      }, sidebarListingClock.focusRefreshDelay(now));
       return;
     }
     if (sidebarInventoryTimer === undefined)

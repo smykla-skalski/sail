@@ -224,7 +224,7 @@ export function shipPoolUsage(runs: ShipRun[]): ShipPoolUsage {
 }
 
 export const shipPoolHint =
-  'Each run allows 1 to 8 workers. A ship-it coordinator starts at most 3 workers and keeps a slot free for review and test gates.';
+  'Each run allows 1 to 8 workers. Coordinators fill available agent capacity while reserving room for review and test gates.';
 
 export function shipPoolLabel(usage: ShipPoolUsage): string {
   if (usage.runs === 0) return 'No workers running';

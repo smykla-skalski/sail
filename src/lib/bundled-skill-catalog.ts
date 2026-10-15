@@ -36,6 +36,7 @@ export const bundledSkillReferences = {
     'replay.md',
     'replay-trace.schema.json',
     'worker-rules.md',
+    'worker-events.md',
     'ci-triage.md',
     'ci-triage.schema.json',
     'fallbacks.md',

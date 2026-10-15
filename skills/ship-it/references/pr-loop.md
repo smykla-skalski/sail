@@ -1,6 +1,6 @@
 # ship-it PR loop: open, wait, fix, merge
 
-Resume the draft PR created in the publish step and take its current head to merge. Never poll in the foreground. Start one background waiter per PR that returns on a hosted-state change or the 30-minute deadline; read hosted status at most once per ten minutes.
+Resume the draft PR created in the publish step and take its current head to merge. Never poll in the foreground. Follow [worker-events.md](worker-events.md): persist one dispatch ID and 30-minute deadline per PR waiter, wake on hosted-state changes, and accept events once. A fallback waiter reads hosted status at most once per ten minutes.
 
 Load the resolved release policy from the checkpoint and reconcile it with live GitHub policy before the first push and immediately before merge. A missing, stale, ambiguous or unsatisfied release policy blocks this loop with the exact required human action.
 
