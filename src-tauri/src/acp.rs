@@ -4715,15 +4715,71 @@ fn register_session(
     Ok(runtime)
 }
 
+/// Agents that keep no transcript for a session until its first turn, so they cannot resume one
+/// that never ran.
+const NEEDS_FIRST_TURN_AGENTS: &[&str] = &["claude"];
+
 /// Agents whose adapter turns `session/close` into releasing the loaded thread and its MCP servers.
 /// OpenCode advertises close but keeps the session's MCP servers until the agent exits, and a
 /// resumed session then starts them again, so its idle agent exit is the release path instead.
 const IDLE_CLOSE_AGENTS: &[&str] = &["claude", "codex"];
 
 impl Connection {
+    fn cached_config_options(&self, session_id: &str) -> Option<Value> {
+        self.session_ui
+            .lock()
+            .ok()?
+            .get(session_id)?
+            .config_options
+            .clone()
+    }
+
+    /// A resume resets session-scoped settings such as mode and effort; put back what the thread had.
+    fn replay_config(&self, session_id: &str, previous: Option<&Value>, resumed: &Value) {
+        let (Some(previous), Some(resumed)) = (
+            previous,
+            resumed.get("configOptions").filter(|v| v.is_array()),
+        ) else {
+            return;
+        };
+        for (config_id, value) in config_replays(previous, resumed) {
+            match self.request(
+                "session/set_config_option",
+                json!({"sessionId":session_id,"configId":config_id,"value":value}),
+                Duration::from_secs(30),
+            ) {
+                Ok(reply) => {
+                    let _ = self.remember_session_ui(session_id, &reply);
+                }
+                Err(error) => crate::diagnostics::record(
+                    "idle_session_config_replay_failed",
+                    json!({"agent":self.agent,"sessionId":session_id,"configId":config_id,"error":error}),
+                ),
+            }
+        }
+    }
+
     fn touch_session(&self, session_id: &str) {
         if let Ok(mut idle) = self.idle.lock() {
             idle.touch(session_id, Instant::now());
+        }
+    }
+
+    /// Waits out an idle close in flight. Returns whether the session is still closed.
+    fn settle_close(&self, session_id: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(35);
+        loop {
+            let state = self
+                .idle
+                .lock()
+                .map(|idle| (idle.is_closing(session_id), idle.is_closed(session_id)));
+            match state {
+                Ok((true, _)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok((_, closed)) => return closed,
+                Err(_) => return false,
+            }
         }
     }
 
@@ -4777,13 +4833,14 @@ impl Connection {
         {
             return Ok(true);
         }
-        if self
-            .idle
-            .lock()
-            .map_err(|error| error.to_string())?
-            .has_async_tasks(session_id)
         {
-            return Ok(true);
+            let idle = self.idle.lock().map_err(|error| error.to_string())?;
+            if idle.has_async_tasks(session_id)
+                || idle.has_background_work(session_id)
+                || idle.is_fresh(session_id)
+            {
+                return Ok(true);
+            }
         }
         Ok(self
             .native_subagents
@@ -4846,22 +4903,32 @@ impl Connection {
             self.idle
                 .lock()
                 .map_err(|error| error.to_string())?
-                .mark_closed(session_id);
+                .begin_close(session_id);
             (profile, directory)
         };
-        match self.request(
+        let closed = self.request(
             "session/close",
             json!({"sessionId":session_id}),
             Duration::from_secs(30),
-        ) {
+        );
+        let end_close = || {
+            if let Ok(mut idle) = self.idle.lock() {
+                idle.end_close(session_id);
+            }
+        };
+        match closed {
             Ok(_) => {
+                end_close();
                 crate::diagnostics::record(
                     "idle_session_closed",
                     json!({"agent":self.agent,"sessionId":session_id}),
                 );
                 Ok(true)
             }
-            Err(error) if is_unknown_session_error(&error) => Ok(true),
+            Err(error) if is_unknown_session_error(&error) => {
+                end_close();
+                Ok(true)
+            }
             Err(error) => {
                 if let (Ok(mut profiles), Ok(mut directories)) = (
                     self.session_profiles.lock(),
@@ -4990,11 +5057,59 @@ async fn reattach_idle_closed(
     };
     let (app, manager, browser) = (app.clone(), manager.clone(), browser.clone());
     tauri::async_runtime::spawn_blocking(move || {
-        restore_session_blocking(app, &manager, &browser, params, "session/resume")
+        if !runtime.settle_close(&params.session_id) {
+            return Ok(());
+        }
+        let session_id = params.session_id.clone();
+        let previous = runtime.cached_config_options(&session_id);
+        let resumed = restore_session_blocking(app, &manager, &browser, params, "session/resume")?;
+        runtime.replay_config(&session_id, previous.as_ref(), &resumed);
+        Ok::<(), String>(())
     })
     .await
     .map_err(|error| error.to_string())??;
     Ok(true)
+}
+
+/// Config selections whose resumed value differs from the one the thread had before the close.
+fn config_replays(previous: &Value, resumed: &Value) -> Vec<(String, String)> {
+    let choices = |option: &Value| -> Vec<String> {
+        let mut values = Vec::new();
+        for choice in option
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let grouped = choice.get("options").and_then(Value::as_array);
+            for choice in grouped.map_or_else(|| std::slice::from_ref(choice), Vec::as_slice) {
+                values.extend(
+                    choice
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+        values
+    };
+    let resumed_options = resumed.as_array().map_or(&[][..], Vec::as_slice);
+    previous
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|option| option.get("type").and_then(Value::as_str) == Some("select"))
+        .filter_map(|option| {
+            let id = option.get("id")?.as_str()?;
+            let wanted = option.get("currentValue")?.as_str()?;
+            let now = resumed_options
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))?;
+            let current = now.get("currentValue").and_then(Value::as_str);
+            (current != Some(wanted) && choices(now).iter().any(|value| value == wanted))
+                .then(|| (id.to_owned(), wanted.to_owned()))
+        })
+        .collect()
 }
 
 async fn connection_for_session_reattaching(
@@ -6473,6 +6588,11 @@ pub async fn acp_new_session(
             .forgotten
             .remove(id);
         runtime.remember_session_ui(id, &result)?;
+        if NEEDS_FIRST_TURN_AGENTS.contains(&agent.as_str()) {
+            if let Ok(mut idle) = runtime.idle.lock() {
+                idle.mark_fresh(id);
+            }
+        }
         browser.identify(&config.token, id);
         Ok(result)
     })
@@ -11827,6 +11947,53 @@ mod idle_close_tests {
             .update("ses_child", "completed");
         assert!(!holds_work(&runtime, "ses_parent", false));
         assert!(!holds_work(&runtime, "ses_child", false));
+    }
+
+    #[test]
+    fn fresh_session_and_background_shell_keep_the_session_loaded() {
+        let runtime = runtime("ses_fresh");
+        runtime.idle.lock().unwrap().mark_fresh("ses_fresh");
+        assert!(holds_work(&runtime, "ses_fresh", false));
+        runtime
+            .idle
+            .lock()
+            .unwrap()
+            .observe_update("ses_fresh", &json!({"sessionUpdate":"agent_message_chunk"}));
+        assert!(!holds_work(&runtime, "ses_fresh", false));
+        runtime.idle.lock().unwrap().observe_update(
+            "ses_fresh",
+            &json!({"sessionUpdate":"tool_call_update","rawInput":{"run_in_background":true}}),
+        );
+        assert!(holds_work(&runtime, "ses_fresh", false));
+    }
+
+    #[test]
+    fn config_replay_restores_only_selections_the_resume_changed() {
+        let option = |id: &str, current: &str, values: &[&str]| {
+            json!({
+                "id": id,
+                "type": "select",
+                "currentValue": current,
+                "options": values.iter().map(|v| json!({"value": v})).collect::<Vec<_>>(),
+            })
+        };
+        let previous = json!([
+            option("model", "fast", &["test", "fast"]),
+            option("mode", "plan", &["auto", "plan"]),
+            option("effort", "high", &["medium", "high"]),
+            {"id": "fast_mode", "type": "boolean", "currentValue": true},
+        ]);
+        let resumed = json!([
+            option("model", "fast", &["test", "fast"]),
+            option("mode", "auto", &["auto", "plan"]),
+            option("effort", "medium", &["medium"]),
+            {"id": "fast_mode", "type": "boolean", "currentValue": false},
+        ]);
+        assert_eq!(
+            config_replays(&previous, &resumed),
+            vec![("mode".to_string(), "plan".to_string())]
+        );
+        assert!(config_replays(&json!(null), &resumed).is_empty());
     }
 
     #[test]

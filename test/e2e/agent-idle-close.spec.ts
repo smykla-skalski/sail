@@ -57,6 +57,31 @@ async function finishTurns(provider: Provider, directory: string, ids: string[])
   );
 }
 
+async function setConfig(
+  provider: Provider,
+  directory: string,
+  sessionId: string,
+  configId: string,
+  value: string,
+) {
+  const result = await browser.tauri.execute(
+    async ({ core }, agent, path, id, config, next) =>
+      core.invoke<{ configOptions: { id: string; currentValue: string }[] }>('acp_set_config', {
+        agent,
+        directory: path,
+        sessionId: id,
+        configId: config,
+        value: next,
+      }),
+    provider,
+    directory,
+    sessionId,
+    configId,
+    value,
+  );
+  return result.configOptions;
+}
+
 async function attached(provider: Provider, directory: string) {
   return browser.tauri.execute(
     async ({ core }, agent, path) => {
@@ -88,10 +113,12 @@ describe('idle session close', () => {
     it(`closes finished unseen ${provider} threads, spares busy and visible ones, and reattaches on prompt`, async () => {
       expect(closeLog).not.toBe('');
       const directory = realpathSync(repository);
-      const sessions = await newSessions(provider, directory, 4);
-      const [finished, visible, busy, reopened] = sessions;
+      const sessions = await newSessions(provider, directory, 5);
+      const [finished, visible, busy, reopened, unprompted] = sessions;
 
       await finishTurns(provider, directory, [finished, visible, reopened]);
+      await setConfig(provider, directory, finished, 'effort', 'high');
+      await setConfig(provider, directory, finished, 'mode', 'plan');
       await browser.tauri.execute(
         async ({ core }, agent, path, id) => {
           void core.invoke('acp_prompt', {
@@ -134,6 +161,7 @@ describe('idle session close', () => {
       const closedWhileBusy = closedSessions();
       expect(closedWhileBusy).not.toContain(visible);
       expect(closedWhileBusy).not.toContain(busy);
+      if (provider === 'claude') expect(closedWhileBusy).not.toContain(unprompted);
 
       const sessionsAfterClose = await attached(provider, directory);
       expect(sessionsAfterClose).not.toContain(finished);
@@ -158,6 +186,10 @@ describe('idle session close', () => {
       );
       expect(outcome.stopReason).toBe('end_turn');
       expect(await attached(provider, directory)).toContain(finished);
+
+      const restored = await setConfig(provider, directory, finished, 'model', 'test');
+      expect(restored.find((option) => option.id === 'effort')?.currentValue).toBe('high');
+      expect(restored.find((option) => option.id === 'mode')?.currentValue).toBe('plan');
 
       await browser.waitUntil(async () => closedSessions().includes(busy), {
         timeout: 60_000,
