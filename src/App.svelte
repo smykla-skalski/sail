@@ -257,10 +257,9 @@
   import DiffPanel from './DiffPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
   import {
+    createSidebarListingClock,
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
-    SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS,
-    sidebarFocusRefreshDue,
     unlistedSidebarPaths,
     type SidebarRefreshPaths,
   } from './lib/sidebar-inventory';
@@ -1741,7 +1740,7 @@
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
   let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
-  let sidebarInventoryLastFullListing = 0;
+  const sidebarListingClock = createSidebarListingClock();
   let sidebarInventoryDeferred = false;
   let sidebarFocusPending = false;
   let sidebarFocusTimer: ReturnType<typeof setTimeout> | undefined;
@@ -10994,10 +10993,10 @@
       const directories: string[] = JSON.parse(sidebarDirectoryKey);
       const wanted = sidebarInventoryWaiting;
       sidebarInventoryWaiting = undefined;
-      if (!wanted) sidebarInventoryLastFullListing = Date.now();
-      const selected = wanted ? directories.filter((path) => wanted.has(path)) : directories;
-      void refreshSidebarOpenCodeThreads(selected.length > 0 ? selected : directories).then(
+      const selected = sidebarListingClock.plan(directories, wanted, Date.now());
+      void refreshSidebarOpenCodeThreads(selected).then(
         (failure) => {
+          if (failure) sidebarListingClock.listingFailed();
           reportSidebarInventoryFailure(failure);
           if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
             sidebarInventoryReadyKey = key;
@@ -11022,11 +11021,11 @@
       return;
     }
     const now = Date.now();
-    if (!sidebarFocusRefreshDue(sidebarInventoryLastFullListing, now)) {
+    if (!sidebarListingClock.focusRefreshDue(now)) {
       // Focus stays put after this event, so check again once the last listing is old enough.
       sidebarFocusTimer = setTimeout(
         refreshSidebarOnFocus,
-        SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - sidebarInventoryLastFullListing),
+        sidebarListingClock.focusRefreshDelay(now),
       );
       return;
     }

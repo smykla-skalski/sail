@@ -57,3 +57,40 @@ export function unlistedSidebarPaths(
 ): string[] {
   return directories.filter((path) => !Object.hasOwn(listed, path));
 }
+
+/**
+ * Tracks when every sidebar directory was last listed, so a focus event does not relist what a
+ * startup or catalog listing already covered.
+ */
+export function createSidebarListingClock() {
+  let lastFullListing = Number.NEGATIVE_INFINITY;
+  return {
+    /** Directories to list now; a request covering the whole catalog restarts the focus clock. */
+    plan(
+      directories: readonly string[],
+      wanted: SidebarRefreshPaths | undefined,
+      now: number,
+    ): string[] {
+      // An empty request has nothing to narrow it, so it lists the whole catalog.
+      if (!wanted || wanted.size === 0) {
+        lastFullListing = now;
+        return [...directories];
+      }
+      if (directories.length > 0 && directories.every((path) => wanted.has(path)))
+        lastFullListing = now;
+      // A directory outside the catalog still gets its own listing, never the whole catalog.
+      return [...wanted];
+    },
+    focusRefreshDue(now: number): boolean {
+      return sidebarFocusRefreshDue(lastFullListing, now);
+    },
+    /** Milliseconds until a focus refresh becomes due. */
+    focusRefreshDelay(now: number): number {
+      return SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - lastFullListing);
+    },
+    /** A failed listing leaves the catalog uncovered, so the next focus tries again. */
+    listingFailed(): void {
+      lastFullListing = Number.NEGATIVE_INFINITY;
+    },
+  };
+}
