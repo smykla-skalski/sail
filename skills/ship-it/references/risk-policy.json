@@ -49,7 +49,9 @@
   "policies": {
     "low": {
       "required_gates": ["local-checks", "inline-review", "ci"],
-      "fallbacks": {}
+      "fallbacks": {
+        "inline-review": ["portable-review-fallback"]
+      }
     },
     "medium": {
       "required_gates": ["local-checks", "adversarial-review", "adversarial-test", "ci"],

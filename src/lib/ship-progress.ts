@@ -48,6 +48,7 @@ export const verdicts = [
   'PASS (partial)',
   'FAIL',
   'BLOCKED',
+  'FAILED',
 ] as const;
 export type GateVerdict = (typeof verdicts)[number];
 export type ShipCheck = {
@@ -259,7 +260,7 @@ export function parseShipReport(value: unknown) {
   }
   if (
     ('status' in report && report.status === 'blocked') ||
-    ('verdict' in report && ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict))
+    ('verdict' in report && ['BLOCKED', 'FAILED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict))
   ) {
     if (!report.reason?.trim()) throw new Error('A blocked or failed report needs a reason.');
   }
@@ -297,8 +298,8 @@ export function requireValidatorEconomics(
 export function validateGateVerdict(gate: GateName, verdict: GateVerdict): void {
   const allowed =
     gate === 'test-adversary'
-      ? ['PASS', 'PASS (partial)', 'FAIL', 'BLOCKED']
-      : ['CLEAN', 'NEEDS_FIXES', 'BLOCKED'];
+      ? ['PASS', 'PASS (partial)', 'FAIL', 'BLOCKED', 'FAILED']
+      : ['CLEAN', 'NEEDS_FIXES', 'BLOCKED', 'FAILED'];
   if (!allowed.includes(verdict)) throw new Error(`Invalid verdict for ${gate}.`);
 }
 
@@ -1004,7 +1005,7 @@ export function shipBlock(issue: ShipIssue): string | null {
   const checkpointBlocker =
     issue.checkpoint?.status === 'blocked' ? issue.checkpoint.blocker : null;
   const gates = currentShipGates(issue);
-  const blockedGate = gates.find((gate) => gate.verdict === 'BLOCKED');
+  const blockedGate = gates.find((gate) => gate.verdict === 'BLOCKED' || gate.verdict === 'FAILED');
   if (issue.reportedStatus === 'blocked')
     return checkpointBlocker ?? issue.blockedReason ?? 'The worker reported a blocker.';
   if (blockedGate)

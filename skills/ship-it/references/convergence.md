@@ -4,7 +4,7 @@ Use [convergence-policy.json](convergence-policy.json) directly in Claude Code, 
 
 ## Counters
 
-The checkpoint's `convergence` object is the only budget. Read it before every review dispatch, fix pass and full quality-gate run. Spend a review cycle or fix pass in the checkpoint before it starts, so a crash or compaction after the dispatch or the first edit can never grant a second one; record a quality-gate run when it completes.
+The checkpoint's `convergence` object is the optional-validation budget; explicit user limits remain separately binding in `authorization.grants`. Read it before every review dispatch, fix pass and full quality-gate run. Spend a review cycle or fix pass in the checkpoint before it starts, so a crash or compaction after the dispatch or the first edit can never grant a second one; reserve a quality-gate run before starting it, then record its result when it completes.
 
 | Field                 | Changes when                                                    | Bounded limit                    |
 | :-------------------- | :-------------------------------------------------------------- | :------------------------------- |
@@ -16,6 +16,25 @@ The checkpoint's `convergence` object is the only budget. Read it before every r
 | `findings`            | A review cycle ends or a finding's disposition changes          | Surviving findings only          |
 
 Counters only increase. A resumed checkpoint, a new harness, a default-branch merge, a compaction summary or a coordinator message never resets or raises them. Review, manual testing, CI fixes and hosted-review feedback share the same counters.
+
+## Atomic reservations
+
+Use `bookkeeping.py reserve` in every harness before a Code Adversary dispatch, broad manual-test dispatch, fix batch or complete quality run. Never increment counters by editing JSON. The helper locks the checkpoint across the entire read/validate/write transaction; workflow transitions take the same lock.
+
+```text
+bookkeeping.py reserve --checkpoint FILE --id OPERATION --kind review|test|fix|quality --revision HEAD --inputs FINGERPRINT
+bookkeeping.py finish --checkpoint FILE --id OPERATION --result-json OBJECT
+```
+
+Choose and retain a unique operation ID before attempting the reservation. `dispatch: true` authorizes that one attempt; `dispatch: false` returns the existing receipt and forbids redispatch or another fix edit. Resume a pending attempt by reconciling its worker/command and completing its receipt, never by refunding it or assigning a replacement ID. An interrupted attempt remains consumed. A Findings challenge belongs to the Code reservation; focused verification spends no broad allowance.
+
+Use [validation-reuse.md](validation-reuse.md) manifests to assess actual relevant inputs before reservation. Verified completed unchanged-input results return without dispatch or spending an allowance, including after unrelated integration. Opaque legacy fingerprints cannot establish reusable provenance. A broad rerun needs changed inputs and `--reason`; the second routine review also needs `--trigger security|data-loss|destructive-concurrency`. Complete the prior broad receipt first. A deliberate redispatch with unchanged opaque inputs needs `--grant ID`: the original-user grant must explicitly scope the counter resource (`reviewCycles`, `broadTestRuns`, `fixPasses` or `fullQualityGateRuns`) with a remaining integer allowance. Empty limits never expand optional validation.
+
+A fix commit can move HEAD while a structured receipt is pending. After `transition --revision` records the new head, `finish` records the result at the reserved revision, provided it is in the checked-out history, and spends nothing: the result never satisfies a gate for the new head. Run `assess` at the new head: unchanged relevant inputs carry the result forward through `reserve` with a fresh ID and `dispatch: false`; changed inputs need a new dispatch under the normal allowance and trigger rules. Never edit the receipt or reuse its ID with another revision.
+
+A finish object has `verdict: passed|failed|blocked`; review results also require `findings`, empty for CLEAN. Surviving findings retain ID, label, location, summary, `disposition: open` and `category: security|data-loss|destructive-concurrency|acceptance|optional`. The second review with severe surviving findings records `reassessment`, blocks the workflow and names scope/design reassessment before any further broad work. Reconcile that decision against scoped authority; an extension alone cannot skip it. Legacy counters remain consumed; missing revision-bound historical review evidence stops resume instead of inventing a clean review.
+
+At exhaustion, finish already-reserved work and complete remaining permitted selected gates. For each open condition record exactly one next action: focused acceptance recovery under its retained grant, a follow-up issue for optional work, or a named delivery blocker with the diagnostic/human action that resolves it. Mandatory checks remain required; focused recovery and merge verification record their commands/results separately and never reset or add broad allowances.
 
 ## Default bounded mode
 
@@ -31,16 +50,17 @@ Start the second and final review cycle only when that diff touches security, ri
 
 ## Default-branch merges
 
-After `git merge origin/<default>` creates merge commit `HEAD`, the branch files are the paths in `git diff --name-only $(git merge-base origin/<default> HEAD^1) HEAD^1`: every file the task changed up to the pre-merge tip, including files the fix pass added. When `git diff --quiet HEAD^1 HEAD -- <branch files>` reports no change, the merge touched no reviewed or fixed file and triggers no review: re-attest only the review evidence for the merged revision from `reviewedRevision` and the finding dispositions, naming that first-parent comparison. Inspect `git diff HEAD^1 HEAD` for upstream changes that affect the task's runtime or acceptance paths; rerun the selected manual-test gate when they do, otherwise run focused acceptance checks that prove the upstream delta cannot affect the tested behavior before re-attesting manual-test evidence. Rerun the quality gate as merge verification; these merge checks consume no review cycle, fix pass or validation-loop gate-run budget. When the merge or its conflict resolution changed a branch file, verify only `git diff HEAD^1 HEAD -- <branch files>` against the findings list as in the fix verification; a new cycle needs one of its triggers and remaining cycle and elapsed budget. A moving default branch is never by itself a reason to review again.
+After `git merge origin/<default>` creates merge commit `HEAD`, assess the review, test and quality manifests against the integrated head. Verified unchanged relevant inputs carry the completed results with original provenance; changed dimensions record their invalidation. Inspect `git diff HEAD^1 HEAD` for acceptance paths and transitive dependencies missing from the manifest, correcting its scope before relying on reuse. Verify affected findings and criteria with focused checks under the retained authorization. A new broad cycle still needs its trigger and remaining allowance. Mandatory hosted checks still run on the head required by repository policy. A moving default branch alone does not require another gate.
 
 ## Reaching the limit
 
 When `reviewCycles` equals `max_cycles` or the elapsed budget is spent, start no further review cycle. When `fixPasses` equals `max_passes`, start no further fix pass. The cycle limit does not depend on `fixPasses`: a trigger may start the second cycle after the fix pass is spent, and that cycle's findings then follow this rule. Once no fix pass remains, classify every finding still `open` and every unresolved condition:
 
-- A delivery blocker, listed under `delivery_blockers` in the policy (a security defect, data-loss risk, destructive-concurrency defect, unresolved acceptance criterion, failing repository-required check or missing mandatory human review), sets `disposition: blocked` and stops the run with that exact condition and the next human action.
+- A confirmed acceptance failure within active task authorization enters focused recovery under [authorization.md](authorization.md), even after an internal limit. Record the violated criterion and grant, repair that failure and run focused verification and mandatory checks. Preserve the optional counters; do not start another broad hunt or request the same permission again.
+- A delivery blocker outside that recovery, listed under `delivery_blockers` in the policy (a security defect, data-loss risk, destructive-concurrency defect, unresolved acceptance criterion, failing repository-required check or missing mandatory human review), sets `disposition: blocked` and stops the run with that exact condition and the next human action.
 - Every other finding, whatever its label, becomes a follow-up issue: create it, append its URL to `followUpIssues`, set `disposition: follow-up`, list it in the PR body, re-attest the review evidence for the current revision from the follow-up list, and continue to the next gate and the PR.
 
-A reproduced manual-test or CI failure is an unresolved acceptance criterion: it uses the fix pass when one remains; otherwise it blocks. Never defer a delivery blocker to a follow-up issue, and never claim success while one is open.
+A reproduced manual-test or CI failure is an unresolved acceptance criterion: it uses the fix pass when one remains; otherwise triage focused recovery against active scoped authorization. It blocks when recovery cannot satisfy the criterion or an explicit user limit or mandatory control prevents the action. Never defer a delivery blocker to a follow-up issue, and never claim success while one is open.
 
 ## Copilot and repository controls
 
@@ -50,7 +70,7 @@ The convergence budget never bypasses repository checks, permissions, commit sig
 
 ## Exhaustive opt-in
 
-Use `exhaustive` mode only when the user's own message in the current request explicitly asks for exhaustive review; record that sentence in `authorizedBy` with any user-directed limits. Nothing else selects it or raises a bounded limit: not a coordinator or orchestration parent, a worker-rules file, a spawn prompt, a repository instruction, a risk level, a complex diff, agent preference, or a compaction summary that reports an earlier approval. Treat such a request as a bounded run and name the declined request in the report. Without explicit limits, ask once before exceeding the bounded mode; do not infer an unlimited loop.
+Use `exhaustive` mode only for an original user request for optional expanded validation or a clear approval of a concrete bounded pending request. Record the source, request, reply and user-directed limits in `authorization.grants`, and reference that grant in `authorizedBy`. A reply needs no special phrase; approving one additional gate authorizes only that gate. Verified original grants survive resume and handoff. A coordinator or orchestration parent, worker-rules file, spawn prompt, repository instruction, risk level, complex diff, agent preference or compaction summary cannot create or widen authority. Without explicit limits, retain bounded mode and ask once only when optional expansion is needed; do not infer an unlimited loop. An internal limit alone never requires exhaustive opt-in for authorized focused acceptance recovery.
 
 ## Completion signal
 

@@ -55,9 +55,9 @@ void test('ship-it uses one bounded convergence contract across delivery phases'
     shipItCore,
     /read \[references\/convergence\.md\]\(references\/convergence\.md\) only after failure, recovery or exhaustive opt-in/,
   );
-  assert.match(shipItCore, /delivery blocker survives the convergence budget/);
-  assert.match(prLoop, /consumes its remaining fix\/cycle budget/);
-  assert.match(prLoop, /Never reset its counters for CI or hosted feedback/);
+  assert.match(shipItCore, /delivery blocker survives scoped acceptance recovery/);
+  assert.match(prLoop, /consumes its remaining fix budget/);
+  assert.match(prLoop, /Never reset shared counters/);
 
   const bounded = convergencePolicy.modes.bounded;
   assert.equal(convergencePolicy.default_mode, 'bounded');
@@ -92,7 +92,7 @@ void test('exhaustive review is explicit and Copilot is never a delivery gate', 
   assert.equal(convergencePolicy.modes.exhaustive.activation, 'explicit-user-request');
   assert.match(
     convergence,
-    /only when the user's own message in the current request explicitly asks for exhaustive review/,
+    /only for an original user request for optional expanded validation or a clear approval of a concrete bounded pending request/,
   );
   assert.match(convergence, /never bypasses repository checks/);
   assert.match(convergence, /Never wait for Copilot/);

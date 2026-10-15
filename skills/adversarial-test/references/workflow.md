@@ -27,17 +27,17 @@ Paths in this file are relative to the skill directory (the one holding this SKI
 
 | Claude Code feature                           | Fallback                                                                                                                                                                                                                                                                                   |
 | :-------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Argument substitution                         | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL and flags from the user's request                                                                                                                                                    |
+| Argument substitution                         | If the `Invocation arguments` line in the Arguments section of SKILL.md is empty or shows the unreplaced placeholder, take the PR URL and flags from the user's request                                                                                                                    |
 | AskUserQuestion                               | Not used; the skill never stops for input                                                                                                                                                                                                                                                  |
 | Named agent `adversarial-test:test-adversary` | Claude Code and Copilot CLI register it from the plugin's `agents/` directory. Codex and opencode do not; there, or whenever the type is unknown, spawn a generic subagent with the full mandate from [references/test-adversary.md](references/test-adversary.md) prepended (see Phase 2) |
-| Subagent tool (Agent)                         | Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `task` tool. If no subagent tool is available or both spawn attempts fail, block the test gate                                                                                                           |
+| Subagent tool (Agent)                         | Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `subagent` tool (`task` on opencode 1). No subagent tool, or both spawn attempts fail: run the pass inline yourself (see Fallback)                                                                       |
 | `context: fork`                               | Not used                                                                                                                                                                                                                                                                                   |
 
 The skill spawns at most one subagent at a time, so it runs sequentially on every agent.
 
 ## Arguments
 
-Parse from `$ARGUMENTS`:
+Parse from the invocation arguments, given in the Arguments section of SKILL.md (or the user's request when that section holds none):
 
 | Argument                 | Meaning                                                                                                       |
 | :----------------------- | :------------------------------------------------------------------------------------------------------------ |
@@ -50,11 +50,11 @@ Parse from `$ARGUMENTS`:
 
 Do not run or read the product yourself; the subagent does. Resolve only what it needs:
 
-- **Local (`--base` or none):** resolve the default branch with `git symbolic-ref --short refs/remotes/origin/HEAD` (fallback `origin/main`). `BASE=$(git merge-base <ref> HEAD)`. Run location: the repository root. Diff command: `git diff <BASE sha>`. Files: `git diff --name-only <BASE sha>` plus untracked files (`git ls-files --others --exclude-standard`).
+- **Local (`--base` or none):** resolve the default branch with `git symbolic-ref --short refs/remotes/origin/HEAD` (fallback `origin/main`). `BASE=$(git merge-base <ref> HEAD)`. If `<ref>` does not resolve (`git rev-parse --verify --quiet "<ref>^{commit}"` fails, as with no `origin/main` in the clone) or has no merge-base with `HEAD`, stop with `Test Verdict: FAILED` and `Gate failure: base ref '<ref>' does not resolve to a merge-base with HEAD; fetch it or pass --base <ref>`. An unresolved base is never an empty diff. Run location: the repository root. Diff command: `git diff <BASE sha>`. Files: `git diff --name-only <BASE sha>` plus untracked files (`git ls-files --others --exclude-standard`).
 - **PR URL:** `gh pr view <url> --json number,headRefOid,baseRefName,title,body`. If local `HEAD` is `headRefOid` and the tree is clean, run from the repository root. Otherwise `git fetch origin pull/<number>/head` and `git worktree add --detach <tmpdir> <headRefOid>`; run from that worktree and remove it after Phase 3. Diff command: `gh pr diff <url>`. Use the PR title and body as context when `--context` is absent.
 - **Evidence dir:** `${XDG_DATA_HOME:-$HOME/.local/share}/sai/adversarial-test/<short base or head sha>-<UTC timestamp>`; `mkdir -p` it. It outlives the run and holds the screenshots the verdict cites.
 
-If the file list is empty, output `Test Verdict: PASS` followed by `Nothing to test: empty diff.` and stop.
+If the base resolved and the file list is empty, output `Test Verdict: PASS` followed by `No test performed: empty diff, nothing to test.` and stop. That second line, not the verdict, tells a caller nothing was exercised.
 
 If no context was given and none can be derived (no PR body), proceed; the subagent derives criteria from the diff and says so.
 
@@ -94,13 +94,13 @@ The instruction for the subagent is: _"Prove this change does not satisfy the ta
 - Agents can finish without returning a payload ([openai/codex#16051](https://github.com/openai/codex/issues/16051)). Validate the reply (below) before using it.
 - Starting servers, binding ports, and network access may need sandbox escalation. Request it with a concise justification rather than downgrading to static evidence.
 
-**opencode.** Use the `task` tool; each call creates a fresh child session, which is the clean context this skill needs. If a `test-adversary` subagent is installed (see the plugin README), use it with the Test assignment and the instruction. Otherwise use the built-in `general` subagent with the mandate prepended.
+**opencode.** Use the `subagent` tool on opencode 2, which renamed `task`; on opencode 1 use `task`. Use whichever of the two the tool list shows. Each call creates a fresh child session, which is the clean context this skill needs. If a `test-adversary` subagent is installed (see the plugin README), use it with the Test assignment and the instruction. Otherwise use the built-in `general` subagent with the mandate prepended.
 
-**Validation and retry.** The reply must have a `Criteria:` list, an `Untested:` line whenever a criterion is UNTESTED, and end with a `TEST_ADVERSARY_VERDICT:` line. If it is empty or malformed, spawn a fresh subagent once more; if that fails too, report no valid test verdict.
+**Validation and retry.** The reply must have a `Criteria:` list, an `Untested:` line whenever a criterion is UNTESTED, and end with a `TEST_ADVERSARY_VERDICT:` line. If it is empty or malformed, spawn a fresh subagent once more; if that fails too, run the pass inline (see Fallback).
 
-Reject a `PASS` whose criteria cite only automated tests, lint, build, or grep while a runnable surface exists - spawn a fresh subagent once with _"Previous attempt used static evidence only. Run the real surface, or mark each criterion you cannot run UNTESTED with the named environmental blocker."_ appended. A retry that names an environmental blocker makes that criterion UNTESTED. A retry that still cites only static evidence for a surface that runs is malformed test execution; discard it and report no valid test verdict.
+Reject a `PASS` whose criteria cite only automated tests, lint, build, or grep while a runnable surface exists - spawn a fresh subagent once with _"Previous attempt used static evidence only. Run the real surface, or mark each criterion you cannot run UNTESTED with the named environmental blocker."_ appended. A retry that names an environmental blocker makes that criterion UNTESTED. A retry that still cites only static evidence for a surface that runs is malformed test execution: discard it and run the inline fallback. If the inline fallback also returns static-only evidence without an environmental blocker, return no verdict and report that the test gate has no valid execution; never turn tester noncompliance into `BLOCKED`.
 
-**Check the screenshot.** When the changed files include UI code (templates, components, stylesheets, view or pane sources), the `Evidence:` line must name a screenshot file that exists, its image pixel size, runtime client/content-area dimensions of at least 2560x1440, and the measurement command and output that proves those dimensions (`window.innerWidth`/`window.innerHeight`, webview content bounds or an equivalent probe). Check the image pixels independently (`sips -g pixelWidth -g pixelHeight <file>` on macOS, `identify <file>` elsewhere). Never infer the content viewport from image pixels, launch flags or outer-window bounds: scaling, decorations or ignored flags can invalidate each. If the evidence omits any item and the `Untested:` line gives no environmental blocker for the capture (no display, no headless browser, an unreachable pane), spawn a fresh subagent once with _"Previous attempt did not prove a changed UI content viewport of 2560x1440 or larger. Capture it and report the image dimensions plus a runtime client/content-area measurement command and output, or name the environmental blocker."_ appended. A retry with incomplete proof is malformed test execution: discard it and report no valid test verdict.
+**Check the screenshot.** When the changed files include UI code (templates, components, stylesheets, view or pane sources), the `Evidence:` line must name a screenshot file that exists, its image pixel size, runtime client/content-area dimensions of at least 2560x1440, and the measurement command and output that proves those dimensions (`window.innerWidth`/`window.innerHeight`, webview content bounds or an equivalent probe). Check the image pixels independently (`sips -g pixelWidth -g pixelHeight <file>` on macOS, `identify <file>` elsewhere). Never infer the content viewport from image pixels, launch flags or outer-window bounds: scaling, decorations or ignored flags can invalidate each. If the evidence omits any item and the `Untested:` line gives no environmental blocker for the capture (no display, no headless browser, an unreachable pane), spawn a fresh subagent once with _"Previous attempt did not prove a changed UI content viewport of 2560x1440 or larger. Capture it and report the image dimensions plus a runtime client/content-area measurement command and output, or name the environmental blocker."_ appended. A retry with incomplete proof is malformed test execution: discard it and run the inline fallback. If the inline fallback also omits the runnable capture proof without an environmental blocker, return no verdict and report that the test gate has no valid execution.
 
 **Reclassify a misfiled blocker.** A `BLOCKED` whose blocker is environmental - sandbox, network, package registry, a missing or fake tool, the build toolchain, a hook false positive, a stop directive, an unreachable display or pane - is not BLOCKED: tag each affected criterion UNTESTED with that blocker, and the verdict is `FAIL` when a reproduction survives Phase 3, otherwise `PASS (partial)`. `BLOCKED` stands only for a product precondition that a human must supply (credentials, hardware, an approval, data).
 
@@ -136,10 +136,16 @@ Test Verdict: FAIL
 Test Verdict: BLOCKED
 ```
 
+```
+Test Verdict: FAILED
+Gate failure: base ref '<ref>' does not resolve to a merge-base with HEAD
+```
+
 - **PASS** - every criterion passed on the real surface and no reproduction survived Phase 3.
 - **PASS (partial)** - no reproduction survived and at least one criterion is UNTESTED for an environmental reason; the second line lists each with its blocker. Callers treat it as passing and carry the `Untested:` line into the PR.
 - **FAIL** - at least one surviving reproduction, whatever else is UNTESTED.
 - **BLOCKED** - a product precondition that only a human can supply is missing; the next line names the exact human action.
+- **FAILED** - the gate could not run because the base ref does not resolve. It is a gate failure, never a pass; the next line is the `Gate failure:` line and no criteria follow.
 
 Then the criteria table from the subagent, the surface and evidence lines (screenshot paths with image pixels and runtime content-viewport measurement proof), and the surviving reproductions, strongest first:
 
@@ -153,7 +159,7 @@ End with one line: `Tester: <subagent verdict value, e.g. FAIL (2)> · confirmed
 
 ## Fallback - no subagents
 
-There is no inline fallback. If a fresh subagent cannot launch after one retry, report `Test Verdict: BLOCKED` and name the launch error.
+If the agent has no subagent tool or both spawn attempts fail, run the pass inline following [references/test-adversary.md](references/test-adversary.md). Derive the criteria from the task context **before** reading the diff, so the implementation does not shape them. Assume your own mistakes are there. Phase 3 still applies. Note `inline` in the final Tester line.
 
 ## Anti-patterns
 
@@ -165,6 +171,7 @@ There is no inline fallback. If a fresh subagent cannot launch after one retry, 
 - Leaving servers, containers, or worktrees running after the verdict
 - Returning BLOCKED for a sandbox, tooling, or build failure - that is UNTESTED with the blocker, and the verdict is PASS (partial) or FAIL
 - Screenshotting a UI change below 2560x1440, or passing a UI criterion without a screenshot
+- Treating a base ref that does not resolve as an empty diff and returning `PASS`
 - Any prose above the `Test Verdict:` line
 
 ## Example invocations

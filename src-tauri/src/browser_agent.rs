@@ -1521,6 +1521,34 @@ macro_rules! ship_it_file {
 
 // Must match src/lib/bundled-skill-catalog.ts and the files under skills/ship-it.
 const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
+    (
+        "authorization.md",
+        ship_it_file!("references/authorization.md"),
+    ),
+    (
+        "telemetry-v2.schema.json",
+        ship_it_file!("references/telemetry-v2.schema.json"),
+    ),
+    (
+        "validation-reuse.md",
+        ship_it_file!("references/validation-reuse.md"),
+    ),
+    (
+        "scripts/checkpoint_state.py",
+        ship_it_file!("scripts/checkpoint_state.py"),
+    ),
+    (
+        "scripts/convergence.py",
+        ship_it_file!("scripts/convergence.py"),
+    ),
+    (
+        "scripts/delivery_benchmark.py",
+        ship_it_file!("scripts/delivery_benchmark.py"),
+    ),
+    (
+        "scripts/validation_reuse.py",
+        ship_it_file!("scripts/validation_reuse.py"),
+    ),
     ("inputs.md", ship_it_file!("references/inputs.md")),
     ("explore.md", ship_it_file!("references/explore.md")),
     ("branch.md", ship_it_file!("references/branch.md")),
@@ -2320,7 +2348,7 @@ pub fn run_mcp_stdio() {
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
                             "status":{"type":"string","enum":["running","blocked"]},
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
-                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED"]},
+                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED","FAILED"]},
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
                             "untestedCriteria":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string","minLength":1,"maxLength":2000},"blocker":{"type":"string","minLength":1,"maxLength":2000}},"required":["criterion","blocker"],"additionalProperties":false},"maxItems":100},

@@ -7,16 +7,11 @@ argument-hint: '[<pr-url> | <diff-file> | --base <ref>] [--context <file|text>]'
 allowed-tools: Agent Bash Glob Grep Read
 user-invocable: true
 metadata:
+  upstream: smykla-skalski/sai plugins/adversarial-review 1.0.9 with Sail mode
   short-description: Two-pass adversarial code review in clean-context subagents
 ---
 
 # Adversarial Review
-
-## Sail execution rule
-
-Run every review pass in a fresh subagent session. In Sail, launch each pass with `validation_gate` and wait for its receipt before starting the next. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, report `Review Verdict: BLOCKED` with the failed pass and reason.
-
-Use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason.
 
 Find the bug, then try to prove the bug report wrong. It answers one question - **is this change correct?** - and answers it hard. It does not evaluate architecture, conventions, dead code, or taste; that is `/staff-code-review`.
 
@@ -27,11 +22,21 @@ Two subagents, opposed, each with a clean context:
 
 The second pass exists because an unrefuted adversary nit-bombs. It sees only the first pass's findings, never its reasoning, so it cannot inherit the same misread. Each adversary lives for exactly one verdict: it starts in a fresh context with no forked or inherited history, is closed once its reply is validated, and is never reused for a fix, a re-check or another change.
 
+## Sail execution rule
+
+Run every pass in a fresh subagent session. In Sail, launch each pass with `validation_gate` and wait for its receipt before starting the next. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, report `Review Verdict: BLOCKED` with the failed pass and reason. Never use the inline fallback in Sail. A FAILED verdict remains FAILED when reported through `ship_progress`, with its `Gate failure:` line as the reason.
+
 ## Required guidance
 
 Before taking any action, read [references/workflow.md](references/workflow.md) completely. It is the authoritative procedure and preserves every platform fallback, decision rule, template, command, validation step, and output contract. Follow its sections in order and load the deeper references it names only at their stated gates.
 
-Paths in the workflow are relative to this skill directory. If argument substitution is unavailable or unresolved, take the input and flags from the user's request. When a named tool, agent, or interaction primitive is unavailable, use the workflow's compatibility fallback; never silently skip the behavior.
+Paths in the workflow are relative to this skill directory. When a named tool, agent, or interaction primitive is unavailable, use the workflow's compatibility fallback; never silently skip the behavior.
+
+## Arguments
+
+Invocation arguments: `$ARGUMENTS`
+
+These are the PR URL, diff file, `--base` and `--context` the user gave on invocation. The workflow reads them from here, not from its own text. If the line above is empty or still shows the literal placeholder, the client passed none: take the same values from the user's request.
 
 ## Core flow
 
@@ -55,5 +60,6 @@ Paths in the workflow are relative to this skill directory. If argument substitu
 - Follow repository instructions and the user's authorized scope.
 - Preserve validation, state-update, deduplication, adversarial-check, and output requirements exactly as defined in the workflow.
 - Check every adversary's final verdict line against the workflow's documented format: one retry with a fresh subagent, then `Review Verdict: FAILED`.
+- Treat a base ref that does not resolve as `Review Verdict: FAILED`, never as an empty diff or `CLEAN`.
 - Never dispatch the Findings Adversary when no finding is labelled `blocking:` or `issue:`, and never reuse an adversary after its verdict.
 - Stop at every hard stop named by the workflow and state the required next action.

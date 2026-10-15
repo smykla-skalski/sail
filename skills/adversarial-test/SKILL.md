@@ -7,16 +7,11 @@ argument-hint: '[<pr-url> | --base <ref>] [--context <file|text>]'
 allowed-tools: Agent Bash Glob Grep Read
 user-invocable: true
 metadata:
+  upstream: smykla-skalski/sai plugins/adversarial-test 1.0.14 with Sail mode
   short-description: Adversarial manual testing in a clean-context subagent
 ---
 
 # Adversarial Test
-
-Run the Test Adversary in a fresh subagent session. In Sail, launch it with `validation_gate` and wait for its receipt. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, stop and report `Test Verdict: BLOCKED` with the reason.
-
-## Sail execution rule
-
-Use a fresh subagent session for every pass and reproduction rerun. If one cannot launch, stop and report `Test Verdict: BLOCKED` with the reason.
 
 Prove the change does **not** do what the task says - by running it. It answers one question - **does this change work for a user?** - and answers it with commands and output, not by reading code. Code correctness review is the `adversarial-review` skill.
 
@@ -27,13 +22,23 @@ One subagent with a clean context, then a check by you:
 
 The subagent gets a clean context so it tests the task, not the implementer's belief about the task.
 
-Verdicts: `PASS`; `PASS (partial)` when a criterion stayed `UNTESTED` because the environment (sandbox, tooling, build, an unreachable pane) could not exercise it - callers treat it as passing and list the untested criteria; `FAIL`; `BLOCKED` when a fresh subagent cannot launch or a product precondition needs a human. A UI change needs a screenshot of the changed surface at a viewport of at least 2560x1440 in the evidence directory. A tester that twice declines a runnable surface produces no valid test verdict.
+Verdicts: `PASS`; `PASS (partial)` when a criterion stayed `UNTESTED` because the environment (sandbox, tooling, build, an unreachable pane) could not exercise it - callers treat it as passing and list the untested criteria; `FAIL`; `BLOCKED` only for a product precondition a human must supply. `FAILED` when the base ref does not resolve: a gate failure, never a pass. A UI change needs a screenshot of the changed surface at a viewport of at least 2560x1440 in the evidence directory. A tester that twice declines a runnable surface triggers the inline fallback, not `BLOCKED`.
+
+## Sail execution rule
+
+Run every pass in a fresh subagent session. In Sail, launch each pass with `validation_gate` and wait for its receipt before starting the next. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, report `Test Verdict: BLOCKED` with the failed pass and reason. Never use the inline fallback in Sail. A FAILED verdict remains FAILED when reported through `ship_progress`, with its `Gate failure:` line as the reason.
 
 ## Required guidance
 
 Before taking any action, read [references/workflow.md](references/workflow.md) completely. It is the authoritative procedure and preserves every platform fallback, decision rule, template, command, validation step, and output contract. Follow its sections in order and load the deeper references it names only at their stated gates.
 
-Paths in the workflow are relative to this skill directory. If argument substitution is unavailable or unresolved, take the input and flags from the user's request. When a named tool, agent, or interaction primitive is unavailable, use the workflow's compatibility fallback; never silently skip the behavior.
+Paths in the workflow are relative to this skill directory. When a named tool, agent, or interaction primitive is unavailable, use the workflow's compatibility fallback; never silently skip the behavior.
+
+## Arguments
+
+Invocation arguments: `$ARGUMENTS`
+
+These are the PR URL, `--base` and `--context` the user gave on invocation. The workflow reads them from here, not from its own text. If the line above is empty or still shows the literal placeholder, the client passed none: take the same values from the user's request.
 
 ## Core flow
 
@@ -54,4 +59,5 @@ Paths in the workflow are relative to this skill directory. If argument substitu
 - Preserve explicit read gates: load each supporting reference immediately before the phase that needs it.
 - Follow repository instructions and the user's authorized scope.
 - Preserve validation, state-update, deduplication, adversarial-check, and output requirements exactly as defined in the workflow.
+- Treat a base ref that does not resolve as `Test Verdict: FAILED`, never as an empty diff or `PASS`.
 - Stop at every hard stop named by the workflow and state the required next action.

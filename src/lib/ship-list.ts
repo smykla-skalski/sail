@@ -233,14 +233,14 @@ function gateSummary(issue: ShipIssue): string[] {
   ].filter(Boolean);
   if (review.length) {
     if (review.includes('NEEDS_FIXES')) parts.push('review needs fixes');
-    else if (review.includes('BLOCKED')) parts.push('review blocked');
+    else if (review.includes('BLOCKED') || review.includes('FAILED')) parts.push('review blocked');
     else if (review.every((item) => item === 'CLEAN')) parts.push('review passed');
   }
   const test = verdict('test-adversary');
   if (test === 'PASS') parts.push('test passed');
   else if (test === 'PASS (partial)') parts.push('test passed (partial)');
   else if (test === 'FAIL') parts.push('test failed');
-  else if (test === 'BLOCKED') parts.push('test blocked');
+  else if (test === 'BLOCKED' || test === 'FAILED') parts.push('test blocked');
   return parts;
 }
 
