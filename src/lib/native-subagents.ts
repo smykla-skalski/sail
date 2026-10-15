@@ -34,6 +34,8 @@ export type NativeSubagent = {
   restored: boolean;
   error?: string;
   capabilityProfile: CapabilityProfile;
+  taskIdentity?: 'verified' | 'observed';
+  taskTurnId?: string | null;
   /** Child controls advertised by the adapter. Absent until it spawns. */
   capabilities?: Record<string, unknown>;
 };
@@ -333,6 +335,8 @@ export function updateNativeSubagents(
         created: previous?.created ?? now,
         updated: now,
         restored: previous?.restored || replayed,
+        taskIdentity: previous?.taskIdentity ?? 'observed',
+        taskTurnId: previous?.taskTurnId ?? null,
         capabilityProfile: replayed
           ? capabilityProfile
           : (previous?.capabilityProfile ??
@@ -438,7 +442,9 @@ export function reconcileNativeSubagents(
         previous.capabilityProfile === snapshot.capabilityProfile &&
         previous.parentSessionId === snapshot.parentSessionId &&
         previous.rootSessionId === rootSessionId &&
-        previous.outcome === snapshot.outcome
+        previous.outcome === snapshot.outcome &&
+        previous.taskIdentity === (snapshot.taskIdentity ?? 'observed') &&
+        previous.taskTurnId === (snapshot.taskTurnId ?? null)
       )
         continue;
       const activity =
@@ -456,6 +462,8 @@ export function reconcileNativeSubagents(
         id,
         agent: snapshot.agent,
         capabilityProfile: snapshot.capabilityProfile,
+        taskIdentity: snapshot.taskIdentity ?? 'observed',
+        taskTurnId: snapshot.taskTurnId ?? null,
         directory: snapshot.directory,
         sessionId: snapshot.sessionId,
         parentSessionId: snapshot.parentSessionId,

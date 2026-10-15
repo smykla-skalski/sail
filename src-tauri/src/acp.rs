@@ -82,7 +82,7 @@ struct AgentEvent {
     message: Value,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSubagentSnapshot {
     agent: String,
@@ -91,6 +91,8 @@ pub struct NativeSubagentSnapshot {
     parent_session_id: String,
     directory: String,
     outcome: String,
+    task_identity: String,
+    task_turn_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -105,36 +107,88 @@ struct NativeSubagentState {
     parent_session_id: String,
     directory: PathBuf,
     outcome: String,
+    can_cancel: bool,
+    task_verified: bool,
+    task_turn_id: Option<String>,
 }
 
 #[derive(Default)]
 struct NativeSubagentRegistry(HashMap<String, NativeSubagentState>);
 
 impl NativeSubagentRegistry {
-    fn spawn(&mut self, parent_session_id: &str, session_id: &str, directory: PathBuf) {
-        self.0
-            .entry(session_id.to_string())
-            .and_modify(|entry| {
-                entry.parent_session_id = parent_session_id.to_string();
-                entry.directory = directory.clone();
-            })
-            .or_insert_with(|| NativeSubagentState {
-                parent_session_id: parent_session_id.to_string(),
-                directory,
-                outcome: "working".into(),
-            });
+    fn spawn(
+        &mut self,
+        parent_session_id: &str,
+        session_id: &str,
+        directory: PathBuf,
+        can_cancel: bool,
+    ) -> Result<(), String> {
+        if let Some(entry) = self.0.get_mut(session_id) {
+            if entry.parent_session_id != parent_session_id || entry.directory != directory {
+                return Err("Native child is already bound to another parent or directory.".into());
+            }
+            entry.can_cancel |= can_cancel;
+        } else {
+            self.0.insert(
+                session_id.to_string(),
+                NativeSubagentState {
+                    parent_session_id: parent_session_id.to_string(),
+                    directory,
+                    outcome: "working".into(),
+                    can_cancel,
+                    task_verified: false,
+                    task_turn_id: None,
+                },
+            );
+        }
+        Ok(())
     }
 
-    fn update(&mut self, session_id: &str, outcome: &str) {
-        let Some(entry) = self.0.get_mut(session_id) else {
-            return;
-        };
+    fn cancellation_eligible(&self, session_id: &str) -> Option<bool> {
+        self.0.get(session_id).map(|entry| {
+            entry.can_cancel
+                && !matches!(
+                    entry.outcome.as_str(),
+                    "completed" | "failed" | "interrupted"
+                )
+        })
+    }
+
+    fn task_scope(&mut self, session_id: &str, verified: bool, live: bool) {
+        if let Some(entry) = self.0.get_mut(session_id) {
+            entry.task_verified = verified;
+            if verified && live && entry.outcome == "working" && entry.task_turn_id.is_none() {
+                entry.task_turn_id = Some(Uuid::new_v4().to_string());
+            }
+            if !verified || !live {
+                entry.task_turn_id = None;
+            }
+        }
+    }
+
+    fn update(
+        &mut self,
+        parent_session_id: &str,
+        session_id: &str,
+        outcome: &str,
+    ) -> Result<(), String> {
+        let entry = self
+            .0
+            .get_mut(session_id)
+            .ok_or("Native child state was not registered.")?;
+        if entry.parent_session_id != parent_session_id {
+            return Err("Native child state came from a different parent.".into());
+        }
         entry.outcome = match outcome {
             "completed" | "failed" | "working" => outcome,
             "cancelled" => "interrupted",
             _ => "unknown",
         }
         .into();
+        if entry.outcome != "working" {
+            entry.task_turn_id = None;
+        }
+        Ok(())
     }
 
     fn is_live(entry: &NativeSubagentState) -> bool {
@@ -142,6 +196,37 @@ impl NativeSubagentRegistry {
             entry.outcome.as_str(),
             "completed" | "failed" | "interrupted"
         )
+    }
+
+    fn task_connections(&self) -> HashMap<String, NativeSubagentState> {
+        let mut connected = self
+            .0
+            .iter()
+            .filter(|(_, entry)| Self::is_live(entry))
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<HashSet<_>>();
+        loop {
+            let previous = connected.len();
+            for session_id in connected.clone() {
+                let Some(parent) = self
+                    .0
+                    .get(&session_id)
+                    .map(|entry| &entry.parent_session_id)
+                    .filter(|parent| self.0.contains_key(*parent))
+                else {
+                    continue;
+                };
+                connected.insert(parent.clone());
+            }
+            if connected.len() == previous {
+                break;
+            }
+        }
+        self.0
+            .iter()
+            .filter(|(session_id, _)| connected.contains(*session_id))
+            .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+            .collect()
     }
 
     fn involves_live_work(&self, session_id: &str) -> bool {
@@ -180,16 +265,67 @@ impl NativeSubagentRegistry {
                 parent_session_id: entry.parent_session_id.clone(),
                 directory: entry.directory.to_string_lossy().into_owned(),
                 outcome: entry.outcome.clone(),
+                task_identity: if entry.task_verified {
+                    "verified"
+                } else {
+                    "observed"
+                }
+                .into(),
+                task_turn_id: entry.task_turn_id.clone(),
             })
             .collect()
+    }
+}
+
+fn native_cancel_eligible(
+    registry: &NativeSubagentRegistry,
+    session_id: &str,
+    requested_turn: Option<&str>,
+) -> Result<bool, String> {
+    if requested_turn.is_some() {
+        return Ok(false);
+    }
+    match registry.cancellation_eligible(session_id) {
+        Some(true) => Ok(true),
+        Some(false) => Err("This native child cannot be cancelled individually.".into()),
+        None => Ok(false),
+    }
+}
+
+fn dispatch_session_cancel(
+    await_settlement: bool,
+    native_cancel: bool,
+    notify: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if await_settlement || native_cancel {
+        notify()
+    } else {
+        Ok(())
     }
 }
 
 #[derive(Default)]
 struct WorktreeFenceState {
     generations: HashMap<PathBuf, u64>,
+    native_task_snapshots: HashMap<PathBuf, Vec<NativeSubagentSnapshot>>,
     starting_sessions: HashMap<PathBuf, usize>,
     guarded_sessions: HashMap<(String, PathBuf, String), GuardedSession>,
+}
+
+impl WorktreeFenceState {
+    fn native_snapshot_generation(
+        &mut self,
+        directory: &Path,
+        children: &[NativeSubagentSnapshot],
+    ) -> u64 {
+        if self.native_task_snapshots.get(directory).map(Vec::as_slice) != Some(children) {
+            self.native_task_snapshots
+                .insert(directory.to_path_buf(), children.to_vec());
+            let generation = self.generations.entry(directory.to_path_buf()).or_default();
+            *generation = generation.saturating_add(1);
+        }
+        self.generations.get(directory).copied().unwrap_or_default()
+    }
 }
 
 struct GuardedSession {
@@ -215,6 +351,32 @@ impl AgentWorktreeFence {
             .entry(directory.to_path_buf())
             .or_default();
         *generation = generation.saturating_add(1);
+        Ok(())
+    }
+
+    fn native_disconnected(
+        &self,
+        alive: &AtomicBool,
+        registry: &Mutex<NativeSubagentRegistry>,
+    ) -> Result<(), String> {
+        let mut state = self.0.lock().map_err(|error| error.to_string())?;
+        let mut native = registry.lock().map_err(|error| error.to_string())?;
+        alive.store(false, Ordering::Release);
+        let mut directories = HashSet::new();
+        for child in native.0.values_mut() {
+            directories.insert(child.directory.clone());
+            child.task_turn_id = None;
+            if !matches!(
+                child.outcome.as_str(),
+                "completed" | "failed" | "interrupted"
+            ) {
+                child.outcome = "unknown".into();
+            }
+        }
+        for directory in directories {
+            let generation = state.generations.entry(directory).or_default();
+            *generation = generation.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -1457,6 +1619,26 @@ impl PermissionState {
         );
     }
 
+    fn begin_native_cancel(&mut self, session_id: &str) {
+        self.canceling_sessions.insert(
+            session_id.to_string(),
+            CancelingSession {
+                turn_id: None,
+                settlement_generation: None,
+            },
+        );
+    }
+
+    fn end_native_cancel(&mut self, session_id: &str) {
+        if self
+            .canceling_sessions
+            .get(session_id)
+            .is_some_and(|canceling| canceling.turn_id.is_none())
+        {
+            self.canceling_sessions.remove(session_id);
+        }
+    }
+
     fn acknowledge_prompt_settlement(&mut self, session_id: &str, turn_id: &str, generation: u64) {
         self.settled_prompts
             .insert(session_id.to_string(), (turn_id.to_string(), generation));
@@ -2531,13 +2713,31 @@ impl AgentManager {
             .collect::<Vec<_>>();
         let mut snapshots = Vec::new();
         for runtime in &agents {
-            snapshots.extend(
-                runtime
-                    .native_subagents
-                    .lock()
-                    .map_err(|error| error.to_string())?
-                    .snapshots(&runtime.agent, runtime.profile, directory),
-            );
+            let prompts = runtime
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let children = runtime
+                .native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .snapshots(&runtime.agent, runtime.profile, directory);
+            for mut child in children {
+                if !runtime.alive.load(Ordering::Acquire) {
+                    child.task_turn_id = None;
+                    if !matches!(
+                        child.outcome.as_str(),
+                        "completed" | "failed" | "interrupted"
+                    ) {
+                        child.outcome = "unknown".into();
+                    }
+                } else if child.task_identity == "verified" {
+                    if let Some(prompt) = prompts.active.get(&child.session_id) {
+                        child.task_turn_id = Some(prompt.turn_id.clone());
+                    }
+                }
+                snapshots.push(child);
+            }
         }
         snapshots.sort_by(|left, right| {
             (&left.agent, &left.session_id).cmp(&(&right.agent, &right.session_id))
@@ -3901,6 +4101,56 @@ mod interruption_report_tests {
     }
 
     #[test]
+    fn native_cancel_without_turn_fences_only_target_until_terminal() {
+        let mut state = PermissionState::default();
+        state.begin_native_cancel("target");
+        let mut resolved = Vec::new();
+
+        state
+            .record(
+                json!({"id":1,"params":{"sessionId":"target"}}),
+                1,
+                None,
+                |request_id| {
+                    resolved.push(request_id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        state
+            .record(
+                json!({"id":2,"params":{"sessionId":"sibling"}}),
+                2,
+                None,
+                |request_id| {
+                    resolved.push(request_id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resolved, [json!(1)]);
+        assert!(!state.pending.contains_key("1"));
+        assert!(state.pending.contains_key("2"));
+
+        state.end_native_cancel("target");
+        state
+            .record(
+                json!({"id":3,"params":{"sessionId":"target"}}),
+                3,
+                None,
+                |request_id| {
+                    resolved.push(request_id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resolved, [json!(1)]);
+        assert!(state.pending.contains_key("3"));
+    }
+
+    #[test]
     fn first_seen_replacement_permission_is_assigned_to_the_active_turn() {
         let mut state = PermissionState::default();
         state.begin_cancel("target", Some("turn-one"));
@@ -4179,6 +4429,22 @@ pub async fn acp_activity(
                 &directories,
                 &permission_state.pending,
             );
+            if runtime.alive.load(Ordering::Acquire) {
+                let native = runtime
+                    .native_subagents
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                if let Some(item) = activity.get_mut(&runtime.agent) {
+                    for (session, child) in &native.0 {
+                        if let Some(turn) = &child.task_turn_id {
+                            item.active_turns
+                                .entry(session.clone())
+                                .or_insert_with(|| turn.clone());
+                            item.active.push(session.clone());
+                        }
+                    }
+                }
+            }
         }
         Ok(activity)
     })
@@ -4196,13 +4462,9 @@ pub async fn acp_native_subagents(
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let directory = PathBuf::from(directory);
-        let state = fence.0.lock().map_err(|error| error.to_string())?;
-        let generation = state
-            .generations
-            .get(&directory)
-            .copied()
-            .unwrap_or_default();
+        let mut state = fence.0.lock().map_err(|error| error.to_string())?;
         let subagents = manager.native_subagent_snapshots(&directory)?;
+        let generation = state.native_snapshot_generation(&directory, &subagents);
         Ok(NativeSubagentSnapshotSet {
             generation,
             subagents,
@@ -4518,6 +4780,166 @@ fn opencode_child_update(message: &Value) -> Option<Option<Value>> {
     })
 }
 
+fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<Value> {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
+        return None;
+    }
+    let parent = message
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)?;
+    let update = message.pointer("/params/update")?;
+    let input = update.get("rawInput").or_else(|| update.get("input"))?;
+    let activity = input.get("activityKind").and_then(Value::as_str)?;
+    let wire_child = input.get("agentThreadId").and_then(Value::as_str)?;
+    if wire_child.trim().is_empty() || wire_child == parent {
+        return None;
+    }
+    let child = owner
+        .map(|owner| owned_session_id(owner, wire_child))
+        .unwrap_or_else(|| wire_child.to_string());
+    let name = input
+        .get("agentPath")
+        .and_then(Value::as_str)
+        .and_then(|path| path.split('/').rfind(|part| !part.is_empty()))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Subagent");
+    let adapter_title = match activity {
+        "started" => format!("Start subagent {name}"),
+        "interacted" => format!("Interact with subagent {name}"),
+        "interrupted" => format!("Interrupt subagent {name}"),
+        "completed" => format!("Complete subagent {name}"),
+        _ => return None,
+    };
+    let trusted = match update.get("subagent") {
+        Some(marker) => marker.as_bool() == Some(true),
+        None => {
+            matches!(
+                update.get("sessionUpdate").and_then(Value::as_str),
+                Some("tool_call" | "tool_call_update")
+            ) && update.get("title").and_then(Value::as_str) == Some(adapter_title.as_str())
+        }
+    };
+    if !trusted {
+        return None;
+    }
+    let update = match activity {
+        "started" | "interacted" => json!({
+            "sessionUpdate":"subagent_spawned",
+            "subagentSessionId":child,
+            "name":name,
+            "task":name
+        }),
+        "completed" | "interrupted" => json!({
+            "sessionUpdate":"subagent_state_update",
+            "subagentSessionId":child,
+            "state":if activity == "completed" { "completed" } else { "cancelled" }
+        }),
+        _ => return None,
+    };
+    Some(json!({"method":"session/update","params":{"sessionId":parent,"update":update}}))
+}
+
+fn claude_native_activity_update(
+    message: &Value,
+    registered: impl FnOnce(&str, &str) -> bool,
+) -> Option<Value> {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
+        return None;
+    }
+    let parent = message
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)?;
+    let update = message.pointer("/params/update")?;
+    if !matches!(
+        update.get("sessionUpdate").and_then(Value::as_str),
+        Some("tool_call" | "tool_call_update")
+    ) {
+        return None;
+    }
+    let tool_id = update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .filter(|tool_id| !tool_id.trim().is_empty())?;
+    let child = format!("{parent}:claude-subagent:{tool_id}");
+    let state = match update.get("status").and_then(Value::as_str) {
+        Some("completed") => Some("completed"),
+        Some("failed") => Some("failed"),
+        Some("cancelled" | "interrupted") => Some("cancelled"),
+        _ => None,
+    };
+    let normalized = if let Some(state) = state {
+        if !registered(parent, &child) {
+            return None;
+        }
+        json!({
+            "sessionUpdate":"subagent_state_update",
+            "subagentSessionId":child,
+            "state":state
+        })
+    } else {
+        if update.get("subagent").and_then(Value::as_bool) != Some(true)
+            && !claude_adapter_subagent_signature(update)
+        {
+            return None;
+        }
+        let task = update
+            .get("title")
+            .and_then(Value::as_str)
+            .or_else(|| update.pointer("/input/description").and_then(Value::as_str))
+            .filter(|task| !task.trim().is_empty())
+            .unwrap_or("Delegated task");
+        json!({
+            "sessionUpdate":"subagent_spawned",
+            "subagentSessionId":child,
+            "name":task,
+            "task":task
+        })
+    };
+    Some(json!({"method":"session/update","params":{"sessionId":parent,"update":normalized}}))
+}
+
+fn claude_adapter_subagent_signature(update: &Value) -> bool {
+    let adapter_name = update
+        .pointer("/_meta/claudeCode/toolName")
+        .and_then(Value::as_str);
+    if !matches!(adapter_name, Some("Agent" | "Task")) {
+        return false;
+    }
+    if update
+        .get("name")
+        .is_some_and(|name| name.as_str() != adapter_name)
+    {
+        return false;
+    }
+    let Some(input) = update.get("rawInput").and_then(Value::as_object) else {
+        return false;
+    };
+    input
+        .get("subagent_type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !kind.trim().is_empty())
+        && input
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .is_some()
+}
+
+fn native_activity_fence(update: &Value) -> Option<(&str, bool)> {
+    let tool_id = update.get("toolCallId").and_then(Value::as_str)?;
+    let status = update.get("status").and_then(Value::as_str);
+    if matches!(
+        status,
+        Some("completed" | "failed" | "cancelled" | "interrupted")
+    ) {
+        return Some((tool_id, false));
+    }
+    update
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .filter(|subagent| *subagent)
+        .map(|_| (tool_id, true))
+}
+
 fn authorize_terminal_request_for(
     profiles: &HashMap<String, CapabilityProfile>,
     params: &Value,
@@ -4658,6 +5080,55 @@ fn connection_for_session(
         .ok_or_else(|| "Agent session is not connected in this worktree.".to_string())
 }
 
+fn register_native_task_connections(
+    runtime: &Connection,
+    browser: &crate::browser_agent::BrowserManager,
+) -> Result<(), String> {
+    let children = runtime
+        .native_subagents
+        .lock()
+        .map_err(|error| error.to_string())?
+        .task_connections();
+    for _ in 0..children.len() {
+        for (child_id, child) in &children {
+            let provider_id = (runtime.agent == "opencode").then(|| {
+                runtime
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| {
+                        child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
+                    })
+                    .unwrap_or(child_id)
+            });
+            browser.register_native_child(
+                &runtime.agent,
+                &child.directory,
+                &child.parent_session_id,
+                child_id,
+                provider_id,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bind_session_directory(
+    directories: &mut HashMap<String, PathBuf>,
+    session_id: &str,
+    directory: PathBuf,
+) -> Result<(), String> {
+    if directories
+        .get(session_id)
+        .is_some_and(|existing| existing != &directory)
+    {
+        return Err("Agent session is already bound to another directory.".into());
+    }
+    directories
+        .entry(session_id.to_string())
+        .or_insert(directory);
+    Ok(())
+}
+
 fn register_session(
     manager: &AgentManager,
     agent: &str,
@@ -4697,11 +5168,12 @@ fn register_session(
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".to_string())?;
-    runtime
+    let mut directories = runtime
         .session_directories
         .lock()
-        .map_err(|error| error.to_string())?
-        .insert(session_id.to_string(), directory);
+        .map_err(|error| error.to_string())?;
+    bind_session_directory(&mut directories, session_id, directory)?;
+    drop(directories);
     runtime
         .session_profiles
         .lock()
@@ -4713,6 +5185,127 @@ fn register_session(
         .map_err(|error| error.to_string())?
         .mark_attached(session_id, Instant::now());
     Ok(runtime)
+}
+
+fn record_native_subagent_update(
+    app: &AppHandle,
+    manager: &AgentManager,
+    fence: &AgentWorktreeFence,
+    runtime: &Arc<Connection>,
+    agent: &str,
+    parent_id: &str,
+    update: &Value,
+) -> Result<(), String> {
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("subagent_spawned") => {
+            let child_id = update
+                .get("subagentSessionId")
+                .and_then(Value::as_str)
+                .ok_or("Native child update has no child session ID.")?;
+            if parent_id == child_id {
+                return Err("Native child session matches its parent.".into());
+            }
+            let directory = runtime
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(parent_id)
+                .cloned()
+                .ok_or("Native child parent directory is unavailable.")?;
+            let owner =
+                register_session(manager, agent, runtime.profile, child_id, directory.clone())?;
+            let parent_live = runtime
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .active
+                .contains_key(parent_id);
+            let can_cancel = update
+                .get("capabilities")
+                .and_then(Value::as_object)
+                .is_some_and(|capabilities| capabilities.contains_key("cancel"));
+            let mut fence = fence.0.lock().map_err(|error| error.to_string())?;
+            let mut native = owner
+                .native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let live = parent_live
+                || native
+                    .0
+                    .get(parent_id)
+                    .is_some_and(|parent| parent.task_turn_id.is_some());
+            native.spawn(parent_id, child_id, directory.clone(), can_cancel)?;
+            native.task_scope(child_id, agent == "opencode", live);
+            let provider_id = (agent == "opencode").then(|| {
+                runtime
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| {
+                        child_id.strip_prefix(&format!("{OWNED_SESSION_PREFIX}{owner}:"))
+                    })
+                    .unwrap_or(child_id)
+            });
+            app.state::<crate::browser_agent::BrowserManager>()
+                .register_native_child(agent, &directory, parent_id, child_id, provider_id);
+            let generation = fence.generations.entry(directory).or_default();
+            *generation = generation.saturating_add(1);
+            Ok(())
+        }
+        Some("subagent_state_update") => {
+            let child_id = update
+                .get("subagentSessionId")
+                .and_then(Value::as_str)
+                .ok_or("Native child state has no child session ID.")?;
+            let outcome = update
+                .get("state")
+                .and_then(Value::as_str)
+                .ok_or("Native child state has no outcome.")?;
+            let directory = runtime
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(child_id)
+                .cloned()
+                .ok_or("Native child directory is unavailable.")?;
+            let live_sessions = runtime
+                .prompt_state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .active
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>();
+            let mut fence = fence.0.lock().map_err(|error| error.to_string())?;
+            let mut native = runtime
+                .native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?;
+            native.update(parent_id, child_id, outcome)?;
+            if outcome == "working" {
+                let live = native.0.get(child_id).is_some_and(|child| {
+                    live_sessions.contains(&child.parent_session_id)
+                        || native
+                            .0
+                            .get(&child.parent_session_id)
+                            .is_some_and(|parent| parent.task_turn_id.is_some())
+                });
+                native.task_scope(child_id, agent == "opencode", live);
+            }
+            let generation = fence.generations.entry(directory.clone()).or_default();
+            *generation = generation.saturating_add(1);
+            if matches!(outcome, "completed" | "failed" | "cancelled") {
+                app.state::<crate::browser_agent::BrowserManager>()
+                    .settle_native_child(agent, &directory, parent_id, child_id);
+                runtime
+                    .permission_state
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .end_native_cancel(child_id);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Agents that keep no transcript for a session until its first turn, so they cannot resume one
@@ -5869,6 +6462,94 @@ fn connect_blocking_inner(
                     params.insert("sailCapabilityProfile".into(), profile.as_str().into());
                 }
             }
+            if agent_id == "codex" {
+                if let Some(mut normalized) =
+                    codex_native_activity_update(&message, reader.owner.as_deref())
+                {
+                    if let Some(params) =
+                        normalized.get_mut("params").and_then(Value::as_object_mut)
+                    {
+                        params.insert("sailCapabilityProfile".into(), profile.as_str().into());
+                    }
+                    let parent_id = normalized
+                        .pointer("/params/sessionId")
+                        .and_then(Value::as_str);
+                    let update = normalized.pointer("/params/update");
+                    if let (Some(parent_id), Some(update)) = (parent_id, update) {
+                        if let Err(error) = record_native_subagent_update(
+                            &app,
+                            &reader_manager,
+                            &worktree_fence,
+                            &reader,
+                            &agent_id,
+                            parent_id,
+                            update,
+                        ) {
+                            crate::diagnostics::record(
+                                "acp_native_activity_rejected",
+                                json!({"agent":agent_id,"sessionId":parent_id,"error":error}),
+                            );
+                        } else {
+                            let _ = app.emit(
+                                "acp-event",
+                                AgentEvent {
+                                    agent: agent_id.clone(),
+                                    directory: session_directory(&reader, parent_id),
+                                    worktree: Some(reader.worktree.to_string_lossy().into_owned()),
+                                    message: normalized,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            if agent_id == "claude" {
+                let mut normalized = claude_native_activity_update(&message, |parent, child| {
+                    reader.native_subagents.lock().ok().is_some_and(|native| {
+                        native
+                            .0
+                            .get(child)
+                            .is_some_and(|entry| entry.parent_session_id == parent)
+                    })
+                });
+                if let Some(normalized) = normalized.as_mut() {
+                    if let Some(params) =
+                        normalized.get_mut("params").and_then(Value::as_object_mut)
+                    {
+                        params.insert("sailCapabilityProfile".into(), profile.as_str().into());
+                    }
+                    let parent_id = normalized
+                        .pointer("/params/sessionId")
+                        .and_then(Value::as_str);
+                    let update = normalized.pointer("/params/update");
+                    if let (Some(parent_id), Some(update)) = (parent_id, update) {
+                        if let Err(error) = record_native_subagent_update(
+                            &app,
+                            &reader_manager,
+                            &worktree_fence,
+                            &reader,
+                            &agent_id,
+                            parent_id,
+                            update,
+                        ) {
+                            crate::diagnostics::record(
+                                "acp_native_activity_rejected",
+                                json!({"agent":agent_id,"sessionId":parent_id,"error":error}),
+                            );
+                        } else {
+                            let _ = app.emit(
+                                "acp-event",
+                                AgentEvent {
+                                    agent: agent_id.clone(),
+                                    directory: session_directory(&reader, parent_id),
+                                    worktree: Some(reader.worktree.to_string_lossy().into_owned()),
+                                    message: normalized.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             if let Some(update) = message.pointer("/params/update") {
                 if let Some(session_id) =
                     message.pointer("/params/sessionId").and_then(Value::as_str)
@@ -5885,68 +6566,36 @@ fn connect_blocking_inner(
                             json!({"agent":agent_id,"sessionId":session_id,"error":error}),
                         );
                     }
-                }
-                if update.get("sessionUpdate").and_then(Value::as_str) == Some("subagent_spawned") {
-                    let parent_id = message.pointer("/params/sessionId").and_then(Value::as_str);
-                    let child_id = update.get("subagentSessionId").and_then(Value::as_str);
-                    if let (Some(parent_id), Some(child_id)) = (parent_id, child_id) {
-                        if parent_id != child_id {
-                            let directory = reader
-                                .session_directories
-                                .lock()
-                                .ok()
-                                .and_then(|directories| directories.get(parent_id).cloned());
-                            if let Some(directory) = directory {
-                                match register_session(
-                                    &reader_manager,
-                                    &agent_id,
-                                    profile,
-                                    child_id,
-                                    directory.clone(),
-                                ) {
-                                    Ok(owner) => {
-                                        if let (Ok(mut fence), Ok(mut native)) =
-                                            (worktree_fence.0.lock(), owner.native_subagents.lock())
-                                        {
-                                            native.spawn(parent_id, child_id, directory.clone());
-                                            let generation =
-                                                fence.generations.entry(directory).or_default();
-                                            *generation = generation.saturating_add(1);
-                                        }
-                                    }
-                                    Err(error) => crate::diagnostics::record(
-                                        "acp_subagent_session_conflict",
-                                        json!({"agent":agent_id,"sessionId":child_id,"error":error}),
-                                    ),
-                                }
-                            }
+                    if let Some((activity, active)) = native_activity_fence(update) {
+                        if let Some(directory) = reader
+                            .session_directories
+                            .lock()
+                            .ok()
+                            .and_then(|directories| directories.get(session_id).cloned())
+                        {
+                            app.state::<crate::browser_agent::BrowserManager>()
+                                .set_unattributed_native_activity(
+                                    &agent_id, &directory, session_id, activity, active,
+                                );
                         }
-                    } else {
-                        crate::diagnostics::record(
-                            "acp_invalid_subagent_update",
-                            json!({"agent":agent_id,"parentSessionId":parent_id}),
-                        );
                     }
-                }
-                if update.get("sessionUpdate").and_then(Value::as_str)
-                    == Some("subagent_state_update")
-                {
-                    let child_id = update.get("subagentSessionId").and_then(Value::as_str);
-                    let outcome = update.get("state").and_then(Value::as_str);
-                    if let (Some(child_id), Some(outcome)) = (child_id, outcome) {
-                        if let Ok(mut fence) = worktree_fence.0.lock() {
-                            let directory = reader
-                                .session_directories
-                                .lock()
-                                .ok()
-                                .and_then(|directories| directories.get(child_id).cloned());
-                            if let (Some(directory), Ok(mut native)) =
-                                (directory, reader.native_subagents.lock())
-                            {
-                                native.update(child_id, outcome);
-                                let generation = fence.generations.entry(directory).or_default();
-                                *generation = generation.saturating_add(1);
-                            }
+                    if matches!(
+                        update.get("sessionUpdate").and_then(Value::as_str),
+                        Some("subagent_spawned" | "subagent_state_update")
+                    ) {
+                        if let Err(error) = record_native_subagent_update(
+                            &app,
+                            &reader_manager,
+                            &worktree_fence,
+                            &reader,
+                            &agent_id,
+                            session_id,
+                            update,
+                        ) {
+                            crate::diagnostics::record(
+                                "acp_native_update_rejected",
+                                json!({"agent":agent_id,"sessionId":session_id,"error":error}),
+                            );
                         }
                     }
                 }
@@ -6165,7 +6814,15 @@ fn connect_blocking_inner(
                 }
             }
         }
-        reader.alive.store(false, Ordering::Release);
+        if let Err(error) =
+            worktree_fence.native_disconnected(&reader.alive, &reader.native_subagents)
+        {
+            reader.alive.store(false, Ordering::Release);
+            crate::diagnostics::record(
+                "acp_native_disconnect_failed",
+                json!({"agent":agent_id,"error":error}),
+            );
+        }
         if let Ok(mut configs) = reader.session_configs.lock() {
             let browser = app.state::<crate::browser_agent::BrowserManager>();
             for (_, config) in configs.drain() {
@@ -6594,6 +7251,7 @@ pub async fn acp_new_session(
             }
         }
         browser.identify(&config.token, id);
+        register_native_task_connections(&runtime, &browser)?;
         Ok(result)
     })
     .await
@@ -7183,6 +7841,7 @@ fn restore_session_blocking(
                         Ok((forget_generation, params, minted_token))
                     },
                 )?;
+            register_native_task_connections(&runtime, browser)?;
             let result = runtime.request(method, params, Duration::from_secs(60));
             if result.is_err() {
                 if let Some(token) = minted_token {
@@ -8423,6 +9082,13 @@ fn cancel_session_after_dispatch(
     session_id: &str,
     turn_id: Option<String>,
 ) -> Result<(), String> {
+    let native_cancel = {
+        let native = runtime
+            .native_subagents
+            .lock()
+            .map_err(|error| error.to_string())?;
+        native_cancel_eligible(&native, session_id, turn_id.as_deref())
+    }?;
     let session_id = session_id.to_string();
     let agent = agent.to_string();
     let (plan, mut permission_state) = {
@@ -8445,6 +9111,9 @@ fn cancel_session_after_dispatch(
             &session_id,
             turn_id,
         );
+        if native_cancel && !plan.await_settlement {
+            permission_state.begin_native_cancel(&session_id);
+        }
         drop(cancelled_prompts);
         drop(prompts);
         (plan, permission_state)
@@ -8453,14 +9122,13 @@ fn cancel_session_after_dispatch(
         "cancel_requested",
         json!({
             "agent":agent,"sessionId":session_id,"turnId":plan.turn_id,
-            "awaitSettlement":plan.await_settlement
+            "awaitSettlement":plan.await_settlement,
+            "nativeChild":native_cancel
         }),
     );
-    let result = if plan.await_settlement {
+    let result = dispatch_session_cancel(plan.await_settlement, native_cancel, || {
         runtime.notify("session/cancel", json!({"sessionId":session_id}))
-    } else {
-        Ok(())
-    };
+    });
     if result.is_err() {
         permission_state.canceling_sessions.remove(&session_id);
         drop(permission_state);
@@ -8491,7 +9159,7 @@ fn cancel_session_after_dispatch(
             );
         }
     }
-    if plan.cleanup_current || plan.await_settlement {
+    if plan.cleanup_current || plan.await_settlement || native_cancel {
         resolve_session_permissions(
             &mut permission_state.pending,
             &session_id,
@@ -10103,7 +10771,8 @@ time.sleep(10)
             .native_subagents
             .lock()
             .unwrap()
-            .spawn(&session, &child, worktree.clone());
+            .spawn(&session, &child, worktree.clone(), false)
+            .unwrap();
         assert_eq!(
             manager.stop_owner(&worktree, owner).unwrap_err(),
             "Agent run still has an active native subagent."
@@ -10113,7 +10782,8 @@ time.sleep(10)
             .native_subagents
             .lock()
             .unwrap()
-            .update(&child, "completed");
+            .update(&session, &child, "completed")
+            .unwrap();
 
         manager.stop_owner(&worktree, owner).unwrap();
 
@@ -10989,6 +11659,185 @@ mod native_subagent_fence_tests {
     use super::*;
 
     #[test]
+    fn changed_task_snapshot_gets_new_generation_even_before_reader_disconnect() {
+        let directory = PathBuf::from("/repo");
+        let mut state = WorktreeFenceState::default();
+        let mut children = NativeSubagentRegistry::default();
+        children
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap();
+        children.task_scope("child", true, true);
+        let live = children.snapshots("opencode", CapabilityProfile::Build, &directory);
+        let before = state.native_snapshot_generation(&directory, &live);
+        assert_eq!(state.native_snapshot_generation(&directory, &live), before);
+        let mut disconnected = live.clone();
+        disconnected[0].task_turn_id = None;
+        disconnected[0].outcome = "unknown".into();
+        let after = state.native_snapshot_generation(&directory, &disconnected);
+        assert!(after > before);
+        assert_eq!(
+            state.native_snapshot_generation(&directory, &disconnected),
+            after
+        );
+    }
+
+    #[test]
+    fn disconnect_changes_task_generation_atomically_and_clears_native_turns() {
+        let fence = AgentWorktreeFence::default();
+        let directory = PathBuf::from("/repo");
+        let mut children = NativeSubagentRegistry::default();
+        children
+            .spawn("parent", "child", directory.clone(), false)
+            .unwrap();
+        children.task_scope("child", true, true);
+        let native = Mutex::new(children);
+        let alive = AtomicBool::new(true);
+        let before = fence
+            .0
+            .lock()
+            .unwrap()
+            .generations
+            .get(&directory)
+            .copied()
+            .unwrap_or(0);
+        fence.native_disconnected(&alive, &native).unwrap();
+        let after = fence.0.lock().unwrap().generations[&directory];
+        assert!(after > before);
+        assert!(!alive.load(Ordering::Acquire));
+        let children = native.lock().unwrap();
+        assert!(children.0["child"].task_turn_id.is_none());
+        assert_eq!(children.0["child"].outcome, "unknown");
+    }
+
+    #[test]
+    fn native_task_turn_is_own_live_scope_and_settles_before_reopening() {
+        let mut registry = NativeSubagentRegistry::default();
+        registry
+            .spawn("parent", "child", PathBuf::from("/repo"), false)
+            .unwrap();
+        registry.task_scope("child", true, false);
+        assert!(registry.0["child"].task_turn_id.is_none());
+        registry.task_scope("child", true, true);
+        let turn = registry.0["child"].task_turn_id.clone().unwrap();
+        registry.task_scope("child", true, true);
+        assert_eq!(
+            registry.0["child"].task_turn_id.as_deref(),
+            Some(turn.as_str())
+        );
+        registry.update("parent", "child", "completed").unwrap();
+        assert!(registry.0["child"].task_turn_id.is_none());
+        registry.update("parent", "child", "working").unwrap();
+        registry.task_scope("child", true, true);
+        assert_ne!(
+            registry.0["child"].task_turn_id.as_deref(),
+            Some(turn.as_str())
+        );
+        registry.update("parent", "child", "cancelled").unwrap();
+        assert!(registry.0["child"].task_turn_id.is_none());
+        registry
+            .spawn("parent", "observed", PathBuf::from("/repo"), false)
+            .unwrap();
+        registry.task_scope("observed", false, true);
+        assert!(registry.0["observed"].task_turn_id.is_none());
+    }
+
+    #[test]
+    fn settled_children_do_not_restrict_restored_parent_tasks() {
+        for outcome in ["completed", "failed", "cancelled"] {
+            let mut registry = NativeSubagentRegistry::default();
+            registry
+                .spawn("parent", "child", PathBuf::from("/repo"), false)
+                .unwrap();
+            registry.update("parent", "child", outcome).unwrap();
+
+            assert!(registry.task_connections().is_empty(), "{outcome}");
+        }
+    }
+
+    #[test]
+    fn live_nested_child_restores_its_terminal_ancestor() {
+        let mut registry = NativeSubagentRegistry::default();
+        registry
+            .spawn("parent", "child", PathBuf::from("/repo"), false)
+            .unwrap();
+        registry
+            .spawn("child", "nested", PathBuf::from("/repo"), false)
+            .unwrap();
+        registry.update("parent", "child", "completed").unwrap();
+
+        let connected = registry.task_connections();
+        assert_eq!(connected.len(), 2);
+        assert!(connected.contains_key("child"));
+        assert!(connected.contains_key("nested"));
+
+        registry.update("child", "nested", "completed").unwrap();
+        assert!(registry.task_connections().is_empty());
+    }
+
+    #[test]
+    fn null_turn_cancels_only_the_live_registered_capable_child_once() {
+        let mut registry = NativeSubagentRegistry::default();
+        let directory = PathBuf::from("/repo");
+        registry
+            .spawn("parent", "target", directory.clone(), true)
+            .unwrap();
+        registry
+            .spawn("parent", "sibling", directory.clone(), true)
+            .unwrap();
+        registry
+            .spawn("parent", "observed", directory, false)
+            .unwrap();
+
+        assert!(native_cancel_eligible(&registry, "target", None).unwrap());
+        assert!(!native_cancel_eligible(&registry, "parent", None).unwrap());
+        assert!(!native_cancel_eligible(&registry, "target", Some("turn")).unwrap());
+        assert!(native_cancel_eligible(&registry, "observed", None).is_err());
+
+        let mut sent = Vec::new();
+        dispatch_session_cancel(false, true, || {
+            sent.push("target".to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sent, ["target"]);
+        assert_eq!(registry.0["target"].outcome, "working");
+        assert_eq!(registry.0["sibling"].outcome, "working");
+        assert!(!registry.0.contains_key("parent"));
+
+        registry.update("parent", "target", "cancelled").unwrap();
+        assert_eq!(registry.0["target"].outcome, "interrupted");
+        assert!(native_cancel_eligible(&registry, "target", None).is_err());
+        assert!(native_cancel_eligible(&registry, "sibling", None).unwrap());
+        assert_eq!(registry.0["sibling"].outcome, "working");
+    }
+
+    #[test]
+    fn native_child_binding_rejects_reparenting_and_directory_change() {
+        let directory = PathBuf::from("/repo");
+        let mut registry = NativeSubagentRegistry::default();
+        registry
+            .spawn("parent", "child", directory.clone(), true)
+            .unwrap();
+
+        assert!(registry
+            .spawn("sibling", "child", directory.clone(), true)
+            .is_err());
+        assert!(registry
+            .spawn("parent", "child", PathBuf::from("/elsewhere"), true)
+            .is_err());
+        assert!(registry.update("sibling", "child", "completed").is_err());
+        assert_eq!(registry.0["child"].parent_session_id, "parent");
+        assert_eq!(registry.0["child"].directory, directory);
+        assert_eq!(registry.0["child"].outcome, "working");
+
+        let mut directories = HashMap::from([("child".into(), PathBuf::from("/repo"))]);
+        assert!(
+            bind_session_directory(&mut directories, "child", PathBuf::from("/elsewhere")).is_err()
+        );
+        assert_eq!(directories["child"], PathBuf::from("/repo"));
+    }
+
+    #[test]
     fn nested_native_sessions_are_active_for_outer_worktree_cleanup() {
         let scratch =
             std::env::temp_dir().join(format!("sail-nested-acp-{}", uuid::Uuid::new_v4()));
@@ -10996,7 +11845,9 @@ mod native_subagent_fence_tests {
         let nested = outer.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         let mut registry = NativeSubagentRegistry::default();
-        registry.spawn("parent", "child", nested.clone());
+        registry
+            .spawn("parent", "child", nested.clone(), false)
+            .unwrap();
 
         assert_eq!(registry.active_in(&outer), vec!["child"]);
 
@@ -11234,10 +12085,14 @@ mod native_subagent_fence_tests {
         let mut registry = NativeSubagentRegistry::default();
         let directory = PathBuf::from("/worktree");
 
-        registry.spawn("retired", "late-child", directory.clone());
+        registry
+            .spawn("retired", "late-child", directory.clone(), false)
+            .unwrap();
 
         assert_eq!(registry.active_in(&directory), vec!["late-child"]);
-        registry.update("late-child", "completed");
+        registry
+            .update("retired", "late-child", "completed")
+            .unwrap();
         assert!(registry.active_in(&directory).is_empty());
     }
 
@@ -11525,6 +12380,363 @@ mod capability_profile_tests {
             ),
             Some(None)
         );
+    }
+
+    #[test]
+    fn codex_activity_becomes_observed_native_child_updates() {
+        let activity = |kind: &str| {
+            json!({
+                "method":"session/update",
+                "params":{"sessionId":"parent","update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":format!("activity-{kind}"),
+                    "subagent":true,
+                    "status":"completed",
+                    "input":{
+                        "activityKind":kind,
+                        "agentPath":"/root/child_identity",
+                        "agentThreadId":"child-thread"
+                    }
+                }}
+            })
+        };
+
+        assert_eq!(
+            codex_native_activity_update(&activity("started"), None)
+                .unwrap()
+                .pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":"child-thread",
+                "name":"child_identity",
+                "task":"child_identity"
+            }))
+        );
+        assert_eq!(
+            codex_native_activity_update(&activity("completed"), None)
+                .unwrap()
+                .pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_state_update",
+                "subagentSessionId":"child-thread",
+                "state":"completed"
+            }))
+        );
+    }
+
+    #[test]
+    fn codex_activity_standard_client_keeps_trusted_child_lifecycle() {
+        let activity = |kind: &str, tool_call_id: &str, title: &str| {
+            json!({
+                "method":"session/update",
+                "params":{"sessionId":"01a13b13-ed9a-79d0-99ed-87e62f1d1ab4","update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":tool_call_id,
+                    "title":title,
+                    "status":"completed",
+                    "rawInput":{
+                        "activityKind":kind,
+                        "agentPath":"/root/native_child_identity",
+                        "agentThreadId":"01a13b14-8984-79c1-9f54-795b4ced3e11"
+                    }
+                }}
+            })
+        };
+
+        let started = codex_native_activity_update(
+            &activity(
+                "started",
+                "call_d70a5f1945ba4b44ad8c0cfcfa112f74",
+                "Start subagent native_child_identity",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            started.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":"01a13b14-8984-79c1-9f54-795b4ced3e11",
+                "name":"native_child_identity",
+                "task":"native_child_identity"
+            }))
+        );
+
+        let completed = codex_native_activity_update(
+            &activity(
+                "completed",
+                "subagent-completed-01a13b14-89cd-7b21-99ac-38cd34441410",
+                "Complete subagent native_child_identity",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            completed.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_state_update",
+                "subagentSessionId":"01a13b14-8984-79c1-9f54-795b4ced3e11",
+                "state":"completed"
+            }))
+        );
+    }
+
+    #[test]
+    fn codex_activity_requires_adapter_subagent_provenance_and_scopes_owned_children() {
+        let owner = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
+        let mut message = json!({
+            "method":"session/update",
+            "params":{"sessionId":owned_session_id(owner, "parent"),"update":{
+                "sessionUpdate":"tool_call",
+                "toolCallId":"activity-started",
+                "subagent":true,
+                "status":"completed",
+                "rawInput":{
+                    "activityKind":"started",
+                    "agentPath":"/root/child",
+                    "agentThreadId":"child-thread"
+                }
+            }}
+        });
+        assert_eq!(
+            codex_native_activity_update(&message, Some(owner))
+                .unwrap()
+                .pointer("/params/update/subagentSessionId"),
+            Some(&json!(owned_session_id(owner, "child-thread")))
+        );
+        message["params"]["update"]["subagent"] = json!(false);
+        assert!(codex_native_activity_update(&message, Some(owner)).is_none());
+        message["params"]["update"]["subagent"] = json!("true");
+        assert!(codex_native_activity_update(&message, Some(owner)).is_none());
+        message["params"]["update"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subagent");
+        message["params"]["update"]["title"] = json!("Generic tool");
+        assert!(codex_native_activity_update(&message, Some(owner)).is_none());
+        message["params"]["update"]["title"] = json!("Start subagent child");
+        assert!(codex_native_activity_update(&message, Some(owner)).is_some());
+        message["params"]["update"]["rawInput"]["agentThreadId"] = Value::Null;
+        assert!(codex_native_activity_update(&message, Some(owner)).is_none());
+    }
+
+    #[test]
+    fn claude_activity_becomes_observed_native_child_updates() {
+        let activity = |status: &str, subagent: Option<bool>, tool_call_id: &str| {
+            let mut update = json!({
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":tool_call_id,
+                "title":"Child task identity check",
+                "status":status,
+                "input":{"description":"Child task identity check"}
+            });
+            if let Some(subagent) = subagent {
+                update["subagent"] = json!(subagent);
+            }
+            json!({"method":"session/update","params":{"sessionId":"parent","update":update}})
+        };
+        let child = "parent:claude-subagent:toolu_child";
+
+        let started = claude_native_activity_update(
+            &activity("in_progress", Some(true), "toolu_child"),
+            |_, _| false,
+        )
+        .unwrap();
+        assert_eq!(
+            started.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":child,
+                "name":"Child task identity check",
+                "task":"Child task identity check"
+            }))
+        );
+
+        for (status, state) in [
+            ("completed", "completed"),
+            ("failed", "failed"),
+            ("interrupted", "cancelled"),
+        ] {
+            let settled = claude_native_activity_update(
+                &activity(status, None, "toolu_child"),
+                |parent, candidate| parent == "parent" && candidate == child,
+            )
+            .unwrap();
+            assert_eq!(
+                settled.pointer("/params/update"),
+                Some(&json!({
+                    "sessionUpdate":"subagent_state_update",
+                    "subagentSessionId":child,
+                    "state":state
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn claude_adapter_agent_signature_becomes_observed_native_child_updates() {
+        let partial = json!({
+            "method":"session/update",
+            "params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call",
+                "toolCallId":"toolu_01SP5UF44Tk2e4NNKGFz9Xua",
+                "name":"Agent",
+                "title":"Native child task identity",
+                "status":"pending",
+                "rawInput":{},
+                "_meta":{"claudeCode":{"toolName":"Agent"}}
+            }}
+        });
+        assert!(claude_native_activity_update(&partial, |_, _| false).is_none());
+
+        let started = json!({
+            "method":"session/update",
+            "params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":"toolu_01SP5UF44Tk2e4NNKGFz9Xua",
+                "title":"Native child task identity",
+                "rawInput":{
+                    "description":"Native child task identity",
+                    "subagent_type":"general-purpose",
+                    "run_in_background":false,
+                    "prompt":"Call Sail sail_tasks_read."
+                },
+                "_meta":{"claudeCode":{"toolName":"Agent"}}
+            }}
+        });
+        let child = "parent:claude-subagent:toolu_01SP5UF44Tk2e4NNKGFz9Xua";
+
+        let normalized = claude_native_activity_update(&started, |_, _| false).unwrap();
+        assert_eq!(
+            normalized.pointer("/params/update"),
+            Some(&json!({
+                "sessionUpdate":"subagent_spawned",
+                "subagentSessionId":child,
+                "name":"Native child task identity",
+                "task":"Native child task identity"
+            }))
+        );
+
+        let settled = json!({
+            "method":"session/update",
+            "params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":"toolu_01SP5UF44Tk2e4NNKGFz9Xua",
+                "status":"completed"
+            }}
+        });
+        assert!(
+            claude_native_activity_update(&settled, |parent, candidate| {
+                parent == "parent" && candidate == child
+            })
+            .is_some()
+        );
+        assert!(claude_native_activity_update(&settled, |_, _| false).is_none());
+    }
+
+    #[test]
+    fn claude_adapter_agent_signature_rejects_malformed_and_generic_tools() {
+        let signature = || {
+            json!({
+                "method":"session/update",
+                "params":{"sessionId":"parent","update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":"toolu_child",
+                    "name":"Agent",
+                    "status":"pending",
+                    "rawInput":{
+                        "subagent_type":"general-purpose",
+                        "run_in_background":false
+                    },
+                    "_meta":{"claudeCode":{"toolName":"Agent"}}
+                }}
+            })
+        };
+        let rejects = |message: &Value| {
+            assert!(claude_native_activity_update(message, |_, _| false).is_none())
+        };
+
+        let mut message = signature();
+        message["params"]["update"]["name"] = json!("Bash");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["_meta"]["claudeCode"]["toolName"] = json!("Bash");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["rawInput"]["subagent_type"] = json!("");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["rawInput"]["run_in_background"] = json!("false");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]["toolCallId"] = json!(" ");
+        rejects(&message);
+
+        let mut message = signature();
+        message["params"]["update"]
+            .as_object_mut()
+            .unwrap()
+            .remove("_meta");
+        rejects(&message);
+    }
+
+    #[test]
+    fn claude_activity_rejects_untrusted_and_mismatched_updates() {
+        let activity = |status: &str, marker: Value, tool_call_id: &str| {
+            json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call",
+                "toolCallId":tool_call_id,
+                "title":"Child task identity check",
+                "status":status,
+                "subagent":marker
+            }}})
+        };
+
+        assert!(claude_native_activity_update(
+            &activity("in_progress", json!(false), "toolu_child"),
+            |_, _| false,
+        )
+        .is_none());
+        assert!(claude_native_activity_update(
+            &activity("in_progress", json!("true"), "toolu_child"),
+            |_, _| false,
+        )
+        .is_none());
+        assert!(claude_native_activity_update(
+            &activity("completed", json!(true), "toolu_other"),
+            |_, _| false,
+        )
+        .is_none());
+        assert!(claude_native_activity_update(
+            &json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                "sessionUpdate":"agent_message_chunk",
+                "toolCallId":"toolu_child",
+                "subagent":true
+            }}}),
+            |_, _| true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn settled_native_activity_reopens_parent_task_access() {
+        let live = json!({"toolCallId":"agent-tool","subagent":true,"status":"in_progress"});
+        let ordinary = json!({"toolCallId":"shell","status":"in_progress"});
+
+        assert_eq!(native_activity_fence(&live), Some(("agent-tool", true)));
+        assert_eq!(native_activity_fence(&ordinary), None);
+        for status in ["completed", "failed", "cancelled", "interrupted"] {
+            let settled = json!({"toolCallId":"agent-tool","status":status});
+            assert_eq!(
+                native_activity_fence(&settled),
+                Some(("agent-tool", false)),
+                "{status} must release the parent task-attribution fence"
+            );
+        }
     }
 
     #[test]
@@ -11933,18 +13145,20 @@ mod idle_close_tests {
     #[test]
     fn live_subagent_keeps_its_parent_loaded_until_it_ends() {
         let runtime = runtime("ses_parent");
-        runtime.native_subagents.lock().unwrap().spawn(
-            "ses_parent",
-            "ses_child",
-            std::env::temp_dir(),
-        );
+        runtime
+            .native_subagents
+            .lock()
+            .unwrap()
+            .spawn("ses_parent", "ses_child", std::env::temp_dir(), false)
+            .unwrap();
         assert!(holds_work(&runtime, "ses_parent", false));
         assert!(holds_work(&runtime, "ses_child", false));
         runtime
             .native_subagents
             .lock()
             .unwrap()
-            .update("ses_child", "completed");
+            .update("ses_parent", "ses_child", "completed")
+            .unwrap();
         assert!(!holds_work(&runtime, "ses_parent", false));
         assert!(!holds_work(&runtime, "ses_child", false));
     }

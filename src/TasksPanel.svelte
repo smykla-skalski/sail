@@ -5,22 +5,27 @@
   import type { TaskSnapshot } from './lib/session-tasks';
   let {
     snapshot,
+    observedActivity = null,
     status = snapshot.turnId ? 'working' : null,
-  }: { snapshot: TaskSnapshot; status?: ThreadStatus | null } = $props();
-  const focus = $derived(agentFocusDisplay(snapshot, status));
+  }: {
+    snapshot: TaskSnapshot;
+    observedActivity?: string | null;
+    status?: ThreadStatus | null;
+  } = $props();
+  const focus = $derived(observedActivity === null ? agentFocusDisplay(snapshot, status) : null);
 </script>
 
 <section class="tasks-panel" aria-label="Session tasks">
   <h2>Tasks</h2>
   {#if focus}<div class="focus-summary"><AgentFocus {focus} /></div>{/if}
-  {#if snapshot.reporting?.state === 'missing'}
+  {#if observedActivity === null && snapshot.reporting?.state === 'missing'}
     <p role="status">
       Task report missing. The agent did not report tasks.
       {#if snapshot.reporting.correctionRequested}One corrective request was attempted.{/if}
     </p>
-  {:else if snapshot.reporting?.state === 'correcting'}
+  {:else if observedActivity === null && snapshot.reporting?.state === 'correcting'}
     <p role="status">Task report missing. Requesting one update from the agent…</p>
-  {:else if snapshot.reporting?.state === 'failed' || snapshot.reporting?.state === 'interrupted'}
+  {:else if observedActivity === null && (snapshot.reporting?.state === 'failed' || snapshot.reporting?.state === 'interrupted')}
     <p>
       Task report unavailable — turn {snapshot.reporting.state}.
       {#if snapshot.reporting.correctionRequested}
@@ -28,7 +33,11 @@
       {:else}No corrective request sent.{/if}
     </p>
   {/if}
-  {#if !snapshot.tasks.length}<p>No tasks reported in this session.</p>{:else}<ul>
+  {#if observedActivity !== null}<p>Observed activity: {observedActivity}</p>
+    <p>
+      This provider does not verify child task calls. Tasks and focus cannot be reported from this
+      child.
+    </p>{:else if !snapshot.tasks.length}<p>No tasks reported in this session.</p>{:else}<ul>
       {#each snapshot.tasks as task (task.id)}<li
           class:focused={status === 'working' &&
             snapshot.focus === task.id &&

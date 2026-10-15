@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import type { AgentSessionListing, AgentThread } from '../src/lib/acp.ts';
+import type { AgentEvent, AgentSessionListing, AgentThread } from '../src/lib/acp.ts';
 import test from 'node:test';
 import {
   advanceFailedChildNotices,
@@ -14,6 +14,11 @@ import {
   waitForSidebarInventory,
 } from '../src/lib/sidebar-agents.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
+import {
+  nativeSubagentReceipts,
+  nativeSubagentThreads,
+  updateNativeSubagents,
+} from '../src/lib/native-subagents.ts';
 
 function nativeReceipt(
   sessionId: string,
@@ -38,6 +43,22 @@ function nativeReceipt(
     updated: 2,
     result: state === 'completed' ? 'Completed' : null,
     error: null,
+  };
+}
+
+function codexEvent(update: Record<string, unknown>): AgentEvent {
+  return {
+    agent: 'codex',
+    directory: '/repo',
+    message: { method: 'session/update', params: { sessionId: 'parent', update } },
+  };
+}
+
+function claudeEvent(update: Record<string, unknown>): AgentEvent {
+  return {
+    agent: 'claude',
+    directory: '/repo',
+    message: { method: 'session/update', params: { sessionId: 'parent', update } },
   };
 }
 
@@ -241,7 +262,7 @@ await test('native child rows use their own outcome without parent attention sta
   assert.equal(status('unavailable'), null);
 });
 
-await test('native sidebar rows preserve ancestry and collapse settled subtrees', () => {
+await test('native sidebar rows preserve ancestry and keep the latest completed child', () => {
   const parent = {
     agent: 'codex',
     directory: '/repo',
@@ -251,29 +272,32 @@ await test('native sidebar rows preserve ancestry and collapse settled subtrees'
   };
   const child = { ...parent, sessionId: 'child', title: 'Child', updated: 3 };
   const grandchild = { ...parent, sessionId: 'grandchild', title: 'Grandchild', updated: 4 };
-  const sibling = { ...parent, sessionId: 'sibling', title: 'Sibling', updated: 2 };
+  const older = { ...parent, sessionId: 'older', title: 'Older', updated: 2 };
+  const recent = { ...parent, sessionId: 'recent', title: 'Recent', updated: 5 };
   const receipts = [
     nativeReceipt('child', 'parent', 'working'),
     nativeReceipt('grandchild', 'child', 'working'),
-    nativeReceipt('sibling', 'parent', 'completed'),
+    { ...nativeReceipt('older', 'parent', 'completed'), updated: 3 },
+    { ...nativeReceipt('recent', 'parent', 'completed'), updated: 5 },
   ];
 
-  const collapsed = sidebarThreadRows([grandchild, child, sibling, parent], receipts);
+  const collapsed = sidebarThreadRows([grandchild, child, older, recent, parent], receipts);
   assert.deepEqual(
     collapsed.map((row) => [row.thread.sessionId, row.depth]),
     [
       ['parent', 0],
+      ['recent', 1],
       ['child', 1],
       ['grandchild', 2],
     ],
   );
   assert.equal(collapsed[0].hiddenHistoricalChildren, 1);
-  const expanded = sidebarThreadRows([grandchild, child, sibling, parent], receipts, [
+  const expanded = sidebarThreadRows([grandchild, child, older, recent, parent], receipts, [
     JSON.stringify(['codex', '/repo', 'parent']),
   ]);
   assert.deepEqual(
     expanded.map((row) => row.thread.sessionId),
-    ['parent', 'child', 'grandchild', 'sibling'],
+    ['parent', 'recent', 'child', 'grandchild', 'older'],
   );
 });
 
@@ -389,17 +413,99 @@ const childThread = (sessionId: string) => ({
   updated: 5,
 });
 
-await test('a failed child stays listed while completed ones collapse', () => {
+await test('a failed and latest completed child stay listed while older completions collapse', () => {
   const rows = sidebarThreadRows(
-    [parentThread, childThread('broke'), childThread('fine')],
-    [nativeReceipt('broke', 'parent', 'failed'), nativeReceipt('fine', 'parent', 'completed')],
+    [parentThread, childThread('broke'), childThread('older'), childThread('recent')],
+    [
+      nativeReceipt('broke', 'parent', 'failed'),
+      { ...nativeReceipt('older', 'parent', 'completed'), updated: 3 },
+      { ...nativeReceipt('recent', 'parent', 'completed'), updated: 4 },
+    ],
   );
   assert.deepEqual(
     rows.map((row) => row.thread.sessionId),
-    ['parent', 'broke'],
+    ['parent', 'broke', 'recent'],
   );
   assert.equal(rows[0].hiddenHistoricalChildren, 1);
   assert.equal(rows[0].historicalChildren, 1);
+});
+
+await test('a completed Codex lifecycle leaves one inspectable depth-1 child row', () => {
+  let store = updateNativeSubagents(
+    {},
+    codexEvent({
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child-thread',
+      name: 'identity_check',
+      task: 'identity_check',
+    }),
+    '/repo',
+    10,
+  );
+  store = updateNativeSubagents(
+    store,
+    codexEvent({
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'child-thread',
+      state: 'completed',
+    }),
+    '/repo',
+    20,
+  );
+
+  const rows = sidebarThreadRows(
+    [parentThread, ...nativeSubagentThreads(store)],
+    nativeSubagentReceipts(store),
+  );
+
+  assert.deepEqual(
+    rows.map((row) => [row.thread.sessionId, row.depth]),
+    [
+      ['parent', 0],
+      ['child-thread', 1],
+    ],
+  );
+  assert.equal(rows[0].hiddenHistoricalChildren, 0);
+});
+
+await test('a completed observed Claude lifecycle leaves one inspectable depth-1 child row', () => {
+  const childId = 'parent:claude-subagent:toolu_child';
+  let store = updateNativeSubagents(
+    {},
+    claudeEvent({
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: childId,
+      name: 'Child task identity check',
+      task: 'Child task identity check',
+    }),
+    '/repo',
+    10,
+  );
+  store = updateNativeSubagents(
+    store,
+    claudeEvent({
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: childId,
+      state: 'completed',
+    }),
+    '/repo',
+    20,
+  );
+
+  const child = Object.values(store)[0];
+  assert.equal(child.taskIdentity, 'observed');
+  const rows = sidebarThreadRows(
+    [{ ...parentThread, agent: 'claude' }, ...nativeSubagentThreads(store)],
+    nativeSubagentReceipts(store),
+  );
+  assert.deepEqual(
+    rows.map((row) => [row.thread.sessionId, row.depth]),
+    [
+      ['parent', 0],
+      [childId, 1],
+    ],
+  );
+  assert.equal(rows[0].hiddenHistoricalChildren, 0);
 });
 
 await test('a failed child notice clears after the next parent turn completes', () => {

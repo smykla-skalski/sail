@@ -4,6 +4,18 @@ import type { ProjectCatalog, WorktreeOrigin } from './projects';
 import { worktreeAncestry } from './projects.ts';
 import { threadKey } from './recent-threads.ts';
 
+export function coordinationSourceThread(
+  threads: AgentThread[],
+  scope: { agent: string; directory: string; sessionId: string },
+): AgentThread | undefined {
+  return threads.find(
+    (thread) =>
+      thread.agent === scope.agent &&
+      thread.directory === scope.directory &&
+      thread.sessionId === scope.sessionId,
+  );
+}
+
 export type RegisteredWorktree = {
   path: string;
   branch: string | null;

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   coordinationKey,
+  coordinationSourceThread,
   coordinationMessageForText,
   coordinationPrompt,
   enqueueCoordinationMessage,
@@ -128,4 +129,23 @@ await test('delivered prompt matches its transcript entry for sender attribution
   const prompt = coordinationPrompt(message);
   assert.equal(coordinationMessageForText(prompt, [message]), message);
   assert.equal(coordinationMessageForText('Unrelated user prompt', [message]), undefined);
+});
+
+await test('opening a native child preserves source identity despite its saved recent-thread copy', () => {
+  const child = {
+    agent: 'opencode',
+    directory: '/repo',
+    sessionId: 'child',
+    title: 'Child',
+    updated: 1,
+  };
+  const recent = { ...child, title: 'Recently opened child', updated: 2 };
+  const unrelated = [
+    { ...child, agent: 'codex' },
+    { ...child, directory: '/elsewhere' },
+    { ...child, sessionId: 'parent' },
+  ];
+  assert.equal(coordinationSourceThread([...unrelated, child], child), child);
+  assert.equal(coordinationSourceThread([...unrelated, recent, child], child)?.sessionId, 'child');
+  assert.equal(coordinationSourceThread(unrelated, child), undefined);
 });

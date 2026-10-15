@@ -32,6 +32,8 @@ struct Client {
     session: Option<String>,
     agent: Option<String>,
     profile: CapabilityProfile,
+    native_children: HashMap<String, Option<String>>,
+    unattributed_native_activity: HashSet<String>,
 }
 
 const RELEASED_TOKENS_KEPT: usize = 64;
@@ -97,6 +99,8 @@ struct ActionEvent {
 struct ToolRequest {
     token: String,
     session_id: Option<String>,
+    #[serde(default)]
+    provider_session_id: Option<String>,
     name: String,
     arguments: Value,
 }
@@ -108,6 +112,44 @@ pub struct McpConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub token: String,
+}
+
+fn resolve_task_session(client: &Client, provider_id: Option<&str>) -> Result<String, String> {
+    let parent = client
+        .session
+        .as_deref()
+        .ok_or("Tasks require a session-bound connection.")?;
+    let wire_parent = parent
+        .strip_prefix("sail-owned:")
+        .and_then(|rest| rest.split_once(':'))
+        .map_or(parent, |(_, id)| id);
+    if !client.unattributed_native_activity.is_empty() {
+        return Err(
+            "Task identity is unavailable while unattributed native child activity shares this connection."
+                .into(),
+        );
+    }
+    if client.native_children.is_empty() {
+        if provider_id.is_some_and(|identity| identity != wire_parent) {
+            return Err("Task identity does not match this connection.".into());
+        }
+        return Ok(parent.to_string());
+    }
+    let identity = provider_id.filter(|_| client.agent.as_deref() == Some("opencode"))
+        .ok_or("Task identity is unavailable while native children share this connection; observed activity cannot write parent tasks.")?;
+    if identity == wire_parent {
+        return Ok(parent.to_string());
+    }
+    let sessions: Vec<_> = client
+        .native_children
+        .iter()
+        .filter(|(_, provider)| provider.as_deref() == Some(identity))
+        .map(|(session, _)| session)
+        .collect();
+    match sessions.as_slice() {
+        [session] => Ok((*session).clone()),
+        _ => Err("Task identity does not match one verified child of this connection.".into()),
+    }
 }
 
 fn requires_phase_lease(tool: &str) -> bool {
@@ -169,6 +211,8 @@ impl BrowserManager {
                     session: session.map(str::to_string),
                     agent: agent.map(str::to_string),
                     profile: CapabilityProfile::Build,
+                    native_children: HashMap::new(),
+                    unattributed_native_activity: HashSet::new(),
                 },
             );
         let port = *self.0.port.lock().map_err(|error| error.to_string())?;
@@ -227,6 +271,84 @@ impl BrowserManager {
         if let Ok(mut clients) = self.0.clients.lock() {
             if let Some(client) = clients.get_mut(token) {
                 client.session = Some(session.to_string());
+            }
+        }
+    }
+
+    pub fn task_identity_available(&self, agent: &str, directory: &Path, session: &str) -> bool {
+        self.0.clients.lock().is_ok_and(|clients| {
+            clients.values().any(|client| {
+                client.agent.as_deref() == Some(agent)
+                    && client.directory == directory
+                    && client.unattributed_native_activity.is_empty()
+                    && ((client.session.as_deref() == Some(session)
+                        && (client.native_children.is_empty() || agent == "opencode"))
+                        || (agent == "opencode"
+                            && client
+                                .native_children
+                                .get(session)
+                                .is_some_and(Option::is_some)))
+            })
+        })
+    }
+
+    pub fn register_native_child(
+        &self,
+        agent: &str,
+        directory: &Path,
+        parent: &str,
+        child: &str,
+        provider_id: Option<&str>,
+    ) {
+        if let Ok(mut clients) = self.0.clients.lock() {
+            for client in clients.values_mut().filter(|client| {
+                client.agent.as_deref() == Some(agent)
+                    && client.directory == directory
+                    && (client.session.as_deref() == Some(parent)
+                        || client.native_children.contains_key(parent))
+            }) {
+                client
+                    .native_children
+                    .insert(child.to_string(), provider_id.map(str::to_string));
+            }
+        }
+    }
+
+    pub fn settle_native_child(&self, agent: &str, directory: &Path, parent: &str, child: &str) {
+        if let Ok(mut clients) = self.0.clients.lock() {
+            for client in clients.values_mut().filter(|client| {
+                client.agent.as_deref() == Some(agent)
+                    && client.directory == directory
+                    && (client.session.as_deref() == Some(parent)
+                        || client.native_children.contains_key(parent))
+            }) {
+                client.native_children.remove(child);
+            }
+        }
+    }
+
+    pub fn set_unattributed_native_activity(
+        &self,
+        agent: &str,
+        directory: &Path,
+        parent: &str,
+        activity: &str,
+        active: bool,
+    ) {
+        if let Ok(mut clients) = self.0.clients.lock() {
+            for client in clients.values_mut().filter(|client| {
+                client.agent.as_deref() == Some(agent)
+                    && client.directory == directory
+                    && (client.session.as_deref() == Some(parent)
+                        || client.native_children.contains_key(parent))
+            }) {
+                if active {
+                    client
+                        .unattributed_native_activity
+                        .insert(activity.to_string());
+                } else {
+                    client.unattributed_native_activity.remove(activity);
+                }
             }
         }
     }
@@ -563,6 +685,12 @@ impl BrowserManager {
         name: &str,
         arguments: Value,
     ) -> Result<Value, String> {
+        if name == "sail_task_report_check"
+            && source_agent
+                .is_some_and(|agent| !self.task_identity_available(agent, directory, session))
+        {
+            return Ok(json!({"needsCorrection":false,"identityAvailable":false}));
+        }
         let setting = match name {
             "worktree_create" | "worktree_list" | "worktree_info" | "agent_spawn"
             | "validation_gate" | "agent_status" | "agent_wait" | "agent_result"
@@ -672,10 +800,21 @@ impl BrowserManager {
         let directory = client.directory.clone();
         let source_agent = client.agent.clone();
         let profile = client.profile;
+        let task_session = if matches!(
+            request.name.as_str(),
+            "sail_tasks_read" | "sail_tasks_report"
+        ) {
+            Some(resolve_task_session(
+                client,
+                request.provider_session_id.as_deref(),
+            )?)
+        } else {
+            None
+        };
         let session = request.session_id.as_deref();
-        let session = client
-            .session
+        let session = task_session
             .as_deref()
+            .or(client.session.as_deref())
             .or(session)
             .unwrap_or(&request.token)
             .to_string();
@@ -2273,6 +2412,7 @@ fn call_bridge(params: &Value) -> Value {
     let request = json!({
         "token":token,
         "sessionId":mcp_session_id(params),
+        "providerSessionId":params.pointer("/_meta/ai.opencode~1sessionID").and_then(Value::as_str),
         "name":params.get("name").and_then(Value::as_str),
         "arguments":params.get("arguments").cloned().unwrap_or_else(|| json!({})),
     });
@@ -2664,5 +2804,255 @@ mod token_redaction_tests {
         assert!(!tokens.contains(&first));
         assert!(tokens.contains(&live));
         assert!(tokens.len() <= RELEASED_TOKENS_KEPT + 1);
+    }
+}
+
+#[cfg(test)]
+mod native_task_identity_tests {
+    use super::*;
+
+    fn client(agent: &str) -> Client {
+        Client {
+            directory: PathBuf::from("/repo"),
+            session: Some("parent".into()),
+            agent: Some(agent.into()),
+            profile: CapabilityProfile::Build,
+            native_children: HashMap::new(),
+            unattributed_native_activity: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn verified_provider_metadata_is_bound_to_registered_descendants() {
+        let mut source = client("opencode");
+        assert_eq!(
+            resolve_task_session(&source, Some("parent")).unwrap(),
+            "parent"
+        );
+        assert!(resolve_task_session(&source, Some("other-session")).is_err());
+        source
+            .native_children
+            .insert("child".into(), Some("child".into()));
+        assert_eq!(
+            resolve_task_session(&source, Some("child")).unwrap(),
+            "child"
+        );
+        assert_eq!(
+            resolve_task_session(&source, Some("parent")).unwrap(),
+            "parent"
+        );
+        assert!(resolve_task_session(&source, None).is_err());
+        assert!(resolve_task_session(&source, Some("sibling-parent")).is_err());
+        source
+            .native_children
+            .insert("alias-child".into(), Some("child".into()));
+        assert!(resolve_task_session(&source, Some("child")).is_err());
+    }
+
+    #[test]
+    fn observed_children_never_fall_back_to_parent_task_scope() {
+        for agent in ["codex", "claude", "opencode"] {
+            let mut source = client(agent);
+            source.native_children.insert("observed".into(), None);
+            assert!(resolve_task_session(&source, None).is_err());
+            assert!(resolve_task_session(&source, Some("observed")).is_err());
+            if agent != "opencode" {
+                assert!(resolve_task_session(&source, Some("parent")).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unattributed_native_activity_fences_parent_and_child_task_writes() {
+        let mut source = client("claude");
+        source
+            .unattributed_native_activity
+            .insert("agent-tool".into());
+
+        assert!(resolve_task_session(&source, None).is_err());
+        assert!(resolve_task_session(&source, Some("parent")).is_err());
+
+        source.unattributed_native_activity.clear();
+        assert_eq!(resolve_task_session(&source, None).unwrap(), "parent");
+    }
+
+    #[test]
+    fn attribution_fence_stays_with_its_parent_agent_directory_and_token() {
+        let manager = BrowserManager::default();
+        let mut clients = manager.0.clients.lock().unwrap();
+        clients.insert("source".into(), client("claude"));
+        let mut unrelated = client("claude");
+        unrelated.session = Some("other".into());
+        clients.insert("other-parent".into(), unrelated);
+        clients.insert("other-agent".into(), client("codex"));
+        let mut elsewhere = client("claude");
+        elsewhere.directory = PathBuf::from("/elsewhere");
+        clients.insert("other-directory".into(), elsewhere);
+        drop(clients);
+
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            true,
+        );
+
+        let clients = manager.0.clients.lock().unwrap();
+        assert!(resolve_task_session(&clients["source"], None).is_err());
+        for key in ["other-parent", "other-agent", "other-directory"] {
+            assert!(clients[key].unattributed_native_activity.is_empty());
+            assert_eq!(
+                resolve_task_session(&clients[key], None).unwrap(),
+                clients[key].session.as_deref().unwrap()
+            );
+        }
+
+        drop(clients);
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            false,
+        );
+        let clients = manager.0.clients.lock().unwrap();
+        assert_eq!(
+            resolve_task_session(&clients["source"], None).unwrap(),
+            "parent"
+        );
+    }
+
+    #[test]
+    fn native_child_and_activity_lifecycles_reopen_only_the_bound_parent() {
+        let manager = BrowserManager::default();
+        let mut clients = manager.0.clients.lock().unwrap();
+        clients.insert("source".into(), client("claude"));
+        let mut sibling = client("claude");
+        sibling.session = Some("sibling".into());
+        clients.insert("sibling".into(), sibling);
+        clients.insert("other-agent".into(), client("codex"));
+        drop(clients);
+
+        manager.register_native_child("claude", Path::new("/repo"), "parent", "child", None);
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            true,
+        );
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "agent-tool",
+            false,
+        );
+        assert!(resolve_task_session(&manager.0.clients.lock().unwrap()["source"], None).is_err());
+
+        manager.settle_native_child("claude", Path::new("/repo"), "sibling", "child");
+        assert!(resolve_task_session(&manager.0.clients.lock().unwrap()["source"], None).is_err());
+        manager.settle_native_child("claude", Path::new("/repo"), "parent", "child");
+
+        let clients = manager.0.clients.lock().unwrap();
+        assert_eq!(
+            resolve_task_session(&clients["source"], None).unwrap(),
+            "parent"
+        );
+        for key in ["sibling", "other-agent"] {
+            assert!(clients[key].native_children.is_empty());
+            assert_eq!(
+                resolve_task_session(&clients[key], None).unwrap(),
+                clients[key].session.as_deref().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn child_grants_stay_with_their_parent_agent_directory_and_token() {
+        let manager = BrowserManager::default();
+        let mut clients = manager.0.clients.lock().unwrap();
+        clients.insert("source".into(), client("opencode"));
+        let mut unrelated = client("opencode");
+        unrelated.session = Some("other".into());
+        clients.insert("other-parent".into(), unrelated);
+        clients.insert("other-agent".into(), client("codex"));
+        let mut elsewhere = client("opencode");
+        elsewhere.directory = PathBuf::from("/elsewhere");
+        clients.insert("other-directory".into(), elsewhere);
+        drop(clients);
+        manager.register_native_child(
+            "opencode",
+            Path::new("/repo"),
+            "parent",
+            "child",
+            Some("child"),
+        );
+        manager.register_native_child(
+            "opencode",
+            Path::new("/repo"),
+            "child",
+            "grandchild",
+            Some("grandchild"),
+        );
+        let clients = manager.0.clients.lock().unwrap();
+        assert_eq!(
+            resolve_task_session(&clients["source"], Some("grandchild")).unwrap(),
+            "grandchild"
+        );
+        for key in ["other-parent", "other-agent", "other-directory"] {
+            assert!(clients[key].native_children.is_empty());
+            assert!(resolve_task_session(&clients[key], Some("child")).is_err());
+        }
+    }
+
+    #[test]
+    fn reporting_correction_is_available_only_for_attributable_connections() {
+        let manager = BrowserManager::default();
+        assert!(!manager.task_identity_available("codex", Path::new("/repo"), "parent"));
+        manager
+            .0
+            .clients
+            .lock()
+            .unwrap()
+            .insert("source".into(), client("codex"));
+        assert!(manager.task_identity_available("codex", Path::new("/repo"), "parent"));
+        manager.register_native_child("codex", Path::new("/repo"), "parent", "observed", None);
+        assert!(!manager.task_identity_available("codex", Path::new("/repo"), "parent"));
+        assert!(!manager.task_identity_available("codex", Path::new("/repo"), "observed"));
+        manager
+            .0
+            .clients
+            .lock()
+            .unwrap()
+            .insert("verified".into(), client("opencode"));
+        manager.register_native_child(
+            "opencode",
+            Path::new("/repo"),
+            "parent",
+            "child",
+            Some("child"),
+        );
+        assert!(manager.task_identity_available("opencode", Path::new("/repo"), "parent"));
+        assert!(manager.task_identity_available("opencode", Path::new("/repo"), "child"));
+    }
+
+    #[test]
+    fn owned_session_names_are_resolved_only_inside_the_bound_connection() {
+        let mut source = client("opencode");
+        source.session = Some("sail-owned:owner:parent".into());
+        source
+            .native_children
+            .insert("sail-owned:owner:child".into(), Some("child".into()));
+        assert_eq!(
+            resolve_task_session(&source, Some("parent")).unwrap(),
+            "sail-owned:owner:parent"
+        );
+        assert_eq!(
+            resolve_task_session(&source, Some("child")).unwrap(),
+            "sail-owned:owner:child"
+        );
+        assert!(resolve_task_session(&source, Some("sail-owned:other:child")).is_err());
     }
 }

@@ -111,9 +111,36 @@ export function recordSidebarOpenCodeOutcome(
   return { ...outcomes, [threadKey(thread)]: status };
 }
 
-/** A failed child stays listed, because its failure is a result the user has to read. */
-function retained(receipt: SpawnReceipt | undefined): boolean {
-  return !receipt || !receiptIsSettled(receipt.state) || receipt.state === 'failed';
+/** A failed child stays listed, because its failure is a result the user has to read. The latest
+ * completed native child also stays listed so a lifecycle that starts and finishes within one
+ * parent turn remains inspectable; an older completion becomes collapsible history when a newer
+ * sibling completes. */
+function retained(
+  receipt: SpawnReceipt | undefined,
+  recentCompleted: ReadonlySet<string>,
+): boolean {
+  return (
+    !receipt ||
+    !receiptIsSettled(receipt.state) ||
+    receipt.state === 'failed' ||
+    recentCompleted.has(receipt.receiptId)
+  );
+}
+
+function recentCompletedNativeChildren(receipts: readonly SpawnReceipt[]): Set<string> {
+  const latest = new Map<string, SpawnReceipt>();
+  for (const receipt of receipts) {
+    if (!receipt.receiptId.startsWith('native:') || receipt.state !== 'completed') continue;
+    const parent = `${receipt.sourceDirectory}\0${receipt.sourceId}`;
+    const previous = latest.get(parent);
+    if (
+      !previous ||
+      receipt.updated > previous.updated ||
+      (receipt.updated === previous.updated && receipt.receiptId > previous.receiptId)
+    )
+      latest.set(parent, receipt);
+  }
+  return new Set([...latest.values()].map((receipt) => receipt.receiptId));
 }
 
 function childThread(receipt: SpawnReceipt): AgentThread | null {
@@ -140,6 +167,7 @@ export function sidebarThreadRows(
   everyThread: AgentThread[] = allListed,
 ): SidebarThreadRow[] {
   const native = receipts.filter(nestedReceipt);
+  const recentCompleted = recentCompletedNativeChildren(native);
   const listed = new Set(allListed.map(sidebarThreadIdentity));
   // OpenCode lists only top-level sessions, so its children come from their receipts.
   const threads = [
@@ -171,7 +199,7 @@ export function sidebarThreadRows(
     if (!thread) continue;
     const parentKey = `${receipt.sourceDirectory}\0${acpThreadId(receipt.sourceId)}`;
     const parent = byIdentity.get(parentKey);
-    if (parent && retained(receipt)) {
+    if (parent && retained(receipt, recentCompleted)) {
       const real = anywhere.get(sidebarThreadIdentity(thread));
       const list = references.get(parentKey) ?? [];
       list.push({ thread: real ?? thread, receipt });
@@ -209,13 +237,13 @@ export function sidebarThreadRows(
       nested.reduce((total, child) => total + 1 + countDescendants(child, nextTrail), 0)
     );
   };
-  const hasLiveDescendant = (thread: AgentThread, trail = new Set<string>()): boolean => {
+  const hasRetainedDescendant = (thread: AgentThread, trail = new Set<string>()): boolean => {
     const key = sidebarThreadIdentity(thread);
     if (trail.has(key)) return false;
     const nextTrail = new Set(trail).add(key);
     return (children.get(key) ?? []).some((child) => {
       const receipt = receiptByChild.get(sidebarThreadIdentity(child));
-      return retained(receipt) || hasLiveDescendant(child, nextTrail);
+      return retained(receipt, recentCompleted) || hasRetainedDescendant(child, nextTrail);
     });
   };
   const visit = (thread: AgentThread, depth: number): void => {
@@ -226,11 +254,13 @@ export function sidebarThreadRows(
     const historicalExpanded = expanded.includes(threadKey(thread));
     const historicalChildren = nested.filter((child) => {
       const receipt = receiptByChild.get(sidebarThreadIdentity(child));
-      return !retained(receipt) && !hasLiveDescendant(child);
+      return !retained(receipt, recentCompleted) && !hasRetainedDescendant(child);
     }).length;
     const visible = nested.filter((child) => {
       const receipt = receiptByChild.get(sidebarThreadIdentity(child));
-      return retained(receipt) || hasLiveDescendant(child) || historicalExpanded;
+      return (
+        retained(receipt, recentCompleted) || hasRetainedDescendant(child) || historicalExpanded
+      );
     });
     rows.push({
       key: threadKey(thread),

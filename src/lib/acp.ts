@@ -409,6 +409,8 @@ export interface NativeSubagentSnapshot {
   parentSessionId: string;
   directory: string;
   outcome: 'working' | 'waiting' | 'completed' | 'failed' | 'interrupted' | 'unknown';
+  taskIdentity?: 'verified' | 'observed';
+  taskTurnId?: string | null;
 }
 
 export interface NativeSubagentSnapshotSet {

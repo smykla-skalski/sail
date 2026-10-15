@@ -1,4 +1,6 @@
 import type { ThreadStatus } from './attention.ts';
+import type { AgentActivity, AgentThread } from './acp.ts';
+import { threadKey } from './recent-threads.ts';
 import type { TaskSnapshot } from './session-tasks.ts';
 
 export type AgentFocusDisplay = {
@@ -34,6 +36,19 @@ export function agentFocusDisplay(
   return task
     ? { text: task.title, source: 'Agent report', reportedAt: snapshot?.reportedAt ?? null }
     : { text: observed[status], source: 'Observed status', reportedAt: null };
+}
+
+export function restoredFocusActiveTurns(
+  threads: AgentThread[],
+  activity: Record<string, AgentActivity>,
+): Record<string, string> {
+  return Object.fromEntries(
+    threads.flatMap((thread) => {
+      const turn =
+        activity[JSON.stringify([thread.directory, thread.agent])]?.activeTurns[thread.sessionId];
+      return turn ? [[threadKey(thread), turn]] : [];
+    }),
+  );
 }
 
 export function focusReportTime(at: number): string {

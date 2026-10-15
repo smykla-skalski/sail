@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { agentFocusDisplay } from '../src/lib/agent-focus.ts';
+import { agentFocusDisplay, restoredFocusActiveTurns } from '../src/lib/agent-focus.ts';
 import { buildAgentStatusItems } from '../src/lib/agent-status.ts';
 import { createTaskStore, type TaskSnapshot } from '../src/lib/session-tasks.ts';
 import { buildTaskOverviewCards } from '../src/lib/task-overview.ts';
@@ -100,6 +100,38 @@ void test('legacy snapshots restore tasks without inventing a report timestamp',
 
   assert.equal(store.snapshot(scope).tasks[0].title, 'Inspect repository');
   assert.equal(agentFocusDisplay(store.snapshot(scope), 'working')?.reportedAt, null);
+});
+
+void test('restored active native child keeps its reported focus visible', () => {
+  const parent = {
+    agent: 'claude',
+    directory: '/repo',
+    sessionId: 'parent',
+    title: 'Parent',
+    updated: 1,
+  } as const;
+  const child = {
+    ...parent,
+    sessionId: 'child',
+    title: 'Child',
+    updated: 2,
+  };
+  const activeTurns = restoredFocusActiveTurns([parent, child], {
+    '["/repo","claude"]': {
+      alive: true,
+      active: ['child'],
+      activeTurns: { child: 'turn' },
+      waiting: [],
+      sessions: ['parent', 'child'],
+      finished: {},
+    },
+  });
+
+  assert.deepEqual(agentFocusDisplay(snapshot, 'working', activeTurns[threadKey(child)]), {
+    text: 'Inspect repository',
+    source: 'Agent report',
+    reportedAt: 1_700_000_000_000,
+  });
 });
 
 void test('Tasks and compact Agents rows keep simultaneous provider sessions separate', () => {

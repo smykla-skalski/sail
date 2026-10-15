@@ -79,6 +79,7 @@ pub(crate) fn sweep_runtime_roots(
         &std::env::temp_dir(),
         SystemTime::now(),
         |path| probe.check(path),
+        |paths| probe.check_quarantined(paths),
         in_use,
         report,
     ) {
@@ -151,15 +152,28 @@ impl RuntimeSweepLog {
     }
 }
 
+// Roots hidden in quarantine per final open-file check. One lsof call
+// answers a whole batch, so a pass costs a few scans instead of one per root.
+const RUNTIME_RECLAIM_BATCH: usize = 100;
+
+struct RuntimeCandidate {
+    name: String,
+    path: PathBuf,
+    device: u64,
+    bytes: u64,
+}
+
 fn sweep_runtime_roots_in(
     temp: &Path,
     now: SystemTime,
     open_files: impl Fn(&Path) -> Option<bool>,
+    quarantined_open_files: impl Fn(&[PathBuf]) -> Vec<Option<bool>>,
     in_use: &dyn Fn(&Path) -> bool,
     report: &mut dyn FnMut(&str, RuntimeRootEvent),
 ) -> std::io::Result<()> {
     let euid = unsafe { nix::libc::geteuid() };
     let ignore_idle_age = now + IDLE_AGE + Duration::from_secs(1);
+    let mut candidates = Vec::new();
     for entry in fs::read_dir(temp)? {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
@@ -233,20 +247,78 @@ fn sweep_runtime_roots_in(
             );
             continue;
         };
-        match reclaim_root(
+        candidates.push(RuntimeCandidate {
+            name: name.to_string(),
+            path,
+            device: metadata.dev(),
+            bytes,
+        });
+    }
+    for batch in candidates.chunks(RUNTIME_RECLAIM_BATCH) {
+        reclaim_runtime_batch(
             temp,
-            &path,
-            name,
-            metadata.dev(),
+            batch,
             ignore_idle_age,
             &open_files,
-        ) {
-            Ok(()) => report(name, RuntimeRootEvent::Removed { bytes }),
-            Err(_) if !path.exists() => {}
-            Err(reason) => report(name, RuntimeRootEvent::Kept { reason }),
-        }
+            &quarantined_open_files,
+            in_use,
+            report,
+        );
     }
     Ok(())
+}
+
+fn reclaim_runtime_batch(
+    temp: &Path,
+    batch: &[RuntimeCandidate],
+    now: SystemTime,
+    open_files: &impl Fn(&Path) -> Option<bool>,
+    quarantined_open_files: &impl Fn(&[PathBuf]) -> Vec<Option<bool>>,
+    in_use: &dyn Fn(&Path) -> bool,
+    report: &mut dyn FnMut(&str, RuntimeRootEvent),
+) {
+    let mut hidden = Vec::new();
+    for candidate in batch {
+        // Earlier batches took time since the scan; a gate may have started.
+        if in_use(&candidate.path) {
+            report(
+                &candidate.name,
+                RuntimeRootEvent::Kept {
+                    reason: "build in use",
+                },
+            );
+            continue;
+        }
+        match quarantine_root(
+            temp,
+            &candidate.path,
+            &candidate.name,
+            candidate.device,
+            open_files,
+        ) {
+            Ok(quarantined) => hidden.push((candidate, quarantined)),
+            Err(_) if !candidate.path.exists() => {}
+            Err(reason) => report(&candidate.name, RuntimeRootEvent::Kept { reason }),
+        }
+    }
+    let paths = hidden
+        .iter()
+        .map(|(_, quarantined)| quarantined.quarantine.clone())
+        .collect::<Vec<_>>();
+    let mut open = quarantined_open_files(&paths).into_iter();
+    for (candidate, quarantined) in hidden {
+        let open = open.next().flatten();
+        match finish_quarantined(quarantined, now, || open) {
+            Ok(()) => report(
+                &candidate.name,
+                RuntimeRootEvent::Removed {
+                    bytes: candidate.bytes,
+                },
+            ),
+            Err(_) if !candidate.path.exists() => {}
+            Err(reason) => report(&candidate.name, RuntimeRootEvent::Kept { reason }),
+        }
+    }
 }
 
 /// Native acceptance runs install a signed app under `~/Applications`, outside
@@ -636,6 +708,29 @@ fn reclaim_root(
     now: SystemTime,
     open_files: &impl Fn(&Path) -> Option<bool>,
 ) -> Result<(), &'static str> {
+    let quarantined = quarantine_root(temp, path, name, device, open_files)?;
+    let hidden = quarantined.quarantine.clone();
+    finish_quarantined(quarantined, now, || open_files(&hidden))
+}
+
+// A root hidden under a private name, waiting for its final open-file check.
+struct Quarantined {
+    original: PathBuf,
+    private: PathBuf,
+    quarantine: PathBuf,
+    device: u64,
+}
+
+// Checks the root's open files, then hides it under a name no process can
+// list. The check after this rename is the authority; this one only spares a
+// busy root the rename.
+fn quarantine_root(
+    temp: &Path,
+    path: &Path,
+    name: &str,
+    device: u64,
+    open_files: &impl Fn(&Path) -> Option<bool>,
+) -> Result<Quarantined, &'static str> {
     // An unknown lsof result is unsafe: lack of permission is not proof of idleness.
     match open_files(path) {
         Some(false) => {}
@@ -670,11 +765,32 @@ fn reclaim_root(
             "gone"
         });
     }
+    Ok(Quarantined {
+        original: path.to_path_buf(),
+        private,
+        quarantine,
+        device,
+    })
+}
+
+// Deletes a quarantined root once its final open-file check passes, or
+// restores it under its original name.
+fn finish_quarantined(
+    quarantined: Quarantined,
+    now: SystemTime,
+    open_files: impl FnOnce() -> Option<bool>,
+) -> Result<(), &'static str> {
+    let Quarantined {
+        original: path,
+        private,
+        quarantine,
+        device,
+    } = quarantined;
     let safe = inspect(&quarantine, device, now).is_ok_and(|result| result.is_some())
         && marker_owner_dead(&quarantine)
-        && open_files(&quarantine) == Some(false);
+        && open_files() == Some(false);
     if !safe {
-        restore(&quarantine, path);
+        restore(&quarantine, &path);
         if !quarantine.exists() {
             remove_private_parent(&private);
         }
@@ -683,7 +799,7 @@ fn reclaim_root(
     // Keep the verified owner outside the tree being removed. A crash can
     // otherwise delete the root marker first and strand a partial build.
     if save_private_owner(&quarantine, &private).is_err() {
-        restore(&quarantine, path);
+        restore(&quarantine, &path);
         if !quarantine.exists() {
             remove_private_parent(&private);
         }
@@ -1056,18 +1172,64 @@ impl OpenFileProbe {
         if !quarantined {
             return Some(listing_names_root(&self.open_file_listing()?, root));
         }
-        // +D misses an unlinked file that is still open, and +L1 lists those
-        // descriptors with their last path; selections combine as a union.
+        Some(listing_names_root(&self.quarantine_listing(&[path])?, root))
+    }
+
+    // lsof +D misses an unlinked file that is still open, and +L1 lists those
+    // descriptors with their last path; selections combine as a union. Every
+    // +D directory is searched in the same scan of the process table.
+    fn quarantine_listing(&self, paths: &[&Path]) -> Option<Vec<u8>> {
         self.reads.set(self.reads.get() + 1);
-        let output = background_lsof()
-            .args(["-nP", "-Fn", "+L1", "+D"])
-            .arg(path)
-            .output()
-            .ok()?;
+        let mut command = background_lsof();
+        command.args(["-nP", "-Fn", "+L1"]);
+        for path in paths {
+            command.arg("+D").arg(path);
+        }
+        let output = command.output().ok()?;
         if !output.stderr.is_empty() || !matches!(output.status.code(), Some(0 | 1)) {
             return None;
         }
-        Some(listing_names_root(&output.stdout, root))
+        Some(output.stdout)
+    }
+
+    /// Final check for roots already hidden in quarantine, one scan for all of
+    /// them. If the combined scan fails, the batch is halved until the failing
+    /// root stands alone, so one unreadable root cannot keep the rest.
+    fn check_quarantined(&self, paths: &[PathBuf]) -> Vec<Option<bool>> {
+        let canonical = paths
+            .iter()
+            .map(|path| fs::canonicalize(path).ok())
+            .collect::<Vec<_>>();
+        let mut results = vec![None; paths.len()];
+        let listed = canonical
+            .iter()
+            .enumerate()
+            .filter_map(|(index, root)| root.as_deref().map(|root| (index, root)))
+            .collect::<Vec<_>>();
+        self.scan_quarantined(&listed, &mut results);
+        results
+    }
+
+    fn scan_quarantined(&self, roots: &[(usize, &Path)], results: &mut [Option<bool>]) {
+        use std::os::unix::ffi::OsStrExt;
+
+        match roots {
+            [] => {}
+            [(index, root)] => results[*index] = self.check(root),
+            _ => {
+                let paths = roots.iter().map(|(_, root)| *root).collect::<Vec<_>>();
+                if let Some(listing) = self.quarantine_listing(&paths) {
+                    for (index, root) in roots {
+                        results[*index] =
+                            Some(listing_names_root(&listing, root.as_os_str().as_bytes()));
+                    }
+                } else {
+                    let (first, second) = roots.split_at(roots.len() / 2);
+                    self.scan_quarantined(first, results);
+                    self.scan_quarantined(second, results);
+                }
+            }
+        }
     }
 }
 
@@ -1427,6 +1589,12 @@ mod tests {
         root
     }
 
+    fn each(
+        open_files: impl Fn(&Path) -> Option<bool>,
+    ) -> impl Fn(&[PathBuf]) -> Vec<Option<bool>> {
+        move |paths| paths.iter().map(|path| open_files(path)).collect()
+    }
+
     fn runtime_sweep(
         temp: &Path,
         open_files: impl Fn(&Path) -> Option<bool>,
@@ -1435,7 +1603,8 @@ mod tests {
         sweep_runtime_roots_in(
             temp,
             SystemTime::now(),
-            open_files,
+            &open_files,
+            each(&open_files),
             &|_| false,
             &mut |name, event| {
                 let outcome = match event {
@@ -1556,6 +1725,7 @@ mod tests {
             &temp,
             SystemTime::now(),
             |_| Some(false),
+            each(|_| Some(false)),
             &|path| path == busy,
             &mut |_, event| {
                 events.push(matches!(
@@ -1587,6 +1757,7 @@ mod tests {
                 }
                 Some(false)
             },
+            each(|_| Some(false)),
             &|_| false,
             &mut |reported, _| events.push(reported.to_string()),
         )
@@ -1644,6 +1815,7 @@ mod tests {
             &temp,
             later,
             |_| Some(false),
+            each(|_| Some(false)),
             &|_| false,
             &mut |name, event| {
                 events.push((
@@ -1711,6 +1883,253 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("sail-"))
             .count();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn runtime_sweep_restores_only_the_batch_roots_that_fail_the_final_check() {
+        let temp = fixture();
+        let dead = format!("{} 1", i32::MAX);
+        let held = runtime_root(&temp, Some(&dead));
+        let unknown = runtime_root(&temp, Some(&dead));
+        let free = runtime_root(&temp, Some(&dead));
+        fs::write(held.join("held"), "").unwrap();
+        fs::write(unknown.join("unknown"), "").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let mut events = std::collections::HashMap::new();
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now(),
+            |_| Some(false),
+            |paths| {
+                calls.set(calls.get() + 1);
+                paths
+                    .iter()
+                    .map(|path| {
+                        if path.join("unknown").exists() {
+                            None
+                        } else {
+                            Some(path.join("held").exists())
+                        }
+                    })
+                    .collect()
+            },
+            &|_| false,
+            &mut |name, event| {
+                events.insert(
+                    name.to_string(),
+                    match event {
+                        RuntimeRootEvent::Removed { .. } => "removed",
+                        RuntimeRootEvent::Kept { reason } => reason,
+                    },
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1, "one final check for the whole batch");
+        for (root, outcome, present) in [
+            (&held, "changed while removing", true),
+            (&unknown, "changed while removing", true),
+            (&free, "removed", false),
+        ] {
+            let name = root.file_name().unwrap().to_str().unwrap();
+            assert_eq!(events[name], outcome);
+            assert_eq!(root.exists(), present);
+        }
+        assert!(fs::read_dir(&*temp)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("sail-cleanup-private-")));
+    }
+
+    #[test]
+    fn runtime_sweep_splits_a_large_pass_into_bounded_batches() {
+        let temp = fixture();
+        let total = RUNTIME_RECLAIM_BATCH * 2 + 1;
+        for _ in 0..total {
+            let root = temp.join(format!("sail-runtime-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("artifact"), "build output").unwrap();
+            fs::write(root.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        }
+        let sizes = std::cell::RefCell::new(Vec::new());
+        let mut removed = 0;
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now(),
+            |_| Some(false),
+            |paths| {
+                sizes.borrow_mut().push(paths.len());
+                vec![Some(false); paths.len()]
+            },
+            &|_| false,
+            &mut |_, event| removed += matches!(event, RuntimeRootEvent::Removed { .. }) as usize,
+        )
+        .unwrap();
+        assert_eq!(removed, total);
+        assert_eq!(
+            *sizes.borrow(),
+            vec![RUNTIME_RECLAIM_BATCH, RUNTIME_RECLAIM_BATCH, 1]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_scan_checks_every_quarantined_root_in_a_batch() {
+        let temp = fixture();
+        let roots = (0..4)
+            .map(|index| {
+                let root = temp.join(format!("sail-cleanup-private-{index}/child"));
+                fs::create_dir_all(&root).unwrap();
+                root
+            })
+            .collect::<Vec<_>>();
+        let probe = OpenFileProbe::default();
+        assert_eq!(probe.check_quarantined(&roots), vec![Some(false); 4]);
+        assert_eq!(probe.reads.get(), 1);
+        let linked = fs::File::create(roots[1].join("linked")).unwrap();
+        let unlinked = fs::File::create(roots[3].join("unlinked")).unwrap();
+        fs::remove_file(roots[3].join("unlinked")).unwrap();
+        assert_eq!(
+            probe.check_quarantined(&roots),
+            vec![Some(false), Some(true), Some(false), Some(true)]
+        );
+        assert_eq!(probe.reads.get(), 2);
+        drop((linked, unlinked));
+        assert_eq!(probe.check_quarantined(&roots), vec![Some(false); 4]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_batch_check_keeps_order_when_a_root_cannot_be_resolved() {
+        let temp = fixture();
+        let roots = [0, 1, 2].map(|index| {
+            let root = temp.join(format!("sail-cleanup-private-{index}/child"));
+            fs::create_dir_all(&root).unwrap();
+            root
+        });
+        let missing = temp.join("sail-cleanup-private-gone/child");
+        let held = fs::File::create(roots[2].join("held")).unwrap();
+        let paths = vec![
+            roots[0].clone(),
+            missing,
+            roots[1].clone(),
+            roots[2].clone(),
+        ];
+        let probe = OpenFileProbe::default();
+        assert_eq!(
+            probe.check_quarantined(&paths),
+            vec![Some(false), None, Some(false), Some(true)]
+        );
+        drop(held);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreadable_root_does_not_hide_the_roots_beside_it() {
+        let temp = fixture();
+        let roots = (0..5)
+            .map(|index| {
+                let root = temp.join(format!("sail-cleanup-private-{index}/child"));
+                fs::create_dir_all(root.join("sub")).unwrap();
+                root
+            })
+            .collect::<Vec<_>>();
+        let held = fs::File::create(roots[4].join("held")).unwrap();
+        fs::set_permissions(roots[1].join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = OpenFileProbe::default();
+        let results = probe.check_quarantined(&roots);
+        fs::set_permissions(roots[1].join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        drop(held);
+        assert_eq!(results[1], None);
+        assert_eq!(
+            [results[0], results[2], results[3], results[4]],
+            [Some(false), Some(false), Some(false), Some(true)]
+        );
+        assert!(probe.reads.get() < roots.len() as u32 * 2);
+    }
+
+    #[test]
+    fn runtime_sweep_rechecks_a_running_build_just_before_quarantine() {
+        let temp = fixture();
+        let root = runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        let busy = root.clone();
+        let asked = std::cell::Cell::new(0);
+        let mut kept = Vec::new();
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now(),
+            |_| Some(false),
+            each(|_| Some(false)),
+            &|path| {
+                asked.set(asked.get() + 1);
+                // The build starts after the first check, before the rename.
+                path == busy && asked.get() > 1
+            },
+            &mut |_, event| {
+                if let RuntimeRootEvent::Kept { reason } = event {
+                    kept.push(reason);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(kept, vec!["build in use"]);
+        assert!(root.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_runtime_pass_scans_open_files_twice_for_any_number_of_roots() {
+        let temp = fixture();
+        for _ in 0..8 {
+            runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+        }
+        let probe = OpenFileProbe::default();
+        let mut removed = 0;
+        sweep_runtime_roots_in(
+            &temp,
+            SystemTime::now(),
+            |path| probe.check(path),
+            |paths| probe.check_quarantined(paths),
+            &|_| false,
+            &mut |_, event| removed += matches!(event, RuntimeRootEvent::Removed { .. }) as u32,
+        )
+        .unwrap();
+        assert_eq!(removed, 8);
+        // One shared listing for the first checks, one scan for the batch.
+        assert_eq!(probe.reads.get(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "timing benchmark that runs the real lsof"]
+    fn runtime_sweep_pass_time_at_scale() {
+        for count in [100, 500, 1000] {
+            let temp = fixture();
+            for _ in 0..count {
+                runtime_root(&temp, Some(&format!("{} 1", i32::MAX)));
+            }
+            let probe = OpenFileProbe::default();
+            let mut removed = 0;
+            let started = std::time::Instant::now();
+            sweep_runtime_roots_in(
+                &temp,
+                SystemTime::now(),
+                |path| probe.check(path),
+                |paths| probe.check_quarantined(paths),
+                &|_| false,
+                &mut |_, event| removed += matches!(event, RuntimeRootEvent::Removed { .. }) as u32,
+            )
+            .unwrap();
+            eprintln!(
+                "BENCH roots={count} removed={removed} lsof_reads={} seconds={:.1}",
+                probe.reads.get(),
+                started.elapsed().as_secs_f64()
+            );
+            assert_eq!(removed, count);
+        }
     }
 
     #[test]

@@ -628,48 +628,74 @@ mod tests {
     fn recovery_stops_background_groups_in_a_recorded_session() {
         use std::time::Instant;
 
-        let path = directory();
-        let marker = path.join("survived");
-        let ready = path.join("ready");
-        let registry = new_registry(&path, process_started(std::process::id()).unwrap());
-        let previous = new_registry(&path, 0);
-        let mut command = Command::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                "set -m; (sleep 1; touch \"$1\") & touch \"$2\"; wait",
-                "sh",
-            ])
-            .arg(&marker)
-            .arg(&ready);
-        unsafe {
-            command.pre_exec(|| {
-                if nix::libc::setsid() == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
+        for recover in [false, true] {
+            let path = directory();
+            let marker = path.join("survived");
+            let ready = path.join("ready");
+            let release = path.join("release");
+            let registry = new_registry(&path, process_started(std::process::id()).unwrap());
+            let previous = new_registry(&path, 0);
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "set -m; (while ! test -e \"$3\"; do sleep 0.01; done; touch \"$1\") & printf '%s' \"$!\" > \"$2\"; wait",
+                    "sh",
+                ])
+                .arg(&marker)
+                .arg(&ready)
+                .arg(&release);
+            unsafe {
+                command.pre_exec(|| {
+                    if nix::libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut shell = command.spawn().unwrap();
+            previous
+                .register_session("crashed-session", shell.id(), shell.id())
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let background = loop {
+                if let Some(pid) = std::fs::read_to_string(&ready)
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                {
+                    break pid;
                 }
-            });
+                assert!(Instant::now() < deadline, "background job did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                process_started(background).is_some(),
+                "background job is not alive"
+            );
+            assert!(!marker.exists());
+            if recover {
+                {
+                    let mut state = previous.state.lock().unwrap();
+                    state.processes[0].recorded = now() - RECOVERY_GRACE.as_secs();
+                    previous.save(&state).unwrap();
+                }
+                registry.recover().unwrap();
+            }
+            std::fs::write(&release, []).unwrap();
+            shell.wait().unwrap();
+            if recover {
+                std::thread::sleep(Duration::from_millis(1200));
+                assert!(!marker.exists(), "background group survived crash recovery");
+            } else {
+                shell.wait().unwrap();
+                assert!(
+                    marker.exists(),
+                    "live background job did not observe release"
+                );
+            }
+            std::fs::remove_dir_all(path).unwrap();
         }
-        let mut shell = command.spawn().unwrap();
-        previous
-            .register_session("crashed-session", shell.id(), shell.id())
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !ready.exists() {
-            assert!(Instant::now() < deadline, "background job did not start");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        {
-            let mut state = previous.state.lock().unwrap();
-            state.processes[0].recorded = now() - RECOVERY_GRACE.as_secs();
-            previous.save(&state).unwrap();
-        }
-        registry.recover().unwrap();
-        shell.wait().unwrap();
-        std::thread::sleep(Duration::from_millis(1200));
-        assert!(!marker.exists(), "background group survived crash recovery");
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

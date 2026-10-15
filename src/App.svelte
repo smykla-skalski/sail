@@ -27,10 +27,15 @@
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
-  import { agentFocusDisplay, type AgentFocusDisplay } from './lib/agent-focus';
+  import {
+    agentFocusDisplay,
+    restoredFocusActiveTurns,
+    type AgentFocusDisplay,
+  } from './lib/agent-focus';
   import TasksPanel from './TasksPanel.svelte';
   import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
   import { sessionTasks, TASK_TOOLS, taskScopeKey } from './lib/session-tasks';
+  import { createNativeTaskReconciler } from './lib/native-session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import {
     acpPlanBackend,
@@ -257,10 +262,10 @@
   import DiffPanel from './DiffPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
   import {
+    createSidebarListingClock,
+    createSidebarPassOwnership,
     createSidebarThreadLoader,
     mergeSidebarRefreshPaths,
-    SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS,
-    sidebarFocusRefreshDue,
     unlistedSidebarPaths,
     type SidebarRefreshPaths,
   } from './lib/sidebar-inventory';
@@ -478,6 +483,7 @@
   import { copyCompletedSelection, copyStatusHost } from './lib/auto-copy';
   import {
     coordinationKey,
+    coordinationSourceThread,
     coordinationPrompt,
     enqueueCoordinationMessage,
     loadCoordinationMessages,
@@ -1735,13 +1741,15 @@
   let disposed = false;
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
-  let sidebarInventoryGeneration = 0;
+  const sidebarPassOwnership = createSidebarPassOwnership();
   const sidebarInventoryRequests = new SvelteSet<Promise<unknown>>();
   let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let sidebarInventoryReadyKey = '';
   let sidebarInventoryWaiting: SidebarRefreshPaths | undefined;
-  let sidebarInventoryLastFullListing = 0;
+  // Directories outside the catalog that a thread asked to list; any other path must be in it.
+  const sidebarInventoryOutside = new SvelteSet<string>();
+  const sidebarListingClock = createSidebarListingClock();
   let sidebarInventoryDeferred = false;
   let sidebarFocusPending = false;
   let sidebarFocusTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2158,6 +2166,7 @@
     setSidebarWidth(width);
   }
 
+  const reconcileNativeTasks = createNativeTaskReconciler(sessionTasks());
   let tasksTick = $state(0);
   let taskSnapshot = $derived.by(() => {
     void tasksTick;
@@ -3306,6 +3315,7 @@
   async function reconcileProviderNativeSubagents(issue: ShipIssue): Promise<number> {
     if (!issue.path) return 0;
     const nativeSnapshot = await acp.nativeSubagents(issue.path);
+    await reconcileNativeTasks(issue.path, nativeSnapshot);
     const previous = nativeSubagents;
     nativeSubagents = reconcileNativeSubagents(nativeSubagents, nativeSnapshot.subagents);
     if (nativeSubagents !== previous) nativeSubagentGeneration += 1;
@@ -6311,15 +6321,16 @@
 
   async function coordinationSource(request: CoordinationRequest): Promise<CoordinationSource> {
     if (!request.sourceAgent) throw new Error('The source agent session is unavailable.');
-    const matches = agentThreads.filter(
-      (item) =>
-        item.directory === request.directory &&
-        item.sessionId === request.sessionId &&
-        item.agent === request.sourceAgent,
-    );
-    if (matches.length > 1) throw new Error('The source agent session is ambiguous.');
-    const thread = matches[0];
+    const thread = coordinationSourceThread([...agentThreads, ...nativeChildThreads], {
+      agent: request.sourceAgent,
+      directory: request.directory,
+      sessionId: request.sessionId,
+    });
     if (!thread) throw new Error('The source agent session is unavailable.');
+    const child =
+      nativeSubagents[nativeSubagentId(thread.agent, thread.directory, thread.sessionId)];
+    if (child && child.taskIdentity !== 'verified')
+      throw new Error('Observed native child activity has no verified task identity.');
     const runtime = (await acp.activity(thread.directory))[thread.agent];
     if (!runtime?.alive || !runtime.sessions.includes(thread.sessionId))
       throw new Error('The source agent session is unavailable.');
@@ -6664,6 +6675,11 @@
   async function performCoordination(request: CoordinationRequest): Promise<unknown> {
     const project = coordinationProject(request.directory);
     if (!project) throw new Error('This worktree is not in the Sail project catalog.');
+    if (request.name === TASK_TOOLS.read || request.name === TASK_TOOLS.report) {
+      const snapshot = await acp.nativeSubagents(request.directory);
+      await reconcileNativeTasks(request.directory, snapshot);
+      nativeSubagents = reconcileNativeSubagents(nativeSubagents, snapshot.subagents);
+    }
     const source = await coordinationSource(request);
     const sourceId = `acp:${source.agent}:${request.sessionId}`;
     const effectiveProfile = effectiveCapabilityProfileForAcpSession(
@@ -10943,14 +10959,23 @@
 
   async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;
-    const generation = ++sidebarInventoryGeneration;
+    const pass = sidebarPassOwnership.begin(paths);
     const request = Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
     sidebarInventoryRequests.add(request);
-    const results = await request.finally(() => sidebarInventoryRequests.delete(request));
-    if (generation !== sidebarInventoryGeneration || disposed) return null;
-    const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
-    for (const path of paths) if (!failed.has(path)) sidebarListedDirectories[path] = true;
-    const listed = new Set(paths);
+    const settled = await request.finally(() => sidebarInventoryRequests.delete(request));
+    if (disposed) return null;
+    // A newer pass that listed a directory owns its result; the rest of this pass still applies.
+    const ownedPaths = new Set(sidebarPassOwnership.owned(paths, pass));
+    const owned = paths.flatMap((path, index) =>
+      ownedPaths.has(path) ? [{ path, result: settled[index] }] : [],
+    );
+    if (owned.length === 0) return null;
+    const results = owned.map((entry) => entry.result);
+    const failed = new Set(
+      owned.filter((entry) => entry.result?.status === 'rejected').map((entry) => entry.path),
+    );
+    for (const { path } of owned) if (!failed.has(path)) sidebarListedDirectories[path] = true;
+    const listed = new Set(owned.map((entry) => entry.path));
     const retained = sidebarOpenCodeThreads.filter(
       (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
     );
@@ -10959,14 +10984,14 @@
     );
     sidebarOpenCodeThreads = [
       ...results
-        .flatMap((result) => (result.status === 'fulfilled' ? result.value : []))
+        .flatMap((result) => (result?.status === 'fulfilled' ? result.value : []))
         .map((thread) => {
           const saved = renamed.get(threadKey(thread));
           return saved ? Object.assign({}, thread, { title: saved.title, renamed: true }) : thread;
         }),
       ...retained,
     ];
-    const failure = results.find((result) => result.status === 'rejected');
+    const failure = results.find((result) => result?.status === 'rejected');
     return failure?.status === 'rejected'
       ? `Could not list OpenCode sessions: ${describe(failure.reason)}`
       : null;
@@ -10994,9 +11019,14 @@
       const directories: string[] = JSON.parse(sidebarDirectoryKey);
       const wanted = sidebarInventoryWaiting;
       sidebarInventoryWaiting = undefined;
-      if (!wanted) sidebarInventoryLastFullListing = Date.now();
-      const selected = wanted ? directories.filter((path) => wanted.has(path)) : directories;
-      void refreshSidebarOpenCodeThreads(selected.length > 0 ? selected : directories).then(
+      const selected = sidebarListingClock.plan(
+        directories,
+        wanted,
+        Date.now(),
+        sidebarInventoryOutside,
+      );
+      sidebarInventoryOutside.clear();
+      void refreshSidebarOpenCodeThreads(selected).then(
         (failure) => {
           reportSidebarInventoryFailure(failure);
           if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
@@ -11022,11 +11052,11 @@
       return;
     }
     const now = Date.now();
-    if (!sidebarFocusRefreshDue(sidebarInventoryLastFullListing, now)) {
+    if (!sidebarListingClock.focusRefreshDue(now)) {
       // Focus stays put after this event, so check again once the last listing is old enough.
       sidebarFocusTimer = setTimeout(
         refreshSidebarOnFocus,
-        SIDEBAR_FOCUS_REFRESH_MIN_AGE_MS - (now - sidebarInventoryLastFullListing),
+        sidebarListingClock.focusRefreshDelay(now),
       );
       return;
     }
@@ -12484,6 +12514,8 @@
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
       rememberRecentThread(thread);
+      if (!(JSON.parse(sidebarDirectoryKey) as string[]).includes(thread.directory))
+        sidebarInventoryOutside.add(thread.directory);
       scheduleSidebarInventoryRefresh(250, [thread.directory]);
       return;
     }
@@ -12991,14 +13023,9 @@
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
       }
-      focusActiveTurns = Object.fromEntries(
-        agentThreads.flatMap((thread) => {
-          const turn =
-            backendActivity[JSON.stringify([thread.directory, thread.agent])]?.activeTurns[
-              thread.sessionId
-            ];
-          return turn ? [[threadKey(thread), turn]] : [];
-        }),
+      focusActiveTurns = restoredFocusActiveTurns(
+        [...agentThreads, ...nativeChildThreads],
+        backendActivity,
       );
       const previousAttention = threadAttention;
       threadAttention = reconcileAttention(
@@ -13328,6 +13355,23 @@
       eventProfile,
     );
     if (nativeSubagents !== previousNativeSubagents) nativeSubagentGeneration += 1;
+    const childUpdate = event.message.params?.update as { sessionUpdate?: string } | undefined;
+    if (
+      event.message.method === 'session/update' &&
+      (childUpdate?.sessionUpdate === 'subagent_spawned' ||
+        childUpdate?.sessionUpdate === 'subagent_state_update')
+    ) {
+      void acp
+        .nativeSubagents(eventDirectory)
+        .then(async (snapshot) => {
+          if (await reconcileNativeTasks(eventDirectory, snapshot))
+            nativeSubagents = reconcileNativeSubagents(nativeSubagents, snapshot.subagents);
+          return undefined;
+        })
+        .catch((cause) => {
+          error = `Could not save native child tasks: ${describe(cause)}`;
+        });
+    }
     const nativeUpdate = event.message.params?.update;
     if (
       event.message.method === 'session/update' &&
@@ -13645,6 +13689,12 @@
         eventDirectory,
         disconnectedSessionIds,
       );
+      void acp
+        .nativeSubagents(eventDirectory)
+        .then((snapshot) => reconcileNativeTasks(eventDirectory, snapshot))
+        .catch((cause) => {
+          error = `Could not save disconnected child tasks: ${describe(cause)}`;
+        });
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
@@ -14236,6 +14286,19 @@
                 )}
                 onopensubagent={openSpawnTarget}
                 {subagentControl}
+                observedTaskActivity={acpThread
+                  ? (() => {
+                      const child =
+                        nativeSubagents[
+                          nativeSubagentId(
+                            acpThread.agent,
+                            acpThread.directory,
+                            acpThread.sessionId,
+                          )
+                        ];
+                      return child && child.taskIdentity !== 'verified' ? child.activity : null;
+                    })()
+                  : null}
                 childPrompts={acpThread
                   ? nativeSubagentAcceptsPrompts(
                       nativeSubagents[
@@ -14583,6 +14646,15 @@
         {#if acpAgent}<div class:inactive={activeSideTab !== 'tasks'} class="side-view">
             <TasksPanel
               snapshot={taskSnapshot}
+              observedActivity={acpThread
+                ? (() => {
+                    const child =
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ];
+                    return child && child.taskIdentity !== 'verified' ? child.activity : null;
+                  })()
+                : null}
               status={acpThread ? (agentStatusStatuses[threadKey(acpThread)] ?? null) : null}
             />
           </div>{/if}

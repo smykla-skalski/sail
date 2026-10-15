@@ -19,9 +19,12 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal }) 
     }
   };
   let killTimer;
+  let killed = false;
   const cancel = () => {
     signalGroup('SIGTERM');
-    killTimer ??= setTimeout(() => signalGroup('SIGKILL'), 1000);
+    killTimer ??= setTimeout(() => {
+      killed = signalGroup('SIGKILL');
+    }, 1000);
   };
   signal.addEventListener('abort', cancel, { once: true });
   child.stdout.on('data', (data) => output.push(data));
@@ -36,12 +39,12 @@ export async function runOwnedCommand(program, args, { cwd, env, log, signal }) 
     return await exited;
   } finally {
     signal.removeEventListener('abort', cancel);
+    clearTimeout(killTimer);
     // The detached group remains owned after its leader exits.
-    if (signalGroup('SIGTERM')) {
+    if (!killed && signalGroup('SIGTERM')) {
       await delay(1000);
       signalGroup('SIGKILL');
     }
-    clearTimeout(killTimer);
     await Promise.race([closed, delay(1000)]);
     writeFileSync(log, Buffer.concat(output));
   }
