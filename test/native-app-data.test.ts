@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -153,15 +153,31 @@ await test('a process that only mentions the bundle path does not keep a run liv
     spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', mentioned], { stdio: 'ignore' }),
     spawn(executable, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }),
   ];
-  context.after(() => spawned.forEach((child) => child.kill('SIGKILL')));
+  context.after(async () => {
+    await Promise.all(
+      spawned.map(
+        (child) =>
+          new Promise<void>((resolve) => {
+            if (child.exitCode !== null || child.signalCode !== null) return resolve();
+            child.once('exit', () => resolve());
+            child.kill('SIGKILL');
+          }),
+      ),
+    );
+  });
   await delay(300);
 
-  const commands = listProcessCommands();
+  const readProcesses = () =>
+    execFileSync('/bin/ps', ['-p', spawned.map((child) => child.pid).join(','), '-o', 'command='], {
+      encoding: 'utf8',
+    });
+  const commands = readProcesses();
+  assert.equal(commands.trim().split('\n').length, spawned.length);
   assert.ok(commands.includes(`tail -f ${mentioned}`));
   const live = liveRunTokens(commands);
   assert.equal(live.has(real.slice(-32, -24)), true);
   assert.equal(live.has(lookAlike.slice(-32, -24)), false);
-  assert.equal(sweepRunData(roots, listProcessCommands).removed.length, roots.length);
+  assert.equal(sweepRunData(roots, readProcesses).removed.length, roots.length);
   assert.deepEqual(remaining(lookAlike), []);
   assert.deepEqual(remaining(real), roots);
 });
