@@ -18,6 +18,7 @@ import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processStart } from '../scripts/e2e-state.mjs';
 import { nativeApp } from '../scripts/native-app.mjs';
+import { isOwnProcess, signalablePid } from '../scripts/native-signal-guard.mjs';
 import {
   reapDeadRuns,
   registerRun,
@@ -51,10 +52,11 @@ function alive(pid: number) {
 function stopAtEnd(context: test.TestContext, ...pids: number[]) {
   context.after(() => {
     for (const pid of pids) {
+      if (!Number.isSafeInteger(pid) || pid <= 1) continue;
       try {
         process.kill(pid, 'SIGKILL');
       } catch {
-        return;
+        continue;
       }
     }
   });
@@ -78,8 +80,8 @@ async function startRunner(
   registry: string,
   name: string,
 ): Promise<Started> {
-  const binary = join(root, name, 'Sail E2E.app/Contents/MacOS/sail');
-  mkdirSync(join(root, name, 'Sail E2E.app/Contents/MacOS'), { recursive: true });
+  const binary = join(root, name, 'Sail E2E 0123abcd.app/Contents/MacOS/sail');
+  mkdirSync(join(root, name, 'Sail E2E 0123abcd.app/Contents/MacOS'), { recursive: true });
   copyFileSync('/bin/cat', binary);
   execFileSync('codesign', ['-f', '-s', '-', binary]);
   const pidFile = join(root, `${name}.descendant`);
@@ -114,34 +116,48 @@ async function startRunner(
   return { runner, ...started, id: name };
 }
 
+const noSignals = (sent: Array<[number, string]>) => (pid: number, signal: string) => {
+  sent.push([pid, signal]);
+};
+
+const reap = (registry: string, options: Parameters<typeof reapDeadRuns>[1]) =>
+  reapDeadRuns(registry, { kill: noSignals([]), ...options });
+
 await test(
-  'a runner killed with SIGKILL leaves its processes, and the next run stops them and no others',
+  'a runner killed with SIGKILL leaves its processes, and the next run asks to stop them and no others',
   { skip: !darwin },
   async (context) => {
     const root = scratch(context);
     const registry = join(root, 'registry');
     const killed = await startRunner(context, root, registry, 'killed');
     const running = await startRunner(context, root, registry, 'running');
-    const killedRecord = recordsIn(registry).find((record) => record.id === 'killed');
-    const leader = killedRecord.groups[0].pid;
-    stopAtEnd(context, leader);
+    const record = (id: string) => recordsIn(registry).find((candidate) => candidate.id === id);
+    const killedGroup = record('killed').groups[0].pid;
+    const runningGroup = record('running').groups[0].pid;
 
     const exited = new Promise((resolve) => killed.runner.once('exit', resolve));
     killed.runner.kill('SIGKILL');
     await exited;
     assert.ok(alive(killed.app) && alive(killed.descendant), 'the dead run leaves its processes');
 
-    const { stopApp, appProcesses } = nativeApp({ checkout });
-    const result = await reapDeadRuns(registry, { stopApp, appProcesses });
+    const sent: Array<[number, string]> = [];
+    const stopped: string[] = [];
+    const result = await reap(registry, {
+      stopApp: async (binary: string) => void stopped.push(binary),
+      appProcesses: () => [],
+      kill: noSignals(sent),
+      readMembers: () => (sent.length === 0 ? [{ pid: killedGroup, pgid: killedGroup }] : []),
+      pause: async () => undefined,
+    });
 
     assert.deepEqual(result, { reaped: ['killed'], kept: ['running'], failed: [] });
-    await delay(200);
-    assert.equal(alive(killed.app), false);
-    assert.equal(alive(killed.descendant), false);
-    assert.equal(alive(leader), false);
+    assert.deepEqual(sent, [[-killedGroup, 'SIGTERM']]);
+    assert.equal(stopped.length, 1);
+    assert.match(stopped[0], /killed\/Sail E2E 0123abcd\.app\/Contents\/MacOS\/sail$/);
+    assert.ok(!sent.some(([pid]) => pid === -runningGroup), 'the live run is not signalled');
     assert.ok(alive(running.app) && alive(running.descendant), 'the live run is untouched');
     assert.deepEqual(
-      recordsIn(registry).map((record) => record.id),
+      recordsIn(registry).map((candidate) => candidate.id),
       ['running'],
     );
   },
@@ -166,22 +182,19 @@ await test(
         groups: [{ pid, started: 'Mon Jan  1 00:00:00 2001' }],
       }),
     );
-    const result = await reapDeadRuns(registry, {
+    const sent: Array<[number, string]> = [];
+    const result = await reap(registry, {
       stopApp: async () => undefined,
       appProcesses: () => [],
       owns: () => false,
+      kill: noSignals(sent),
     });
     assert.deepEqual(result, { reaped: ['old'], kept: [], failed: [] });
+    assert.deepEqual(sent, []);
     assert.ok(alive(pid));
     assert.equal(existsSync(join(registry, 'old.json')), false);
   },
 );
-
-// These tests pass `kill`, `readStart` and `readMembers` so that a regression cannot signal for
-// real: `kill(-1)` reaches every process the user owns.
-const noSignals = (sent: Array<[number, string]>) => (pid: number, signal: string) => {
-  sent.push([pid, signal]);
-};
 
 await test('a record naming group 0, 1, -1 or a non-integer is never signalled', async (context) => {
   const root = scratch(context);
@@ -197,7 +210,7 @@ await test('a record naming group 0, 1, -1 or a non-integer is never signalled',
     }),
   );
   const sent: Array<[number, string]> = [];
-  const result = await reapDeadRuns(registry, {
+  const result = await reap(registry, {
     stopApp: async () => undefined,
     appProcesses: () => [],
     owns: () => false,
@@ -234,7 +247,7 @@ await test('a living leader without a recorded start time is left alone', async 
     }),
   );
   const sent: Array<[number, string]> = [];
-  const result = await reapDeadRuns(registry, {
+  const result = await reap(registry, {
     stopApp: async () => undefined,
     appProcesses: () => [],
     owns: () => false,
@@ -262,7 +275,7 @@ await test('a group whose leader died is stopped with SIGTERM, then SIGKILL if n
     }),
   );
   const sent: Array<[number, string]> = [];
-  const result = await reapDeadRuns(registry, {
+  const result = await reap(registry, {
     stopApp: async () => undefined,
     appProcesses: () => [],
     owns: () => false,
@@ -284,7 +297,7 @@ await test('a run whose process table cannot be read stays registered', async (c
   const handle = registerRun(registry, 'unreadable');
   handle.groupHooks().onStart(99_999_999);
   const stops: string[] = [];
-  const result = await reapDeadRuns(registry, {
+  const result = await reap(registry, {
     stopApp: async (binary: string) => void stops.push(binary),
     appProcesses: () => [],
     owns: () => false,
@@ -298,9 +311,9 @@ await test('a run whose runner is alive is kept and its app is not stopped', asy
   const root = scratch(context);
   const registry = join(root, 'registry');
   const handle = registerRun(registry, 'mine');
-  handle.setBinary('/nowhere/Sail E2E.app/Contents/MacOS/sail');
+  handle.setBinary('/nowhere/Sail E2E 0123abcd.app/Contents/MacOS/sail');
   const stops: string[] = [];
-  const result = await reapDeadRuns(registry, {
+  const result = await reap(registry, {
     stopApp: async (binary: string) => void stops.push(binary),
     appProcesses: () => [],
   });
@@ -312,8 +325,8 @@ await test('an app that survives its stop request keeps the record', async (cont
   const root = scratch(context);
   const registry = join(root, 'registry');
   const handle = registerRun(registry, 'stubborn');
-  handle.setBinary('/nowhere/Sail E2E.app/Contents/MacOS/sail');
-  const result = await reapDeadRuns(registry, {
+  handle.setBinary('/nowhere/Sail E2E 0123abcd.app/Contents/MacOS/sail');
+  const result = await reap(registry, {
     stopApp: async () => undefined,
     appProcesses: () => [4242],
     owns: () => false,
@@ -332,7 +345,7 @@ await test('an unreadable record is reported and cleared only when old', async (
   writeFileSync(old, '{"id":');
   const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
   utimesSync(old, longAgo, longAgo);
-  const result = await reapDeadRuns(registry, {
+  const result = await reap(registry, {
     stopApp: async () => undefined,
     appProcesses: () => [],
     owns: () => false,
@@ -345,7 +358,7 @@ await test('an unreadable record is reported and cleared only when old', async (
 await test('a missing registry has nothing to stop', async (context) => {
   const root = scratch(context);
   assert.deepEqual(
-    await reapDeadRuns(join(root, 'absent'), {
+    await reap(join(root, 'absent'), {
       stopApp: async () => undefined,
       appProcesses: () => [],
     }),
@@ -359,7 +372,7 @@ await test('a registration follows its command groups and ends with release', as
   const handle = registerRun(registry, 'tracked');
   assert.deepEqual(recordsIn(registry)[0].runner.pid, process.pid);
   assert.equal(recordsIn(registry)[0].runner.started, processStart(process.pid));
-  handle.setBinary('/x/Sail E2E.app/Contents/MacOS/sail');
+  handle.setBinary('/x/Sail E2E 0123abcd.app/Contents/MacOS/sail');
   const hooks = handle.groupHooks();
   const seen: number[] = [];
   const code = await runOwnedCommand(process.execPath, ['-e', 'setTimeout(() => {}, 200)'], {
@@ -377,7 +390,7 @@ await test('a registration follows its command groups and ends with release', as
   assert.equal(code, 0);
   assert.equal(seen.length, 1);
   assert.deepEqual(recordsIn(registry)[0].groups, []);
-  assert.equal(recordsIn(registry)[0].binary, '/x/Sail E2E.app/Contents/MacOS/sail');
+  assert.equal(recordsIn(registry)[0].binary, '/x/Sail E2E 0123abcd.app/Contents/MacOS/sail');
   handle.release();
   assert.deepEqual(readdirSync(registry), []);
 });
@@ -438,6 +451,161 @@ await test('a failing registry update does not orphan the command it follows', a
   await delay(200);
   assert.equal(alive(descendant), false);
   assert.ok(existsSync(join(root, 'command.log')));
+});
+
+const recordWith = (registry: string, name: string, changes: Record<string, unknown>) => {
+  mkdirSync(registry, { recursive: true });
+  writeFileSync(
+    join(registry, `${name}.json`),
+    JSON.stringify({
+      id: name,
+      runner: { pid: 2 ** 22 - 1, started: null },
+      binary: null,
+      groups: [],
+      ...changes,
+    }),
+  );
+};
+
+await test('records with an unusable shape are never acted on', async (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  const fixture = '/x/Sail E2E 0123abcd.app/Contents/MacOS/sail';
+  const bad: Array<[string, Record<string, unknown>]> = [
+    ['runner-zero', { runner: { pid: 0 } }],
+    ['runner-one', { runner: { pid: 1 } }],
+    ['runner-negative', { runner: { pid: -1 } }],
+    ['runner-fraction', { runner: { pid: 7.5 } }],
+    ['runner-text', { runner: { pid: '7' } }],
+    ['runner-start-number', { runner: { pid: 4242, started: 5 } }],
+    ['binary-launchd', { binary: '/sbin/launchd' }],
+    ['binary-wrong-app', { binary: '/x/Other.app/Contents/MacOS/sail' }],
+    ['binary-relative', { binary: 'Sail E2E 0123abcd.app/Contents/MacOS/sail' }],
+    ['binary-number', { binary: 1 }],
+    ['group-nan', { binary: fixture, groups: [{ pid: null, started: null }] }],
+    ['group-null', { groups: [null] }],
+    ['group-big', { groups: [{ pid: 2 ** 60, started: null }] }],
+    ['group-own', { groups: [{ pid: process.pid, started: null }] }],
+    ['group-parent', { groups: [{ pid: process.ppid, started: null }] }],
+    ['group-start-object', { groups: [{ pid: 4242, started: {} }] }],
+    ['groups-text', { groups: 'all' }],
+    ['no-id', { id: undefined }],
+  ];
+  for (const [name, changes] of bad) recordWith(registry, name, changes);
+  const sent: Array<[number, string]> = [];
+  const stopped: string[] = [];
+  const result = await reap(registry, {
+    stopApp: async (binary: string) => void stopped.push(binary),
+    appProcesses: () => [],
+    owns: () => false,
+    readStart: () => null,
+    readMembers: () => [{ pid: 4242, pgid: 4242 }],
+    pause: async () => undefined,
+    kill: noSignals(sent),
+  });
+  assert.deepEqual(sent, []);
+  assert.deepEqual(stopped, []);
+  assert.deepEqual(result.reaped, []);
+  assert.equal(result.failed.length, bad.length);
+});
+
+await test('a well-formed record is acted on, so the guards above are not blanket refusals', async (context) => {
+  const root = scratch(context);
+  const registry = join(root, 'registry');
+  const binary = '/x/Sail E2E 0123abcd.app/Contents/MacOS/sail';
+  recordWith(registry, 'fine', { binary, groups: [{ pid: 4242, started: null }] });
+  const sent: Array<[number, string]> = [];
+  const stopped: string[] = [];
+  const result = await reap(registry, {
+    stopApp: async (name: string) => void stopped.push(name),
+    appProcesses: () => [],
+    owns: () => false,
+    readStart: () => null,
+    readMembers: () => (sent.length === 0 ? [{ pid: 4243, pgid: 4242 }] : []),
+    pause: async () => undefined,
+    kill: noSignals(sent),
+  });
+  assert.deepEqual(result, { reaped: ['fine'], kept: [], failed: [] });
+  assert.deepEqual(sent, [[-4242, 'SIGTERM']]);
+  assert.deepEqual(stopped, [binary]);
+});
+
+await test('the signal guard accepts only ordinary process ids', () => {
+  for (const pid of [0, 1, -1, -2, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 60, '5', null])
+    assert.equal(signalablePid(pid), false, String(pid));
+  for (const pid of [2, 4242, 2 ** 22]) assert.equal(signalablePid(pid), true, String(pid));
+  assert.equal(isOwnProcess(process.pid), true);
+  assert.equal(isOwnProcess(process.ppid), true);
+  assert.equal(isOwnProcess(process.pid + 100_000), false);
+});
+
+await test('a group id of the runner or its shell is refused by the signal helper', () => {
+  const sent: Array<[number, string]> = [];
+  for (const pgid of [process.pid, process.ppid])
+    assert.throws(() => signalGroup(pgid, 'SIGKILL', noSignals(sent)), RangeError);
+  assert.deepEqual(sent, []);
+});
+
+const table = (rows: Array<[number, number | string]>) =>
+  rows.map(([first, second]) => `${first} ${second}`).join('\n');
+
+await test('stopping an app signals only ordinary, unchanged processes of that app', async () => {
+  const binary = '/x/Sail E2E 0123abcd.app/Contents/MacOS/sail';
+  const sent: Array<[number, string]> = [];
+  const commands = table([
+    [900, binary],
+    [901, '/usr/bin/other'],
+  ]);
+  const tree = table([
+    [0, 0],
+    [1, 0],
+    [900, 1],
+    [910, 900],
+    [911, 910],
+    [1, 900],
+    [0, 900],
+    [-1, 900],
+    [920, 1],
+  ]);
+  const identities = new Map<number, string>([
+    [900, 'app'],
+    [910, 'child'],
+    [911, 'grandchild'],
+    [1, 'init'],
+    [0, 'kernel'],
+    [-1, 'all'],
+    [920, 'stranger'],
+  ]);
+  const { stopApp } = nativeApp({
+    checkout,
+    kill: noSignals(sent),
+    identity: (pid: number) => identities.get(pid) ?? null,
+    listing: (columns: string) => (columns === 'pid=,command=' ? commands : tree),
+  });
+  await stopApp(binary);
+  const signalled = new Set(sent.map(([pid]) => pid));
+  assert.deepEqual(
+    [...signalled].toSorted((a, b) => a - b),
+    [900, 910, 911],
+  );
+  assert.deepEqual(
+    sent.map(([, signal]) => signal),
+    ['SIGTERM', 'SIGTERM', 'SIGTERM', 'SIGKILL', 'SIGKILL', 'SIGKILL'],
+  );
+});
+
+await test('an app whose identity changes before the signal is not signalled', async () => {
+  const binary = '/x/Sail E2E 0123abcd.app/Contents/MacOS/sail';
+  const sent: Array<[number, string]> = [];
+  let reads = 0;
+  const { stopApp } = nativeApp({
+    checkout,
+    kill: noSignals(sent),
+    identity: () => `identity-${reads++ === 0 ? 'before' : 'after'}`,
+    listing: (columns: string) => (columns === 'pid=,command=' ? `900 ${binary}` : '900 1'),
+  });
+  await stopApp(binary);
+  assert.deepEqual(sent, []);
 });
 
 await test('the registry folder can be chosen and must be absolute', () => {

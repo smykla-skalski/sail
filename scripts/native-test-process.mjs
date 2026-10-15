@@ -3,6 +3,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { realpathSync, writeFileSync } from 'node:fs';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { signalablePid } from './native-signal-guard.mjs';
 
 function notify(hook, pid) {
   try {
@@ -96,6 +97,7 @@ async function stopMatching(directory, timeout) {
         const match = /^\s*(\d+)\s+(.+)$/.exec(line);
         const pid = Number(match?.[1]);
         return match &&
+          signalablePid(pid) &&
           pid !== process.pid &&
           prefixes.some((prefix) => match[2].startsWith(prefix))
           ? [pid]

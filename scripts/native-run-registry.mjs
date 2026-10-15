@@ -13,6 +13,7 @@ import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processOwns, processStart } from './e2e-state.mjs';
 import { userTemporaryDirectory } from './native-app-data.mjs';
+import { isOwnProcess, signalablePid } from './native-signal-guard.mjs';
 
 const recordName = /^[A-Za-z0-9._-]+\.json$/;
 const corruptGraceMs = 2 * 60 * 60 * 1000;
@@ -110,10 +111,10 @@ function groupMembers() {
 
 // A group id of 0 or 1 turns `kill(-pgid)` into a signal to the caller's own group or, with -1, to
 // every process the user owns.
-const signalableGroup = (pgid) => Number.isSafeInteger(pgid) && pgid > 1;
 
 export function signalGroup(pgid, signal, kill = (pid, name) => process.kill(pid, name)) {
-  if (!signalableGroup(pgid)) throw new RangeError(`Refusing to signal process group ${pgid}`);
+  if (!signalablePid(pgid) || isOwnProcess(pgid))
+    throw new RangeError(`Refusing to signal process group ${pgid}`);
   try {
     kill(-pgid, signal);
   } catch (error) {
@@ -149,13 +150,30 @@ async function reapGroup(group, { readStart, readMembers, pause, kill }) {
   return escalate(['SIGTERM', 'SIGKILL']);
 }
 
+const fixtureBinary = /\/Sail E2E [a-f0-9]{8}\.app\/Contents\/MacOS\/sail$/;
+
+const text = (value) => value === null || typeof value === 'string';
+
+function validRecord(record) {
+  return (
+    typeof record.id === 'string' &&
+    signalablePid(record.runner.pid) &&
+    text(record.runner.started ?? null) &&
+    (record.binary === null ||
+      (typeof record.binary === 'string' && fixtureBinary.test(record.binary))) &&
+    record.groups.every(
+      (group) =>
+        signalablePid(group?.pid) && !isOwnProcess(group.pid) && text(group.started ?? null),
+    )
+  );
+}
+
 function readRecord(path) {
   try {
     const record = JSON.parse(readFileSync(path, 'utf8'));
     if (!record || !Number.isInteger(record.runner?.pid) || !Array.isArray(record.groups))
       return null;
-    if (!record.groups.every((group) => signalableGroup(group?.pid))) return null;
-    return record;
+    return validRecord(record) ? record : null;
   } catch (error) {
     if (error.code === 'ENOENT') return undefined;
     if (error instanceof SyntaxError) return null;
