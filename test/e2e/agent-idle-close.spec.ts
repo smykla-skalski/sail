@@ -270,6 +270,27 @@ describe('idle session close', () => {
   });
 
   for (const provider of ['codex', 'claude'] as const) {
+    it(`closes an abandoned ${provider} restore after its reservation expires`, async () => {
+      expect(closeLog).not.toBe('');
+      const directory = realpathSync(repository);
+      const [session] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [session]);
+      await browser.tauri.execute(
+        async ({ core }, agent, path, id) => {
+          await core.invoke('acp_begin_session_restore', {
+            agent,
+            cwd: path,
+            sessionId: id,
+          });
+        },
+        provider,
+        directory,
+        session,
+      );
+      await closeIdleThreads(session);
+      expect(await attached(provider, directory)).not.toContain(session);
+    });
+
     it(`closes finished unseen ${provider} threads, spares busy and visible ones, and reattaches on prompt`, async () => {
       expect(closeLog).not.toBe('');
       const directory = realpathSync(repository);
@@ -556,6 +577,78 @@ describe('idle session close', () => {
   }
 
   for (const provider of ['codex', 'claude'] as const) {
+    it(`removes a loaded or restored ${provider} thread from activity immediately on delete`, async () => {
+      const directory = realpathSync(repository);
+      await pauseIdleClose();
+      const [restored] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [restored]);
+      await closeIdleThreads(restored);
+      await browser.tauri.execute(
+        async ({ core }, agent, path, session) => {
+          const reservation = await core.invoke<{ restoreToken: string }>(
+            'acp_begin_session_restore',
+            { agent, cwd: path, sessionId: session },
+          );
+          await core.invoke('acp_resume_session', {
+            params: {
+              agent,
+              cwd: path,
+              sessionId: session,
+              restoreToken: reservation.restoreToken,
+            },
+          });
+          await core.invoke('acp_end_session_restore', {
+            agent,
+            directory: path,
+            sessionId: session,
+            restoreToken: reservation.restoreToken,
+          });
+        },
+        provider,
+        directory,
+        restored,
+      );
+      const [loaded] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [loaded]);
+      await Promise.all(
+        [loaded, restored].map(async (id) => {
+          expect(await attached(provider, directory)).toContain(id);
+          await browser.tauri.execute(
+            async ({ core }, agent, path, sessionId) => {
+              await core.invoke('acp_forget_session', { agent, directory: path, sessionId });
+            },
+            provider,
+            directory,
+            id,
+          );
+          expect(await attached(provider, directory)).not.toContain(id);
+        }),
+      );
+    });
+
+    it(`deletes a loaded ${provider} thread even when its agent close fails`, async () => {
+      const directory = realpathSync(repository);
+      await pauseIdleClose();
+      const [id] = await newSessions(provider, directory, 1);
+      await finishTurns(provider, directory, [id]);
+      const failedClose = join(directory, 'idle-failed-close.log');
+      writeFileSync(join(directory, 'idle-fail-next-close.txt'), 'fail');
+      await browser.tauri.execute(
+        async ({ core }, agent, path, sessionId) => {
+          await core.invoke('acp_forget_session', { agent, directory: path, sessionId });
+        },
+        provider,
+        directory,
+        id,
+      );
+      expect(await attached(provider, directory)).not.toContain(id);
+      await browser.waitUntil(
+        async () => existsSync(failedClose) && readFileSync(failedClose, 'utf8').includes(id),
+        { timeout: 10_000, interval: 100, timeoutMsg: 'the close failure was never injected' },
+      );
+      expect(await attached(provider, directory)).not.toContain(id);
+    });
+
     it(`drops a closed ${provider} thread's idle state when it is deleted, also during a resume`, async () => {
       const directory = realpathSync(repository);
       await pauseIdleClose();

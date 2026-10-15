@@ -1893,16 +1893,33 @@ impl Connection {
         if idle && requests_idle && subagents.active_in(&self.worktree).is_empty() {
             let child_id = self.child.lock().map_err(|error| error.to_string())?.id();
             let _pause = PausedAgent::new(child_id)?;
+            #[cfg(unix)]
+            let scratch = self
+                .runtime_scratch
+                .lock()
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            let owned_temp = scratch.as_ref().map(|scratch| scratch.path().join("tmp"));
+            #[cfg(not(unix))]
+            let owned_temp: Option<PathBuf> = None;
             if runtime_has_live_children(
                 child_id,
-                self._storage_lease
-                    .as_ref()
-                    .map(|lease| lease.temp_directory()),
+                owned_temp.as_deref().or_else(|| {
+                    self._storage_lease
+                        .as_ref()
+                        .map(|lease| lease.temp_directory())
+                }),
             ) {
                 return Ok(());
             }
             if let Some(lease) = &self._storage_lease {
                 lease.clear_turn_temp()?;
+            }
+            #[cfg(unix)]
+            if let Some(scratch) = scratch.as_ref() {
+                scratch
+                    .clear_turn_temp()
+                    .map_err(|error| error.to_string())?;
             }
             temp_gate.pending = false;
         }
@@ -1916,7 +1933,7 @@ impl Connection {
         {
             return false;
         }
-        let timeout = if self.lists_only() {
+        let earliest_timeout = if self.profile == CapabilityProfile::Explore {
             timeout.min(OPENCODE_LISTING_IDLE_TIMEOUT)
         } else {
             timeout
@@ -1925,7 +1942,8 @@ impl Connection {
             .last_activity
             .lock()
             .map_or(Duration::ZERO, |last| last.elapsed());
-        if silent < timeout || self.capabilities.lock().is_ok_and(|value| value.is_null()) {
+        if silent < earliest_timeout || self.capabilities.lock().is_ok_and(|value| value.is_null())
+        {
             return false;
         }
         // A prompt being dispatched holds this lock; leave it alone.
@@ -1937,7 +1955,21 @@ impl Connection {
             self.touch();
             return false;
         }
+        let Ok(profiles) = self.session_profiles.lock() else {
+            return false;
+        };
+        let timeout = if self.profile == CapabilityProfile::Explore && profiles.is_empty() {
+            earliest_timeout
+        } else {
+            timeout
+        };
+        if silent < timeout {
+            return false;
+        }
+        // Commit the decision while session registration is excluded.
         self.idle_exit.store(true, Ordering::Release);
+        drop(profiles);
+        drop(_dispatch);
         if let Err(error) = self.terminate() {
             self.idle_exit.store(false, Ordering::Release);
             crate::diagnostics::record(
@@ -1951,15 +1983,6 @@ impl Connection {
             json!({"agent":self.agent,"idleSeconds":silent.as_secs()}),
         );
         true
-    }
-
-    /// The shared sidebar agent holds no session, only its listing requests.
-    fn lists_only(&self) -> bool {
-        self.profile == CapabilityProfile::Explore
-            && self
-                .session_profiles
-                .lock()
-                .is_ok_and(|profiles| profiles.is_empty())
     }
 
     fn has_pending_work(&self) -> bool {
@@ -2387,6 +2410,8 @@ fn runtime_environment(
     runtime_scratch: Option<&Path>,
     shared_build_directory: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
+    let owned_temp = runtime_scratch.map(|scratch| scratch.join("tmp"));
+    let temp_directory = owned_temp.as_deref().unwrap_or(temp_directory);
     let mut environment = crate::acp_terminal::terminal_environment(data_directory, temp_directory);
     let shared_download_cache = data_directory
         .parent()
@@ -5211,11 +5236,12 @@ fn register_native_task_connections(
     runtime: &Connection,
     browser: &crate::browser_agent::BrowserManager,
 ) -> Result<(), String> {
-    let children = runtime
+    // Keep settlement serialized with browser registration and ancestor pruning.
+    let native = runtime
         .native_subagents
         .lock()
-        .map_err(|error| error.to_string())?
-        .task_connections();
+        .map_err(|error| error.to_string())?;
+    let children = native.task_connections();
     for _ in 0..children.len() {
         for (child_id, child) in &children {
             let provider_id = task_provider_id(runtime, child_id);
@@ -5316,17 +5342,21 @@ fn register_session_detached(
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".to_string())?;
+    let mut profiles = runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if runtime.idle_exit.load(Ordering::Acquire) {
+        return Err(IDLE_EXIT_ERROR.into());
+    }
     let mut directories = runtime
         .session_directories
         .lock()
         .map_err(|error| error.to_string())?;
     bind_session_directory(&mut directories, session_id, directory)?;
     drop(directories);
-    runtime
-        .session_profiles
-        .lock()
-        .map_err(|error| error.to_string())?
-        .insert(session_id.to_string(), profile);
+    profiles.insert(session_id.to_string(), profile);
+    drop(profiles);
     Ok(runtime)
 }
 
@@ -5590,7 +5620,9 @@ impl Connection {
         if terminal_running
             || prompts.active.contains_key(session_id)
             || prompts.finishing.contains(session_id)
-            || restores.contains_key(session_id)
+            || restores
+                .get(session_id)
+                .is_some_and(|claim| claim.request_active || claim.expires > Instant::now())
         {
             return Ok(true);
         }
@@ -6059,11 +6091,39 @@ fn agent_availability(
         .collect()
 }
 
+fn assigned_scratch_directory(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("Assigned scratch directory must be absolute.".into());
+    }
+    let assigned = WritableDirectory::capture(path)?;
+    for root in roots {
+        let root = dunce::canonicalize(root).map_err(|error| error.to_string())?;
+        if assigned.path != root && assigned.path.starts_with(&root) {
+            let mut current = path.to_path_buf();
+            while dunce::canonicalize(&current).ok().as_ref() != Some(&root) {
+                if std::fs::symlink_metadata(&current)
+                    .map_err(|error| error.to_string())?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err("Assigned scratch directory must not traverse symlinks.".into());
+                }
+                if !current.pop() {
+                    break;
+                }
+            }
+            return Ok(assigned.path);
+        }
+    }
+    Err("Assigned scratch directory is outside its owner's private scratch space.".into())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpBuildLease {
     owner: String,
     revision: String,
+    scratch_directory: Option<PathBuf>,
 }
 
 #[tauri::command]
@@ -6086,9 +6146,13 @@ pub async fn acp_connect(
             profile,
             Path::new(&directory),
             owner.as_deref(),
-            build_lease
-                .as_ref()
-                .map(|lease| (lease.owner.as_str(), lease.revision.as_str())),
+            build_lease.as_ref().map(|lease| {
+                (
+                    lease.owner.as_str(),
+                    lease.revision.as_str(),
+                    lease.scratch_directory.as_deref(),
+                )
+            }),
         )
     })
     .await
@@ -6160,12 +6224,12 @@ fn connect_blocking_with_build_lease(
     profile: CapabilityProfile,
     directory: &Path,
     owner: Option<&str>,
-    build_lease: Option<(&str, &str)>,
+    build_lease: Option<(&str, &str, Option<&Path>)>,
 ) -> Result<Value, String> {
     if owner.is_some_and(|owner| Uuid::parse_str(owner).is_err()) {
         return Err("Invalid agent run owner ID.".into());
     }
-    if build_lease.is_some_and(|(build_owner, revision)| {
+    if build_lease.is_some_and(|(build_owner, revision, _)| {
         owner.is_none() || Uuid::parse_str(build_owner).is_err() || revision.is_empty()
     }) {
         return Err("Invalid shared build target lease.".into());
@@ -6244,7 +6308,7 @@ fn connect_blocking_inner(
     profile: CapabilityProfile,
     worktree: &Path,
     owner: Option<&str>,
-    build_lease: Option<(&str, &str)>,
+    build_lease: Option<(&str, &str, Option<&Path>)>,
 ) -> Result<Value, String> {
     #[cfg(not(unix))]
     let _ = build_lease;
@@ -6324,7 +6388,7 @@ fn connect_blocking_inner(
         return Err("Reef canary is supported only on macOS and Linux.".into());
     }
     #[cfg(unix)]
-    let shared_build_directory = build_lease.and_then(|(build_owner, revision)| {
+    let shared_build_directory = build_lease.and_then(|(build_owner, revision, _)| {
         let parent = manager
             .0
             .lock()
@@ -6357,6 +6421,38 @@ fn connect_blocking_inner(
     });
     #[cfg(not(unix))]
     let shared_build_directory: Option<PathBuf> = None;
+    let assigned_scratch = if let Some((build_owner, _, Some(path))) = build_lease {
+        let parent = manager
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .find(|runtime| {
+                runtime.worktree == worktree
+                    && runtime.owner.as_deref() == Some(build_owner)
+                    && runtime.alive.load(Ordering::Acquire)
+            })
+            .cloned()
+            .ok_or("Assigned scratch owner is no longer running.")?;
+        parent.validate_codex_workspace(None)?;
+        let mut roots = Vec::new();
+        if let Some(lease) = parent._storage_lease.as_ref() {
+            roots.push(lease.temp_directory().to_path_buf());
+        }
+        #[cfg(unix)]
+        if let Some(root) = parent
+            .runtime_scratch
+            .lock()
+            .map_err(|error| error.to_string())?
+            .as_ref()
+        {
+            roots.push(root.path().to_path_buf());
+        }
+        Some(assigned_scratch_directory(path, &roots)?)
+    } else {
+        None
+    };
+
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     let home =
         std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
@@ -6471,6 +6567,9 @@ fn connect_blocking_inner(
         if let Some(build) = shared_build_directory.as_ref() {
             std::fs::create_dir_all(build).map_err(|error| error.to_string())?;
             writable.push(build.clone());
+        }
+        if let Some(scratch) = assigned_scratch.as_ref() {
+            writable.push(scratch.clone());
         }
         let access = CodexWorkspaceAccess::capture(worktree, &writable)?;
         command.env(
@@ -7655,35 +7754,20 @@ pub async fn acp_forget_session(
                 return Err(error.to_string());
             }
         }
-        let restoring = match runtime
+        if let Err(error) = runtime
             .restores
             .lock()
             .map(|mut claims| claims.remove(&session_id))
         {
-            Ok(claim) => claim.is_some(),
-            Err(error) => {
-                runtime
-                    .prompt_state
-                    .lock()
-                    .map_err(|cause| cause.to_string())?
-                    .finish_forget(&session_id, false);
-                return Err(error.to_string());
-            }
-        };
+            runtime
+                .prompt_state
+                .lock()
+                .map_err(|cause| cause.to_string())?
+                .finish_forget(&session_id, false);
+            return Err(error.to_string());
+        }
         runtime.restore_ready.notify_all();
-        // A restore reservation registered the thread; a deleted thread must not stay registered.
-        let cleared = runtime
-            .idle
-            .lock()
-            .map(|mut idle| idle.forget(&session_id))
-            .map_err(|error| error.to_string())
-            .and_then(|()| {
-                if restoring {
-                    unregister_session(&runtime, &session_id)
-                } else {
-                    Ok(())
-                }
-            });
+        let cleared = forget_registered_session(&runtime, &session_id);
         if let Err(error) = cleared {
             runtime
                 .prompt_state
@@ -7731,6 +7815,19 @@ pub async fn acp_forget_session(
             .lock()
             .map_err(|error| error.to_string())?
             .finish_forget(&session_id, true);
+        if runtime.supports_session_close() {
+            let closing = Arc::clone(&runtime);
+            let closing_session = session_id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                close_deleted_session(&closing, &closing_session, || {
+                    closing.request(
+                        "session/close",
+                        json!({"sessionId":closing_session}),
+                        Duration::from_secs(30),
+                    )
+                });
+            });
+        }
     }
     Ok(())
 }
@@ -8103,7 +8200,17 @@ fn restore_session_blocking(
                     },
                 )?;
             register_native_task_connections(&runtime, browser)?;
+            browser.clear_unattributed_native_activity(
+                &agent,
+                &canonical_directory(&cwd),
+                &session_id,
+            );
             let result = runtime.request(method, params, Duration::from_secs(60));
+            browser.clear_unattributed_native_activity(
+                &agent,
+                &canonical_directory(&cwd),
+                &session_id,
+            );
             if result.is_err() {
                 if let Some(token) = minted_token {
                     let mut tokens = runtime
@@ -8177,6 +8284,28 @@ fn unregister_if_deleted(runtime: &Connection, session_id: &str) -> Result<bool,
         unregister_session(runtime, session_id)?;
     }
     Ok(forgotten)
+}
+
+fn forget_registered_session(runtime: &Connection, session_id: &str) -> Result<(), String> {
+    runtime
+        .idle
+        .lock()
+        .map_err(|error| error.to_string())?
+        .forget(session_id);
+    unregister_session(runtime, session_id)
+}
+
+fn close_deleted_session(
+    runtime: &Connection,
+    session_id: &str,
+    close: impl FnOnce() -> Result<Value, String>,
+) {
+    if let Err(error) = close() {
+        crate::diagnostics::record(
+            "deleted_session_close_failed",
+            json!({"agent":runtime.agent,"sessionId":session_id,"error":error}),
+        );
+    }
 }
 
 fn unregister_session(runtime: &Connection, session_id: &str) -> Result<(), String> {
@@ -8778,6 +8907,10 @@ pub async fn acp_prompt(
                 turn_id: turn_id.clone(),
             },
             || {
+                if let Some(directory) = directory.as_ref() {
+                    app.state::<crate::browser_agent::BrowserManager>()
+                        .clear_unattributed_native_activity(&agent, directory, &session_id);
+                }
                 if !runtime.stopped.load(Ordering::Acquire) {
                     if let Some(directory) = directory.as_ref() {
                     let _ = crate::settings::clear_interrupted_turn(
@@ -10041,9 +10174,16 @@ time.sleep(10)
         );
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
 
+        let owned = crate::scratch_cleanup::OwnedRuntimeScratch::create().unwrap();
+        let owned_artifact = owned.path().join("tmp/artifact");
+        let build_artifact = owned.path().join("build/artifact");
+        std::fs::write(&owned_artifact, "retain").unwrap();
+        std::fs::write(&build_artifact, "retain").unwrap();
+        *runtime.runtime_scratch.lock().unwrap() = Some(owned);
         runtime.record_process_cleanup("session", false).unwrap();
         runtime.clear_idle_temp(false).unwrap();
         assert!(artifact.exists());
+        assert!(owned_artifact.exists());
         assert!(
             crate::worktree_storage::cleanup_status(&scratch.join("cache"))
                 .iter()
@@ -10053,6 +10193,8 @@ time.sleep(10)
         runtime.record_process_cleanup("session", true).unwrap();
         runtime.clear_idle_temp(false).unwrap();
         assert!(!artifact.exists());
+        assert!(!owned_artifact.exists());
+        assert!(build_artifact.exists());
         runtime.stop_child().unwrap();
         drop(runtime);
         std::fs::remove_dir_all(scratch).unwrap();
@@ -10314,6 +10456,87 @@ time.sleep(10)
 
     #[cfg(unix)]
     #[test]
+    fn session_registered_at_idle_decision_keeps_listing_agent_alive() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key(
+                "opencode",
+                CapabilityProfile::Explore,
+                Path::new("/worktree"),
+            ),
+            Arc::clone(&runtime),
+        );
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(600), || {
+            register_session(
+                &manager,
+                "opencode",
+                CapabilityProfile::Explore,
+                "registered-at-boundary",
+                PathBuf::from("/worktree"),
+            )
+            .unwrap();
+            false
+        }));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_rejects_an_agent_committed_to_idle_exit() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        runtime.idle_exit.store(true, Ordering::Release);
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key(
+                "opencode",
+                CapabilityProfile::Explore,
+                Path::new("/worktree"),
+            ),
+            Arc::clone(&runtime),
+        );
+
+        let error = register_session(
+            &manager,
+            "opencode",
+            CapabilityProfile::Explore,
+            "too-late",
+            PathBuf::from("/worktree"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, IDLE_EXIT_ERROR);
+        assert!(runtime.session_profiles.lock().unwrap().is_empty());
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_claim_keeps_listing_agent_alive_until_release() {
+        let runtime = idle_runtime("opencode", None);
+        runtime.session_profiles.lock().unwrap().clear();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        let token = runtime.begin_restore("restoring").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        assert!(!runtime.exit_if_idle(Duration::from_secs(600), || false));
+        assert!(runtime.alive.load(Ordering::Acquire));
+        assert!(!runtime.idle_exit.load(Ordering::Acquire));
+        runtime.release_restore("restoring", &token).unwrap();
+        *runtime.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(150);
+        assert!(runtime.exit_if_idle(Duration::from_secs(600), || false));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn listing_only_agent_follows_a_shorter_configured_limit() {
         let runtime = idle_runtime("opencode", None);
         runtime.session_profiles.lock().unwrap().clear();
@@ -10518,6 +10741,20 @@ time.sleep(10)
     }
 
     #[test]
+    fn runtime_temp_environment_ignores_long_storage_paths() {
+        let data = Path::new("/private/tmp").join("terminal-worktrees".repeat(16));
+        let legacy = data.join("turn-temp/run-long");
+        let scratch = Path::new("/private/tmp/sail-runtime-fixture");
+        let environment = runtime_environment(&data, &legacy, Some(scratch), None);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert!(environment.contains(&(name, scratch.join("tmp"))));
+        }
+        assert!(environment.contains(&("GOTMPDIR", scratch.join("tmp/go-tmp"))));
+        let fallback = runtime_environment(&data, &legacy, None, None);
+        assert!(fallback.contains(&("TMPDIR", legacy)));
+    }
+
+    #[test]
     fn runtime_keys_and_build_caches_are_private_per_worktree() {
         let scratch = scratch("runtime-cache");
         let first = scratch.join("first");
@@ -10574,7 +10811,13 @@ time.sleep(10)
             path(&first_environment, "CARGO_TARGET_DIR"),
             first_scratch.join("build/cargo-target")
         );
-        assert_eq!(path(&first_environment, "TMPDIR"), first_temp);
+        for name in ["TMPDIR", "TEMP", "TMP"] {
+            assert_eq!(path(&first_environment, name), first_scratch.join("tmp"));
+        }
+        assert_eq!(
+            path(&first_environment, "GOTMPDIR"),
+            first_scratch.join("tmp/go-tmp")
+        );
         for directory in [
             first_temp.clone(),
             first_data.join("cache"),
@@ -11464,6 +11707,81 @@ time.sleep(10)
                 .unwrap_err()
                 .contains("symlink"));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn assigned_scratch_grants_only_the_selected_subtree() {
+        let root = dunce::canonicalize(scratch("assigned-scratch")).unwrap();
+        let owner = root.join("owner");
+        let selected = owner.join("task/review");
+        let sibling = owner.join("other-task");
+        let workspace = root.join("workspace");
+        for path in [&selected, &sibling, &workspace] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let roots = vec![owner.clone()];
+        let granted = assigned_scratch_directory(&selected, &roots).unwrap();
+        let access = CodexWorkspaceAccess::capture(&workspace, &[granted]).unwrap();
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let rules = config["configOverrides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let selected_key =
+            serde_json::to_string(dunce::canonicalize(&selected).unwrap().to_str().unwrap())
+                .unwrap();
+        let sibling_key =
+            serde_json::to_string(dunce::canonicalize(&sibling).unwrap().to_str().unwrap())
+                .unwrap();
+        assert!(rules.contains(&selected_key));
+        assert!(!rules.contains(&sibling_key));
+        #[cfg(target_os = "macos")]
+        if let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") {
+            let run = |path: &Path| {
+                let mut command = Command::new(&codex);
+                command
+                    .args(["sandbox", "-P", "sail-agent", "-C"])
+                    .arg(&workspace);
+                for value in config["configOverrides"].as_array().unwrap() {
+                    command.arg("-c").arg(value.as_str().unwrap());
+                }
+                command
+                    .args(["--", "mkdir", "-p"])
+                    .arg(path)
+                    .output()
+                    .unwrap()
+            };
+            let evidence = selected.join("review-worker/evidence");
+            let allowed = run(&evidence);
+            assert!(
+                allowed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&allowed.stderr)
+            );
+            assert!(evidence.is_dir());
+            assert!(!run(&sibling.join("evidence")).status.success());
+            assert!(!sibling.join("evidence").exists());
+        }
+        assert!(assigned_scratch_directory(&owner, &roots).is_err());
+        assert!(assigned_scratch_directory(&workspace, &roots).is_err());
+        assert!(assigned_scratch_directory(Path::new("task/review"), &roots).is_err());
+        assert!(assigned_scratch_directory(&owner.join("missing"), &roots).is_err());
+        #[cfg(unix)]
+        {
+            let alias = owner.join("alias");
+            std::os::unix::fs::symlink(&selected, &alias).unwrap();
+            assert!(assigned_scratch_directory(&alias, &roots).is_err());
+            let escape = owner.join("escape");
+            std::os::unix::fs::symlink(&workspace, &escape).unwrap();
+            assert!(assigned_scratch_directory(&escape, &roots).is_err());
+        }
+        std::fs::rename(&selected, owner.join("previous")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        assert!(access.validate(None).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -13721,6 +14039,40 @@ mod idle_close_tests {
     }
 
     #[test]
+    fn expired_restore_reservation_does_not_keep_the_session_loaded() {
+        let runtime = runtime("ses_abandoned");
+        runtime.begin_restore("ses_abandoned").unwrap();
+        runtime
+            .restores
+            .lock()
+            .unwrap()
+            .get_mut("ses_abandoned")
+            .unwrap()
+            .expires = Instant::now();
+        assert!(!holds_work(&runtime, "ses_abandoned", false));
+    }
+
+    #[test]
+    fn active_restore_keeps_the_session_loaded_after_reservation_expiry() {
+        let runtime = runtime("ses_slow_restore");
+        let reservation = runtime.begin_restore("ses_slow_restore").unwrap();
+        let token = reservation["restoreToken"].as_str().unwrap();
+        let request = runtime
+            .begin_restore_request("ses_slow_restore", token)
+            .unwrap();
+        runtime
+            .restores
+            .lock()
+            .unwrap()
+            .get_mut("ses_slow_restore")
+            .unwrap()
+            .expires = Instant::now();
+        assert!(holds_work(&runtime, "ses_slow_restore", false));
+        drop(request);
+        assert!(holds_work(&runtime, "ses_slow_restore", false));
+    }
+
+    #[test]
     fn close_support_requires_a_releasing_adapter_that_advertises_it() {
         let advertised = json!({"agentCapabilities":{"sessionCapabilities":{"close":{}}}});
         for (agent, closes) in [("claude", true), ("codex", true), ("opencode", false)] {
@@ -13900,6 +14252,45 @@ mod idle_close_tests {
             .unwrap()
             .is_none());
         assert!(!runtime.idle.lock().unwrap().is_closed("ses_ui_loaded"));
+    }
+
+    #[test]
+    fn deleting_loaded_or_just_restored_threads_unregisters_before_close() {
+        for agent in ["codex", "claude"] {
+            for restored in [false, true] {
+                let session = format!("ses_loaded_delete_{agent}_{restored}");
+                let runtime = closed_runtime(agent, &session);
+                if restored {
+                    let mut claim = runtime.begin_attaching_restore(&session).unwrap().unwrap();
+                    claim.resumed = true;
+                    drop(claim);
+                    let token = runtime.begin_restore(&session).unwrap()["restoreToken"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    runtime.release_restore(&session, &token).unwrap();
+                } else {
+                    attach(&runtime, &session);
+                }
+                forget_registered_session(&runtime, &session).unwrap();
+                close_deleted_session(&runtime, &session, || {
+                    assert!(!runtime
+                        .session_profiles
+                        .lock()
+                        .unwrap()
+                        .contains_key(&session));
+                    assert!(!runtime
+                        .session_directories
+                        .lock()
+                        .unwrap()
+                        .contains_key(&session));
+                    Err("close failed".into())
+                });
+                let idle = runtime.idle.lock().unwrap();
+                assert!(!idle.is_closed(&session));
+                assert!(!idle.is_resuming(&session));
+            }
+        }
     }
 
     #[test]

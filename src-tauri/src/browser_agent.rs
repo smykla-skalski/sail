@@ -346,6 +346,24 @@ impl BrowserManager {
         }
     }
 
+    pub fn clear_unattributed_native_activity(&self, agent: &str, directory: &Path, parent: &str) {
+        if let Ok(mut clients) = self.0.clients.lock() {
+            for client in clients.values_mut().filter(|client| {
+                client.agent.as_deref() == Some(agent)
+                    && client.directory == directory
+                    && (client.session.as_deref() == Some(parent)
+                        || client.native_children.contains_key(parent))
+            }) {
+                for activity in client.unattributed_native_activity.drain() {
+                    if client.ended_native_activity.len() >= ENDED_ACTIVITY_KEPT {
+                        client.ended_native_activity.pop_front();
+                    }
+                    client.ended_native_activity.push_back(activity);
+                }
+            }
+        }
+    }
+
     pub fn set_unattributed_native_activity(
         &self,
         agent: &str,
@@ -2332,6 +2350,7 @@ pub fn run_mcp_stdio() {
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "prompt":{"type":"string"},
                             "revision":{"type":"string","pattern":"^[0-9a-fA-F]{7,64}$"},
+                            "scratchDirectory":{"type":"string","minLength":1,"description":"Existing private scratch subtree owned by the assigned Ship worker; grants this validator write access only inside that subtree."},
                         },
                         "required":["gate","prompt"]
                     }});
@@ -2986,6 +3005,37 @@ mod native_task_identity_tests {
             resolve_task_session(&clients["source"], None).unwrap(),
             "parent"
         );
+    }
+
+    #[test]
+    fn ended_parent_releases_unfinished_native_activity() {
+        let manager = BrowserManager::default();
+        manager
+            .0
+            .clients
+            .lock()
+            .unwrap()
+            .insert("source".into(), client("claude"));
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "tool",
+            true,
+        );
+        assert!(!manager.task_identity_available("claude", Path::new("/repo"), "parent"));
+        manager.clear_unattributed_native_activity("claude", Path::new("/repo"), "other");
+        assert!(!manager.task_identity_available("claude", Path::new("/repo"), "parent"));
+        manager.clear_unattributed_native_activity("claude", Path::new("/repo"), "parent");
+        assert!(manager.task_identity_available("claude", Path::new("/repo"), "parent"));
+        manager.set_unattributed_native_activity(
+            "claude",
+            Path::new("/repo"),
+            "parent",
+            "tool",
+            true,
+        );
+        assert!(manager.task_identity_available("claude", Path::new("/repo"), "parent"));
     }
 
     #[test]

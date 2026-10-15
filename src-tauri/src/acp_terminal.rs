@@ -633,6 +633,8 @@ struct AcpTerminal {
     owner: Option<String>,
     directory: PathBuf,
     _storage_lease: Option<std::sync::Arc<crate::worktree_storage::WorktreeDataLease>>,
+    #[cfg(unix)]
+    _runtime_scratch: Option<crate::scratch_cleanup::OwnedRuntimeScratch>,
     child: Mutex<Child>,
     #[cfg(windows)]
     job: WindowsTerminalJob,
@@ -954,6 +956,14 @@ pub fn handle(
                     .map_err(|error| error.to_string())?,
                 worktree,
             )?;
+            #[cfg(unix)]
+            let mut runtime_scratch = crate::scratch_cleanup::OwnedRuntimeScratch::create()
+                .map_err(|error| format!("Cannot prepare command scratch: {error}"))?;
+            #[cfg(unix)]
+            let owned_temp = runtime_scratch.path().join("tmp");
+            #[cfg(unix)]
+            let temp_directory = owned_temp.as_path();
+            #[cfg(not(unix))]
             let temp_directory = storage_lease.temp_directory();
             let cache_directory = data_directory.join("cache");
             std::fs::create_dir_all(temp_directory).map_err(|error| error.to_string())?;
@@ -1056,6 +1066,18 @@ pub fn handle(
             .inspect_err(|_| {
                 let _ = crate::owned_processes::stop_pid(&owner, child.id());
             })?;
+            #[cfg(unix)]
+            if let Err(error) = runtime_scratch.mark_owner(child.id()) {
+                if child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+                {
+                    let _ = crate::owned_processes::stop_pid(&owner, child.id());
+                    let _ = child.wait();
+                    return Err(format!("Cannot track command scratch: {error}"));
+                }
+            }
             let stdout = child
                 .stdout
                 .take()
@@ -1076,6 +1098,8 @@ pub fn handle(
                 owner: Some(owner),
                 directory: worktree.to_path_buf(),
                 _storage_lease: Some(storage_lease),
+                #[cfg(unix)]
+                _runtime_scratch: Some(runtime_scratch),
                 child: Mutex::new(child),
                 #[cfg(windows)]
                 job,
@@ -1821,6 +1845,7 @@ mod tests {
             owner: None,
             directory: nested.clone(),
             _storage_lease: None,
+            _runtime_scratch: None,
             child: Mutex::new(child),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),

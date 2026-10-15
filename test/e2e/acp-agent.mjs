@@ -488,6 +488,13 @@ for await (const line of createInterface({ input: process.stdin })) {
     );
   } else if (message.method === 'session/close') {
     const closing = sessions.get(message.params.sessionId);
+    const failClose = closing && join(closing.cwd, 'idle-fail-next-close.txt');
+    if (failClose && existsSync(failClose)) {
+      unlinkSync(failClose);
+      appendFileSync(join(closing.cwd, 'idle-failed-close.log'), `${message.params.sessionId}\n`);
+      send({ id: message.id, error: { code: -32000, message: 'Injected close failure' } });
+      continue;
+    }
     if (closing) closing.evicted = true;
     if (process.env.SAIL_E2E_ACP_CLOSE_LOG)
       appendFileSync(process.env.SAIL_E2E_ACP_CLOSE_LOG, `${message.params.sessionId}\n`);
