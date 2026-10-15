@@ -402,7 +402,7 @@ mod tests {
             assert_eq!(reports.len(), 1, "{label}: {reports:?}");
             assert!(reports[0].contains(key), "{label}: {}", reports[0]);
             assert!(
-                reports[0].contains(&file.display().to_string()),
+                reports[0].contains(&format!("{:?}", file.display().to_string())),
                 "{label}: {}",
                 reports[0]
             );
