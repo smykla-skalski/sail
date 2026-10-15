@@ -11,6 +11,11 @@ to version 2.0.0 and preserve it across Codex process restarts and ACP forks.
 The distribution is licensed under Apache-2.0; see `LICENSE`. Sail changed
 the upstream distribution to select launch-provided permission profiles and to
 keep the selected profile through session lifecycle operations.
+For Sail permission profiles, turns inherit the globally configured approval
+reviewer instead of applying the ACP mode reviewer preset. The mode approval
+policy and explicit filesystem profile remain enforced. Legacy adapter sessions
+retain their mode reviewer presets.
+
 Sail stores the generated JavaScript as `dist/index.js.txt`, then stages it as
 `index.mjs` in the connection's private temporary directory at launch.
 
@@ -27,4 +32,4 @@ cp dist/index.js /path/to/sail/vendor/codex-acp/dist/index.js.txt
 ```
 
 The committed bundle's SHA-256 is
-`a9750334c121173e93d85966cded27bb1974ec8e8635a73082851704f5e55cbe`.
+`87474ec40d66c3e2dac0e513e86a1f2f65cdcdd9c455fdda2f56cbdb252bcc02`.

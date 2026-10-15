@@ -27,7 +27,7 @@ index 58dd0e8..f8e40a5 100644
 +sandbox behavior.
 +
 diff --git a/src/CodexAcpClient.ts b/src/CodexAcpClient.ts
-index 3b3aca4..4e18f91 100644
+index 3b3aca4..508325c 100644
 --- a/src/CodexAcpClient.ts
 +++ b/src/CodexAcpClient.ts
 @@ -49 +48,0 @@ import type {
@@ -99,13 +99,15 @@ index 3b3aca4..4e18f91 100644
 +        return developerInstructions ? {developerInstructions} : {};
 +    }
 +
-@@ -1056,0 +1102,5 @@ export class CodexAcpClient {
+@@ -1056,0 +1102,6 @@ export class CodexAcpClient {
 +        const sandboxSelection = this.permissionProfileConfig ? {
 +            runtimeWorkspaceRoots: sessionRoots(cwd, additionalDirectories),
 +        } : {
++            approvalsReviewer: agentMode.approvalsReviewer,
 +            sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
 +        };
-@@ -1062 +1112 @@ export class CodexAcpClient {
+@@ -1061,2 +1112 @@ export class CodexAcpClient {
+-            approvalsReviewer: agentMode.approvalsReviewer,
 -            sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
 +            ...sandboxSelection,
 @@ -1069,0 +1120,13 @@ export class CodexAcpClient {
@@ -296,12 +298,12 @@ index 1a533df..a3c6e1a 100644
 +        ...dependencies.developerInstructionSelection(),
 +        ...dependencies.permissionProfileSelection(request.cwd, additionalDirectories),
 diff --git a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
-index fc673fa..a57f7f1 100644
+index fc673fa..4a90e7f 100644
 --- a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
 +++ b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
 @@ -11,0 +12 @@ import {
 +    TEST_PERMISSION_PROFILE_CONFIG,
-@@ -530,0 +532,55 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+@@ -530,0 +532,102 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 +    it('selects external permission profiles without losing workspace roots', async () => {
 +        const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
 +        const codexAcpClient = mockFixture.getCodexAcpClient();
@@ -339,6 +341,53 @@ index fc673fa..a57f7f1 100644
 +        });
 +    });
 +
++    it.each([AgentMode.ReadOnly, AgentMode.WorkspaceWrite, AgentMode.Agent, AgentMode.AgentFullAccess])(
++        'inherits the configured reviewer for external profile turns in mode $id', async (mode) => {
++            const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
++            const client = mockFixture.getCodexAcpClient();
++            const server = mockFixture.getCodexAppServerClient();
++            vi.spyOn(server, "skillsExtraRootsSet").mockResolvedValue(undefined);
++            vi.spyOn(server, "listSkills").mockResolvedValue({data: []});
++            const runTurn = vi.spyOn(server, "runTurn").mockResolvedValue({} as TurnCompletedNotification);
++
++            await client.sendPrompt(
++                {sessionId: "thread-id", prompt: [{type: "text", text: "hello"}]},
++                mode, ModelId.create("gpt-5", "medium"), null, false,
++                "/workspace", ["/workspace/extra"],
++            );
++
++            const request = runTurn.mock.calls[0]![0];
++            expect(request).not.toHaveProperty("approvalsReviewer");
++            expect(request).not.toHaveProperty("sandboxPolicy");
++            expect(request).toMatchObject({
++                approvalPolicy: mode.approvalPolicy,
++                runtimeWorkspaceRoots: ["/workspace", "/workspace/extra"],
++            });
++        },
++    );
++
++    it.each([AgentMode.ReadOnly, AgentMode.WorkspaceWrite, AgentMode.Agent, AgentMode.AgentFullAccess])(
++        'preserves the mode reviewer for legacy turns in mode $id', async (mode) => {
++            const mockFixture = createCodexMockTestFixture();
++            const client = mockFixture.getCodexAcpClient();
++            const server = mockFixture.getCodexAppServerClient();
++            vi.spyOn(server, "skillsExtraRootsSet").mockResolvedValue(undefined);
++            vi.spyOn(server, "listSkills").mockResolvedValue({data: []});
++            const runTurn = vi.spyOn(server, "runTurn").mockResolvedValue({} as TurnCompletedNotification);
++
++            await client.sendPrompt(
++                {sessionId: "thread-id", prompt: [{type: "text", text: "hello"}]},
++                mode, ModelId.create("gpt-5", "medium"), null, false, "/workspace", [],
++            );
++
++            expect(runTurn.mock.calls[0]![0]).toMatchObject({
++                approvalPolicy: mode.approvalPolicy,
++                approvalsReviewer: mode.approvalsReviewer,
++                sandboxPolicy: mode.sandboxPolicy,
++            });
++        },
++    );
++
 +    it('preserves per-thread developer instructions before appending external policy', async () => {
 +        const mockFixture = createCodexMockTestFixture(
 +            undefined,
@@ -357,7 +406,7 @@ index fc673fa..a57f7f1 100644
 +            .toBe("per-thread policy\n\nexternal process policy");
 +    });
 +
-@@ -532 +588 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+@@ -532 +635 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 -        const mockFixture = createCodexMockTestFixture();
 +        const mockFixture = createCodexMockTestFixture(undefined, undefined, TEST_PERMISSION_PROFILE_CONFIG);
 diff --git a/src/__tests__/CodexACPAgent/session-config-options.test.ts b/src/__tests__/CodexACPAgent/session-config-options.test.ts

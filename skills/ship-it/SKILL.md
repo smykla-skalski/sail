@@ -9,6 +9,7 @@ user-invocable: true
 metadata:
   short-description: Ship a change, issue, or Jira ticket to merge
   upstream: smykla-skalski/sai plugins/ship-it 1.4.36 with Sail mode
+  scheduling-source: Selective scheduling and worker-events port from SAI ship-it 1.4.63
 ---
 
 # Ship It
@@ -27,7 +28,7 @@ Invocation: `/ship-it [--issue] [--risk low|medium|high] <task|GitHub issue|Jira
 - Read this entry once. Read each selected phase reference once, immediately before that phase, and keep its rules in the checkpoint. Do not reread a reference on phase transitions.
 - Resolve routine capabilities from current tools and the phase reference. Read [references/capabilities.md](references/capabilities.md) and [references/capabilities.json](references/capabilities.json) only on a missing/changed capability or fallback; then rerun the machine preflight.
 - Phase references name routine routes. Read [references/roles.md](references/roles.md) and [references/roles.json](references/roles.json) only for unresolved aliases or policy overrides. Give each gate its mandate by path or inline exactly once in fresh context.
-- After each subagent dispatch, use one blocking wait of at least ten minutes unless the worker returns sooner. Do not list agents or read status between waits; close the worker after its verdict.
+- Before dispatch, read [references/worker-events.md](references/worker-events.md). Launch every eligible independent dispatch before waiting; multiplex meaningful events without status polling. Persist dispatch IDs and deadlines, accept terminal events once and release capacity only when the host makes it reusable. Close completed executions when supported.
 - Maintain the checkpoint through the helper. Read [references/checkpoint.md](references/checkpoint.md) only for migration, recovery or validation error. Claims, evidence and telemetry default off; read [references/claims.md](references/claims.md), [references/evidence.md](references/evidence.md) or [references/telemetry.md](references/telemetry.md) only when enabled.
 - Routine guidance is this entry, selected phase references, [references/risk-policy.json](references/risk-policy.json), [references/release-policy.json](references/release-policy.json) and [references/convergence-policy.json](references/convergence-policy.json): keep it under 12k input tokens. After compaction, read only the checkpoint and current phase reference.
 - Read [references/risk.md](references/risk.md) or [references/release.md](references/release.md) only on override/ambiguity; read [references/convergence.md](references/convergence.md) only after failure, recovery or exhaustive opt-in. Checkpoint gates, release policy and budget before validation.

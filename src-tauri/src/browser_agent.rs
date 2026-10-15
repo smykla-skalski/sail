@@ -1553,6 +1553,10 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         "worker-rules.md",
         ship_it_file!("references/worker-rules.md"),
     ),
+    (
+        "worker-events.md",
+        ship_it_file!("references/worker-events.md"),
+    ),
     ("ci-triage.md", ship_it_file!("references/ci-triage.md")),
     (
         "ci-triage.schema.json",
