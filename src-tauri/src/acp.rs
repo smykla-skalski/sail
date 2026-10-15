@@ -2413,6 +2413,7 @@ fn default_gnupg_directory(home: Option<&Path>) -> Option<PathBuf> {
 fn ship_it_checkpoint_directory(data_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     let root = match data_home {
         Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) if !path.as_os_str().is_empty() => return None,
         _ => home?.join(".local/share"),
     };
     let directory = root.join("sai/ship-it/checkpoints");
@@ -2426,6 +2427,13 @@ fn ship_it_checkpoint_directory(data_home: Option<&Path>, home: Option<&Path>) -
         .file_type()
         .is_dir();
     (is_directory && WritableDirectory::capture(&directory).is_ok()).then_some(directory)
+}
+
+fn user_writable_directories(home: Option<&Path>, data_home: Option<&Path>) -> Vec<PathBuf> {
+    default_gnupg_directory(home)
+        .into_iter()
+        .chain(ship_it_checkpoint_directory(data_home, home))
+        .collect()
 }
 
 fn agent_path(
@@ -6343,15 +6351,11 @@ fn connect_blocking_inner(
             .join("terminal-package-downloads");
         std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
         let mut writable = vec![temp.0.clone(), data_directory.clone(), shared_cache];
-        if let Some(gnupg) = default_gnupg_directory(home.as_deref()) {
-            writable.push(gnupg);
-        }
         let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-        if let Some(checkpoints) =
-            ship_it_checkpoint_directory(data_home.as_deref(), home.as_deref())
-        {
-            writable.push(checkpoints);
-        }
+        writable.extend(user_writable_directories(
+            home.as_deref(),
+            data_home.as_deref(),
+        ));
         if let Some(overlay) = overlay.as_ref() {
             writable.push(overlay.git_dir.clone());
         }
@@ -10557,10 +10561,23 @@ time.sleep(10)
             Some(data_home.join("sai/ship-it/checkpoints"))
         );
         assert_eq!(
-            ship_it_checkpoint_directory(Some(Path::new("relative")), Some(&home)),
+            ship_it_checkpoint_directory(Some(Path::new("")), Some(&home)),
             Some(default.clone())
         );
+        assert!(ship_it_checkpoint_directory(Some(Path::new("relative")), Some(&home)).is_none());
         assert!(ship_it_checkpoint_directory(None, None).is_none());
+
+        let gnupg = home.join(".gnupg");
+        std::fs::create_dir_all(&gnupg).unwrap();
+        assert_eq!(
+            user_writable_directories(Some(&home), Some(&data_home)),
+            vec![gnupg.clone(), data_home.join("sai/ship-it/checkpoints")]
+        );
+        assert_eq!(
+            user_writable_directories(Some(&home), None),
+            vec![gnupg, default.clone()]
+        );
+        assert!(user_writable_directories(None, None).is_empty());
 
         #[cfg(unix)]
         {
