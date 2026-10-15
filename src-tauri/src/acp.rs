@@ -857,6 +857,20 @@ struct SessionUiState {
 
 impl Connection {
     fn native_replay_update(&self, parent: &str, update: &Value) -> Result<bool, String> {
+        let child_id = update.get("subagentSessionId").and_then(Value::as_str);
+        let registered_child = if let Some(child) = child_id {
+            self.native_subagents
+                .lock()
+                .map_err(|error| error.to_string())?
+                .0
+                .get(child)
+                .filter(|child| {
+                    child.parent_session_id == parent && NativeSubagentRegistry::is_live(child)
+                })
+                .cloned()
+        } else {
+            None
+        };
         let mut replays = self
             .native_replays
             .lock()
@@ -867,7 +881,14 @@ impl Connection {
         else {
             return Ok(false);
         };
-        if let Some(child) = update.get("subagentSessionId").and_then(Value::as_str) {
+        if let Some(child) = child_id {
+            // A live spawn can finish registration after the restore snapshot was taken.
+            if let Some(registered) = registered_child {
+                replay
+                    .live_children
+                    .entry(child.to_string())
+                    .or_insert(registered);
+            }
             replay.sessions.insert(child.to_string());
             return Ok(!replay.live_children.contains_key(child));
         }
@@ -12791,6 +12812,69 @@ mod native_subagent_fence_tests {
             );
             assert!(result.is_err());
             assert!(!runtime.native_replay_update("parent", &spawn).unwrap());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_replay_activation_reconciles_new_live_children() {
+        for classified_before_activation in [false, true] {
+            let runtime = super::session_config_tests::test_runtime(
+                "codex",
+                CapabilityProfile::Build,
+                Path::new("/repo"),
+                "parent",
+                None,
+            );
+            let spawn = json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"new-live"});
+            let live_children = runtime
+                .native_subagents
+                .lock()
+                .unwrap()
+                .live_descendants("parent");
+            if classified_before_activation {
+                assert!(!runtime.native_replay_update("parent", &spawn).unwrap());
+            } else {
+                runtime
+                    .native_subagents
+                    .lock()
+                    .unwrap()
+                    .spawn("parent", "new-live", PathBuf::from("/repo"), false)
+                    .unwrap();
+            }
+            runtime.native_replays.lock().unwrap().insert(
+                7,
+                NativeReplay {
+                    sessions: HashSet::from(["parent".into()]),
+                    live_children,
+                },
+            );
+            if classified_before_activation {
+                runtime
+                    .native_subagents
+                    .lock()
+                    .unwrap()
+                    .spawn("parent", "new-live", PathBuf::from("/repo"), false)
+                    .unwrap();
+            }
+            let completed = json!({"sessionUpdate":"subagent_state_update","subagentSessionId":"new-live","state":"completed"});
+            assert!(!runtime.native_replay_update("parent", &completed).unwrap());
+            assert!(runtime.replaying_live_child("parent", "new-live"));
+            runtime
+                .native_subagents
+                .lock()
+                .unwrap()
+                .update("parent", "new-live", "completed")
+                .unwrap();
+            assert!(runtime.replaying_live_child("parent", "new-live"));
+            runtime.finish_native_replay(7, true);
+            assert!(!runtime.replaying_live_child("parent", "new-live"));
+            assert!(runtime
+                .native_subagents
+                .lock()
+                .unwrap()
+                .task_connections()
+                .is_empty());
         }
     }
 
