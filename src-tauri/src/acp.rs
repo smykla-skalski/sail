@@ -8006,14 +8006,7 @@ fn restore_session_blocking(
         });
         // A delete that lands during the restore leaves nothing registered for the thread.
         if outcome.is_err()
-            && unregister_if_deleted(
-                manager,
-                &runtime,
-                &agent,
-                &cwd,
-                &session_id,
-                manager_generation,
-            )?
+            && unregister_if_deleted(&runtime, &session_id)?
             && loaded.get()
             && runtime.supports_session_close()
         {
@@ -8033,19 +8026,9 @@ fn restore_session_blocking(
     }
 }
 
-/// Unregisters a thread whose delete committed while a restore ran. An aborted delete leaves the
-/// generation bumped but the thread live, so the committed fence decides, not the generation.
-fn unregister_if_deleted(
-    manager: &AgentManager,
-    runtime: &Connection,
-    agent: &str,
-    directory: &str,
-    session_id: &str,
-    manager_generation: u64,
-) -> Result<bool, String> {
-    if manager.forget_generation(agent, directory, session_id)? == manager_generation {
-        return Ok(false);
-    }
+/// Unregisters a thread whose delete is committed or in progress, whether it began before or
+/// during the failed restore. An aborted delete clears its fence, so a live thread stays registered.
+fn unregister_if_deleted(runtime: &Connection, session_id: &str) -> Result<bool, String> {
     let forgotten = runtime
         .prompt_state
         .lock()
@@ -13602,18 +13585,8 @@ mod idle_close_tests {
                 .contains_key(&session));
             // The delete drops the idle state while the resume is still in flight.
             runtime.idle.lock().unwrap().forget(&session);
-            let manager = AgentManager::default();
-            let directory = std::env::temp_dir();
-            let directory = directory.to_str().unwrap();
-            let generation = manager
-                .forget_generation(agent, directory, &session)
-                .unwrap();
-            manager.mark_forget(agent, directory, &session).unwrap();
-            // An aborted delete bumped the generation but left the thread live.
-            assert!(!unregister_if_deleted(
-                &manager, &runtime, agent, directory, &session, generation
-            )
-            .unwrap());
+            // An aborted delete leaves the thread live and clears its fence.
+            assert!(!unregister_if_deleted(&runtime, &session).unwrap());
             assert!(runtime
                 .session_profiles
                 .lock()
@@ -13624,10 +13597,7 @@ mod idle_close_tests {
                 .lock()
                 .unwrap()
                 .mark_forgotten(&session);
-            assert!(unregister_if_deleted(
-                &manager, &runtime, agent, directory, &session, generation
-            )
-            .unwrap());
+            assert!(unregister_if_deleted(&runtime, &session).unwrap());
             drop(claim);
             assert!(!runtime
                 .session_profiles
