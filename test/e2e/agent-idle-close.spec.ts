@@ -122,6 +122,13 @@ async function closeIdleThreads(...ids: string[]) {
   });
 }
 
+// An earlier test leaves a short timeout behind, which could close a thread before the test counts.
+async function pauseIdleClose() {
+  await browser.tauri.execute(async ({ core }) => {
+    await core.invoke('acp_set_idle_close_timeout', { seconds: 3600 });
+  });
+}
+
 describe('idle session close', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-idle-close-'));
 
@@ -341,6 +348,7 @@ describe('idle session close', () => {
   for (const provider of ['codex', 'claude'] as const) {
     it(`restores a closed ${provider} thread from the UI without racing config changes, and keeps it closed when the resume fails`, async () => {
       const directory = realpathSync(repository);
+      await pauseIdleClose();
       const [id] = await newSessions(provider, directory, 1);
       await finishTurns(provider, directory, [id]);
       await closeIdleThreads(id);
@@ -443,7 +451,8 @@ describe('idle session close', () => {
   for (const provider of ['codex', 'claude'] as const) {
     it(`drops a closed ${provider} thread's idle state when it is deleted, also during a resume`, async () => {
       const directory = realpathSync(repository);
-      const [closed, resuming] = await newSessions(provider, directory, 2);
+      await pauseIdleClose();
+      const [closed, resuming, reserved] = await newSessions(provider, directory, 3);
       await finishTurns(provider, directory, [closed, resuming]);
       await closeIdleThreads(closed, resuming);
 
@@ -524,6 +533,29 @@ describe('idle session close', () => {
       rmSync(slowResume, { force: true });
       expect(outcome).toContain('deleted while reconnecting');
       expect(await attached(provider, directory)).not.toContain(resuming);
+
+      // A delete between the restore reservation and its resume leaves nothing registered either.
+      await finishTurns(provider, directory, [reserved]);
+      await closeIdleThreads(reserved);
+      await browser.tauri.execute(
+        async ({ core }, agent, path, session) => {
+          const reservation = await core.invoke<{ restoreToken: string }>(
+            'acp_begin_session_restore',
+            { agent, cwd: path, sessionId: session },
+          );
+          await core.invoke('acp_forget_session', { agent, directory: path, sessionId: session });
+          await core.invoke('acp_end_session_restore', {
+            agent,
+            directory: path,
+            sessionId: session,
+            restoreToken: reservation.restoreToken,
+          });
+        },
+        provider,
+        directory,
+        reserved,
+      );
+      expect(await attached(provider, directory)).not.toContain(reserved);
     });
   }
 

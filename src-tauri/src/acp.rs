@@ -7519,26 +7519,42 @@ pub async fn acp_forget_session(
                 return Err(error.to_string());
             }
         }
-        if let Err(error) = runtime
+        let restoring = match runtime
             .restores
             .lock()
             .map(|mut claims| claims.remove(&session_id))
         {
-            runtime
-                .prompt_state
-                .lock()
-                .map_err(|cause| cause.to_string())?
-                .finish_forget(&session_id, false);
-            return Err(error.to_string());
-        }
+            Ok(claim) => claim.is_some(),
+            Err(error) => {
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        };
         runtime.restore_ready.notify_all();
-        if let Err(error) = runtime.idle.lock().map(|mut idle| idle.forget(&session_id)) {
+        // A restore reservation registered the thread; a deleted thread must not stay registered.
+        let cleared = runtime
+            .idle
+            .lock()
+            .map(|mut idle| idle.forget(&session_id))
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                if restoring {
+                    unregister_session(&runtime, &session_id)
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = cleared {
             runtime
                 .prompt_state
                 .lock()
                 .map_err(|cause| cause.to_string())?
                 .finish_forget(&session_id, false);
-            return Err(error.to_string());
+            return Err(error);
         }
         let mut configs = match runtime.session_configs.lock() {
             Ok(configs) => configs,
