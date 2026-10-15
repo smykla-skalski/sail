@@ -2,7 +2,7 @@ import type { AgentThread } from './acp';
 import type { SpawnReceipt } from './agent-results';
 import type { AttentionMap, ThreadStatus } from './attention';
 import type { ProjectCatalog, WorktreeOrigin } from './projects';
-import { worktreeAncestry } from './projects.ts';
+import { owningRepository, worktreeAncestry } from './projects.ts';
 import { threadKey } from './recent-threads.ts';
 
 export type CoordinationThread = {
@@ -11,6 +11,24 @@ export type CoordinationThread = {
   title: string;
   agent: string;
 };
+
+export function coordinationDeliveryProject(
+  catalog: ProjectCatalog,
+  receipts: SpawnReceipt[],
+  directory: string,
+  threadId: string,
+): string | null {
+  const owner = owningRepository(catalog, directory);
+  if (owner) return owner;
+  return (
+    receipts.find(
+      (receipt) =>
+        receipt.targetId === threadId &&
+        receipt.targetDirectory === directory &&
+        catalog.repositories.includes(receipt.project),
+    )?.project ?? null
+  );
+}
 
 export function projectReceiptThreads(
   receipts: SpawnReceipt[],

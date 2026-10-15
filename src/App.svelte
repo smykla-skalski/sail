@@ -489,6 +489,7 @@
   import { copyCompletedSelection, copyStatusHost } from './lib/auto-copy';
   import {
     coordinationKey,
+    coordinationDeliveryProject,
     coordinationSourceThread,
     coordinationTarget,
     coordinationPrompt,
@@ -6672,7 +6673,8 @@
       if (split < 0) continue;
       const targetDirectory = message.target.slice(0, split);
       const id = message.target.slice(split + 1);
-      if (!coordinationProject(targetDirectory)) continue;
+      if (!coordinationDeliveryProject(projectCatalog, spawnReceipts, targetDirectory, id))
+        continue;
       coordinationAttempts.set(message.id, Date.now());
       queueCoordinationDelivery({ id, directory: targetDirectory, title: '', agent: '' }, message);
     }

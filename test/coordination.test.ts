@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   coordinationKey,
+  coordinationDeliveryProject,
   coordinationSourceThread,
   coordinationTarget,
   coordinationMessageForText,
@@ -44,6 +45,38 @@ await test('returned owned IDs resolve without sidebar or worktree catalog entri
     coordinationTarget(threads, [receipt], '/repo', receipt.targetId!).directory,
     '/scratch/worker',
   );
+});
+
+await test('an accepted receipt-only target remains authorized when its queued message retries', () => {
+  const receipt = ownedReceipt();
+  const catalog = { repositories: ['/repo'], groups: [], worktrees: {} };
+  const target = coordinationTarget(
+    projectReceiptThreads([receipt], '/repo'),
+    [receipt],
+    '/repo',
+    receipt.targetId!,
+  );
+  const queue = enqueueCoordinationMessage([], {
+    id: 'message',
+    target: coordinationKey(target.directory, target.id),
+    sender: 'parent',
+    text: 'recover',
+    created: 1,
+  });
+  const split = queue[0].target.lastIndexOf('\0');
+  const directory = queue[0].target.slice(0, split);
+  const id = queue[0].target.slice(split + 1);
+  assert.equal(coordinationDeliveryProject(catalog, [receipt], directory, id), '/repo');
+  assert.equal(
+    coordinationDeliveryProject(catalog, [receipt], directory, 'acp:codex:unrelated'),
+    null,
+  );
+  assert.equal(coordinationDeliveryProject(catalog, [receipt], '/different', id), null);
+  assert.equal(
+    coordinationDeliveryProject(catalog, [ownedReceipt({ project: '/foreign' })], directory, id),
+    null,
+  );
+  assert.equal(coordinationDeliveryProject(catalog, [], '/repo', 'saved-thread'), '/repo');
 });
 
 await test('owned IDs remain scoped to their receipt project', () => {
