@@ -197,6 +197,8 @@ export function rssWindows({ samples, launchedAt, options }) {
         readings: found.length,
         rssBytes: median(found.map((sample) => sample.rssBytes)),
         children: median(found.map((sample) => sample.children)),
+        appRssBytes: median(found.flatMap((sample) => sample.appRssBytes ?? [])),
+        appFootprintBytes: median(found.flatMap((sample) => sample.appFootprintBytes ?? [])),
       };
     };
     return { early: summary(early), late: summary(late) };
@@ -360,6 +362,25 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
         .map((phase) => `${phase.name} ${percent(phase)}`)
         .join(', ')} (${limit})`
     : `no phase had ${windows.minimumReadings} readings in both windows`;
+  const nativePhases = windows.phases.filter(
+    (phase) => phase.early.appFootprintBytes != null && phase.late.appFootprintBytes != null,
+  );
+  const nativeMemory = nativePhases.length
+    ? [
+        '',
+        'Sail process only: physical footprint includes compressed or swapped memory; RSS excludes it. These diagnostics do not change the RSS verdict.',
+        ...table(
+          ['Phase', 'Early RSS', 'Late RSS', 'Early footprint', 'Late footprint'],
+          nativePhases.map((phase) => [
+            phase.name,
+            megabytes(phase.early.appRssBytes),
+            megabytes(phase.late.appRssBytes),
+            megabytes(phase.early.appFootprintBytes),
+            megabytes(phase.late.appFootprintBytes),
+          ]),
+        ),
+      ]
+    : [];
   return [
     ...table(header, rows),
     '',
@@ -367,6 +388,7 @@ export function formatReport({ first, second, verdict, maintenance, options, lau
     '',
     `Total RSS: median per phase over two ${fixed(windows.widthMinutes)}-minute windows (readings in brackets); active means the app has child processes.`,
     ...table(['Phase', span(windows.early), span(windows.late), 'Difference', 'Change'], phaseRows),
+    ...nativeMemory,
     `Child processes (${verdict.children.basis}): ${fixed(verdict.children.first, 0)} in the first window, ${fixed(verdict.children.second, 0)} in the last.`,
     '',
     `${mark(verdict.children.pass)}  child processes ${percent(verdict.children)} (${limit})`,

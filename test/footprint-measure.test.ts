@@ -394,6 +394,37 @@ await test('the report prints the windows, the phases, the difference and the ve
   assert.match(report, /RESULT: PASS$/);
 });
 
+await test('a flat physical footprint is reported without masking RSS growth', () => {
+  const samples = series((at) => ({ children: 0, rssMb: at < 60 ? 50 : 100 })).map((sample) => ({
+    time: sample.time,
+    children: sample.children,
+    rssBytes: sample.rssBytes,
+    appRssBytes: sample.rssBytes,
+    appFootprintBytes: 40 * MB,
+  }));
+  const maintenance = { elapsedMs: 1000 };
+  const verdict = evaluate({ samples, launchedAt: 0, maintenance, options: defaults });
+
+  const report = formatReport({
+    first: snap(0, 50 * MB, 10 * minute),
+    second: snap(0, 100 * MB, 120 * minute),
+    verdict,
+    maintenance,
+    options: defaults,
+    launchedAt: 0,
+  });
+
+  assert.equal(verdict.rss.pass, false);
+  assert.equal(verdict.pass, false);
+  assert.match(
+    report,
+    /Sail process only: physical footprint includes compressed or swapped memory/,
+  );
+  assert.match(report, /idle\s+50\.0 MB\s+100\.0 MB\s+40\.0 MB\s+40\.0 MB/);
+  assert.match(report, /FAIL\s+total RSS idle \+100\.0%/);
+  assert.match(report, /RESULT: FAIL$/);
+});
+
 await test('a failing report names the failed threshold', () => {
   const first = snap(3, 100, 10 * minute);
   const second = snap(9, 100, 120 * minute);

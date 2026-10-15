@@ -104,7 +104,10 @@ async function loadProfileInWebview(port, binary, branch) {
             localStorage.setItem('sai-settings-migrated-v1', '1');
             return true;`,
           args: [],
-        }).catch(() => false),
+        }).catch((error) => {
+          process.stderr.write(`Webview storage setup: ${error.message}\n`);
+          return false;
+        }),
       Date.now() + 30_000,
       'The webview never accepted its storage settings',
     );
@@ -114,7 +117,10 @@ async function loadProfileInWebview(port, binary, branch) {
         webdriver(port, 'POST', `${base}/execute/sync`, {
           script: 'return document.body.innerText.includes(arguments[0]);',
           args: [branch],
-        }).catch(() => false),
+        }).catch((error) => {
+          process.stderr.write(`Webview profile readiness: ${error.message}\n`);
+          return false;
+        }),
       Date.now() + 60_000,
       `The sidebar never listed ${branch}`,
     );
@@ -226,6 +232,15 @@ async function main() {
   try {
     const run = join(root, 'run');
     mkdirSync(run);
+    const memoryProbe = join(root, 'process-memory');
+    command('/usr/bin/cc', [
+      '-Wall',
+      '-Wextra',
+      '-Werror',
+      join(checkout, 'scripts/macos-process-memory.c'),
+      '-o',
+      memoryProbe,
+    ]);
     const source = options.app
       ? resolve(options.app)
       : (process.stdout.write('Building the private app\n'), await buildApp(root, run));
@@ -296,8 +311,10 @@ async function main() {
             });
             const tree =
               table.status === 0 ? measureTree(parseProcessTable(table.stdout), appPid) : null;
-            if (tree) samples.push({ time: Date.now(), ...tree });
-            else exited = true;
+            if (tree) {
+              const memory = JSON.parse(command(memoryProbe, [String(appPid)]));
+              samples.push({ time: Date.now(), ...tree, ...memory });
+            } else exited = true;
           }),
         options.intervalSeconds * 1000,
       ),
