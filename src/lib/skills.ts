@@ -46,8 +46,11 @@ const defaultGateRules: Record<string, string> = {
 const failedGateRule =
   'If a required fresh session cannot launch, pause and report the failed gate and reason in this thread. Never run a gate inline. This overrides any inline fallback in an installed skill.';
 
+const shipAssignmentRule =
+  "Sail Ship assignment boundary: Native Ship progress and validation_gate instructions in this prompt, including any configured cross-validation policy, apply only to assigned Ship workers and gates. An ordinary thread has no Ship worker or gate assignment and no local Ship claim. It continues user-authorized shipping through portable bookkeeping, claims policy and fresh-subagent review/test routes when native Ship tools are absent or reject unassigned checkpoint/progress access. Do not request a Ship assignment just to continue. Assigned workers with missing or expired ownership, access denial or revision/delivery mismatch must stop; portable fallback never grants another worker's checkpoint, progress or claim.";
+
 const shipProgressStageRule =
-  'Sail progress reporting: call ship_progress with { stage, status: "running" } before implementing, reviewing, testing, opening the pull request, waiting on CI, and merging. Use stages implementing, reviewing, testing, pull_request, ci, and merging respectively. When the user merges and the pull request is mergeable, call ship_progress with { stage: "awaiting_merge", status: "running" } and stop. When work cannot continue, call ship_progress with { stage, status: "blocked", reason } before explaining the blocker.';
+  'For assigned Ship workers and gates, Sail progress reporting: call ship_progress with { stage, status: "running" } before implementing, reviewing, testing, opening the pull request, waiting on CI, and merging. Use stages implementing, reviewing, testing, pull_request, ci, and merging respectively. When the user merges and the pull request is mergeable, call ship_progress with { stage: "awaiting_merge", status: "running" } and stop. When work cannot continue, call ship_progress with { stage, status: "blocked", reason } before explaining the blocker.';
 
 export function mergeSkills(installed: SkillChoice[], bundled: SkillChoice[]): SkillChoice[] {
   const native = new Map(installed.map((skill) => [skill.name.toLowerCase(), skill]));
@@ -65,6 +68,7 @@ export function resolveSkillPrompt(
 ): string {
   const skill = promptSkill(skills, text);
   if (!skill) return text;
+  const assignment = skill.name.toLowerCase() === 'ship-it' ? `\n\n${shipAssignmentRule}` : '';
   const rule = sailGateRules[skill.name.toLowerCase()];
   const settings =
     typeof localStorage !== 'undefined'
@@ -79,8 +83,8 @@ export function resolveSkillPrompt(
     : '';
   const reporting = skill.name.toLowerCase() === 'ship-it' ? `\n\n${shipProgressStageRule}` : '';
   return skill.instructions
-    ? `${text}${gate}${reporting}\n\nFollow this bundled Sail skill:\n\n${skill.instructions}`
-    : `${text}${gate}${reporting}`;
+    ? `${text}${assignment}${gate}${reporting}\n\nFollow this bundled Sail skill:\n\n${skill.instructions}`
+    : `${text}${assignment}${gate}${reporting}`;
 }
 
 export function skillQuery(draft: string): string | null {

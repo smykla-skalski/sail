@@ -257,6 +257,12 @@ void test('ordinary threads continue shipping through the portable workflow', ()
     /with claims enabled acquire and reconcile its own GitHub claim through `claims\.md` before writes/,
   );
   assert.match(claims, /Native Ship ownership is not required for that portable task/);
+  const merge = sailModeRule('Merge owner');
+  assert.match(merge, /For native Ship assignments, never post a GitHub comment/);
+  assert.match(
+    merge,
+    /Ordinary threads on the portable workflow follow its resolved claims and release policy, including permitted GitHub claim and bot-merge comments, subject to session capabilities and permissions/,
+  );
 });
 
 void test('portable fallback never replaces an assigned Ship worker ownership check', () => {
@@ -296,6 +302,34 @@ void test('an installed ship-it skill keeps Sail stage reporting without the bun
   assert.doesNotMatch(prompt, /Follow this bundled Sail skill/);
   assert.doesNotMatch(prompt, /## Sail mode/);
 });
+
+for (const installed of [[], [{ id: 'native', name: 'ship-it', description: 'Installed' }]]) {
+  void test(`shipping prompt scopes native instructions with ${installed.length ? 'installed' : 'bundled'} skill`, () => {
+    const prompt = resolveSkillPrompt(mergeSkills(installed, bundled), '/ship-it #859');
+    assert.match(
+      prompt,
+      /Native Ship progress and validation_gate instructions in this prompt, including any configured cross-validation policy, apply only to assigned Ship workers and gates/,
+    );
+    assert.match(
+      prompt,
+      /ordinary thread has no Ship worker or gate assignment and no local Ship claim/,
+    );
+    assert.match(
+      prompt,
+      /continues user-authorized shipping through portable bookkeeping, claims policy and fresh-subagent review\/test routes/,
+    );
+    assert.match(
+      prompt,
+      /Assigned workers with missing or expired ownership, access denial or revision\/delivery mismatch must stop/,
+    );
+    assert.match(
+      prompt,
+      /portable fallback never grants another worker's checkpoint, progress or claim/,
+    );
+    assert.ok(prompt.indexOf('Sail Ship assignment boundary:') < prompt.indexOf('Sail gate rule:'));
+    assert.match(prompt, /For assigned Ship workers and gates, Sail progress reporting:/);
+  });
+}
 
 void test('bundled scheduling fills capacity before waiting and keeps Sail gates authoritative', () => {
   const scheduling = read('ship-it', 'references/orchestration.md');
