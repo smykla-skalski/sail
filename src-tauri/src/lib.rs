@@ -1772,16 +1772,24 @@ fn allow_worktree_terminal_creation(app: &AppHandle, worktree: &Path) {
 }
 
 fn default_worktree_parent(repository: &Path) -> Result<PathBuf, String> {
-    let root = if let Some(root) = std::env::var_os("SAIL_WORKTREE_ROOT") {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    worktree_parent(repository, std::env::var_os("SAIL_WORKTREE_ROOT"), home)
+}
+
+fn worktree_parent(
+    repository: &Path,
+    override_root: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let root = if let Some(root) = override_root {
         let root = PathBuf::from(root);
         if !root.is_absolute() {
             return Err("SAIL_WORKTREE_ROOT must be an absolute path.".to_string());
         }
         root
     } else {
-        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-            .ok_or("Home directory is unavailable. Choose a worktree destination.")?;
-        Path::new(&home).join("sail").join("worktrees")
+        let home = home.ok_or("Home directory is unavailable. Choose a worktree destination.")?;
+        Path::new(&home).join(".sail").join("worktrees")
     };
     Ok(root.join(repository_namespace(repository)))
 }
@@ -5770,7 +5778,8 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-worktree-test-{}", uuid::Uuid::new_v4()));
         let repository = root.join("repository");
-        let child = root.join("child");
+        let child = root.join("sail/worktrees/repository/legacy");
+        let hidden = root.join(".sail/worktrees/repository/new");
         fs::create_dir_all(&repository).unwrap();
         let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
@@ -5795,6 +5804,11 @@ mod tests {
             &["worktree", "add", "-qb", "child", child.to_str().unwrap()],
         );
 
+        git(
+            repository_path,
+            &["worktree", "add", "-qb", "hidden", hidden.to_str().unwrap()],
+        );
+
         let alias = child.join(".").to_string_lossy().into_owned();
         let matched =
             registered_worktrees_sync(repository_path.into(), vec![alias.clone()]).unwrap();
@@ -5807,6 +5821,27 @@ mod tests {
             .iter()
             .any(|entry| entry.path == canonical_child.to_string_lossy()
                 && entry.generation.is_some()));
+
+        let canonical_hidden = hidden.git_canonical().unwrap();
+        assert!(discovered
+            .iter()
+            .any(|entry| entry.path == canonical_hidden.to_string_lossy()
+                && entry.generation.is_some()));
+        let targets = super::worktree_removal_targets(
+            repository_path.into(),
+            vec![
+                child.to_string_lossy().into_owned(),
+                hidden.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .any(|target| target.canonical == canonical_child));
+        assert!(targets
+            .iter()
+            .any(|target| target.canonical == canonical_hidden));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -8690,6 +8725,25 @@ mod tests {
             .unwrap()
             .is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_worktree_location_is_hidden_and_override_is_preserved() {
+        let home = std::env::temp_dir().join("sail-home");
+        let repository = home.join("repository");
+        let namespace = repository_namespace(&repository);
+        assert_eq!(
+            super::worktree_parent(&repository, None, Some(home.clone().into_os_string())).unwrap(),
+            home.join(".sail/worktrees").join(&namespace)
+        );
+        let custom = home.join("custom");
+        assert_eq!(
+            super::worktree_parent(&repository, Some(custom.clone().into_os_string()), None)
+                .unwrap(),
+            custom.join(&namespace)
+        );
+        assert!(super::worktree_parent(&repository, Some("relative".into()), None).is_err());
+        assert!(super::worktree_parent(&repository, None, None).is_err());
     }
 
     #[test]
