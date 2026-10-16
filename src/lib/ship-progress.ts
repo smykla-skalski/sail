@@ -1,3 +1,4 @@
+import { shipTokenCostSchema } from './ship-token-cost.ts';
 import { z } from 'zod';
 import {
   defaultMergeOwner,
@@ -219,6 +220,7 @@ const reportSchema = z.union([
     .object({
       stage: z.enum(stages),
       status: z.enum(['running', 'blocked']),
+      tokenCost: shipTokenCostSchema.optional(),
       reason: z.string().max(2000).optional(),
     })
     .strict(),
@@ -1587,6 +1589,7 @@ const shipIssueSchema = z.object({
   retryCount: z.number().int().nonnegative().optional(),
   lostStateFailures: z.number().int().nonnegative().optional(),
   evidenceManifests: evidenceManifestsSchema.optional(),
+  tokenCost: shipTokenCostSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
   validationPolicyRequired: z.boolean().default(true),

@@ -2073,6 +2073,44 @@ fn plan_tool_schema(name: &str) -> Option<Value> {
     }
 }
 
+fn token_cost_input_schema() -> Value {
+    let amount = json!({"type":["string","null"],"maxLength":100,"pattern":r"^\d+(?:\.\d+)?(?:E[+-]?\d+)?$"});
+    let count = json!({"type":"integer","minimum":0,"maximum":9007199254740991_u64});
+    let group = json!({"type":"object","properties":{
+        "estimated_usd":amount,"known_estimated_usd":amount,
+        "unknown_observations":count,"usage_observations":count
+    },"required":["estimated_usd","known_estimated_usd","unknown_observations","usage_observations"],"additionalProperties":false});
+    let phases = [
+        "resolve",
+        "orchestrate",
+        "explore",
+        "branch",
+        "implement",
+        "publish",
+        "review",
+        "test",
+        "pr",
+        "wait",
+        "fix",
+        "merge",
+        "complete",
+    ];
+    let roles = [
+        "primary",
+        "subagent",
+        "validator",
+        "guardian",
+        "synthetic",
+        "probe",
+    ];
+    let grouped = |names: &[&str]| json!({"type":"object","properties": names.iter().map(|name| ((*name).to_owned(),group.clone())).collect::<serde_json::Map<String,Value>>(),"additionalProperties":false});
+    json!({"type":"object","properties":{
+        "currency":{"const":"USD"},
+        "basis":{"const":"host usage deltas; caller-supplied USD prices per million tokens"},
+        "total":group,"by_phase":grouped(&phases),"by_role":grouped(&roles)
+    },"required":["currency","basis","total","by_phase","by_role"],"additionalProperties":false})
+}
+
 fn economics_input_schema() -> Value {
     let counter = || json!({"type":"integer","minimum":0,"maximum":9007199254740991_u64});
     json!({
@@ -2366,6 +2404,7 @@ pub fn run_mcp_stdio() {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object","properties":{
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
+                            "tokenCost":token_cost_input_schema(),
                             "status":{"type":"string","enum":["running","blocked"]},
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED","FAILED"]},

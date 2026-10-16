@@ -7697,6 +7697,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
+        ...(report.tokenCost ? { tokenCost: report.tokenCost } : {}),
         ...shipWorkerProgressChanges(report.status, report.reason),
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
