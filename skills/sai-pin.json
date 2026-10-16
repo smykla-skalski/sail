@@ -69,11 +69,11 @@
     "skills/ship-it/scripts/handoff.py": "dce346274b7bf211a9f5e9c7e1e82560e981b9ce7ae67aa321f553ac69a6fd91",
     "skills/ship-it/scripts/hosted_wait.py": "dd2d823e61f393f3d08023ef4e5c8a6b79c2e1350fc8072301307b7a9e338cc8",
     "skills/ship-it/scripts/replay_failures.py": "19e295f0c08e97e2942898338ab402f823d15b6972e602746bc2f2c74a38a898",
-    "skills/ship-it/scripts/telemetry.py": "3d81f3f19e7a91d5cb3ff5460f7fd6ae5512a64b2fb9a5517a91a08d00c57fce",
+    "skills/ship-it/scripts/telemetry.py": "3a1d949fd187cc38b114aa00a5ee40b64babbd84f12f7cbd67aaa8d4d6005b33",
     "skills/ship-it/scripts/test_copilot_quota.py": "bd54c18eb1ab01dc4c00de00d2215a4ea8166691ceae702e892551d830b9c125",
     "skills/ship-it/scripts/test_copilot_review.py": "f26a805e2c4d4e0806a24076a0b24f09b4f09c854d7a1565a231e7301ec9355d",
     "skills/ship-it/scripts/test_replay_failures.py": "87e5d84c9ebcc6028d2b8d638d19afbfa95c529036ca2cdc57eedfdc5dc623f8",
-    "skills/ship-it/scripts/test_telemetry.py": "9861575e5dab2966920f813bc86bba01af8b65da85bf46d431cef5c71aebcaed",
+    "skills/ship-it/scripts/test_telemetry.py": "ea6950e3e2b7c164fc7335d3ed69807050313e01059614e362cb4f376da04db3",
     "skills/ship-it/scripts/token_cost.py": "d53465ebd658b450b1dcef6727b2a8d8d01fd83031847171955cb52446d1a27e",
     "skills/ship-it/scripts/validation_reuse.py": "80b90504fbeb565f4f2fb13844e17d58e8215fc3b92152df977e6e49de894f35",
     "skills/adversarial-review/SKILL.md": "e11a4b3b89b99a6e48b8b285b531214d237323c04e5d93981358c3983329141a",
@@ -89,5 +89,15 @@
   },
   "metadata": {
     "plugin.json": "plugins/ship-it/plugin.json"
+  },
+  "upstreamOverrides": {
+    "skills/ship-it/scripts/telemetry.py": {
+      "revision": "d315fdb007d334e7d588f22bd816ff6b776ee676",
+      "path": "plugins/ship-it/skills/ship-it/scripts/telemetry.py"
+    },
+    "skills/ship-it/scripts/test_telemetry.py": {
+      "revision": "d315fdb007d334e7d588f22bd816ff6b776ee676",
+      "path": "plugins/ship-it/skills/ship-it/scripts/test_telemetry.py"
+    }
   }
 }

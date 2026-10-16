@@ -1,4 +1,3 @@
-import process from 'node:process';
 import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { basename, dirname, resolve, relative } from 'node:path';
@@ -35,6 +34,6 @@ export async function checkBundledSkills(root = fileURLToPath(new URL('..', impo
   );
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main) {
   await checkBundledSkills();
 }
