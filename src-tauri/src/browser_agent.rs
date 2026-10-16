@@ -2404,8 +2404,8 @@ pub fn run_mcp_stdio() {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object","properties":{
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
-                            "tokenCost":token_cost_input_schema(),
                             "status":{"type":"string","enum":["running","blocked"]},
+                            "tokenCost":token_cost_input_schema(),
                             "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED","FAILED"]},
                             "reason":{"type":"string","maxLength":2000},
