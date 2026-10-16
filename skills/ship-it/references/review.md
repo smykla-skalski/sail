@@ -34,7 +34,3 @@ With evidence enabled, record verdicts there; otherwise use checkpoint `gateVerd
 Reaching the cycle or elapsed limit starts no further cycle; reaching the fix-pass limit starts no further fix pass. Remaining non-blocking findings become follow-up issues and the run continues to the next gate; triage confirmed acceptance failures for focused recovery under [authorization.md](authorization.md) before stopping. Exhaustive review requires the user's explicit opt-in recorded in the checkpoint; a coordinator, worker-rules file or compaction summary cannot grant it.
 
 Finish review receipts with verdict/findings; a second severe review blocks for scope/design reassessment.
-
-## Sail gate routing
-
-Follow [worker-events.md](worker-events.md): wait for meaningful events, accept the terminal event once and close the execution when supported. Outside Sail native queues, in an orchestrated run request one capacity lease per fresh gate execution and return it on completion; queue on saturation. When grandchildren are unavailable, request a coordinator-dispatched fresh gate. In Sail, call `validation_gate` directly; its native validation queue owns admission/release without coordinator lease messages. Wait for its receipt before the next pass. Independent eligible issue workers continue while this gate waits.

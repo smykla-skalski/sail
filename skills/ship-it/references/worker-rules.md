@@ -7,7 +7,3 @@
 - Keep the checkpoint current. Send gate-capacity requests and releases as scheduling events; send other interim status only when the coordinator asks.
 - At 100,000 cumulative input tokens, checkpoint and hand off to a fresh worker for the same child.
 - Send one terminal hand-back with a stable event ID, checkpoint path, PR, gated head, merge commit, issue state and blocker or completion result. If delivery is uncertain, retry that event ID; never create a new terminal event.
-
-## Sail overrides
-
-In Sail, use the entry's Native capacity rule: call `validation_gate` directly, let its native validation queue own admission/release and await its receipt. Do not send coordinator lease messages or wait for a message grant. Preserve local claims, permission and checkpoint controls, merge ownership and `validation_gate` receipts; a portable capacity lease grants no permission and satisfies no gate.

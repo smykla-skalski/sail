@@ -3,7 +3,7 @@ name: adversarial-test
 description: Adversarial manual testing of a change. A clean-context Test Adversary subagent derives acceptance criteria from the task, runs the real product surface (service, CLI, sandbox) in isolated state, and attacks boundaries, malformed input, repetition, and adjacent flows; every reproduction is then rerun to drop hallucinated failures. Use to prove a branch or PR actually works before merging, or as the testing gate inside ship-it.
 license: MIT
 compatibility: Works in Claude Code, Codex, opencode and Copilot CLI. Needs git, a shell that can run the product under test, and gh for PR targets.
-argument-hint: '[<pr-url> | --base <ref>] [--context <file|text>]'
+argument-hint: "[<pr-url> | --base <ref>] [--context <file|text>]"
 allowed-tools: Agent Bash Glob Grep Read
 user-invocable: true
 metadata:
@@ -25,13 +25,13 @@ The subagent gets a clean context so it tests the task, not the implementer's be
 
 Paths in this file are relative to the skill directory (the one holding this SKILL.md). The workflow is written for Claude Code; on other agents, or when a Claude feature is missing, use these fallbacks:
 
-| Claude Code feature                           | Fallback                                                                                                                                                                                                                                                                                   |
-| :-------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Argument substitution                         | If the `Invocation arguments` line in the Arguments section of SKILL.md is empty or shows the unreplaced placeholder, take the PR URL and flags from the user's request                                                                                                                    |
-| AskUserQuestion                               | Not used; the skill never stops for input                                                                                                                                                                                                                                                  |
+| Claude Code feature | Fallback |
+| :-- | :-- |
+| Argument substitution | If the `Invocation arguments` line in the Arguments section of SKILL.md is empty or shows the unreplaced placeholder, take the PR URL and flags from the user's request |
+| AskUserQuestion | Not used; the skill never stops for input |
 | Named agent `adversarial-test:test-adversary` | Claude Code and Copilot CLI register it from the plugin's `agents/` directory. Codex and opencode do not; there, or whenever the type is unknown, spawn a generic subagent with the full mandate from [references/test-adversary.md](references/test-adversary.md) prepended (see Phase 2) |
-| Subagent tool (Agent)                         | Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `subagent` tool (`task` on opencode 1). No subagent tool, or both spawn attempts fail: run the pass inline yourself (see Fallback)                                                                       |
-| `context: fork`                               | Not used                                                                                                                                                                                                                                                                                   |
+| Subagent tool (Agent) | Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `subagent` tool (`task` on opencode 1). No subagent tool, or both spawn attempts fail: run the pass inline yourself (see Fallback) |
+| `context: fork` | Not used |
 
 The skill spawns at most one subagent at a time, so it runs sequentially on every agent.
 
@@ -39,11 +39,11 @@ The skill spawns at most one subagent at a time, so it runs sequentially on ever
 
 Parse from the invocation arguments, given in the Arguments section of SKILL.md (or the user's request when that section holds none):
 
-| Argument                 | Meaning                                                                                                       |
-| :----------------------- | :------------------------------------------------------------------------------------------------------------ |
-| `<pr-url>`               | Test a GitHub PR's head                                                                                       |
-| `--base <ref>`           | Test the working tree; the change is everything since the merge-base with `<ref>`                             |
-| (none)                   | Same as `--base origin/<default-branch>`                                                                      |
+| Argument | Meaning |
+| :-- | :-- |
+| `<pr-url>` | Test a GitHub PR's head |
+| `--base <ref>` | Test the working tree; the change is everything since the merge-base with `<ref>` |
+| (none) | Same as `--base origin/<default-branch>` |
 | `--context <file\|text>` | Task context: issue body, acceptance criteria, PR description. A path is read; anything else is used verbatim |
 
 ## Phase 1 - Build the test assignment
@@ -80,7 +80,7 @@ Before any build, run `df -h` for the cache filesystem. Under 20 GB available, s
 
 ## Phase 2 - Test Adversary (subagent)
 
-The instruction for the subagent is: _"Prove this change does not satisfy the task by running it. Do not edit tracked files. Reuse the assigned revision-keyed build cache."_ Pass the Test assignment and the instruction, nothing else - not your own reading of the code, not what you expect to work, not this conversation. When the mandate is not already the subagent's system prompt, prepend the full content of [references/test-adversary.md](references/test-adversary.md).
+The instruction for the subagent is: *"Prove this change does not satisfy the task by running it. Do not edit tracked files. Reuse the assigned revision-keyed build cache."* Pass the Test assignment and the instruction, nothing else - not your own reading of the code, not what you expect to work, not this conversation. When the mandate is not already the subagent's system prompt, prepend the full content of [references/test-adversary.md](references/test-adversary.md).
 
 **Claude Code and Copilot CLI.**
 
@@ -98,9 +98,9 @@ The instruction for the subagent is: _"Prove this change does not satisfy the ta
 
 **Validation and retry.** The reply must have a `Criteria:` list, an `Untested:` line whenever a criterion is UNTESTED, and end with a `TEST_ADVERSARY_VERDICT:` line. If it is empty or malformed, spawn a fresh subagent once more; if that fails too, run the pass inline (see Fallback).
 
-Reject a `PASS` whose criteria cite only automated tests, lint, build, or grep while a runnable surface exists - spawn a fresh subagent once with _"Previous attempt used static evidence only. Run the real surface, or mark each criterion you cannot run UNTESTED with the named environmental blocker."_ appended. A retry that names an environmental blocker makes that criterion UNTESTED. A retry that still cites only static evidence for a surface that runs is malformed test execution: discard it and run the inline fallback. If the inline fallback also returns static-only evidence without an environmental blocker, return no verdict and report that the test gate has no valid execution; never turn tester noncompliance into `BLOCKED`.
+Reject a `PASS` whose criteria cite only automated tests, lint, build, or grep while a runnable surface exists - spawn a fresh subagent once with *"Previous attempt used static evidence only. Run the real surface, or mark each criterion you cannot run UNTESTED with the named environmental blocker."* appended. A retry that names an environmental blocker makes that criterion UNTESTED. A retry that still cites only static evidence for a surface that runs is malformed test execution: discard it and run the inline fallback. If the inline fallback also returns static-only evidence without an environmental blocker, return no verdict and report that the test gate has no valid execution; never turn tester noncompliance into `BLOCKED`.
 
-**Check the screenshot.** When the changed files include UI code (templates, components, stylesheets, view or pane sources), the `Evidence:` line must name a screenshot file that exists, its image pixel size, runtime client/content-area dimensions of at least 2560x1440, and the measurement command and output that proves those dimensions (`window.innerWidth`/`window.innerHeight`, webview content bounds or an equivalent probe). Check the image pixels independently (`sips -g pixelWidth -g pixelHeight <file>` on macOS, `identify <file>` elsewhere). Never infer the content viewport from image pixels, launch flags or outer-window bounds: scaling, decorations or ignored flags can invalidate each. If the evidence omits any item and the `Untested:` line gives no environmental blocker for the capture (no display, no headless browser, an unreachable pane), spawn a fresh subagent once with _"Previous attempt did not prove a changed UI content viewport of 2560x1440 or larger. Capture it and report the image dimensions plus a runtime client/content-area measurement command and output, or name the environmental blocker."_ appended. A retry with incomplete proof is malformed test execution: discard it and run the inline fallback. If the inline fallback also omits the runnable capture proof without an environmental blocker, return no verdict and report that the test gate has no valid execution.
+**Check the screenshot.** When the changed files include UI code (templates, components, stylesheets, view or pane sources), the `Evidence:` line must name a screenshot file that exists, its image pixel size, runtime client/content-area dimensions of at least 2560x1440, and the measurement command and output that proves those dimensions (`window.innerWidth`/`window.innerHeight`, webview content bounds or an equivalent probe). Check the image pixels independently (`sips -g pixelWidth -g pixelHeight <file>` on macOS, `identify <file>` elsewhere). Never infer the content viewport from image pixels, launch flags or outer-window bounds: scaling, decorations or ignored flags can invalidate each. If the evidence omits any item and the `Untested:` line gives no environmental blocker for the capture (no display, no headless browser, an unreachable pane), spawn a fresh subagent once with *"Previous attempt did not prove a changed UI content viewport of 2560x1440 or larger. Capture it and report the image dimensions plus a runtime client/content-area measurement command and output, or name the environmental blocker."* appended. A retry with incomplete proof is malformed test execution: discard it and run the inline fallback. If the inline fallback also omits the runnable capture proof without an environmental blocker, return no verdict and report that the test gate has no valid execution.
 
 **Reclassify a misfiled blocker.** A `BLOCKED` whose blocker is environmental - sandbox, network, package registry, a missing or fake tool, the build toolchain, a hook false positive, a stop directive, an unreachable display or pane - is not BLOCKED: tag each affected criterion UNTESTED with that blocker, and the verdict is `FAIL` when a reproduction survives Phase 3, otherwise `PASS (partial)`. `BLOCKED` stands only for a product precondition that a human must supply (credentials, hardware, an approval, data).
 

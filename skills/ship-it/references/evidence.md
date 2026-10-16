@@ -25,8 +25,8 @@ Write UTF-8 JSON and preserve unknown fields. Every result includes its producer
   "roleRoutes": [
     {
       "role": "implementation",
-      "requested": { "provider": "default", "model": "default", "variant": "default" },
-      "actual": { "provider": "codex", "model": "resolved-model", "variant": "resolved-variant" },
+      "requested": {"provider": "default", "model": "default", "variant": "default"},
+      "actual": {"provider": "codex", "model": "resolved-model", "variant": "resolved-variant"},
       "sourceRevision": "full hexadecimal commit SHA",
       "mechanism": "inline",
       "executionId": "opaque execution identifier",
@@ -66,7 +66,7 @@ Write UTF-8 JSON and preserve unknown fields. Every result includes its producer
       "provider": "local-process",
       "model": null,
       "timestamp": "RFC 3339 UTC timestamp",
-      "outputReference": { "kind": "command", "value": "test command", "sha256": null }
+      "outputReference": {"kind": "command", "value": "test command", "sha256": null}
     },
     {
       "id": "adversarial-review",
@@ -79,7 +79,7 @@ Write UTF-8 JSON and preserve unknown fields. Every result includes its producer
       "provider": "codex",
       "model": "model identifier or null",
       "timestamp": "RFC 3339 UTC timestamp",
-      "outputReference": { "kind": "inline", "value": "Review Verdict: CLEAN", "sha256": null }
+      "outputReference": {"kind": "inline", "value": "Review Verdict: CLEAN", "sha256": null}
     },
     {
       "id": "adversarial-test",
@@ -92,7 +92,7 @@ Write UTF-8 JSON and preserve unknown fields. Every result includes its producer
       "provider": "codex",
       "model": "model identifier or null",
       "timestamp": "RFC 3339 UTC timestamp",
-      "outputReference": { "kind": "inline", "value": "Test Verdict: PASS", "sha256": null }
+      "outputReference": {"kind": "inline", "value": "Test Verdict: PASS", "sha256": null}
     },
     {
       "id": "ci-test",
@@ -105,8 +105,8 @@ Write UTF-8 JSON and preserve unknown fields. Every result includes its producer
       "provider": "github-actions",
       "model": null,
       "timestamp": "RFC 3339 UTC timestamp",
-      "outputReference": { "kind": "url", "value": "CI job URL", "sha256": null },
-      "ciTriage": { "failureIds": [], "resolution": null }
+      "outputReference": {"kind": "url", "value": "CI job URL", "sha256": null},
+      "ciTriage": {"failureIds": [], "resolution": null}
     }
   ],
   "createdAt": "RFC 3339 UTC timestamp",

@@ -68,7 +68,11 @@ Before opening a PR, read repository-level policy:
 
 After the PR exists, and again immediately before merge, reconcile its live review requests, reviews, check runs, threads, head SHA and mergeability. PR-specific state never blocks initial policy resolution or PR creation.
 
-Resolve hosted-review serviceability once and store it in `hostedReviewDecision`. An empty configured reviewer list is `not-required` and sends no request. A reviewer whose last request returned quota, permission or service-unavailable is not serviceable: send no request. When policy requires that reviewer, activate its configured fallback immediately and record `fallback`; without one, record `blocked` with the exact policy change or human review required. Resume uses this recorded decision instead of reconsidering or polling the unavailable reviewer.
+Before any Copilot request, run `python3 <skill-dir>/scripts/copilot_quota.py status`. A false `requestAllowed` makes Copilot unserviceable immediately: use only the configured fallback or stop with the required policy action. This user-wide memory supplements the retained PR decision; expiry or clearing it never resets a refusal already observed on that PR.
+
+Resolve hosted-review serviceability once and store it in `hostedReviewDecision` with `bookkeeping.py set-hosted-review-decision`; the same command records the one permitted `serviceable` to `fallback|blocked` change. An empty configured reviewer list is `not-required` and sends no request. A reviewer whose last request returned quota, permission or service-unavailable is not serviceable: send no request. When policy requires that reviewer, activate its configured fallback immediately and record `fallback`; without one, record `blocked` with the exact policy change or human review required. Resume uses this recorded decision instead of reconsidering or polling the unavailable reviewer.
+
+A successful request can still produce a submitted Copilot quota refusal. Classify review bodies through `scripts/copilot_quota.py classify` (the `copilot_review.py` classifier plus shared memory) before satisfying any review requirement. Persist its PR-scoped refusal evidence and apply the same fallback or blocked decision immediately. The refusal itself never satisfies `review` or `approval`. Once observed, do not request or poll Copilot again on that PR, including after a new head or resume. Genuine reviews on the same PR remain valid inputs, and their threads still require resolution under repository policy. Quota-status credits never override the submitted refusal.
 
 Union named checks and reviewers from GitHub with the repository policy. When GitHub requires an approval count without naming actors, add synthetic reviewer entries `github-required-approval-1`, and so on, with `kind: human`, `actor: any-authorized-reviewer`, `requirement: approval`, `request: automatic` and `request_target: null`. A submitted approval can satisfy at most one synthetic entry. Dismissed, stale or changes-requested reviews do not satisfy approval requirements.
 
@@ -80,7 +84,7 @@ Persist a normalized checkpoint object:
   "sources": [".sai/ship-it-release.json", "github:rulesets"],
   "requiredReviewers": [],
   "requiredChecks": ["test"],
-  "merge": { "method": "github", "strategy": "squash", "botComment": null },
+  "merge": {"method": "github", "strategy": "squash", "botComment": null},
   "issueClosure": "pull-request-keyword",
   "branchCleanup": "delete",
   "activatedFallbacks": [],
@@ -93,6 +97,22 @@ Sort and deduplicate sources, reviewers and checks; preserve reviewer semantics.
 Release requirements are gate floors. Add `hosted-review` to the selected risk gates when `requiredReviewers` is non-empty, and add `ci` when `requiredChecks` is non-empty or GitHub requires checks. A risk policy can add stricter validation but cannot remove a repository release requirement. Persist the final union in `risk.requiredGates` before creating evidence.
 
 Apply the legacy `copilot-review` normalization from the risk contract before this union. Store its normalized reviewer and any activated `human-review` fallback in `releasePolicy.activatedFallbacks`, so resume never depends on remembering the legacy translation.
+
+## Request hosted reviewers
+
+Run this section only when `hosted-review` is selected and the checkpoint's `hostedReviewDecision` is `serviceable`. Request every resolved reviewer whose request mode is `reviewer` or `team-reviewer`; reviewers with `automatic` are requested by repository policy. `not-required` satisfies the gate without a request. `fallback` uses the recorded fallback immediately. `blocked` is a hard stop. Never retry a request after quota, permission or unavailable-service made that reviewer unserviceable.
+
+```bash
+gh pr edit <n> --add-reviewer <request-target>
+```
+
+If the request mechanism itself fails, use the matching GitHub REST reviewer or team-reviewer field once. A quota, permission or unavailable-service response immediately changes `hostedReviewDecision` to the configured `fallback`; activate it without another request. When no fallback exists, record `blocked` with the named policy action and stop. Never leave an unserviceable reviewer pending or retry it. Do not request Copilot unless the resolved policy names it, and do not substitute an actor outside the configured fallback.
+
+## Copilot quota refusals
+
+Before treating any submitted review as satisfied, classify the complete paginated review response with `scripts/copilot_quota.py classify` (or its `classify_and_remember` function), which delegates to `copilot_review.classify_reviews`. Pass the preceding PR-scoped classifier state as `--previous`; retain its returned `refusalEvidence` and `unserviceable` status across head changes and resumes. A submitted Copilot quota refusal is unserviceable evidence, never a completed review, even when its state is `COMMENTED`. Remaining credits from a quota endpoint do not override an observed refusal.
+
+After a refusal, persist the reviewer decision as unserviceable and set `hostedReviewDecision` to the configured `fallback`, or `blocked` with the exact policy action when no fallback exists. Activate only a configured non-Copilot fallback. Send no further Copilot request and start no Copilot poll or wait for that PR. Optional Copilot never adds a wait or release requirement. General PR snapshots needed for CI, other reviewers and thread resolution may continue; they must retain genuine Copilot reviews and resolve their blocking threads according to repository policy. Use the classifier's `reviews` list for review satisfaction, and the original thread response for thread resolution; a refusal never erases a genuine review on the same PR.
 
 ## Hosted review and checks
 
@@ -109,7 +129,3 @@ If any required reviewer or check remains unsatisfied for 30 minutes, including 
 For `github`, invoke `gh pr merge` with the resolved strategy and `--delete-branch` only when cleanup is `delete`. For `bot-comment`, post the exact `botComment`, wait for the bot, and diagnose its response; never call `gh pr merge` as a fallback. After either mechanism completes, verify the merge commit topology and resulting tree match the resolved `merge|squash|rebase` strategy before completion. A mismatch is a terminal release-policy failure with the PR URL and expected/actual strategy; never rewrite merged history. Protected-branch and merge-queue requirements remain authoritative. Stop with their exact requested approval, queue or administrator action instead of using admin or force options.
 
 At PR creation, emit `Closes` only for `pull-request-keyword`; use non-closing `Refs` for the other policies. After GitHub confirms the merge, verify keyword closure, manually close only for `manual-after-merge`, or leave the source unchanged for `unchanged`. Delete a still-present remote task branch only for `delete`; preserve it otherwise. Record actual closure and cleanup in the completion outcome.
-
-## Sail overrides
-
-In Sail mode, never post a GitHub comment, including a bot merge comment. Hand a `bot-comment` merge to the user. Follow the entry's Merge owner and Merge handoff rules; structured release policy determines how to merge, not who merges.

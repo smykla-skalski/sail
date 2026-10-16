@@ -4,3 +4,9 @@ package-lock.json
 src-tauri/Cargo.lock
 src-tauri/target
 src-tauri/gen
+
+# Upstream bytes are verified against skills/sai-pin.json.
+skills/ship-it
+skills/adversarial-review
+skills/adversarial-test
+plugin.json

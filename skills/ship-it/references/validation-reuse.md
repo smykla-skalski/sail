@@ -13,8 +13,8 @@ Write one JSON manifest per review, test or local quality gate outside the workt
   "dependencies": ["ruff.toml"],
   "policy": ["CLAUDE.md", "plugins/ship-it/skills/ship-it/references"],
   "command": ["mise", "exec", "--", "python", "-m", "unittest", "discover", "-s", "tests"],
-  "environment": { "variables": ["PATH"], "facts": { "python": "3.14.8" } },
-  "policyFacts": { "requiredChecks": [], "requiredApprovals": 1 }
+  "environment": {"variables": ["PATH"], "facts": {"python": "3.14.8"}},
+  "policyFacts": {"requiredChecks": [], "requiredApprovals": 1}
 }
 ```
 

@@ -1539,113 +1539,103 @@ macro_rules! ship_it_file {
 
 // Must match src/lib/bundled-skill-catalog.ts and the files under skills/ship-it.
 const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
+    ("plugin.json", include_str!("../../plugin.json")),
     (
         "authorization.md",
         ship_it_file!("references/authorization.md"),
     ),
+    ("branch.md", ship_it_file!("references/branch.md")),
     (
-        "telemetry-v2.schema.json",
-        ship_it_file!("references/telemetry-v2.schema.json"),
+        "capabilities.json",
+        ship_it_file!("references/capabilities.json"),
     ),
     (
-        "validation-reuse.md",
-        ship_it_file!("references/validation-reuse.md"),
+        "capabilities.md",
+        ship_it_file!("references/capabilities.md"),
+    ),
+    ("checkpoint.md", ship_it_file!("references/checkpoint.md")),
+    ("ci-triage.md", ship_it_file!("references/ci-triage.md")),
+    (
+        "ci-triage.schema.json",
+        ship_it_file!("references/ci-triage.schema.json"),
+    ),
+    ("claims.md", ship_it_file!("references/claims.md")),
+    ("completion.md", ship_it_file!("references/completion.md")),
+    (
+        "convergence-policy.json",
+        ship_it_file!("references/convergence-policy.json"),
+    ),
+    ("convergence.md", ship_it_file!("references/convergence.md")),
+    ("evidence.md", ship_it_file!("references/evidence.md")),
+    ("explore.md", ship_it_file!("references/explore.md")),
+    ("fallbacks.md", ship_it_file!("references/fallbacks.md")),
+    ("handoff.md", ship_it_file!("references/handoff.md")),
+    (
+        "helper-loading.md",
+        ship_it_file!("references/helper-loading.md"),
+    ),
+    (
+        "implementation.md",
+        ship_it_file!("references/implementation.md"),
+    ),
+    ("inputs.md", ship_it_file!("references/inputs.md")),
+    (
+        "orchestration.md",
+        ship_it_file!("references/orchestration.md"),
+    ),
+    ("pr-loop.md", ship_it_file!("references/pr-loop.md")),
+    ("publish.md", ship_it_file!("references/publish.md")),
+    (
+        "release-policy.json",
+        ship_it_file!("references/release-policy.json"),
+    ),
+    ("release.md", ship_it_file!("references/release.md")),
+    (
+        "replay-trace.schema.json",
+        ship_it_file!("references/replay-trace.schema.json"),
+    ),
+    ("replay.md", ship_it_file!("references/replay.md")),
+    ("review.md", ship_it_file!("references/review.md")),
+    (
+        "risk-policy.json",
+        ship_it_file!("references/risk-policy.json"),
+    ),
+    ("risk.md", ship_it_file!("references/risk.md")),
+    ("roles.json", ship_it_file!("references/roles.json")),
+    ("roles.md", ship_it_file!("references/roles.md")),
+    ("sail.md", ship_it_file!("references/sail.md")),
+    (
+        "scripts/bookkeeping.py",
+        ship_it_file!("scripts/bookkeeping.py"),
     ),
     (
         "scripts/checkpoint_state.py",
         ship_it_file!("scripts/checkpoint_state.py"),
     ),
     (
+        "scripts/ci_triage.py",
+        ship_it_file!("scripts/ci_triage.py"),
+    ),
+    (
         "scripts/convergence.py",
         ship_it_file!("scripts/convergence.py"),
+    ),
+    (
+        "scripts/copilot_quota.py",
+        ship_it_file!("scripts/copilot_quota.py"),
+    ),
+    (
+        "scripts/copilot_review.py",
+        ship_it_file!("scripts/copilot_review.py"),
     ),
     (
         "scripts/delivery_benchmark.py",
         ship_it_file!("scripts/delivery_benchmark.py"),
     ),
+    ("scripts/handoff.py", ship_it_file!("scripts/handoff.py")),
     (
-        "scripts/validation_reuse.py",
-        ship_it_file!("scripts/validation_reuse.py"),
-    ),
-    ("inputs.md", ship_it_file!("references/inputs.md")),
-    ("explore.md", ship_it_file!("references/explore.md")),
-    ("branch.md", ship_it_file!("references/branch.md")),
-    (
-        "implementation.md",
-        ship_it_file!("references/implementation.md"),
-    ),
-    ("publish.md", ship_it_file!("references/publish.md")),
-    ("review.md", ship_it_file!("references/review.md")),
-    ("test.md", ship_it_file!("references/test.md")),
-    ("pr-loop.md", ship_it_file!("references/pr-loop.md")),
-    ("completion.md", ship_it_file!("references/completion.md")),
-    (
-        "orchestration.md",
-        ship_it_file!("references/orchestration.md"),
-    ),
-    (
-        "capabilities.md",
-        ship_it_file!("references/capabilities.md"),
-    ),
-    (
-        "capabilities.json",
-        ship_it_file!("references/capabilities.json"),
-    ),
-    ("roles.md", ship_it_file!("references/roles.md")),
-    ("roles.json", ship_it_file!("references/roles.json")),
-    ("checkpoint.md", ship_it_file!("references/checkpoint.md")),
-    ("claims.md", ship_it_file!("references/claims.md")),
-    ("telemetry.md", ship_it_file!("references/telemetry.md")),
-    (
-        "telemetry.schema.json",
-        ship_it_file!("references/telemetry.schema.json"),
-    ),
-    (
-        "telemetry-v1.schema.json",
-        ship_it_file!("references/telemetry-v1.schema.json"),
-    ),
-    ("evidence.md", ship_it_file!("references/evidence.md")),
-    ("risk.md", ship_it_file!("references/risk.md")),
-    (
-        "risk-policy.json",
-        ship_it_file!("references/risk-policy.json"),
-    ),
-    ("release.md", ship_it_file!("references/release.md")),
-    (
-        "release-policy.json",
-        ship_it_file!("references/release-policy.json"),
-    ),
-    ("convergence.md", ship_it_file!("references/convergence.md")),
-    (
-        "convergence-policy.json",
-        ship_it_file!("references/convergence-policy.json"),
-    ),
-    ("replay.md", ship_it_file!("references/replay.md")),
-    (
-        "replay-trace.schema.json",
-        ship_it_file!("references/replay-trace.schema.json"),
-    ),
-    (
-        "worker-rules.md",
-        ship_it_file!("references/worker-rules.md"),
-    ),
-    (
-        "worker-events.md",
-        ship_it_file!("references/worker-events.md"),
-    ),
-    ("ci-triage.md", ship_it_file!("references/ci-triage.md")),
-    (
-        "ci-triage.schema.json",
-        ship_it_file!("references/ci-triage.schema.json"),
-    ),
-    ("fallbacks.md", ship_it_file!("references/fallbacks.md")),
-    (
-        "scripts/bookkeeping.py",
-        ship_it_file!("scripts/bookkeeping.py"),
-    ),
-    (
-        "scripts/ci_triage.py",
-        ship_it_file!("scripts/ci_triage.py"),
+        "scripts/hosted_wait.py",
+        ship_it_file!("scripts/hosted_wait.py"),
     ),
     (
         "scripts/replay_failures.py",
@@ -1656,12 +1646,62 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         ship_it_file!("scripts/telemetry.py"),
     ),
     (
+        "scripts/test_copilot_quota.py",
+        ship_it_file!("scripts/test_copilot_quota.py"),
+    ),
+    (
+        "scripts/test_copilot_review.py",
+        ship_it_file!("scripts/test_copilot_review.py"),
+    ),
+    (
         "scripts/test_replay_failures.py",
         ship_it_file!("scripts/test_replay_failures.py"),
     ),
     (
         "scripts/test_telemetry.py",
         ship_it_file!("scripts/test_telemetry.py"),
+    ),
+    (
+        "scripts/token_cost.py",
+        ship_it_file!("scripts/token_cost.py"),
+    ),
+    (
+        "scripts/validation_reuse.py",
+        ship_it_file!("scripts/validation_reuse.py"),
+    ),
+    (
+        "small-code-policy.json",
+        ship_it_file!("references/small-code-policy.json"),
+    ),
+    (
+        "telemetry-v1.schema.json",
+        ship_it_file!("references/telemetry-v1.schema.json"),
+    ),
+    (
+        "telemetry-v2.schema.json",
+        ship_it_file!("references/telemetry-v2.schema.json"),
+    ),
+    (
+        "telemetry-v3.schema.json",
+        ship_it_file!("references/telemetry-v3.schema.json"),
+    ),
+    ("telemetry.md", ship_it_file!("references/telemetry.md")),
+    (
+        "telemetry.schema.json",
+        ship_it_file!("references/telemetry.schema.json"),
+    ),
+    ("test.md", ship_it_file!("references/test.md")),
+    (
+        "validation-reuse.md",
+        ship_it_file!("references/validation-reuse.md"),
+    ),
+    (
+        "worker-events.md",
+        ship_it_file!("references/worker-events.md"),
+    ),
+    (
+        "worker-rules.md",
+        ship_it_file!("references/worker-rules.md"),
     ),
 ];
 const ADVERSARIAL_REVIEW_SKILL: &str = include_str!("../../skills/adversarial-review/SKILL.md");
@@ -2765,7 +2805,7 @@ mod skill_tests {
             .filter_map(|reference| reference["name"].as_str().map(str::to_owned))
             .collect();
         let skill_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/ship-it");
-        let bundled_files: BTreeSet<String> = ["references", "scripts"]
+        let mut bundled_files: BTreeSet<String> = ["references", "scripts"]
             .into_iter()
             .flat_map(|directory| {
                 fs::read_dir(skill_root.join(directory))
@@ -2788,7 +2828,15 @@ mod skill_tests {
                     })
             })
             .collect();
+        bundled_files.insert("plugin.json".into());
         assert_eq!(listed_names, bundled_files);
+        let metadata = call_bridge(&json!({
+            "name":"skill_reference",
+            "arguments":{"skill":"ship-it","reference":"plugin.json"}
+        }));
+        assert!(metadata["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("1.4.78")));
 
         let loaded = call_bridge(&json!({
             "name":"skill_reference",

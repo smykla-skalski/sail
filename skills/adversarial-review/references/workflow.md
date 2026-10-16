@@ -3,7 +3,7 @@ name: adversarial-review
 description: Fast two-pass adversarial code review. A Code Adversary subagent red-teams a diff or PR to find the concrete bug, then a separate Findings Adversary subagent with a clean context tries to refute every finding to cut false positives. Use for routine changes where a full staff review is overkill, or as the review gate inside ship-it.
 license: MIT
 compatibility: Works in Claude Code, Codex, opencode and Copilot CLI. Needs git; the gh CLI for PR reviews.
-argument-hint: '[<pr-url> | <diff-file> | --base <ref>] [--context <file|text>]'
+argument-hint: "[<pr-url> | <diff-file> | --base <ref>] [--context <file|text>]"
 allowed-tools: Agent Bash Glob Grep Read
 user-invocable: true
 metadata:
@@ -25,12 +25,12 @@ The second pass exists because an unrefuted adversary nit-bombs. It sees only th
 
 Paths in this file are relative to the skill directory (the one holding this SKILL.md). The workflow is written for Claude Code; on other agents, or when a Claude feature is missing, use these fallbacks:
 
-| Claude Code feature                                                     | Fallback                                                                                                                                                                                                |
-| :---------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Argument substitution                                                   | If the `Invocation arguments` line in the Arguments section of SKILL.md is empty or shows the unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request      |
-| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent))                                      |
-| Subagent tool (Agent)                                                   | Codex: `spawn_agent`; opencode: `subagent` (`task` on opencode 1); Copilot CLI: its task/subagent tool. With no subagent tool at all, run both passes inline (see [Fallback](#fallback---no-subagents)) |
-| AskUserQuestion, `context: fork`                                        | Not used                                                                                                                                                                                                |
+| Claude Code feature | Fallback |
+| :-- | :-- |
+| Argument substitution | If the `Invocation arguments` line in the Arguments section of SKILL.md is empty or shows the unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request |
+| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent)) |
+| Subagent tool (Agent) | Codex: `spawn_agent`; opencode: `subagent` (`task` on opencode 1); Copilot CLI: its task/subagent tool. With no subagent tool at all, run both passes inline (see [Fallback](#fallback---no-subagents)) |
+| AskUserQuestion, `context: fork` | Not used |
 
 The two passes always run sequentially, so the skill never needs more than one extra subagent at a time.
 
@@ -38,12 +38,12 @@ The two passes always run sequentially, so the skill never needs more than one e
 
 Parse from the invocation arguments, given in the Arguments section of SKILL.md (or the user's request when that section holds none):
 
-| Argument                 | Meaning                                                                                                       |
-| :----------------------- | :------------------------------------------------------------------------------------------------------------ |
-| `<pr-url>`               | Review a GitHub PR                                                                                            |
-| `<diff-file>`            | Review a saved patch file                                                                                     |
-| `--base <ref>`           | Review the working tree (committed + uncommitted) against the merge-base with `<ref>`                         |
-| (none)                   | Same as `--base origin/<default-branch>`                                                                      |
+| Argument | Meaning |
+| :-- | :-- |
+| `<pr-url>` | Review a GitHub PR |
+| `<diff-file>` | Review a saved patch file |
+| `--base <ref>` | Review the working tree (committed + uncommitted) against the merge-base with `<ref>` |
+| (none) | Same as `--base origin/<default-branch>` |
 | `--context <file\|text>` | Task context: issue body, acceptance criteria, PR description. A path is read; anything else is used verbatim |
 
 ## Phase 1 - Build the review assignment
@@ -102,7 +102,7 @@ An empty reply, a missing or malformed verdict line, a keyword that disagrees wi
 
 ## Phase 2 - Code Adversary
 
-Spawn per [Spawning a clean-context subagent](#spawning-a-clean-context-subagent): named agent `adversarial-review:code-adversary`, mandate [references/code-adversary.md](references/code-adversary.md), payload _"Find the bug in this change and prove it. Read only; do not modify files."_
+Spawn per [Spawning a clean-context subagent](#spawning-a-clean-context-subagent): named agent `adversarial-review:code-adversary`, mandate [references/code-adversary.md](references/code-adversary.md), payload *"Find the bug in this change and prove it. Read only; do not modify files."*
 
 Validate the reply with the verdict check, then close the subagent; nothing else is ever sent to it. The Findings Adversary exists to filter findings that would trigger a fix, so it runs only on a result that needs fixes. Decide from the labels, not the keyword: when no finding is labelled `blocking:` or `issue:` (a validated `CLEAN` or `MINOR ONLY`), skip Phase 3 and go to Output with `findings skipped`. Never dispatch the Findings Adversary to refute a clean result.
 

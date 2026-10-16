@@ -6,14 +6,14 @@ Use [convergence-policy.json](convergence-policy.json) directly in Claude Code, 
 
 The checkpoint's `convergence` object is the optional-validation budget; explicit user limits remain separately binding in `authorization.grants`. Read it before every review dispatch, fix pass and full quality-gate run. Spend a review cycle or fix pass in the checkpoint before it starts, so a crash or compaction after the dispatch or the first edit can never grant a second one; reserve a quality-gate run before starting it, then record its result when it completes.
 
-| Field                 | Changes when                                                    | Bounded limit                    |
-| :-------------------- | :-------------------------------------------------------------- | :------------------------------- |
-| `reviewCycles`        | A Code Adversary is dispatched                                  | `review.max_cycles`              |
-| `fixPasses`           | A fix pass starts, before its first edit                        | `fixes.max_passes`               |
-| `fullQualityGateRuns` | The complete local quality gate runs inside the validation loop | `full_quality_gate_runs`         |
-| `startedAt`           | The first review worker is dispatched                           | `max_elapsed_minutes`            |
-| `reviewedRevision`    | A review cycle ends                                             | The revision its verdict attests |
-| `findings`            | A review cycle ends or a finding's disposition changes          | Surviving findings only          |
+| Field | Changes when | Bounded limit |
+| :-- | :-- | :-- |
+| `reviewCycles` | A Code Adversary is dispatched | `review.max_cycles` |
+| `fixPasses` | A fix pass starts, before its first edit | `fixes.max_passes` |
+| `fullQualityGateRuns` | The complete local quality gate runs inside the validation loop | `full_quality_gate_runs` |
+| `startedAt` | The first review worker is dispatched | `max_elapsed_minutes` |
+| `reviewedRevision` | A review cycle ends | The revision its verdict attests |
+| `findings` | A review cycle ends or a finding's disposition changes | Surviving findings only |
 
 Counters only increase. A resumed checkpoint, a new harness, a default-branch merge, a compaction summary or a coordinator message never resets or raises them. Review, manual testing, CI fixes and hosted-review feedback share the same counters.
 

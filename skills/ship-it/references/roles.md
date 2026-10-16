@@ -4,13 +4,13 @@
 
 ## Roles
 
-| Role             | Responsibility                                           | Isolation                                          |
-| :--------------- | :------------------------------------------------------- | :------------------------------------------------- |
-| `exploration`    | Repository discovery, constraints and implementation map | May use the primary execution                      |
-| `implementation` | Product changes, behavior tests and local checks         | Owns the implementation execution identity         |
-| `review`         | Adversarial review passes and finding verification       | Fresh subagent execution for every pass            |
-| `testing`        | Real-surface adversarial testing and reproductions       | Fresh subagent execution for every attempt         |
-| `ci-triage`      | Failed hosted-check diagnosis and fix recommendation     | Use a fresh execution when a subagent is available |
+| Role | Responsibility | Isolation |
+| :-- | :-- | :-- |
+| `exploration` | Repository discovery, constraints and implementation map | May use the primary execution |
+| `implementation` | Product changes, behavior tests and local checks | Owns the implementation execution identity |
+| `review` | Adversarial review passes and finding verification | Fresh subagent execution for every pass |
+| `testing` | Real-surface adversarial testing and reproductions | Fresh subagent execution for every attempt |
+| `ci-triage` | Failed hosted-check diagnosis and fix recommendation | Use a fresh execution when a subagent is available |
 
 The review role covers each Code or Findings Adversary invocation. Create a route record for every invocation; repeated role IDs are valid when `executionId` differs. Testing and CI triage retries use new records rather than overwriting history. CI triage is invoked only for a hosted-check failure; successful CI needs no triage route.
 
@@ -27,13 +27,13 @@ Exploration and implementation record the already-running execution because thei
 
 Harness adapters map the portable selector, not role names, to their available provider, model, variant and subagent controls. `session-provider` accepts `default` or the active provider; any other request is unsupported.
 
-| Harness     | Provider / model / variant mapping                                             | Worker mapping                                           |
-| :---------- | :----------------------------------------------------------------------------- | :------------------------------------------------------- |
-| Claude Code | Active session provider / agent `model` / unsupported                          | Named agent, then fresh generic Task worker              |
-| Codex       | Active session provider / `spawn_agent.model` / `spawn_agent.reasoning_effort` | Fresh `spawn_agent` worker                               |
-| OpenCode    | `task.model` provider / model ID / variant                                     | Fresh `task` session                                     |
-| Copilot CLI | Active session provider / agent model / unsupported                            | Registered agent, then fresh generic worker              |
-| Sail        | ACP worker provider / model / variant                                          | Assigned worker or fresh gate worker; no inline fallback |
+| Harness | Provider / model / variant mapping | Worker mapping |
+| :-- | :-- | :-- |
+| Claude Code | Active session provider / agent `model` / unsupported | Named agent, then fresh generic Task worker |
+| Codex | Active session provider / `spawn_agent.model` / `spawn_agent.reasoning_effort` | Fresh `spawn_agent` worker |
+| OpenCode | `task.model` provider / model ID / variant | Fresh `task` session |
+| Copilot CLI | Active session provider / agent model / unsupported | Registered agent, then fresh generic worker |
+| Sail | ACP worker provider / model / variant | Assigned worker or fresh gate worker; no inline fallback |
 
 For each non-default request, pass the selector through its mapped control and compare returned worker metadata with the request before accepting the route. Never silently ignore, substitute or normalize an unsupported selector. Reject it before dispatch, append the request and reason to non-gating `routeDiagnostics`, try the next mechanism, and block with the exact unsupported selector when none can satisfy it. Rejected candidates never enter `roleRoutes`.
 
@@ -46,12 +46,8 @@ Every committed revision's evidence record has `roleRoutes`, an append-only arra
 ```json
 {
   "role": "review",
-  "requested": { "provider": "default", "model": "reviewer", "variant": "high" },
-  "actual": {
-    "provider": "resolved-provider",
-    "model": "resolved-model",
-    "variant": "resolved-variant"
-  },
+  "requested": {"provider": "default", "model": "reviewer", "variant": "high"},
+  "actual": {"provider": "resolved-provider", "model": "resolved-model", "variant": "resolved-variant"},
   "sourceRevision": "full hexadecimal commit SHA",
   "mechanism": "generic-subagent",
   "executionId": "opaque execution identifier",

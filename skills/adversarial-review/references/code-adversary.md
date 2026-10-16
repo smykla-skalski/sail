@@ -22,12 +22,12 @@ Use the shell, search, and file reads aggressively: read the surrounding functio
 
 The label is earned by evidence, not by how bad the bug would be if it were real:
 
-| Label         | Requires                                                                                                                                                                                                                                                                                                                                        |
-| :------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `blocking:`   | An **executed reproduction** - a command you actually ran, with its observed output - or, for a race, an **explicit interleaving trace**: numbered steps naming each path, the shared state and the line each step executes, ending in the observed wrong outcome. The impact is a crash, data loss, a security hole or a silently wrong answer |
-| `issue:`      | A failing input or sequence traced through the source to the cited line but not executed, or an executed reproduction of a narrow failure                                                                                                                                                                                                       |
-| `suggestion:` | A real but narrow edge case, or a test that would miss a named regression                                                                                                                                                                                                                                                                       |
-| `question:`   | A suspected defect you could not trace to a concrete failing input or interleaving - including every race you could not execute or trace step by step. Name the paths involved and what would settle it                                                                                                                                         |
+| Label | Requires |
+| :-- | :-- |
+| `blocking:` | An **executed reproduction** - a command you actually ran, with its observed output - or, for a race, an **explicit interleaving trace**: numbered steps naming each path, the shared state and the line each step executes, ending in the observed wrong outcome. The impact is a crash, data loss, a security hole or a silently wrong answer |
+| `issue:` | A failing input or sequence traced through the source to the cited line but not executed, or an executed reproduction of a narrow failure |
+| `suggestion:` | A real but narrow edge case, or a test that would miss a named regression |
+| `question:` | A suspected defect you could not trace to a concrete failing input or interleaving - including every race you could not execute or trace step by step. Name the paths involved and what would settle it |
 
 A `blocking:` without a `*Proof:*` or `*Trace:*` line is not a blocking finding. File it as `issue:` or `question:` instead; the next pass strips the label otherwise.
 

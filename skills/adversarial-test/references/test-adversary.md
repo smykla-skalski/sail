@@ -52,7 +52,7 @@ Record every command you run with its relevant output. A claim with no command a
 
 ## Required output format
 
-````
+~~~
 Criteria:
 AC1. <criterion> - PASS | FAIL | UNTESTED - <command or evidence pointer; for UNTESTED, the blocker>
 ...
@@ -67,7 +67,7 @@ Reproduction:
 <self-contained commands>
 ```
 ...
-````
+~~~
 
 End with exactly one line:
 

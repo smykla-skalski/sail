@@ -6,6 +6,8 @@ Start testing only after the selected review gate is CLEAN for the exact current
 
 Bundled policy selects `adversarial-test` for `medium` and `high` only. Low risk selects no manual test: record no skipped or blocked result.
 
+For `small-code`, read [risk.md](risk.md) for the `testScope: changed-surface` mandate. Ordinary code profiles retain the broad mandate.
+
 For GitHub work with claims enabled, verify and renew the claim when due before writing the manual-test result. A verdict from another holder or after expiry does not satisfy the gate until ownership is reconciled.
 
 The tester derives acceptance criteria from the task, runs the real changed product surface in isolated state, and attacks happy paths, boundaries, malformed input, repeated or concurrent use and adjacent flows. Every reproduction rerun is a separate attempt: dispatch it to a fresh subagent execution, including checks before a fix and focused checks after a fix. Automated tests, lint, build and source inspection are supporting evidence, not manual testing.
@@ -23,7 +25,3 @@ Review and test share the same fix, cycle and 90-minute counters. When they are 
 `BLOCKED` is a hard stop only for a product precondition that a human must supply: report the exact human action required. A tester that twice declines a runnable surface has not produced a valid verdict; dispatch a fresh generic subagent with the same test mandate, and leave the gate unsatisfied if it also produces no valid execution. Mark the draft ready only after every selected ready-due review and test gate passes on the same revision.
 
 Record provider, model, timestamp, bounded summary and exact revision in enabled evidence or checkpoint `gateVerdicts`. Passing verdicts advance to PR; a reproduced failure marks the result failed and returns to implement. BLOCKED preserves the tested revision and records the required human action in the result, workflow blocker and next action.
-
-## Sail gate routing
-
-Follow [worker-events.md](worker-events.md): wait for meaningful events, accept the terminal event once and close the execution when supported. Outside Sail native queues, in an orchestrated run request one capacity lease per fresh gate execution and return it on completion; queue on saturation. When grandchildren are unavailable, request a coordinator-dispatched fresh gate. In Sail, call `validation_gate` directly; its native validation queue owns admission/release without coordinator lease messages. Wait for its receipt before the next pass. Independent eligible issue workers continue while this gate waits.

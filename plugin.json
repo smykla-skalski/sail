@@ -1,0 +1,35 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ship-it",
+  "version": "1.4.78",
+  "description": "Ship a change or coordinate an approved plan through independent issues, adversarial gates, PRs, CI, repository-required review, and merge.",
+  "author": {
+    "name": "Smykla Skalski Labs"
+  },
+  "homepage": "https://github.com/smykla-skalski/sai/tree/main/plugins/ship-it",
+  "repository": "https://github.com/smykla-skalski/sai",
+  "license": "MIT",
+  "keywords": ["github", "jira", "issues", "pull-request", "ci", "copilot", "automation", "shipping"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Ship It",
+        "shortDescription": "Ship a change or coordinate an approved plan",
+        "longDescription": "Implements a task description, GitHub issue, or Jira ticket, or coordinates an approved complex plan as an umbrella of independent issues. Each change passes risk-selected review and test gates, CI, and repository-required review before merge. Sail pauses when worker or gate agents are unavailable. Runs only when invoked by name.",
+        "developerName": "SAI",
+        "category": "Developer Tools",
+        "capabilities": ["Interactive", "Write"],
+        "websiteURL": "https://github.com/smykla-skalski/sai/tree/main/plugins/ship-it",
+        "privacyPolicyURL": "https://github.com/smykla-skalski/sai/blob/main/README.md",
+        "termsOfServiceURL": "https://github.com/smykla-skalski/sai/blob/main/LICENSE",
+        "defaultPrompt": [
+          "Use $ship-it to implement and ship this change.",
+          "Use $ship-it to coordinate this approved plan as independent issues.",
+          "Use $ship-it to ship this GitHub issue.",
+          "Use $ship-it to ship this Jira ticket."
+        ],
+        "brandColor": "#2563EB"
+      }
+    }
+  }
+}

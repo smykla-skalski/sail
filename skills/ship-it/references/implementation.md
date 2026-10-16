@@ -12,12 +12,12 @@ Keep commits focused and sign them. Commit titles use `<type>(<scope>): <descrip
 
 Add the source footer when applicable:
 
-| Source                             | Footer                     |
-| :--------------------------------- | :------------------------- |
-| GitHub issue in this repository    | `Refs #<number>`           |
+| Source | Footer |
+| :-- | :-- |
+| GitHub issue in this repository | `Refs #<number>` |
 | GitHub issue in another repository | `Refs owner/repo#<number>` |
-| Jira ticket                        | `Refs KEY-123`             |
-| Task description                   | no footer                  |
+| Jira ticket | `Refs KEY-123` |
+| Task description | no footer |
 
 Comply with every commit hook. If a hook changes files, inspect and stage the intended result before committing again.
 

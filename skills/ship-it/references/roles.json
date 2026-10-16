@@ -1,11 +1,11 @@
 {
   "schema_version": "sai.ship-it.roles/v1",
   "roles": [
-    { "id": "exploration", "phase": "explore", "dispatch": "current-execution" },
-    { "id": "implementation", "phase": "implement", "dispatch": "current-execution" },
-    { "id": "review", "phase": "review", "dispatch": "routed-worker" },
-    { "id": "testing", "phase": "test", "dispatch": "routed-worker" },
-    { "id": "ci-triage", "phase": "pr", "dispatch": "routed-worker" }
+    {"id": "exploration", "phase": "explore", "dispatch": "current-execution"},
+    {"id": "implementation", "phase": "implement", "dispatch": "current-execution"},
+    {"id": "review", "phase": "review", "dispatch": "routed-worker"},
+    {"id": "testing", "phase": "test", "dispatch": "routed-worker"},
+    {"id": "ci-triage", "phase": "pr", "dispatch": "routed-worker"}
   ],
   "route_record": {
     "required_fields": [
@@ -41,63 +41,43 @@
     "required_for": ["review", "testing"],
     "execution": "fresh-subagent-per-pass-or-retry",
     "rejections": ["execution-context-reuse", "inline-execution"],
-    "model_difference_required": false,
-    "adapter_fallback_roles_excluded": ["review", "testing"]
+      "model_difference_required": false,
+      "adapter_fallback_roles_excluded": ["review", "testing"]
   },
   "adapters": {
     "claude-code": {
       "subagents": ["native-subagent", "generic-subagent"],
       "fallback": "inline",
       "fallback_roles": ["exploration", "implementation", "ci-triage"],
-      "selectors": {
-        "provider": "session-provider",
-        "model": "agent-model",
-        "variant": "unsupported"
-      },
+      "selectors": {"provider": "session-provider", "model": "agent-model", "variant": "unsupported"},
       "unsupported_selector": "reject-before-dispatch"
     },
     "codex": {
       "subagents": ["generic-subagent"],
       "fallback": "inline",
       "fallback_roles": ["exploration", "implementation", "ci-triage"],
-      "selectors": {
-        "provider": "session-provider",
-        "model": "spawn-agent-model",
-        "variant": "spawn-agent-reasoning-effort"
-      },
+      "selectors": {"provider": "session-provider", "model": "spawn-agent-model", "variant": "spawn-agent-reasoning-effort"},
       "unsupported_selector": "reject-before-dispatch"
     },
     "opencode": {
       "subagents": ["generic-subagent"],
       "fallback": "inline",
       "fallback_roles": ["exploration", "implementation", "ci-triage"],
-      "selectors": {
-        "provider": "task-model-provider",
-        "model": "task-model-id",
-        "variant": "task-model-variant"
-      },
+      "selectors": {"provider": "task-model-provider", "model": "task-model-id", "variant": "task-model-variant"},
       "unsupported_selector": "reject-before-dispatch"
     },
     "copilot-cli": {
       "subagents": ["native-subagent", "generic-subagent"],
       "fallback": "inline",
       "fallback_roles": ["exploration", "implementation", "ci-triage"],
-      "selectors": {
-        "provider": "session-provider",
-        "model": "agent-model",
-        "variant": "unsupported"
-      },
+      "selectors": {"provider": "session-provider", "model": "agent-model", "variant": "unsupported"},
       "unsupported_selector": "reject-before-dispatch"
     },
     "sail": {
       "subagents": ["native-subagent"],
       "fallback": null,
       "fallback_roles": [],
-      "selectors": {
-        "provider": "worker-provider",
-        "model": "worker-model",
-        "variant": "worker-variant"
-      },
+      "selectors": {"provider": "worker-provider", "model": "worker-model", "variant": "worker-variant"},
       "unsupported_selector": "reject-before-dispatch"
     }
   }

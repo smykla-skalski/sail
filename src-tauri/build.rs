@@ -1,4 +1,8 @@
+mod bundled_skills;
+
 fn main() {
+    bundled_skills::check(std::path::Path::new(".."))
+        .expect("bundled sai skills must match their pin");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=src/context_service.m");
         let mut native = cc::Build::new();

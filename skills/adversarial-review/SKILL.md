@@ -3,13 +3,13 @@ name: adversarial-review
 description: Fast two-pass adversarial code review. A Code Adversary subagent red-teams a diff or PR to find the concrete bug, then a separate Findings Adversary subagent with a clean context tries to refute every finding to cut false positives. Use for routine changes where a full staff review is overkill, or as the review gate inside ship-it.
 license: MIT
 compatibility: Works in Claude Code, Codex, opencode and Copilot CLI. Needs git; the gh CLI for PR reviews.
-argument-hint: '[<pr-url> | <diff-file> | --base <ref>] [--context <file|text>]'
+argument-hint: "[<pr-url> | <diff-file> | --base <ref>] [--context <file|text>]"
 allowed-tools: Agent Bash Glob Grep Read
 user-invocable: true
 metadata:
-  upstream: smykla-skalski/sai plugins/adversarial-review 1.0.9 with Sail mode
   short-description: Two-pass adversarial code review in clean-context subagents
 ---
+
 
 # Adversarial Review
 
@@ -21,10 +21,6 @@ Two subagents, opposed, each with a clean context:
 2. **Findings Adversary** - assumes the Code Adversary is wrong and tries to refute each finding against the source, stripping `blocking:` from findings without proof. Runs only when the first pass found a `blocking:` or `issue:`. Mandate: [references/findings-adversary.md](references/findings-adversary.md).
 
 The second pass exists because an unrefuted adversary nit-bombs. It sees only the first pass's findings, never its reasoning, so it cannot inherit the same misread. Each adversary lives for exactly one verdict: it starts in a fresh context with no forked or inherited history, is closed once its reply is validated, and is never reused for a fix, a re-check or another change.
-
-## Sail execution rule
-
-Run every pass in a fresh subagent session. In Sail, launch each pass with `validation_gate` and wait for its receipt before starting the next. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, report `Review Verdict: BLOCKED` with the failed pass and reason. Never use the inline fallback in Sail. A FAILED verdict remains FAILED when reported through `ship_progress`, with its `Gate failure:` line as the reason.
 
 ## Required guidance
 

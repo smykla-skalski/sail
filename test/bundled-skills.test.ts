@@ -16,22 +16,26 @@ const skillPath = (skill: string, path = '') =>
   new URL(`../skills/${skill}/${path}`, import.meta.url);
 const read = (skill: string, path: string) => readFileSync(skillPath(skill, path), 'utf8');
 const shipItCore = read('ship-it', 'SKILL.md');
+const sailContract = read('sail', 'SKILL.md');
 const cores = Object.fromEntries(
   bundledSkillNames.map((name) => [bundledSkillCorePath(name), read(name, 'SKILL.md')]),
 );
 const bundled = bundledSkillChoices(cores);
 const sailModeRule = (label: string) =>
-  new RegExp(`\\*\\*${label}:\\*\\*.*$`, 'm').exec(shipItCore)?.[0] ?? '';
+  new RegExp(`\\*\\*${label}:\\*\\*.*$`, 'm').exec(sailContract)?.[0] ?? '';
 const quotedValues = (list: string) => [...list.matchAll(/"([^"]+)"/g)].map(([, value]) => value);
 
 function filesOnDisk(skill: string): string[] {
-  return ['references', 'scripts'].flatMap((directory) => {
-    const path = skillPath(skill, `${directory}/`);
-    if (!existsSync(path)) return [];
-    return readdirSync(path, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
-      .map((entry) => (directory === 'scripts' ? `scripts/${entry.name}` : entry.name));
-  });
+  return [
+    ...(skill === 'ship-it' ? ['plugin.json'] : []),
+    ...['references', 'scripts'].flatMap((directory) => {
+      const path = skillPath(skill, `${directory}/`);
+      if (!existsSync(path)) return [];
+      return readdirSync(path, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+        .map((entry) => (directory === 'scripts' ? `scripts/${entry.name}` : entry.name));
+    }),
+  ];
 }
 
 function rustShipItReferences(): Array<[string, string]> {
@@ -56,7 +60,7 @@ void test('the Rust bridge embeds the same ship-it references under the same nam
   const embedded = rustShipItReferences();
   assert.deepEqual(
     embedded.map(([name]) => name),
-    [...bundledSkillReferences['ship-it']],
+    [...bundledSkillReferences['ship-it']].filter((name) => name !== 'plugin.json'),
   );
   for (const [name, path] of embedded)
     assert.equal(path, name.startsWith('scripts/') ? name : `references/${name}`);
@@ -111,26 +115,28 @@ void test('Vite loads bundled-skills.ts with each skill on its own core', async 
   );
 });
 
-void test('the bundled ship-it records which upstream release it matches', () => {
-  assert.match(
-    shipItCore,
-    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.68 with Sail mode/,
-  );
+void test('the upstream skill loads Sail rules only through its optional reference', () => {
+  assert.match(shipItCore, /If connected tools expose Sail, read/);
+  assert.match(shipItCore, /references\/sail\.md/);
+  assert.doesNotMatch(shipItCore, /## Sail mode/);
+  assert.match(read('ship-it', 'references/sail.md'), /# Optional Sail integration/);
+  assert.match(sailContract, /## Ship workflow host contract/);
 });
 
 void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule', () => {
   const prompt = resolveSkillPrompt(mergeSkills([], bundled), '/ship-it https://x.test/o/r/1');
   assert.match(prompt, /Follow this bundled Sail skill/);
-  assert.match(prompt, /^## Sail mode$/m);
-  assert.match(prompt, /stages `implementing`, `reviewing`, `testing`, `pull_request`, `ci`/);
-  assert.match(prompt, /`task_checkpoint_update`/);
-  assert.match(prompt, /`task_evidence_record`/);
-  assert.match(prompt, /`validation_gate`/);
-  assert.match(prompt, /Available references: .*inputs\.md, .*scripts\/test_telemetry\.py\./);
+  assert.doesNotMatch(prompt, /^## Sail mode$/m);
+  assert.match(prompt, /references\/sail\.md/);
+  assert.match(sailContract, /stages `implementing`, `reviewing`, `testing`, `pull_request`, `ci`/);
+  assert.match(sailContract, /`task_checkpoint_update`/);
+  assert.match(sailContract, /`task_evidence_record`/);
+  assert.match(sailContract, /`validation_gate`/);
+  assert.match(prompt, /Available references: .*inputs\.md, .*scripts\/test_telemetry\.py/);
   assert.match(prompt, /publish\.md/);
   assert.match(prompt, /scripts\/bookkeeping\.py/);
   assert.doesNotMatch(prompt, /# Durable ship-it checkpoint/);
-  assert.match(shipItCore, /They extend the phases, hard stops and references\./);
+  assert.match(sailContract, /They extend the phases, hard stops and references\./);
 
   const owner = sailModeRule('Merge owner');
   assert.match(
@@ -181,7 +187,7 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   const progress = sailModeRule('Progress');
   assert.match(progress, /NEEDS_FIXES, FAIL and CI fix rounds stay `running`/);
   assert.match(progress, /when the convergence budget stops the run, report `status: "blocked"`/);
-  assert.match(shipItCore, /When they reject it because Sail does not track this thread/);
+  assert.match(sailContract, /When they reject it because Sail does not track this thread/);
   assert.match(
     readFileSync(skillPath('sail', 'SKILL.md'), 'utf8'),
     /delivery-state mismatch, unless\s+the user merged a pull request you left mergeable for them/,
@@ -247,8 +253,7 @@ void test('bundled scheduling fills capacity before waiting and keeps Sail gates
   assert.match(scheduling, /Dispatch the entire eligible batch before any blocking wait/);
   assert.match(scheduling, /Grant capacity to ready review\/test gates first/);
   assert.match(scheduling, /coordinator owns the shared slot ledger/);
-  assert.match(scheduling, /coordinator dispatches the worker's gate request/);
-  assert.match(scheduling, /`validation_gate` and its receipt remains mandatory/);
+  assert.match(sailContract, /use `validation_gate` for every gate pass/);
   assert.match(events, /Ignore duplicate worker events/);
   assert.match(events, /Never pretend an occupied slot is free/);
   assert.match(worker, /gate-capacity requests and releases as scheduling events/);
@@ -259,18 +264,8 @@ void test('Sail native gate admission needs no phase-forbidden or inactive-turn 
   assert.match(capacity, /separate agent and validation resource queues/);
   assert.match(capacity, /workers call it directly and wait for their own receipts/);
   assert.match(capacity, /Do not require coordinator lease messages/);
-  for (const name of ['review.md', 'test.md']) {
-    const phase = read('ship-it', `references/${name}`);
-    assert.match(phase, /Outside Sail native queues/);
-    assert.match(
-      phase,
-      /native validation queue owns admission\/release without coordinator lease messages/,
-    );
-  }
-  assert.match(
-    read('ship-it', 'references/worker-rules.md'),
-    /Do not send coordinator lease messages/,
-  );
+  assert.match(capacity, /queues own admission and release/);
+  assert.match(capacity, /Do not require coordinator lease messages/);
 });
 
 void test('adversarial cores carry arguments and updated base failure semantics', () => {

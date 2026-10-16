@@ -11,19 +11,7 @@ Register each available adapter with `--adapter HARNESS=/absolute/executable`. H
 The runner starts the executable once per applicable case. [`replay-trace.schema.json`](replay-trace.schema.json) defines the machine-readable trace contract. The runner writes this JSON envelope to stdin:
 
 ```json
-{
-  "schema_version": 1,
-  "harness": "codex",
-  "case": {
-    "id": "synthetic-case",
-    "privacy": {
-      "classification": "public",
-      "provenance": "synthetic-redaction",
-      "reviewed": true,
-      "contains_source_content": false
-    }
-  }
-}
+{"schema_version":1,"harness":"codex","case":{"id":"synthetic-case","privacy":{"classification":"public","provenance":"synthetic-redaction","reviewed":true,"contains_source_content":false}}}
 ```
 
 The real `case` value contains the complete validated synthetic case. The adapter must isolate its run from user repositories and credentials, drive its harness contract, and emit exactly one normalized JSON trace on stdout:
@@ -35,8 +23,8 @@ The real `case` value contains the complete validated synthetic case. The adapte
   "harness": "codex",
   "outcome": "accepted",
   "events": [
-    { "sequence": 1, "phase": "resolve", "observation": "ownership_checked" },
-    { "sequence": 2, "phase": "complete", "observation": "no_repository_mutation" }
+    {"sequence": 1, "phase": "resolve", "observation": "ownership_checked"},
+    {"sequence": 2, "phase": "complete", "observation": "no_repository_mutation"}
   ],
   "cost": {
     "turns": 2,

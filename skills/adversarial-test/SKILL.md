@@ -3,13 +3,13 @@ name: adversarial-test
 description: Adversarial manual testing of a change. A clean-context Test Adversary subagent derives acceptance criteria from the task, runs the real product surface (service, CLI, sandbox) in isolated state, and attacks boundaries, malformed input, repetition, and adjacent flows; every reproduction is then rerun to drop hallucinated failures. Use to prove a branch or PR actually works before merging, or as the testing gate inside ship-it.
 license: MIT
 compatibility: Works in Claude Code, Codex, opencode and Copilot CLI. Needs git, a shell that can run the product under test, and gh for PR targets.
-argument-hint: '[<pr-url> | --base <ref>] [--context <file|text>]'
+argument-hint: "[<pr-url> | --base <ref>] [--context <file|text>]"
 allowed-tools: Agent Bash Glob Grep Read
 user-invocable: true
 metadata:
-  upstream: smykla-skalski/sai plugins/adversarial-test 1.0.14 with Sail mode
   short-description: Adversarial manual testing in a clean-context subagent
 ---
+
 
 # Adversarial Test
 
@@ -23,10 +23,6 @@ One subagent with a clean context, then a check by you:
 The subagent gets a clean context so it tests the task, not the implementer's belief about the task.
 
 Verdicts: `PASS`; `PASS (partial)` when a criterion stayed `UNTESTED` because the environment (sandbox, tooling, build, an unreachable pane) could not exercise it - callers treat it as passing and list the untested criteria; `FAIL`; `BLOCKED` only for a product precondition a human must supply. `FAILED` when the base ref does not resolve: a gate failure, never a pass. A UI change needs a screenshot of the changed surface at a viewport of at least 2560x1440 in the evidence directory. A tester that twice declines a runnable surface triggers the inline fallback, not `BLOCKED`.
-
-## Sail execution rule
-
-Run every pass in a fresh subagent session. In Sail, launch each pass with `validation_gate` and wait for its receipt before starting the next. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, report `Test Verdict: BLOCKED` with the failed pass and reason. Never use the inline fallback in Sail. A FAILED verdict remains FAILED when reported through `ship_progress`, with its `Gate failure:` line as the reason.
 
 ## Required guidance
 
