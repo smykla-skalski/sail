@@ -734,7 +734,7 @@ struct Connection {
     released_owner: AtomicBool,
     idle_exit: AtomicBool,
     last_activity: Mutex<Instant>,
-    input: Mutex<ChildStdin>,
+    input: Mutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
     native_replays: Mutex<HashMap<u64, NativeReplay>>,
     reader_progress: ReaderProgress,
@@ -2129,6 +2129,13 @@ impl Connection {
         } else {
             return Err("Cannot lock agent process for shutdown.".into());
         }
+        // Cached sessions retain Connection after the process exits.
+        drop(
+            self.input
+                .lock()
+                .map_err(|_| "Cannot lock agent input for shutdown.")?
+                .take(),
+        );
         #[cfg(unix)]
         self.watchdog
             .lock()
@@ -2174,6 +2181,7 @@ impl Connection {
     fn write(&self, message: &Value) -> Result<(), String> {
         self.touch();
         let mut input = self.input.lock().map_err(|error| error.to_string())?;
+        let input = input.as_mut().ok_or(IDLE_EXIT_ERROR)?;
         let mut message = message.clone();
         if let Some(owner) = &self.owner {
             translate_session_ids(&mut message, owner, true);
@@ -6924,7 +6932,7 @@ fn connect_blocking_inner(
         released_owner: AtomicBool::new(false),
         idle_exit: AtomicBool::new(false),
         last_activity: Mutex::new(Instant::now()),
-        input: Mutex::new(input),
+        input: Mutex::new(Some(input)),
         pending: Mutex::new(HashMap::new()),
         native_replays: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
@@ -10235,6 +10243,8 @@ mod session_config_tests {
             .input
             .lock()
             .unwrap()
+            .as_mut()
+            .unwrap()
             .write_all(b"release\n")
             .unwrap();
 
@@ -10675,7 +10685,7 @@ time.sleep(10)
             released_owner: AtomicBool::new(false),
             idle_exit: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
-            input: Mutex::new(input),
+            input: Mutex::new(Some(input)),
             pending: Mutex::new(HashMap::new()),
             native_replays: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),
@@ -10840,6 +10850,53 @@ time.sleep(10)
         results.sort_unstable();
         assert_eq!(results, (0..8).collect::<Vec<_>>());
         assert!(runtime.pending.lock().unwrap().is_empty());
+        runtime.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_connection_closes_input_while_cached() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (input, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut child = super::spawn_test_session_process();
+        child.stdin = Some(ChildStdin::from(OwnedFd::from(input)));
+        let runtime = test_runtime_with_child(
+            "opencode",
+            CapabilityProfile::Build,
+            Path::new("/worktree"),
+            "session",
+            child,
+        );
+
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        runtime.terminate().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match peer.read(&mut [0]) {
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "stopped agent input remains open"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => panic!("unexpected stopped agent input result: {result:?}"),
+            }
+        }
+        assert!(runtime
+            .session_directories
+            .lock()
+            .unwrap()
+            .contains_key("session"));
         runtime.terminate().unwrap();
     }
 
@@ -11584,7 +11641,7 @@ time.sleep(10)
                 released_owner: AtomicBool::new(false),
                 idle_exit: AtomicBool::new(false),
                 last_activity: Mutex::new(Instant::now()),
-                input: Mutex::new(input),
+                input: Mutex::new(Some(input)),
                 pending: Mutex::new(HashMap::new()),
                 native_replays: Mutex::new(HashMap::new()),
                 reader_progress: ReaderProgress::default(),
@@ -13427,7 +13484,7 @@ mod native_subagent_fence_tests {
             released_owner: AtomicBool::new(false),
             idle_exit: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
-            input: Mutex::new(input),
+            input: Mutex::new(Some(input)),
             pending: Mutex::new(HashMap::new()),
             native_replays: Mutex::new(HashMap::new()),
             reader_progress: ReaderProgress::default(),

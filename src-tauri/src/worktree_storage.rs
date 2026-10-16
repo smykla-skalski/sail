@@ -3983,7 +3983,7 @@ fn log_lock_holder(path: &Path) {
 }
 
 pub(crate) struct FileLock {
-    file: File,
+    file: Mutex<Option<File>>,
 }
 
 impl Drop for FileLock {
@@ -4013,7 +4013,9 @@ impl FileLock {
             .map_err(|error| format!("Cannot open lock file {}: {error}", path.display()))?;
         lock_file(&file, exclusive, nonblocking)
             .map_err(|error| format!("Cannot lock file {}: {error}", path.display()))?;
-        Ok(Self { file })
+        Ok(Self {
+            file: Mutex::new(Some(file)),
+        })
     }
 
     fn try_acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
@@ -4021,7 +4023,12 @@ impl FileLock {
     }
 
     fn unlock(&self) -> Result<(), String> {
-        unlock_file(&self.file).map_err(|error| error.to_string())
+        let mut file = self.file.lock().map_err(|error| error.to_string())?;
+        if let Some(locked) = file.as_ref() {
+            unlock_file(locked).map_err(|error| error.to_string())?;
+        }
+        drop(file.take());
+        Ok(())
     }
 }
 
@@ -4193,12 +4200,57 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn process_has_open_file(path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let expected = fs::metadata(path).unwrap();
+        fs::read_dir("/dev/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let fd = entry.file_name().to_str()?.parse::<i32>().ok()?;
+                let mut metadata = std::mem::MaybeUninit::<nix::libc::stat>::uninit();
+                if unsafe { nix::libc::fstat(fd, metadata.as_mut_ptr()) } != 0 {
+                    return None;
+                }
+                Some(unsafe { metadata.assume_init() })
+            })
+            .any(|opened| {
+                i128::from(opened.st_dev) == i128::from(expected.dev())
+                    && i128::from(opened.st_ino) == i128::from(expected.ino())
+            })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn released_lock_closes_file_while_object_is_retained() {
+        let fixture = GitFixture::new();
+        let path = fixture.cache.join("released.lock");
+        let lock = FileLock::acquire(&path, false).unwrap();
+        assert!(process_has_open_file(&path));
+
+        lock.unlock().unwrap();
+
+        assert!(!process_has_open_file(&path));
+        lock.unlock().unwrap();
+        assert!(FileLock::try_acquire(&path, true).is_ok());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn dropped_lease_releases_lock_with_inherited_descriptor() {
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         lease.mark_started();
-        let inherited = lease._lease_lock.file.try_clone().unwrap();
+        let inherited = lease
+            ._lease_lock
+            .file
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
         let path = lock_path(&fixture.cache, "lease", &directory).unwrap();
 
         drop(lease);
