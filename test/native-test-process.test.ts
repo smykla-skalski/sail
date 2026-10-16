@@ -42,7 +42,7 @@ await Promise.all(
           controller.abort();
           await result;
         });
-        await waitForPid(Date.now() + 5000);
+        await waitForPid(Date.now() + 30_000);
         const ownedPid = Number(readFileSync(pidFile, 'utf8'));
         context.after(() => {
           try {

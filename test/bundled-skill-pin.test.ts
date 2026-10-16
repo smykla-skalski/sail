@@ -1,9 +1,65 @@
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { checkBundledSkills } from '../scripts/check-bundled-skills.mjs';
+
+void test('direct CLI paths enforce the pin while imports remain side-effect free', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sail-skill-cli-'));
+  try {
+    const checkout = join(root, 'checkout');
+    await mkdir(join(checkout, 'scripts'), { recursive: true });
+    await cp(new URL('../skills', import.meta.url), join(checkout, 'skills'), { recursive: true });
+    await cp(new URL('../plugin.json', import.meta.url), join(checkout, 'plugin.json'));
+    await cp(
+      new URL('../scripts/check-bundled-skills.mjs', import.meta.url),
+      join(checkout, 'scripts/check-bundled-skills.mjs'),
+    );
+    const alias = join(root, 'alias');
+    await symlink(checkout, alias, 'dir');
+    const canonical = await realpath(checkout);
+    const paths = [canonical, alias];
+    if (canonical.startsWith('/private/var/'))
+      paths.push(canonical.replace('/private/var/', '/var/'));
+    for (const directory of paths) {
+      const result = spawnSync(
+        process.execPath,
+        [join(directory, 'scripts/check-bundled-skills.mjs')],
+        { encoding: 'utf8' },
+      );
+      assert.equal(result.status, 0, result.stderr);
+    }
+    await writeFile(join(checkout, 'skills/ship-it/SKILL.md'), 'locally edited');
+    for (const directory of paths) {
+      const script = join(directory, 'scripts/check-bundled-skills.mjs');
+      const result = spawnSync(process.execPath, [script], { encoding: 'utf8' });
+      assert.equal(result.status, 1, script);
+      assert.match(result.stderr, /Bundled sai file drifted:/);
+      const imported = spawnSync(
+        process.execPath,
+        ['--input-type=module', '--eval', 'await import(process.argv[1])', script],
+        { encoding: 'utf8' },
+      );
+      assert.equal(imported.status, 0, imported.stderr);
+      assert.equal(imported.stdout, '');
+      assert.equal(imported.stderr, '');
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 void test('the complete bundle matches its immutable upstream pin', async () => {
   await checkBundledSkills();

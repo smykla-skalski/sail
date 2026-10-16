@@ -115,6 +115,11 @@ if (fixture.pulls) {
   }
 }
 
+if (process.env.SAIL_E2E_GH_ALLOW_REAL !== '1') {
+  process.stderr.write(`Fake gh fixture has no response for ${JSON.stringify(args)}\n`);
+  process.exit(1);
+}
+
 const search = (process.env.PATH ?? '')
   .split(delimiter)
   .filter((entry) => entry && entry !== process.env.SAIL_E2E_FAKE_GH_BIN);
