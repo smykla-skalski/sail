@@ -231,6 +231,7 @@ mod dev_servers;
 mod diagnostics;
 #[cfg(feature = "e2e")]
 mod e2e_config;
+mod e2e_keyboard;
 mod git_overlay;
 mod github;
 pub mod hook_activity;
@@ -4808,6 +4809,7 @@ pub fn run() {
             set_worktree_cache_limit,
             clean_pending_worktree_temp,
             settings::reset_test_settings,
+            e2e_keyboard::send_test_tab,
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,

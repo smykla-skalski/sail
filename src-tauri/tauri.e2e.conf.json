@@ -39,7 +39,8 @@
             "core:path:allow-resolve-directory",
             "allow-acp-reset-test-runtimes",
             "allow-acp-set-idle-close-timeout",
-            "allow-reset-test-settings"
+            "allow-reset-test-settings",
+            "allow-send-test-tab"
           ]
         }
       ]
