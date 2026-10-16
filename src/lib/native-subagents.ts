@@ -293,8 +293,9 @@ export function updateNativeSubagents(
     // The backend identifies synthetic Claude history without treating concurrent live spawns
     // as replay. Older adapters use replay ids or the session replay boundary.
     const replayed =
-      params.sailHistoricalActivity === true ||
-      (restored && (event.agent !== 'claude' || isReplaySubagent(sessionId)));
+      typeof params?.sailHistoricalActivity === 'boolean'
+        ? params.sailHistoricalActivity
+        : restored && (event.agent !== 'claude' || isReplaySubagent(sessionId));
     const malformed =
       replayed &&
       (!(typeof update.name === 'string' && update.name.trim()) ||

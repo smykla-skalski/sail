@@ -800,6 +800,7 @@ impl Drop for EndResume<'_> {
 struct NativeReplay {
     sessions: HashSet<String>,
     live_children: HashMap<String, NativeSubagentState>,
+    historical_tools: HashSet<(String, String)>,
 }
 
 struct NativeReplayGuard<'a> {
@@ -2288,6 +2289,7 @@ impl Connection {
                     .insert(
                         id,
                         NativeReplay {
+                            historical_tools: HashSet::new(),
                             sessions: HashSet::from([session.clone()]),
                             live_children,
                         },
@@ -5501,6 +5503,9 @@ fn register_session_detached(
 }
 
 fn historical_native_activity_message(runtime: &Connection, mut message: Value) -> Value {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
+        return message;
+    }
     let historical = message
         .pointer("/params/sessionId")
         .and_then(Value::as_str)
@@ -5512,6 +5517,50 @@ fn historical_native_activity_message(runtime: &Connection, mut message: Value) 
         });
     if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
         params.insert("sailHistoricalActivity".into(), historical.into());
+        if historical {
+            let session = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(update) = params.get_mut("update").and_then(Value::as_object_mut) {
+                let child_tool = matches!(
+                    update.get("sessionUpdate").and_then(Value::as_str),
+                    Some("tool_call" | "tool_call_update")
+                ) && session
+                    .as_deref()
+                    .zip(update.get("toolCallId").and_then(Value::as_str))
+                    .is_some_and(|(session, tool)| {
+                        runtime.native_replays.lock().is_ok_and(|mut replays| {
+                            replays
+                                .values_mut()
+                                .filter(|replay| replay.sessions.contains(session))
+                                .any(|replay| {
+                                    let key = (session.to_string(), tool.to_string());
+                                    if update.get("subagent").and_then(Value::as_bool) == Some(true)
+                                    {
+                                        replay.historical_tools.insert(key.clone());
+                                    }
+                                    replay.historical_tools.contains(&key)
+                                })
+                        })
+                    });
+                let unfinished = matches!(
+                    update.get("status").and_then(Value::as_str),
+                    None | Some(
+                        "pending"
+                            | "in_progress"
+                            | "running"
+                            | "working"
+                            | "stopping"
+                            | "queued"
+                            | "starting"
+                    )
+                );
+                if child_tool && unfinished {
+                    update.insert("status".into(), "unavailable".into());
+                }
+            }
+        }
     }
     message
 }
@@ -6975,7 +7024,9 @@ fn connect_blocking_inner(
                                     agent: agent_id.clone(),
                                     directory: session_directory(&reader, parent_id),
                                     worktree: Some(reader.worktree.to_string_lossy().into_owned()),
-                                    message: normalized,
+                                    message: historical_native_activity_message(
+                                        &reader, normalized,
+                                    ),
                                 },
                             );
                         }
@@ -7283,7 +7334,7 @@ fn connect_blocking_inner(
                             .and_then(Value::as_str)
                             .and_then(|session_id| session_directory(&reader, session_id)),
                         worktree: Some(reader.worktree.to_string_lossy().into_owned()),
-                        message,
+                        message: historical_native_activity_message(&reader, message),
                     },
                 );
             } else if let Some(id) = message.get("id").and_then(Value::as_u64) {
@@ -12824,6 +12875,7 @@ mod native_subagent_fence_tests {
         runtime.native_replays.lock().unwrap().insert(
             7,
             NativeReplay {
+                historical_tools: HashSet::new(),
                 sessions: HashSet::from(["parent".into()]),
                 live_children: HashMap::new(),
             },
@@ -12835,6 +12887,36 @@ mod native_subagent_fence_tests {
             json!({"method":"session/update","params":{"sessionId":"parent","update":spawn}}),
         );
         assert_eq!(historical["params"]["sailHistoricalActivity"], true);
+        for status in ["pending", "in_progress", "completed", "failed"] {
+            let tool = historical_native_activity_message(
+                &runtime,
+                json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                    "sessionUpdate":"tool_call","toolCallId":"unattributed","subagent":true,"status":status
+                }}}),
+            );
+            assert_eq!(
+                tool["params"]["update"]["status"],
+                if matches!(status, "pending" | "in_progress") {
+                    "unavailable"
+                } else {
+                    status
+                }
+            );
+        }
+        let live_tool = historical_native_activity_message(
+            &runtime,
+            json!({"method":"session/update","params":{"sessionId":"unrelated","update":{
+                "sessionUpdate":"tool_call","toolCallId":"live-tool","subagent":true,"status":"in_progress"
+            }}}),
+        );
+        assert_eq!(live_tool["params"]["update"]["status"], "in_progress");
+        let later_tool = historical_native_activity_message(
+            &runtime,
+            json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call_update","toolCallId":"unattributed","status":"in_progress"
+            }}}),
+        );
+        assert_eq!(later_tool["params"]["update"]["status"], "unavailable");
         assert!(runtime
             .native_replay_update("historical", &json!({"sessionUpdate":"tool_call"}))
             .unwrap());
@@ -12946,6 +13028,7 @@ mod native_subagent_fence_tests {
             runtime.native_replays.lock().unwrap().insert(
                 7,
                 NativeReplay {
+                    historical_tools: HashSet::new(),
                     sessions: HashSet::from(["parent".into()]),
                     live_children,
                 },

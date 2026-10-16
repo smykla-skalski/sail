@@ -620,6 +620,17 @@ await test('an adapter without replay markers still restores its children', () =
   assert.equal(finalized[nativeSubagentId('codex', '/repo', 'thread-7')]?.activity, 'Disconnected');
 });
 
+await test('backend-confirmed live children stay active during a concurrent restore', () => {
+  for (const agent of ['codex', 'claude', 'opencode'] as const) {
+    const live = { ...spawnEvent('root', 'live-child'), agent };
+    live.message.params = { ...live.message.params, sailHistoricalActivity: false };
+    const store = updateNativeSubagents({}, live, '/repo', 1, true);
+    const finalized = finalizeNativeSubagentRestore(store, agent, '/repo', 'root', 2);
+    assert.equal(finalized, store);
+    assert.equal(nativeSubagentCounts(finalized, agent, 'root').active, 1);
+  }
+});
+
 await test('a first replay still restores historical children', () => {
   const restored = updateNativeSubagents(
     {},
