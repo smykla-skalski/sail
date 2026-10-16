@@ -1,7 +1,7 @@
 import process from 'node:process';
 import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
-import { resolve, relative } from 'node:path';
+import { basename, dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export async function checkBundledSkills(root = fileURLToPath(new URL('..', import.meta.url))) {
@@ -14,8 +14,10 @@ export async function checkBundledSkills(root = fileURLToPath(new URL('..', impo
       entries.map(async (entry) => {
         const path = resolve(directory, entry.name);
         if (entry.isDirectory()) await visit(path);
-        else if (entry.isFile()) actual.push(relative(root, path).replaceAll('\\', '/'));
-        else throw new Error(`Unsupported bundled skill entry: ${path}`);
+        else if (entry.isFile()) {
+          if (basename(dirname(path)) !== '__pycache__' || !entry.name.endsWith('.pyc'))
+            actual.push(relative(root, path).replaceAll('\\', '/'));
+        } else throw new Error(`Unsupported bundled skill entry: ${path}`);
       }),
     );
   }

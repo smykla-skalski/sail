@@ -49,6 +49,13 @@ fn visit(root: &Path, directory: &Path, files: &mut BTreeSet<String>) -> Result<
         if kind.is_dir() {
             visit(root, &path, files)?;
         } else if kind.is_file() {
+            if directory
+                .file_name()
+                .is_some_and(|name| name == "__pycache__")
+                && path.extension().is_some_and(|extension| extension == "pyc")
+            {
+                continue;
+            }
             files.insert(
                 path.strip_prefix(root)
                     .map_err(|error| error.to_string())?
