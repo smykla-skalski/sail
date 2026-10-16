@@ -7,7 +7,6 @@ argument-hint: "[--issue] [--risk low|medium|high] <task description | github-is
 allowed-tools: Agent Bash Edit Glob Grep Read Skill ToolSearch Write
 user-invocable: true
 metadata:
-  upstream-patches: smykla-skalski/sai d315fdb007d334e7d588f22bd816ff6b776ee676 (resume blocked telemetry)
   short-description: Ship a change, issue, or Jira ticket to merge
 ---
 
