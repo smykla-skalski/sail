@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { delimiter, join } from 'node:path';
 import process from 'node:process';
@@ -9,6 +9,14 @@ import { buildIdentifierKey } from './native-app-data.mjs';
 import { isOwnProcess, signalablePid } from './native-signal-guard.mjs';
 
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+
+function canonicalPath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
 
 export async function availablePort() {
   const server = createServer();
@@ -124,10 +132,11 @@ export function nativeApp({
   }
 
   function appProcesses(binary) {
+    const executable = canonicalPath(binary);
     const processes = processTable('pid=,command=');
     return processes
       .split('\n')
-      .filter((line) => line.trim().replace(/^\d+\s+/, '') === binary)
+      .filter((line) => canonicalPath(line.trim().replace(/^\d+\s+/, '')) === executable)
       .map((line) => Number(line.trim().split(/\s+/)[0]));
   }
 
