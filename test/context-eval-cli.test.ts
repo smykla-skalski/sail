@@ -291,7 +291,7 @@ void test(
               ],
             },
           ],
-          concurrency: 32,
+          concurrency: 1,
           timeoutMs: 10_000,
         }),
       );

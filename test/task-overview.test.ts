@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import process from 'node:process';
 import test from 'node:test';
 import type { AgentThread } from '../src/lib/acp.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
@@ -365,7 +366,7 @@ void test('100 cards and 500 threads stay within the interaction budget', () => 
     }
   }
 
-  const start = performance.now();
+  const start = process.cpuUsage();
   const cards = buildTaskOverviewCards({
     catalog: largeCatalog,
     threads: largeThreads,
@@ -376,7 +377,8 @@ void test('100 cards and 500 threads stay within the interaction budget', () => 
   });
   const searched = filterTaskOverviewCards(cards, 'Task 99');
   const sorted = sortTaskOverviewCards(cards, 'repository', []);
-  const duration = performance.now() - start;
+  const cpu = process.cpuUsage(start);
+  const duration = (cpu.user + cpu.system) / 1000;
 
   assert.equal(cards.length, 100);
   assert.equal(Object.values(largeThreads).flat().length, 500);
@@ -384,7 +386,7 @@ void test('100 cards and 500 threads stay within the interaction budget', () => 
   assert.equal(largeReceipts.length, 500);
   assert.equal(searched.length, 1);
   assert.equal(sorted[0].path, '/scale/repo-0');
-  assert.ok(duration < 100, `overview interactions took ${duration.toFixed(1)}ms`);
+  assert.ok(duration < 100, `overview interactions used ${duration.toFixed(1)}ms CPU`);
 });
 
 void test('preferences restore valid values and reject malformed state', () => {

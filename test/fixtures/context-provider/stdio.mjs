@@ -1,14 +1,38 @@
+import { createServer } from 'node:net';
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 
 const mode = process.argv[2] ?? 'valid';
-const output = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+if (mode === 'never-ready') {
+  setInterval(() => {}, 1000);
+  await new Promise(() => {});
+}
+let inputStream = process.stdin;
+let outputStream = process.stdout;
+if (process.argv.includes('--listen')) {
+  const server = createServer();
+  const connected = new Promise((resolveConnection, rejectConnection) => {
+    server.once('connection', resolveConnection);
+    server.once('error', rejectConnection);
+  });
+  await new Promise((resolveListening, rejectListening) => {
+    server.once('error', rejectListening);
+    server.listen(0, '127.0.0.1', resolveListening);
+  });
+  process.send({ port: server.address().port });
+  process.disconnect();
+  inputStream = outputStream = await connected;
+  server.close();
+}
 
-for await (const line of createInterface({ input: process.stdin })) {
+const output = (message) => outputStream.write(`${JSON.stringify(message)}\n`);
+
+for await (const line of createInterface({ input: inputStream })) {
   const message = JSON.parse(line);
+  if (mode === 'hung') continue;
   if (message.method === 'notifications/initialized') continue;
   if (mode === 'invalid-stdout') {
-    process.stdout.write('ready\n');
+    outputStream.write('ready\n');
     continue;
   }
   const reply = { jsonrpc: '2.0', id: message.id };
@@ -84,9 +108,9 @@ for await (const line of createInterface({ input: process.stdin })) {
   }
   output(reply);
   if (message.method === 'tools/call' && message.params.name === 'fixture_error') {
-    if (mode === 'trailing-stdout') process.stdout.write('ready\n');
-    if (mode === 'delayed-trailing-stdout') setTimeout(() => process.stdout.write('ready\n'), 10);
-    if (mode === 'late-trailing-stdout') setTimeout(() => process.stdout.write('ready\n'), 250);
-    if (mode === 'late-trailing-fragment') setTimeout(() => process.stdout.write('ready'), 250);
+    if (mode === 'trailing-stdout') outputStream.write('ready\n');
+    if (mode === 'delayed-trailing-stdout') setTimeout(() => outputStream.write('ready\n'), 10);
+    if (mode === 'late-trailing-stdout') setTimeout(() => outputStream.write('ready\n'), 250);
+    if (mode === 'late-trailing-fragment') setTimeout(() => outputStream.write('ready'), 250);
   }
 }
