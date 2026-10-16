@@ -34,7 +34,7 @@ The macOS development DMGs use ad-hoc signing when no Developer ID credentials w
 3. In OpenCode, run `/connect` to connect a provider and `/models` to select a model.
 4. Start an agent thread, or **New plan** for an OpenCode thread in plan mode. Review permissions, questions, plan revisions, execution, history, and diffs in the app.
 
-Use the sidebar to create named project groups and save repositories. The **+** button beside a repository creates a worktree and a branch from the repository's default branch, then opens it. Sail stores these checkouts under `~/sail/worktrees/<repository>/<name>` by default. Choose another parent folder in the creation form if needed.
+Use the sidebar to create named project groups and save repositories. The **+** button beside a repository creates a worktree and a branch from the repository's default branch, then opens it. Sail stores these checkouts under `~/.sail/worktrees/<repository>-<id>/<name>` by default. Choose another parent folder in the creation form, or set `SAIL_WORKTREE_ROOT` to an absolute path to override the default root. The hidden default keeps new worktrees out of macOS Spotlight. Existing worktrees under `~/sail/worktrees` remain in place and continue to work, including cleanup and disk pressure checks.
 
 ## Troubleshooting and updates
 

@@ -4,14 +4,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 #[cfg(unix)]
 use wait_timeout::ChildExt;
 
 const SETTING: &str = "sai-reef-canary-percent";
 
 pub(crate) fn configured_percent(app: &AppHandle) -> Result<Option<u8>, String> {
-    parse_percent(crate::settings::string_setting(app, SETTING)?.as_deref())
+    effective_percent(
+        app.state::<crate::reef_admission::StartupMode>().0,
+        crate::settings::string_setting(app, SETTING)?.as_deref(),
+    )
+}
+
+fn effective_percent(admission: bool, stored: Option<&str>) -> Result<Option<u8>, String> {
+    if admission {
+        return Ok(None);
+    }
+    parse_percent(stored)
 }
 
 fn parse_percent(value: Option<&str>) -> Result<Option<u8>, String> {
@@ -118,6 +128,19 @@ mod tests {
         assert_eq!(parse_percent(Some("0")).unwrap(), Some(0));
         assert_eq!(parse_percent(Some("10")).unwrap(), Some(10));
         assert_eq!(parse_percent(Some("100")).unwrap(), Some(100));
+    }
+
+    #[test]
+    fn turn_admission_suppresses_canary_without_changing_its_preference() {
+        assert_eq!(super::effective_percent(true, Some("100")).unwrap(), None);
+        assert_eq!(
+            super::effective_percent(false, Some("100")).unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            super::effective_percent(true, Some("invalid")).unwrap(),
+            None
+        );
     }
 
     #[test]

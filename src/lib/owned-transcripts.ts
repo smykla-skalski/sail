@@ -1,4 +1,5 @@
 import type { AgentEntry } from './acp.ts';
+import { acpSessionOwner } from './session-identity.ts';
 
 const databaseName = 'sail-owned-transcripts';
 const storeName = 'threads';
@@ -97,7 +98,7 @@ export async function flushOwnedTranscriptWrites(owner: string): Promise<void> {
           return (
             Array.isArray(identity) &&
             typeof identity[2] === 'string' &&
-            identity[2].startsWith(`sail-owned:${owner}:`)
+            acpSessionOwner(identity[2]) === owner
           );
         } catch {
           return false;

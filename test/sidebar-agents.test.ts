@@ -686,3 +686,24 @@ await test('Sail keywords survive a newer agent listing for the same thread', ()
   const listed = { ...saved, title: 'Listed', keywords: undefined, updated: 5 };
   assert.deepEqual(groupSidebarThreads([saved, listed])['/repo/a'][0]?.keywords, saved.keywords);
 });
+
+void test('provider inventory retains each live profile when opening sidebar history', async () => {
+  const threads = await listSidebarAcpThreads(
+    'opencode',
+    async () => ({
+      sessions: [
+        { sessionId: 'sail-profile:build:1', cwd: '/repo', capabilityProfile: 'build' },
+        { sessionId: 'sail-profile:review:1', cwd: '/repo', capabilityProfile: 'review' },
+      ],
+    }),
+    '/repo',
+  );
+  assert.deepEqual(
+    threads.map(({ sessionId, capabilityProfile }) => ({ sessionId, capabilityProfile })),
+    [
+      { sessionId: 'sail-profile:build:1', capabilityProfile: 'build' },
+      { sessionId: 'sail-profile:review:1', capabilityProfile: 'review' },
+    ],
+  );
+  assert.equal(groupSidebarThreads([...threads, ...threads])['/repo'].length, 2);
+});

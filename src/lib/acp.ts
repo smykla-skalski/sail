@@ -1,3 +1,5 @@
+import { acpSessionOwner } from './session-identity.ts';
+export { acpSessionOwner } from './session-identity.ts';
 import { invoke } from '@tauri-apps/api/core';
 import { flushTranscriptWrite, getSetting, setSetting, setTranscriptSetting } from './settings.ts';
 import { resourceQueues } from './resource-limits.ts';
@@ -103,7 +105,13 @@ export function mergeAgentThreadListing(previous: AgentThread, incoming: AgentTh
 }
 
 export interface AgentSessionListing {
-  sessions: { sessionId: string; cwd: string; title?: string | null; updatedAt?: string | null }[];
+  sessions: {
+    sessionId: string;
+    cwd: string;
+    title?: string | null;
+    updatedAt?: string | null;
+    capabilityProfile?: CapabilityProfile;
+  }[];
   nextCursor?: string | null;
 }
 
@@ -363,14 +371,6 @@ export function acpDisconnectedSessionIds(message: AgentEvent['message']): strin
 /** The backend stopped an idle agent; attached sessions resume on their next use. */
 export function acpDisconnectedForIdleness(message: AgentEvent['message']): boolean {
   return message.method === 'sail/disconnected' && message.params?.idle === true;
-}
-
-export function acpSessionOwner(sessionId: string | null): string | null {
-  if (!sessionId) return null;
-  const match = /^sail-owned:([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}):/.exec(
-    sessionId,
-  );
-  return match?.[1] ?? null;
 }
 
 export function acpDisconnectAffectsSession(

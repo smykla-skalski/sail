@@ -2183,6 +2183,7 @@ impl Connection {
         let mut input = self.input.lock().map_err(|error| error.to_string())?;
         let input = input.as_mut().ok_or(IDLE_EXIT_ERROR)?;
         let mut message = message.clone();
+        translate_profile_session_ids(&mut message, self.profile, true, &HashMap::new());
         if let Some(owner) = &self.owner {
             translate_session_ids(&mut message, owner, true);
         }
@@ -2466,13 +2467,30 @@ fn owned_session_id(owner: &str, wire_id: &str) -> String {
 }
 
 fn session_owner(session_id: &str) -> Option<&str> {
+    let (_, session_id) = session_profile(session_id);
     let rest = session_id.strip_prefix(OWNED_SESSION_PREFIX)?;
     let (owner, _) = rest.split_once(':')?;
     Uuid::parse_str(owner).ok()?;
     Some(owner)
 }
 
-fn translate_session_ids(value: &mut Value, owner: &str, to_wire: bool) {
+const PROFILE_SESSION_PREFIX: &str = "sail-profile:";
+
+pub(crate) fn session_profile(session_id: &str) -> (Option<CapabilityProfile>, &str) {
+    session_id
+        .strip_prefix(PROFILE_SESSION_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(profile, id)| {
+            CapabilityProfile::parse(profile).map(|profile| (Some(profile), id))
+        })
+        .unwrap_or((None, session_id))
+}
+
+fn profile_session_id(profile: CapabilityProfile, id: &str) -> String {
+    format!("{PROFILE_SESSION_PREFIX}{}:{id}", profile.as_str())
+}
+
+fn map_session_ids(value: &mut Value, translate: &mut impl FnMut(&str) -> String) {
     match value {
         Value::Object(fields) => {
             for (key, entry) in fields {
@@ -2481,27 +2499,56 @@ fn translate_session_ids(value: &mut Value, owner: &str, to_wire: bool) {
                     "sessionId" | "subagentSessionId" | "parentSessionId"
                 ) {
                     if let Some(id) = entry.as_str() {
-                        let prefix = format!("{OWNED_SESSION_PREFIX}{owner}:");
-                        if to_wire {
-                            if let Some(wire_id) = id.strip_prefix(&prefix) {
-                                *entry = Value::String(wire_id.to_string());
-                            }
-                        } else if !id.starts_with(&prefix) {
-                            *entry = Value::String(owned_session_id(owner, id));
-                        }
+                        *entry = Value::String(translate(id));
                     }
                 } else {
-                    translate_session_ids(entry, owner, to_wire);
+                    map_session_ids(entry, translate);
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                translate_session_ids(item, owner, to_wire);
+                map_session_ids(item, translate);
             }
         }
         _ => {}
     }
+}
+
+fn translate_session_ids(value: &mut Value, owner: &str, to_wire: bool) {
+    let prefix = format!("{OWNED_SESSION_PREFIX}{owner}:");
+    map_session_ids(value, &mut |id| {
+        if to_wire {
+            id.strip_prefix(&prefix).unwrap_or(id).to_string()
+        } else if id.starts_with(&prefix) {
+            id.to_string()
+        } else {
+            owned_session_id(owner, id)
+        }
+    });
+}
+
+fn translate_profile_session_ids(
+    value: &mut Value,
+    profile: CapabilityProfile,
+    to_wire: bool,
+    legacy_sessions: &HashMap<String, CapabilityProfile>,
+) {
+    map_session_ids(value, &mut |id| {
+        if to_wire {
+            let (scoped_profile, wire_id) = session_profile(id);
+            if scoped_profile == Some(profile) {
+                wire_id
+            } else {
+                id
+            }
+            .to_string()
+        } else if legacy_sessions.contains_key(id) && session_profile(id).0.is_none() {
+            id.to_string()
+        } else {
+            profile_session_id(profile, id)
+        }
+    });
 }
 
 /// Git roots by requested directory. Each ACP command resolves its worktree, and a `git`
@@ -5076,12 +5123,19 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
     let input = update.get("rawInput").or_else(|| update.get("input"))?;
     let activity = input.get("activityKind").and_then(Value::as_str)?;
     let wire_child = input.get("agentThreadId").and_then(Value::as_str)?;
-    if wire_child.trim().is_empty() || wire_child == parent {
+    if wire_child.trim().is_empty() {
         return None;
     }
     let child = owner
         .map(|owner| owned_session_id(owner, wire_child))
         .unwrap_or_else(|| wire_child.to_string());
+    let child = session_profile(parent)
+        .0
+        .map(|profile| profile_session_id(profile, &child))
+        .unwrap_or(child);
+    if child == parent {
+        return None;
+    }
     let name = input
         .get("agentPath")
         .and_then(Value::as_str)
@@ -5374,6 +5428,7 @@ fn connection_for_session(
 /// OpenCode attaches the child's own session ID to its MCP calls; other agents give none.
 fn task_provider_id<'a>(runtime: &Connection, child_id: &'a str) -> Option<&'a str> {
     (runtime.agent == "opencode").then(|| {
+        let (_, child_id) = session_profile(child_id);
         runtime
             .owner
             .as_ref()
@@ -5460,6 +5515,12 @@ fn register_session_detached(
     session_id: &str,
     directory: PathBuf,
 ) -> Result<Arc<Connection>, String> {
+    if session_profile(session_id)
+        .0
+        .is_some_and(|owner| owner != profile)
+    {
+        return Err("Agent session belongs to another capability profile.".into());
+    }
     let owner = session_owner(session_id);
     let key = connection_key_for_owner(agent, profile, &directory, owner);
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
@@ -6986,6 +7047,13 @@ fn connect_blocking_inner(
             if let Some(owner) = &reader.owner {
                 translate_session_ids(&mut message, owner, false);
             }
+            {
+                let profiles = reader
+                    .session_profiles
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                translate_profile_session_ids(&mut message, reader.profile, false, &profiles);
+            }
             if message
                 .get("method")
                 .and_then(Value::as_str)
@@ -8252,6 +8320,52 @@ fn listing_connection(
     Ok((runtime, capabilities))
 }
 
+fn profiled_session_history(
+    mut listing: Value,
+    known: &[(String, CapabilityProfile, PathBuf)],
+) -> Value {
+    let Some(sessions) = listing.get_mut("sessions").and_then(Value::as_array_mut) else {
+        return listing;
+    };
+    *sessions = std::mem::take(sessions)
+        .into_iter()
+        .flat_map(|session| {
+            let Some(id) = session.get("sessionId").and_then(Value::as_str) else {
+                return vec![session];
+            };
+            let (_, wire_id) = session_profile(id);
+            let directory = session
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(canonical_directory);
+            let mut identities = known
+                .iter()
+                .filter(|(id, _, cwd)| {
+                    session_profile(id).1 == wire_id && directory.as_ref() == Some(cwd)
+                })
+                .map(|(id, profile, _)| (id.clone(), *profile))
+                .collect::<Vec<_>>();
+            // History lookup grants listing access, not ownership of persisted conversations.
+            if identities.is_empty() {
+                identities.push((
+                    profile_session_id(CapabilityProfile::Build, wire_id),
+                    CapabilityProfile::Build,
+                ));
+            }
+            identities
+                .into_iter()
+                .map(|(id, profile)| {
+                    let mut session = session.clone();
+                    session["sessionId"] = json!(id);
+                    session["capabilityProfile"] = json!(profile.as_str());
+                    session
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    listing
+}
+
 /// One page of the agent's own session history for a working directory.
 #[tauri::command]
 pub async fn acp_list_sessions(
@@ -8284,7 +8398,39 @@ pub async fn acp_list_sessions(
             if result.is_err() && attempts < 2 && !runtime.reusable() {
                 continue;
             }
-            return result;
+            let result = result?;
+            let mut known = Vec::new();
+            for connection in manager
+                .0
+                .lock()
+                .map_err(|error| error.to_string())?
+                .values()
+                .filter(|connection| {
+                    connection.agent == agent
+                        && connection.worktree == runtime.worktree
+                        && connection.owner.is_none()
+                        && connection.alive.load(Ordering::Acquire)
+                })
+            {
+                let profiles = connection
+                    .session_profiles
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                let directories = connection
+                    .session_directories
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                known.extend(profiles.iter().filter_map(|(id, profile)| {
+                    directories.get(id).map(|cwd| {
+                        (
+                            id.clone(),
+                            *profile,
+                            canonical_directory(&cwd.to_string_lossy()),
+                        )
+                    })
+                }));
+            }
+            return Ok(profiled_session_history(result, &known));
         }
     })
     .await
@@ -13828,6 +13974,133 @@ mod native_subagent_fence_tests {
 #[cfg(test)]
 mod capability_profile_tests {
     use super::*;
+
+    #[test]
+    fn reused_provider_ids_route_to_their_profile() {
+        let owner = "0d66d3a1-5c47-45d1-8c3d-4a789f129001";
+        let original = json!({"params":{"sessionId":"1","update":{"subagentSessionId":"2","parentSessionId":"1"}}});
+        let mut ids = Vec::new();
+        for profile in [
+            CapabilityProfile::Explore,
+            CapabilityProfile::Review,
+            CapabilityProfile::Build,
+            CapabilityProfile::Release,
+        ] {
+            let mut event = original.clone();
+            translate_session_ids(&mut event, owner, false);
+            translate_profile_session_ids(&mut event, profile, false, &HashMap::new());
+            let id = event["params"]["sessionId"].as_str().unwrap().to_owned();
+            assert_eq!(session_owner(&id), Some(owner));
+            assert_eq!(session_profile(&id).0, Some(profile));
+            assert!(!ids.contains(&id));
+            ids.push(id);
+            translate_profile_session_ids(&mut event, profile, true, &HashMap::new());
+            translate_session_ids(&mut event, owner, true);
+            assert_eq!(event, original);
+        }
+    }
+
+    #[test]
+    fn legacy_restored_sessions_keep_their_event_identity() {
+        let profile = CapabilityProfile::Review;
+        let mut event = json!({"params":{"sessionId":"1"}});
+        let legacy = HashMap::from([("1".to_string(), profile)]);
+        translate_profile_session_ids(&mut event, profile, false, &legacy);
+        assert_eq!(event["params"]["sessionId"], "1");
+        translate_profile_session_ids(&mut event, profile, true, &legacy);
+        assert_eq!(event["params"]["sessionId"], "1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_ids_register_and_select_independent_profile_connections() {
+        let directory = std::env::temp_dir();
+        let manager = AgentManager::default();
+        let mut expected = Vec::new();
+        for profile in [CapabilityProfile::Build, CapabilityProfile::Review] {
+            let id = profile_session_id(profile, "1");
+            let runtime =
+                super::session_config_tests::test_runtime("codex", profile, &directory, &id, None);
+            manager.0.lock().unwrap().insert(
+                connection_key("codex", profile, &directory),
+                Arc::clone(&runtime),
+            );
+            expected.push((profile, id, runtime));
+        }
+        for (profile, id, runtime) in expected {
+            let registered =
+                register_session(&manager, "codex", profile, &id, directory.clone()).unwrap();
+            assert!(Arc::ptr_eq(&registered, &runtime));
+            let selected = connection_for_session(&manager, "codex", &id, &directory).unwrap();
+            assert!(Arc::ptr_eq(&selected, &runtime));
+            assert!(register_session(
+                &manager,
+                "codex",
+                if profile == CapabilityProfile::Build {
+                    CapabilityProfile::Review
+                } else {
+                    CapabilityProfile::Build
+                },
+                &id,
+                directory.clone()
+            )
+            .is_err());
+        }
+        manager.shutdown();
+    }
+
+    #[test]
+    fn history_listing_uses_live_owners_and_default_build_for_unbound_history() {
+        let build = profile_session_id(CapabilityProfile::Build, "1");
+        let review = profile_session_id(CapabilityProfile::Review, "1");
+        let listed = profiled_session_history(
+            json!({"sessions":[
+            {"sessionId":profile_session_id(CapabilityProfile::Explore, "1"),"cwd":"/repo"},
+            {"sessionId":profile_session_id(CapabilityProfile::Explore, "unbound"),"cwd":"/repo"}
+        ],"nextCursor":"next"}),
+            &[
+                (
+                    build.clone(),
+                    CapabilityProfile::Build,
+                    PathBuf::from("/repo"),
+                ),
+                (
+                    review.clone(),
+                    CapabilityProfile::Review,
+                    PathBuf::from("/repo"),
+                ),
+                (
+                    profile_session_id(CapabilityProfile::Explore, "1"),
+                    CapabilityProfile::Explore,
+                    PathBuf::from("/repo/other"),
+                ),
+            ],
+        );
+        assert_eq!(listed["sessions"][0]["sessionId"], build);
+        assert_eq!(listed["sessions"][0]["capabilityProfile"], "build");
+        assert_eq!(listed["sessions"][1]["sessionId"], review);
+        assert_eq!(listed["sessions"][1]["capabilityProfile"], "review");
+        assert_eq!(
+            listed["sessions"][2]["sessionId"],
+            profile_session_id(CapabilityProfile::Build, "unbound")
+        );
+        assert_eq!(listed["sessions"][2]["capabilityProfile"], "build");
+        assert_eq!(listed["nextCursor"], "next");
+    }
+
+    #[test]
+    fn history_listing_keeps_registered_legacy_session_identity() {
+        let listed = profiled_session_history(
+            json!({"sessions":[{"sessionId":profile_session_id(CapabilityProfile::Explore, "legacy"),"cwd":"/repo"}]}),
+            &[(
+                "legacy".into(),
+                CapabilityProfile::Review,
+                PathBuf::from("/repo"),
+            )],
+        );
+        assert_eq!(listed["sessions"][0]["sessionId"], "legacy");
+        assert_eq!(listed["sessions"][0]["capabilityProfile"], "review");
+    }
 
     #[test]
     fn session_ids_have_only_one_live_capability_owner() {

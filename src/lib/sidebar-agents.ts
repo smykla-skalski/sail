@@ -76,6 +76,7 @@ export async function listSidebarAcpThreads(
       agent,
       directory: path,
       sessionId: session.sessionId,
+      ...(session.capabilityProfile ? { capabilityProfile: session.capabilityProfile } : {}),
       title: session.title?.trim() || 'Untitled session',
       updated: session.updatedAt ? Date.parse(session.updatedAt) || 0 : 0,
     });

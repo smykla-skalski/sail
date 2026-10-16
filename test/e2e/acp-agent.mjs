@@ -29,7 +29,7 @@ if (process.env.SAIL_E2E_ACP_START_LOG)
 let authenticated = agent !== 'codex';
 let nextSession = 0;
 // A provider can run under several capability profiles in separate processes.
-const sessionRun = `-${process.pid}`;
+const sessionRun = process.env.SAIL_E2E_ACP_SESSION_RUN ?? `-${process.pid}`;
 let nextPermission = 1000;
 
 function send(message) {

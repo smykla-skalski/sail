@@ -121,10 +121,11 @@ fn resolve_task_session(client: &Client, provider_id: Option<&str>) -> Result<St
         .session
         .as_deref()
         .ok_or("Tasks require a session-bound connection.")?;
-    let wire_parent = parent
+    let (_, unscoped_parent) = crate::acp::session_profile(parent);
+    let wire_parent = unscoped_parent
         .strip_prefix("sail-owned:")
         .and_then(|rest| rest.split_once(':'))
-        .map_or(parent, |(_, id)| id);
+        .map_or(unscoped_parent, |(_, id)| id);
     if !client.unattributed_native_activity.is_empty() {
         return Err(
             "Task identity is unavailable while unattributed native child activity shares this connection."
@@ -3358,6 +3359,17 @@ mod native_task_identity_tests {
         );
         assert!(manager.task_identity_available("opencode", Path::new("/repo"), "parent"));
         assert!(manager.task_identity_available("opencode", Path::new("/repo"), "child"));
+    }
+
+    #[test]
+    fn profile_session_names_resolve_provider_task_identity() {
+        let mut source = client("opencode");
+        source.session = Some("sail-profile:review:sail-owned:owner:parent".into());
+        assert_eq!(
+            resolve_task_session(&source, Some("parent")).unwrap(),
+            "sail-profile:review:sail-owned:owner:parent"
+        );
+        assert!(resolve_task_session(&source, Some("sail-profile:build:parent")).is_err());
     }
 
     #[test]

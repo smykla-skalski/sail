@@ -189,6 +189,8 @@ void test('an idle agent exit is not reported as a failed thread', () => {
 void test('a reopened owned thread reconnects to its run', () => {
   const owner = '0d66d3a1-5c47-45d1-8c3d-4a789f129001';
   assert.equal(acpSessionOwner(`sail-owned:${owner}:wire-session`), owner);
+  assert.equal(acpSessionOwner(`sail-profile:review:sail-owned:${owner}:wire-session`), owner);
+  assert.equal(acpSessionOwner('sail-profile:build:wire-session'), null);
   assert.equal(acpSessionOwner('wire-session'), null);
   assert.equal(acpSessionOwner('sail-owned:invalid:wire-session'), null);
 });

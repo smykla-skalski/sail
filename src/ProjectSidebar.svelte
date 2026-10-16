@@ -1494,7 +1494,7 @@
         </p>{/if}
       <div class="worktree-destination">
         <div>
-          <strong>Location</strong><span title={worktreeDestination ?? '~/sail/worktrees'}
+          <strong>Location</strong><span title={worktreeDestination ?? '~/.sail/worktrees'}
             >{worktreeDestination ?? 'Sail worktrees folder'}</span
           >
         </div>
