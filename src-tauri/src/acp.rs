@@ -191,7 +191,7 @@ impl NativeSubagentRegistry {
             return Err("Native child state came from a different parent.".into());
         }
         entry.outcome = match outcome {
-            "completed" | "failed" | "working" => outcome,
+            "completed" | "failed" | "working" | "interrupted" => outcome,
             "cancelled" => "interrupted",
             _ => "unknown",
         }
@@ -12740,6 +12740,21 @@ time.sleep(10)
 #[cfg(test)]
 mod native_subagent_fence_tests {
     use super::*;
+
+    #[test]
+    fn interrupted_native_child_releases_its_parent_fence() {
+        let mut native = NativeSubagentRegistry::default();
+        native
+            .spawn("parent", "child", PathBuf::from("/repo"), false)
+            .unwrap();
+        native.task_scope("child", true, true);
+        assert!(!native.task_connections().is_empty());
+        native.update("parent", "child", "interrupted").unwrap();
+        assert_eq!(native.0["child"].outcome, "interrupted");
+        assert!(native.0["child"].task_turn_id.is_none());
+        assert!(native.task_connections().is_empty());
+        assert!(!native.involves_live_work("parent"));
+    }
 
     #[test]
     fn changed_task_snapshot_gets_new_generation_even_before_reader_disconnect() {

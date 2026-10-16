@@ -65,7 +65,7 @@ export function coordinationTarget(
     .toSorted((a, b) => b.updated - a.updated)[0];
   if (receipt && (receipt.state === 'interrupted' || receipt.state === 'unavailable'))
     throw new Error(
-      `Target worker is ${receipt.state}. Inspect agent_result with its original receiptId and accessKey, then use agent_spawn to launch a replacement worker.`,
+      `Target worker is ${receipt.state}. Inspect agent_result with its original receiptId and accessKey. For a tracked Ship assignment, use agent_spawn with the same shipIssue and retry: true; otherwise launch a replacement worker.`,
     );
   return target;
 }

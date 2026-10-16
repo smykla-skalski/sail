@@ -186,6 +186,7 @@
   import type { ShipItIssue } from './lib/implementation-models';
   import {
     parseSpawnShipIssue,
+    spawnShipRetry,
     requireSpawnShipIssueAvailable,
   } from './lib/spawn-ship-assignment.ts';
   import { checkState } from './lib/pull-request-checks.ts';
@@ -8091,8 +8092,27 @@
 
     if (shipIssue) {
       await assertShipItIssueRepository(request.directory, shipIssue);
+      if (request.arguments.retry === true) {
+        const assigned = spawnShipRetry(
+          shipRuns,
+          spawnReceipts,
+          project,
+          shipIssue,
+          sourceId,
+          request.directory,
+        );
+        const message = await retryShipIssue(assigned.run, assigned.issue);
+        return {
+          status: message ? 'queued' : 'cancelled',
+          runId: assigned.run.id,
+          issueNumber: assigned.issue.number,
+          message,
+        };
+      }
       requireSpawnShipIssueAvailable(shipRuns, project, shipIssue);
     }
+    if (request.arguments.retry !== undefined && request.arguments.retry !== false)
+      throw new Error('Retry requires an explicit Ship issue and retry: true.');
 
     const routeSelection = routed
       ? selectModelRoute(modelRouting, {

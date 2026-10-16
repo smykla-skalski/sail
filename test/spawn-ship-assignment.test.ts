@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   parseSpawnShipIssue,
+  spawnShipRetry,
   requireSpawnShipIssueAvailable,
 } from '../src/lib/spawn-ship-assignment.ts';
 import { adoptRegisteredDirectShipRun, type ShipRun } from '../src/lib/issue-shipping.ts';
@@ -54,6 +55,61 @@ const input = {
   threadId: 'acp:codex:worker',
   approvedAt: 100,
 };
+
+void test('Ship retry retains the assignment and rejects foreign or live workers', async () => {
+  let runs: ShipRun[] = [];
+  await adoptRegisteredDirectShipRun(
+    Promise.resolve([
+      { path: input.directory, branch: input.branch, present: true, generation: null },
+    ]),
+    input,
+    () => runs,
+    (value) => {
+      runs = value;
+    },
+    async () => {},
+  );
+  const issue = runs[0].issues[0];
+  issue.receiptId = 'old';
+  const receipt: import('../src/lib/agent-results.ts').SpawnReceipt = {
+    receiptId: 'old',
+    project: input.project,
+    sourceId: 'coordinator',
+    sourceDirectory: input.project,
+    targetId: issue.threadId,
+    targetDirectory: issue.path,
+    state: 'interrupted',
+    accessKey: 'key',
+    requestId: 'request',
+    turnId: 'turn',
+    worktreeId: input.directory,
+    provider: 'codex',
+    prompt: null,
+    created: 1,
+    updated: 2,
+    result: null,
+    error: null,
+  };
+  const lookup = (receipts = [receipt], source = 'coordinator', directory = input.project) =>
+    spawnShipRetry(
+      runs,
+      receipts,
+      input.project,
+      { repository: 'A/B', number: 789 },
+      source,
+      directory,
+    );
+  const selected = lookup();
+  assert.equal(selected.run, runs[0]);
+  assert.equal(selected.issue, issue);
+  assert.equal(selected.issue.path, input.directory);
+  assert.throws(() => lookup([], 'coordinator'), /original coordinator/);
+  assert.throws(() => lookup([receipt], 'other'), /original coordinator/);
+  assert.throws(() => lookup([receipt], 'coordinator', '/other'), /original coordinator/);
+  assert.throws(() => lookup([{ ...receipt, targetId: 'foreign' }]), /original coordinator/);
+  for (const state of ['working', 'waiting', 'queued', 'starting', 'completed'] as const)
+    assert.throws(() => lookup([{ ...receipt, state }]), /has not stopped/);
+});
 
 void test('persisted spawned assignment grants all worker controls only to its thread and worktree', async () => {
   let runs: ShipRun[] = [];

@@ -2329,6 +2329,7 @@ pub fn run_mcp_stdio() {
                             "risk":{"type":"string","enum":["low","medium","high"]},
                             "prompt":{"type":"string"},
                             "shipIssue":{"type":"object","properties":{"repository":{"type":"string","pattern":"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},"number":{"type":"integer","minimum":1}},"required":["repository","number"],"additionalProperties":false},
+                            "retry":{"type":"boolean","description":"Retry an interrupted tracked Ship assignment owned by this coordinator through the existing Ship retry confirmation and safety checks. Returns queued runId and issueNumber rather than a new launch receipt."},
                             "receiptId":{"type":"string","format":"uuid"},
                             "accessKey":{"type":"string","format":"uuid"},
                             "target":{"oneOf":[

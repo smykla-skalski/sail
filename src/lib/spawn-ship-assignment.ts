@@ -1,5 +1,38 @@
 import type { ShipItIssue } from './implementation-models.ts';
 import type { ShipRun } from './issue-shipping.ts';
+import type { SpawnReceipt } from './agent-results.ts';
+
+export function spawnShipRetry(
+  runs: ShipRun[],
+  receipts: SpawnReceipt[],
+  project: string,
+  issue: ShipItIssue,
+  sourceId: string,
+  sourceDirectory: string,
+) {
+  const run = runs.find(
+    (candidate) =>
+      candidate.repository === project &&
+      candidate.remote.toLowerCase() === issue.repository.toLowerCase() &&
+      candidate.issues.some((item) => item.number === issue.number),
+  );
+  const assigned = run?.issues.find((item) => item.number === issue.number);
+  const receipt = receipts.find((item) => item.receiptId === assigned?.receiptId);
+  if (
+    !run ||
+    !assigned ||
+    !receipt ||
+    receipt.project !== project ||
+    receipt.sourceId !== sourceId ||
+    receipt.sourceDirectory !== sourceDirectory ||
+    receipt.targetId !== assigned.threadId ||
+    receipt.targetDirectory !== assigned.path
+  )
+    throw new Error('Only the original coordinator can retry this tracked Ship assignment.');
+  if (!['interrupted', 'unavailable', 'failed'].includes(receipt.state))
+    throw new Error('The assigned worker has not stopped; inspect its launch receipt first.');
+  return { run, issue: assigned };
+}
 
 export function parseSpawnShipIssue(value: unknown, role: unknown): ShipItIssue | undefined {
   if (value === undefined) return undefined;
@@ -36,7 +69,7 @@ export function requireSpawnShipIssueAvailable(
     )
   )
     throw new Error(
-      'This Ship issue already has a tracked assignment; resume its assigned worker.',
+      'This Ship issue already has a tracked assignment. Inspect its receipt; if interrupted, retry agent_spawn with the same shipIssue and retry: true.',
     );
   if (directory && runs.some((run) => run.issues.some((candidate) => candidate.path === directory)))
     throw new Error('This worktree already has a Ship assignment; choose a fresh worktree.');
