@@ -1555,6 +1555,8 @@ const shipIssueSchema = z.object({
       z.object({
         id: z.string().min(1),
         provider: z.enum(['claude', 'codex', 'opencode']),
+        boundary: z.enum(['draft-published', 'before-pr-loop']).optional(),
+        brief: z.string().min(1).max(1999).optional(),
         fromThreadId: z.string().min(1),
         toThreadId: z.string().nullable(),
         context: z.number().min(0).max(100),

@@ -2437,7 +2437,12 @@ pub fn run_mcp_stdio() {
                             },
                             "expectedSequence":{"type":"integer","minimum":0},
                             "expectedRevision":{"type":["string","null"]},
-                            "rebindRevision":{"type":"boolean"}
+                            "rebindRevision":{"type":"boolean"},
+                            "handoff":{"type":"object","properties":{
+                                "id":{"type":"string","minLength":1},
+                                "boundary":{"type":"string","enum":["draft-published","before-pr-loop"]},
+                                "brief":{"type":"string","minLength":1,"maxLength":1999}
+                            },"required":["id","boundary","brief"],"additionalProperties":false}
                         },"required":["checkpoint","expectedSequence","expectedRevision"]
                     }});
                 }

@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { TaskCheckpoint } from './task-checkpoint.ts';
 import type { SpawnReceipt } from './agent-results.ts';
 
@@ -9,6 +10,8 @@ export type ContextProvider = 'claude' | 'codex' | 'opencode';
 export type ContextHandoff = {
   id: string;
   provider: ContextProvider;
+  boundary?: 'draft-published' | 'before-pr-loop';
+  brief?: string;
   fromThreadId: string;
   toThreadId: string | null;
   context: number;
@@ -168,5 +171,47 @@ export function contextHandoffPrompt(input: {
     '',
     'Checkpoint snapshot:',
     JSON.stringify(input.checkpoint, null, 2),
+  ].join('\n');
+}
+
+export function phaseHandoffRequest(
+  value: unknown,
+  checkpoint: TaskCheckpoint,
+  handoffs: ContextHandoff[] = [],
+  namespace = '',
+): { id: string; boundary: 'draft-published' | 'before-pr-loop'; brief: string } | null {
+  if (value === undefined) return null;
+  if (!value || typeof value !== 'object') throw new Error('A phase handoff requires a brief.');
+  const { id, boundary, brief } = z
+    .object({ id: z.unknown(), boundary: z.unknown(), brief: z.unknown() })
+    .parse(value);
+  if (typeof id !== 'string' || !id.trim()) throw new Error('A phase handoff requires an ID.');
+  if (boundary !== 'draft-published' && boundary !== 'before-pr-loop')
+    throw new Error('Unknown phase handoff boundary.');
+  if (typeof brief !== 'string' || !brief.trim() || new TextEncoder().encode(brief).length > 1999)
+    throw new Error('The phase handoff brief must contain 1–1999 UTF-8 bytes.');
+  if (
+    checkpoint.status !== 'active' ||
+    checkpoint.phase !== (boundary === 'draft-published' ? 'review' : 'pr')
+  )
+    throw new Error('The phase handoff must target an active destination checkpoint.');
+  const qualifiedId = namespace ? `${namespace}:${id}` : id;
+  const existing = handoffs.find((handoff) => handoff.boundary === boundary);
+  if (existing) {
+    if (existing.id !== qualifiedId || existing.brief !== brief)
+      throw new Error('This phase boundary already has a different handoff.');
+    return null;
+  }
+  return { id: qualifiedId, boundary, brief };
+}
+
+export function phaseHandoffPrompt(brief: string): string {
+  return [
+    'Continue the same Ship run as a fresh phase worker. Read the canonical task checkpoint with task_checkpoint_read first.',
+    'Reconcile original authorization and live delivery; preserve the existing local claim, completed gates, evidence and budgets. Load only destination phase guidance and missing repository instructions.',
+    'Sail owns the phase worker transfer. Do not start another run or reacquire ownership. Never post a GitHub comment. Follow the existing merge owner rule.',
+    'At the next skill phase boundary, submit its handoff brief through task_checkpoint_update.handoff and end your turn.',
+    '',
+    brief,
   ].join('\n');
 }

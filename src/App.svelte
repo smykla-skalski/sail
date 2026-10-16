@@ -170,6 +170,7 @@
     shipOwnerReleaseReady,
     shipWorkerPrompt,
     parseMergeOwner,
+    mergeOwnerRule,
     type MergeOwner,
     shippingSetupAction,
     settledLostClaimFence,
@@ -206,6 +207,8 @@
   import {
     contextCheckpointLead,
     contextHandoffPrompt,
+    phaseHandoffRequest,
+    phaseHandoffPrompt,
     contextPressureStage,
     parseContextHandoffThreshold,
     reconcileHandoffOutcomes,
@@ -3586,16 +3589,18 @@
         const settledRevision = await invoke<string>('working_tree_revision', { path: issue.path });
         if (issue.checkpoint.revision !== settledRevision)
           throw new Error('The settled checkpoint must match the current worktree revision.');
-        const prompt = contextHandoffPrompt({
-          checkpoint: issue.checkpoint,
-          branch: issue.branch,
-          revision: settledRevision,
-          pullRequest: issue.pullRequest,
-          gates: (issue.gates ?? []).map(
-            (gate) =>
-              `${gate.gate}: ${gate.verdict ?? gate.state}${gate.reason ? ` (${gate.reason})` : ''}`,
-          ),
-        });
+        const prompt = offer.brief
+          ? `${phaseHandoffPrompt(offer.brief)}\n${mergeOwnerRule(mergeOwner)}`
+          : contextHandoffPrompt({
+              checkpoint: issue.checkpoint,
+              branch: issue.branch,
+              revision: settledRevision,
+              pullRequest: issue.pullRequest,
+              gates: (issue.gates ?? []).map(
+                (gate) =>
+                  `${gate.gate}: ${gate.verdict ?? gate.state}${gate.reason ? ` (${gate.reason})` : ''}`,
+              ),
+            });
         saveSpawnReceipt({
           receiptId,
           accessKey,
@@ -3653,6 +3658,16 @@
               contextPercent: undefined,
               handoffRecoveryRequired: false,
               state: 'working',
+              blockedReason: null,
+              ...(offer.boundary && issue.checkpoint?.status === 'blocked'
+                ? {
+                    checkpoint: updateTaskCheckpoint(
+                      issue.checkpoint,
+                      { status: 'active', blocker: null },
+                      Date.now(),
+                    ),
+                  }
+                : {}),
               error: null,
               refreshError: null,
               workerSettled: false,
@@ -7175,7 +7190,63 @@
           Date.now(),
           await cleanCheckpointCommit(request.directory, execution.revision),
         );
-        await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
+        const phaseHandoff = phaseHandoffRequest(
+          request.arguments.handoff,
+          updated,
+          owner.issue.contextHandoffs,
+          `${owner.run.id}:${owner.issue.id}`,
+        );
+        if (phaseHandoff && (sourceId !== owner.issue.threadId || !owner.issue.pullRequest))
+          throw new Error(
+            'Only the primary worker with a published PR can request a phase handoff.',
+          );
+        await updateShipIssue(owner.run, owner.issue, {
+          checkpoint: updated,
+          ...(phaseHandoff
+            ? {
+                contextHandoffs: [
+                  ...(owner.issue.contextHandoffs ?? []),
+                  {
+                    ...phaseHandoff,
+                    provider: contextProvider(sourceId),
+                    fromThreadId: sourceId,
+                    toThreadId: null,
+                    context: owner.issue.contextPercent ?? 0,
+                    compactions: 0,
+                    checkpointSequence: updated.sequence - 1,
+                    revision: updated.revision,
+                    offeredAt: Date.now(),
+                    startedAt: null,
+                    retriesBefore: owner.issue.retryCount ?? 0,
+                    lostStateFailuresBefore: owner.issue.lostStateFailures ?? 0,
+                    retriesAfter: null,
+                    lostStateFailuresAfter: null,
+                    outcome: 'pending' as const,
+                    error: null,
+                  },
+                ],
+              }
+            : {}),
+        });
+        if (phaseHandoff)
+          setTimeout(() => {
+            void handoffShipIssue(owner.run, owner.issue).catch(async (cause) => {
+              const reason = `Phase handoff paused: ${describe(cause)}`;
+              await updateShipIssue(owner.run, owner.issue, {
+                blockedReason: reason,
+                error: reason,
+                checkpoint: updateTaskCheckpoint(
+                  owner.issue.checkpoint ?? updated,
+                  {
+                    status: 'blocked',
+                    blocker: reason,
+                    nextAction: 'Retry the pending phase handoff.',
+                  },
+                  Date.now(),
+                ),
+              });
+            });
+          }, 0);
       } else if (!owner.issue.checkpoint) {
         await updateShipIssue(owner.run, owner.issue, { checkpoint });
       }

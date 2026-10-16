@@ -3,6 +3,8 @@ import test from 'node:test';
 import {
   ContextPressureRecorder,
   contextHandoffPrompt,
+  phaseHandoffRequest,
+  phaseHandoffPrompt,
   contextPressureStage,
   handoffOutcome,
   parseContextHandoffThreshold,
@@ -175,4 +177,62 @@ void test('pins the owner while newer descendant context fills the history', () 
   assert.equal(Object.keys(bounded.contexts).length, 100);
   assert.equal(primary.previous, 86);
   assert.equal(contextPressureStage(primary.previous, 87, 85), null);
+});
+
+void test('phase handoff validates destination, bounded brief and once-only receipt', () => {
+  const checkpoint = {
+    ...initialTaskCheckpoint({ id: 'task', url: 'url', title: 'task' }, 10),
+    phase: 'review' as const,
+  };
+  const request = {
+    id: 'draft-1',
+    boundary: 'draft-published',
+    brief: 'Read checkpoint /durable/task; continue review in /work.',
+  };
+  assert.deepEqual(phaseHandoffRequest(request, checkpoint), request);
+  assert.equal(phaseHandoffRequest(undefined, checkpoint), null);
+  assert.throws(
+    () => phaseHandoffRequest(request, { ...checkpoint, phase: 'publish' }),
+    /destination/,
+  );
+  assert.throws(
+    () => phaseHandoffRequest({ ...request, brief: '界'.repeat(667) }, checkpoint),
+    /UTF-8/,
+  );
+  assert.throws(() => phaseHandoffRequest({ ...request, brief: '' }, checkpoint), /UTF-8/);
+  assert.throws(
+    () => phaseHandoffRequest({ ...request, boundary: 'before-pr-loop' }, checkpoint),
+    /destination/,
+  );
+  assert.deepEqual(
+    phaseHandoffRequest({ ...request, boundary: 'before-pr-loop' }, { ...checkpoint, phase: 'pr' }),
+    { ...request, boundary: 'before-pr-loop' },
+  );
+  const handoff: import('../src/lib/context-handoff.ts').ContextHandoff = {
+    ...request,
+    boundary: 'draft-published',
+    provider: 'codex',
+    fromThreadId: 'old',
+    toThreadId: 'fresh',
+    context: 0,
+    compactions: 0,
+    checkpointSequence: 1,
+    revision: null,
+    offeredAt: 10,
+    startedAt: 11,
+    retriesBefore: 0,
+    lostStateFailuresBefore: 0,
+    retriesAfter: null,
+    lostStateFailuresAfter: null,
+    outcome: 'pending',
+    error: null,
+  };
+  assert.equal(phaseHandoffRequest(request, checkpoint, [handoff]), null);
+  assert.throws(
+    () => phaseHandoffRequest({ ...request, id: 'other' }, checkpoint, [handoff]),
+    /already/,
+  );
+  assert.match(phaseHandoffPrompt(request.brief), /task_checkpoint_read/);
+  assert.match(phaseHandoffPrompt(request.brief), /completed gates/);
+  assert.match(phaseHandoffPrompt(request.brief), /Read checkpoint \/durable\/task/);
 });
