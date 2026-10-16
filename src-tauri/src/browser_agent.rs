@@ -1876,7 +1876,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ("sail_tasks_report", "Report routine work live in Sail Tasks. Upsert stable task IDs with pending/in_progress/done/blocked/skipped status. Pass turnId and expectedRevision from sail_tasks_read; read again after stale errors. Set focus to an in_progress task ID or null. Never report another session's work. Successful writes are durable.", ""),
     (
         "sail_plan_propose",
-        "Submit a structured implementation plan for the user to review step by step in Sail. Use it for risky, ambiguous or multi-file work; small, obvious changes need no plan. Always include an overview flowchart and a sequenceDiagram, as lists of lines. Replaces any previous version; approved and finished steps keep their status if you keep their id, title, detail and files unchanged. Mark only the steps that need a human decision with needsYou. After calling this, end your turn and wait for a <plan-review> message.",
+        "Submit a structured implementation plan for the user to review step by step in Sail. Use it for risky, ambiguous or multi-file work without an approved plan or assigned Ship task contract. Follow existing approved work without requiring a second plan; ask for uncovered material decisions or scope changes. Small, obvious changes need no plan. Always include an overview flowchart and a sequenceDiagram, as lists of lines. Replaces any previous version; approved and finished steps keep their status if you keep their id, title, detail and files unchanged. Mark only the steps that need a human decision with needsYou. After calling this, end your turn and wait for a <plan-review> message.",
         "",
     ),
     (
@@ -2407,7 +2407,7 @@ pub fn run_mcp_stdio() {
                             "risk":{"type":"string","enum":["low","medium","high"]},
                             "prompt":{"type":"string"},
                             "shipIssue":{"type":"object","properties":{"repository":{"type":"string","pattern":"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},"number":{"type":"integer","minimum":1}},"required":["repository","number"],"additionalProperties":false},
-                            "retry":{"type":"boolean","description":"Retry an interrupted tracked Ship assignment owned by this coordinator through the existing Ship retry confirmation and safety checks. Returns queued runId and issueNumber rather than a new launch receipt."},
+                            "retry":{"type":"boolean","description":"Retry an interrupted tracked Ship assignment owned by this coordinator through the existing Ship retry confirmation and safety checks. Returns an awaiting_confirmation receipt immediately; read agent_result for the confirmation outcome. A completed retry receipt means the replacement was queued, not that its implementation finished."},
                             "receiptId":{"type":"string","format":"uuid"},
                             "accessKey":{"type":"string","format":"uuid"},
                             "target":{"oneOf":[

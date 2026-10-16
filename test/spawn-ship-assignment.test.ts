@@ -3,8 +3,52 @@ import test from 'node:test';
 import {
   parseSpawnShipIssue,
   spawnShipRetry,
+  finishSpawnShipRetry,
   requireSpawnShipIssueAvailable,
 } from '../src/lib/spawn-ship-assignment.ts';
+
+void test('retry receipt stays pending until confirmation then records the queue outcome', async () => {
+  let resolve!: (value: string) => void;
+  const confirmation = new Promise<string>((done) => {
+    resolve = done;
+  });
+  const recorded: Array<{ state: string; result: string | null; error: string | null }> = [];
+  const operation = finishSpawnShipRetry(
+    () => confirmation,
+    async (result) => {
+      recorded.push(result);
+    },
+  );
+  await Promise.resolve();
+  assert.deepEqual(recorded, []);
+  resolve('Retry queued.');
+  await operation;
+  assert.deepEqual(recorded, [{ state: 'completed', result: 'Retry queued.', error: null }]);
+});
+
+void test('retry receipt records cancellation and failures without claiming a launch', async () => {
+  const recorded: Array<{ state: string; result: string | null; error: string | null }> = [];
+  const record = async (result: { state: string; result: string | null; error: string | null }) => {
+    recorded.push(result);
+  };
+  await finishSpawnShipRetry(async () => '', record);
+  await finishSpawnShipRetry(async () => {
+    throw new Error('Claim ownership changed.');
+  }, record);
+  assert.deepEqual(recorded, [
+    { state: 'interrupted', result: 'Retry cancelled.', error: null },
+    { state: 'failed', result: null, error: 'Claim ownership changed.' },
+  ]);
+  await assert.rejects(
+    finishSpawnShipRetry(
+      async () => 'queued',
+      async () => {
+        throw new Error('Storage failed.');
+      },
+    ),
+    /Storage failed/,
+  );
+});
 import { adoptRegisteredDirectShipRun, type ShipRun } from '../src/lib/issue-shipping.ts';
 import {
   loadShipRuns,

@@ -188,6 +188,7 @@
   import {
     parseSpawnShipIssue,
     spawnShipRetry,
+    finishSpawnShipRetry,
     requireSpawnShipIssueAvailable,
   } from './lib/spawn-ship-assignment.ts';
   import { checkState } from './lib/pull-request-checks.ts';
@@ -2934,7 +2935,20 @@
     launchReadyShipIssues(run);
   }
 
+  const shipRetriesInFlight = new SvelteSet<string>();
+
   async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const key = `${run.id}:${issue.id}`;
+    if (shipRetriesInFlight.has(key)) throw new Error('A retry request is already in progress.');
+    shipRetriesInFlight.add(key);
+    try {
+      return await requestShipRetry(run, issue);
+    } finally {
+      shipRetriesInFlight.delete(key);
+    }
+  }
+
+  async function requestShipRetry(run: ShipRun, issue: ShipIssue): Promise<string> {
     const available = shipRetryAction(issue);
     if (!available.enabled) throw new Error(available.reason ?? 'This issue cannot be retried.');
     requireShipClaimOwnership(issue, 'Retry');
@@ -6018,6 +6032,7 @@
 
   function saveSpawnReceipt(receipt: SpawnReceipt) {
     const protectedIds = new SvelteSet<string>();
+    for (const id of activeSpawnRequests) protectedIds.add(id);
     for (const run of shipRuns)
       for (const issue of run.issues)
         for (const gate of issue.gates ?? [])
@@ -8215,12 +8230,49 @@
           sourceId,
           request.directory,
         );
-        const message = await retryShipIssue(assigned.run, assigned.issue);
+        if (spawnReceipts.some((item) => item.receiptId === receiptId))
+          throw new Error('Launch receipt ID is already in use.');
+        saveSpawnReceipt({
+          receiptId,
+          accessKey: receiptAccessKey,
+          requestId: request.id,
+          project,
+          sourceId,
+          sourceDirectory: request.directory,
+          targetId: null,
+          targetDirectory: null,
+          turnId: null,
+          worktreeId: assigned.issue.path ?? null,
+          provider: assigned.receipt.provider,
+          prompt: null,
+          state: 'waiting',
+          created: Date.now(),
+          updated: Date.now(),
+          result: null,
+          error: null,
+          name: `Retry Ship issue #${assigned.issue.number}`,
+        });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        activeSpawnRequests.add(receiptId);
+        void finishSpawnShipRetry(
+          () => retryShipIssue(assigned.run, assigned.issue),
+          async (result) => {
+            updateSpawnReceipt(receiptId, result);
+            await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+          },
+        )
+          .catch((cause) => {
+            error = describe(cause);
+          })
+          .finally(() => {
+            activeSpawnRequests.delete(receiptId);
+          });
         return {
-          status: message ? 'queued' : 'cancelled',
+          status: 'awaiting_confirmation',
+          receiptId,
+          accessKey: receiptAccessKey,
           runId: assigned.run.id,
           issueNumber: assigned.issue.number,
-          message,
         };
       }
       requireSpawnShipIssueAvailable(shipRuns, project, shipIssue);

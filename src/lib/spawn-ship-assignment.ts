@@ -2,6 +2,28 @@ import type { ShipItIssue } from './implementation-models.ts';
 import type { ShipRun } from './issue-shipping.ts';
 import type { SpawnReceipt } from './agent-results.ts';
 
+export async function finishSpawnShipRetry(
+  retry: () => Promise<string>,
+  record: (result: Pick<SpawnReceipt, 'state' | 'result' | 'error'>) => Promise<void>,
+): Promise<void> {
+  let result: Pick<SpawnReceipt, 'state' | 'result' | 'error'>;
+  try {
+    const message = await retry();
+    result = {
+      state: message ? 'completed' : 'interrupted',
+      result: message || 'Retry cancelled.',
+      error: null,
+    };
+  } catch (cause) {
+    result = {
+      state: 'failed',
+      result: null,
+      error: cause instanceof Error ? cause.message : String(cause),
+    };
+  }
+  await record(result);
+}
+
 export function spawnShipRetry(
   runs: ShipRun[],
   receipts: SpawnReceipt[],
@@ -31,7 +53,7 @@ export function spawnShipRetry(
     throw new Error('Only the original coordinator can retry this tracked Ship assignment.');
   if (!['interrupted', 'unavailable', 'failed'].includes(receipt.state))
     throw new Error('The assigned worker has not stopped; inspect its launch receipt first.');
-  return { run, issue: assigned };
+  return { run, issue: assigned, receipt };
 }
 
 export function parseSpawnShipIssue(value: unknown, role: unknown): ShipItIssue | undefined {

@@ -104,7 +104,8 @@ reason, and policy revision; unknown and high-risk actions require a person.
 
 ## Plan review
 
-- For risky, ambiguous or multi-file work, propose a plan instead of editing:
+- Follow an approved plan or an assigned Ship issue's resolved task contract. Do not require a second plan solely because that authorized work spans multiple files. Ask only for a material decision or scope change not covered by the existing contract.
+- For risky, ambiguous or multi-file work without an approved plan or assigned Ship task contract, propose a plan instead of editing:
   read the code first, then call `sail_plan_propose` (steps, an overview
   flowchart and a sequence diagram, each as lists of lines) and end your turn.
   Small, obvious changes need no plan.
