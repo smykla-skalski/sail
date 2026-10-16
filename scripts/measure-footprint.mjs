@@ -18,6 +18,7 @@ import {
   createTemporaryClutter,
   createWorktrees,
   deadOwnerIdentity,
+  githubFixture,
   privateRoot,
   removePrivateRoot,
   profileSettings,
@@ -26,6 +27,8 @@ import {
 import {
   WriteCounter,
   evaluate,
+  controlledActivity,
+  phaseCoverage,
   formatReport,
   measureTree,
   parseOptions,
@@ -124,9 +127,11 @@ async function loadProfileInWebview(port, binary, branch) {
       Date.now() + 60_000,
       `The sidebar never listed ${branch}`,
     );
-  } finally {
+  } catch (error) {
     await webdriver(port, 'DELETE', base).catch(() => undefined);
+    throw error;
   }
+  return base;
 }
 
 function settingsSignatures(configDirectory) {
@@ -229,6 +234,8 @@ async function main() {
   let runIdentifier;
   let buildIdentifier;
   let result;
+  let webdriverSession;
+  let webdriverPort;
   try {
     const run = join(root, 'run');
     mkdirSync(run);
@@ -260,6 +267,11 @@ async function main() {
     env.SAIL_E2E_ACP_START_LOG = join(run, 'acp-start.log');
 
     const profile = createWorktrees(root, options.worktrees);
+    writeFileSync(
+      join(env.SAIL_E2E_FAKE_GH_DIR, 'state.json'),
+      JSON.stringify(githubFixture(profile)),
+    );
+    webdriverPort = env.TAURI_WEBDRIVER_PORT;
     const configDirectory = env.SAIL_E2E_CONFIG_DIR;
     writeFileSync(
       join(configDirectory, 'settings.json'),
@@ -319,7 +331,11 @@ async function main() {
         options.intervalSeconds * 1000,
       ),
     );
-    await loadProfileInWebview(env.TAURI_WEBDRIVER_PORT, binary, profile.worktrees[0].branch);
+    webdriverSession = await loadProfileInWebview(
+      webdriverPort,
+      binary,
+      profile.worktrees[0].branch,
+    );
 
     const windowMs = minutes(options.windowMinutes);
     const take = (offset) =>
@@ -330,9 +346,27 @@ async function main() {
         at: launchedAt + offset,
         windowMs,
       });
+    const activity = [];
+    let nextActivityAt = 0;
     const waitUntil = async (offset) => {
       if (pollFailure) throw pollFailure;
       if (exited) throw new Error('The private app exited during the run');
+      const now = Date.now();
+      if (now >= nextActivityAt && controlledActivity(now - launchedAt, options)) {
+        const paths = profile.worktrees.map(({ path }) => path);
+        await webdriver(webdriverPort, 'POST', `${webdriverSession}/execute/async`, {
+          script: `const done = arguments[arguments.length - 1];
+            Promise.all(arguments[0].map(cwd => window.__TAURI_INTERNALS__.invoke(
+              'acp_list_sessions', { agent: 'opencode', cwd }
+            ))).then(() => done({ ok: true }), error => done({ error: String(error) }));`,
+          args: [paths],
+        }).then((value) => {
+          if (!value?.ok) throw new Error(`Controlled ACP activity failed: ${value?.error}`);
+          return value;
+        });
+        activity.push({ time: now, worktrees: paths.length });
+        nextActivityAt = now + 20_000;
+      }
       const remaining = launchedAt + offset - Date.now();
       if (remaining <= 0) return;
       await sleep(Math.min(5000, remaining));
@@ -351,6 +385,12 @@ async function main() {
       name.startsWith('sail-footprint-stale-'),
     ).length;
     const verdict = evaluate({ samples, launchedAt, maintenance, options });
+    verdict.coverage = phaseCoverage(verdict.rss.windows);
+    verdict.pass &&= verdict.coverage.pass;
+    for (const phase of verdict.coverage.phases)
+      process.stdout.write(
+        `${phase.pass ? 'PASS' : 'FAIL'} ${phase.name} coverage: ${phase.early} early, ${phase.late} late readings (minimum ${verdict.coverage.minimumReadings})\n`,
+      );
     const totals = {
       listings: readTimes(env.SAIL_E2E_ACP_LIST_LOG).length,
       settingsWrites: writes.times.length,
@@ -364,6 +404,7 @@ async function main() {
       staleRootsLeft: staleLeft,
       totals,
       samples,
+      activity,
       events: {
         listings: readLines(env.SAIL_E2E_ACP_LIST_LOG),
         starts: readLines(env.SAIL_E2E_ACP_START_LOG),
@@ -385,6 +426,8 @@ async function main() {
   } finally {
     for (const timer of timers) clearInterval(timer);
     try {
+      if (webdriverSession)
+        await webdriver(webdriverPort, 'DELETE', webdriverSession).catch(() => undefined);
       if (binary) await stopApp(binary);
     } finally {
       const leftovers = await removeAppData(runIdentifier, buildIdentifier, dataRoots);

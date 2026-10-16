@@ -30,6 +30,8 @@ export const usage = `Usage: npm run measure:footprint -- [options]
 Launches a private Sail on a generated profile, samples it twice and checks for memory growth.
 Children and RSS are judged from two long windows, one after each sample
 point, compared per phase (with and without child processes) because the footprint cycles.
+Controlled ACP listings exercise the first 40% of each comparison window; the remainder
+allows agents to idle. Both phases must meet the existing minimum reading count.
 
   --app <path>                      Private "Sail E2E" bundle from "npm run build:e2e" (built when omitted)
   --json <file>                     Also write the result as JSON
@@ -212,6 +214,27 @@ export function rssWindows({ samples, launchedAt, options }) {
     late,
     phases,
     all: summarize(() => true),
+  };
+}
+
+export function controlledActivity(offset, options) {
+  const windows = rssWindows({ samples: [], launchedAt: 0, options });
+  return [windows.early, windows.late].some(
+    ({ from, to }) => offset > from && offset <= from + (to - from) * 0.4,
+  );
+}
+
+export function phaseCoverage(windows) {
+  const phases = windows.phases.map((phase) => ({
+    name: phase.name,
+    early: phase.early.readings,
+    late: phase.late.readings,
+    pass: enough(phase, windows.minimumReadings),
+  }));
+  return {
+    minimumReadings: windows.minimumReadings,
+    phases,
+    pass: phases.every((phase) => phase.pass),
   };
 }
 

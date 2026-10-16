@@ -16,6 +16,8 @@ import test from 'node:test';
 import {
   WriteCounter,
   defaults,
+  controlledActivity,
+  phaseCoverage,
   evaluate,
   formatReport,
   measureTree,
@@ -31,6 +33,7 @@ import {
   createTemporaryClutter,
   createWorktrees,
   deadOwnerIdentity,
+  githubFixture,
   profileSettings,
   removePrivateRoot,
   scratchMarker,
@@ -561,4 +564,56 @@ await test('only footprint roots directly under the base are removed', (context)
   assert.throws(() => removePrivateRoot(other, base), /Refusing/);
   assert.throws(() => removePrivateRoot(nested, base), /Refusing/);
   assert.ok(existsSync(other) && existsSync(nested));
+});
+
+await test('controlled listing activity covers both windows and leaves independent idle spans', () => {
+  const windows = rssWindows({ samples: [], launchedAt: 0, options: defaults });
+  const samples = [];
+  let lastListing = -Infinity;
+  for (
+    let time = 0;
+    time <= defaults.secondMinutes * minute;
+    time += defaults.intervalSeconds * 1000
+  ) {
+    if (controlledActivity(time, defaults)) lastListing = time;
+    const active = time - lastListing < 120_000;
+    samples.push({ time, children: active ? 1 : 0, rssBytes: active ? 150 : 50 });
+  }
+  const verdict = verdictFor(samples);
+  const coverage = phaseCoverage(verdict.rss.windows);
+  assert.equal(coverage.pass, true);
+  assert.ok(
+    coverage.phases.every(
+      ({ early, late }) => early >= windows.minimumReadings && late >= windows.minimumReadings,
+    ),
+  );
+  assert.equal(verdict.children.basis, 'active phase');
+  assert.equal(verdict.pass, true);
+  assert.equal(controlledActivity(windows.early.from, defaults), false);
+  assert.equal(controlledActivity(windows.early.to, defaults), false);
+});
+
+await test('coverage fails when either intended phase is undersampled', () => {
+  const samples = series(() => ({ children: 0, rssMb: 50 }));
+  const coverage = phaseCoverage(verdictFor(samples).rss.windows);
+  assert.equal(coverage.pass, false);
+  assert.equal(coverage.phases.find(({ name }) => name === 'active')?.pass, false);
+});
+
+await test('the footprint seeds pull state for every generated worktree', (context) => {
+  const profile = createWorktrees(scratch(context), 4);
+  const fixture = githubFixture(profile);
+  assert.equal(fixture.repository, 'fixture/footprint');
+  assert.equal(Object.keys(fixture.pulls).length, 4);
+  for (const [index, worktree] of profile.worktrees.entries()) {
+    const pull = fixture.pulls[`fixture/footprint#${index + 1}`];
+    assert.equal(pull.branch, worktree.branch);
+    assert.equal(pull.state, 'open');
+    assert.match(pull.head, /^[a-f0-9]{40}$/);
+  }
+  const remote = spawnSync('git', ['config', '--get', 'remote.origin.url'], {
+    cwd: profile.repository,
+    encoding: 'utf8',
+  });
+  assert.equal(remote.stdout.trim(), 'https://github.com/fixture/footprint.git');
 });

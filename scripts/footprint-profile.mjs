@@ -54,6 +54,7 @@ export function createWorktrees(root, count) {
         `module ${directory} file ${file}\n`.repeat(40),
       );
   }
+  git(repository, ['remote', 'add', 'origin', 'https://github.com/fixture/footprint.git']);
   git(repository, ['add', '-A']);
   git(repository, ['commit', '-q', '-m', 'fixture']);
   const parent = join(root, 'worktrees');
@@ -152,4 +153,17 @@ export function removePrivateRoot(root, base) {
     throw new Error(`Refusing to remove ${root}`);
   makeTreeWritable(root);
   rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+}
+
+export function githubFixture({ repository, worktrees }) {
+  const head = git(repository, ['rev-parse', 'HEAD']);
+  return {
+    repository: 'fixture/footprint',
+    pulls: Object.fromEntries(
+      worktrees.map(({ branch }, index) => [
+        `fixture/footprint#${index + 1}`,
+        { branch, head, state: 'open', merged: false, draft: false },
+      ]),
+    ),
+  };
 }
