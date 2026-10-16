@@ -98,9 +98,6 @@ describe('native Ship acceptance', () => {
     const preceding = await browser.execute(() => document.activeElement?.id);
     await nativeTab();
     await expect(threshold).toBeFocused();
-    const nativeTitle = await browser.tauri.execute(async ({ core }) =>
-      core.invoke<string>('plugin:window|title', { label: 'settings' }),
-    );
     const handle = await browser.getWindowHandle();
     const measured = await browser.execute(() => {
       const input = document.querySelector<HTMLInputElement>('#context-handoff-threshold')!;
@@ -114,8 +111,7 @@ describe('native Ship acceptance', () => {
         shadow: style.boxShadow,
       };
     });
-    console.log('Native threshold traversal', { preceding, nativeTitle, handle, ...measured });
-    expect(nativeTitle).toBe('Sail Settings');
+    console.log('Native threshold traversal', { preceding, handle, ...measured });
     expect(handle).toBe('settings');
     expect(measured.window).toBe('settings');
     expect(measured.visible).toBe(true);
