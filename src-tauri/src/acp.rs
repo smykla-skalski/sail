@@ -10599,7 +10599,14 @@ sys.stdin.buffer.read()
             Some(&temp)
         ));
         runtime.clear_idle_temp(true).unwrap();
-        runtime.input.lock().unwrap().write_all(b"1").unwrap();
+        runtime
+            .input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .write_all(b"1")
+            .unwrap();
         for _ in 0..200 {
             if std::fs::read(&artifact).is_ok_and(|bytes| bytes == b"live") {
                 break;
