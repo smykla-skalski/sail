@@ -576,7 +576,7 @@ await test('controlled listing activity covers both windows and leaves independe
     time += defaults.intervalSeconds * 1000
   ) {
     if (controlledActivity(time, defaults)) lastListing = time;
-    const active = time - lastListing < 120_000;
+    const active = time - lastListing < 600_000;
     samples.push({ time, children: active ? 1 : 0, rssBytes: active ? 150 : 50 });
   }
   const verdict = verdictFor(samples);
@@ -616,4 +616,43 @@ await test('the footprint seeds pull state for every generated worktree', (conte
     encoding: 'utf8',
   });
   assert.equal(remote.stdout.trim(), 'https://github.com/fixture/footprint.git');
+});
+
+await test('the sidebar PR command matches every seeded footprint branch', (context) => {
+  const root = scratch(context);
+  const profile = createWorktrees(root, 26);
+  const fixture = githubFixture(profile);
+  writeFileSync(join(root, 'state.json'), JSON.stringify(fixture));
+  const run = (options: string[]) => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        new URL('./e2e/fake-gh.mjs', import.meta.url).pathname,
+        'pr',
+        'list',
+        '--repo',
+        fixture.repository,
+        '--state',
+        'open',
+        '--limit',
+        '500',
+        '--json',
+        'number,url,headRefOid,statusCheckRollup,headRepositoryOwner,headRefName',
+        ...options,
+      ],
+      { encoding: 'utf8', env: { ...process.env, SAIL_E2E_FAKE_GH_DIR: root } },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  const pulls = run([]);
+  assert.equal(pulls.length, 26);
+  for (const { branch } of profile.worktrees)
+    assert.ok(
+      pulls.some(
+        (pull: { headRefName: string; headRepositoryOwner: { login: string } }) =>
+          pull.headRefName === branch && pull.headRepositoryOwner.login === 'fixture',
+      ),
+    );
+  assert.equal(run(['--head', 'fixture:footprint-wt-01']).length, 1);
 });

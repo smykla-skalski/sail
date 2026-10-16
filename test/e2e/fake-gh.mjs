@@ -31,15 +31,30 @@ if (fixture.pulls) {
   if (args[0] === 'repo' && args[1] === 'view')
     answer({ nameWithOwner: fixture.repository ?? 'fixture/repo', isFork: false });
   if (args[0] === 'pr' && args[1] === 'list') {
-    const wanted = args[args.indexOf('--head') + 1] ?? '';
+    const option = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+    const wanted = option('--head');
+    const repository = option('--repo') ?? fixture.repository;
+    const wantedState = option('--state') ?? 'open';
     answer(
       Object.entries(fixture.pulls)
-        .filter(([, found]) => wanted.endsWith(`:${found.branch}`) || wanted === found.branch)
+        .filter(
+          ([key, found]) =>
+            (!repository || key.split('#')[0] === repository) &&
+            (wantedState === 'all' ||
+              (wantedState === 'merged'
+                ? found.merged
+                : found.state === wantedState && !found.merged)) &&
+            (!wanted ||
+              wanted === found.branch ||
+              wanted === `${key.split('/')[0]}:${found.branch}`),
+        )
         .map(([key, found]) => ({
           number: Number(key.split('#')[1]),
           url: `https://github.com/${key.replace('#', '/pull/')}`,
-          state: 'OPEN',
-          mergedAt: null,
+          state: found.merged ? 'MERGED' : found.state.toUpperCase(),
+          mergedAt: found.merged ? '2026-01-01T00:00:00Z' : null,
+          headRefName: found.branch,
+          headRepositoryOwner: { login: key.split('/')[0] },
           headRefOid: found.head,
           statusCheckRollup: [],
         })),
