@@ -82,15 +82,13 @@ describe('split agent header', () => {
     await browser.keys(['Meta', 'l']);
     await $('.pane-leaf.focused button[role="tab"]*=Tasks').click();
     const width = await browser.execute(() => innerWidth);
-    for (
-      let step = 0;
-      step < 8 && (await browser.execute(() => innerWidth)) > width / 1.9;
-      step++
-    ) {
-      const previous = await browser.execute(() => innerWidth);
+    const zoomTo200 = async (previous: number, remaining = 8): Promise<void> => {
+      if (previous <= width / 1.9 || remaining === 0) return;
       await browser.keys(['Meta', '=']);
       await browser.waitUntil(async () => (await browser.execute(() => innerWidth)) < previous);
-    }
+      await zoomTo200(await browser.execute(() => innerWidth), remaining - 1);
+    };
+    await zoomTo200(width);
     expect(await browser.execute(() => innerWidth)).toBeLessThanOrEqual(width / 1.9);
     await expectReadableHeaders();
     const mode = $('.pane-leaf.focused .agent-config .option-trigger');
