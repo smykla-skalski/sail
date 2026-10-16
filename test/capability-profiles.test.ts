@@ -698,3 +698,52 @@ await test('session metadata profile overrides a build workspace fallback', () =
     'explore',
   );
 });
+
+await test('native session task tools receive reviewed permission decisions', () => {
+  for (const [tool, risk] of [
+    ['sail_tasks_read', 'low'],
+    ['sail_tasks_report', 'medium'],
+  ] as const) {
+    const name = `mcp__sail-browser__${tool}`;
+    for (const toolCall of [
+      { name, rawInput: {} },
+      { _meta: { claudeCode: { toolName: name } }, rawInput: {} },
+      {
+        name,
+        _meta: { claudeCode: { toolName: name } },
+        rawInput: {
+          turnId: 'turn',
+          expectedRevision: 1,
+          tasks: [{ id: 'task', title: 'Review release credentials', status: 'in_progress' }],
+          focus: 'task',
+        },
+      },
+    ]) {
+      const decision = permissionPolicy({ profile: 'build', title: name, toolCall, options });
+      assert.equal(decision.risk, risk);
+      assert.equal(decision.recommendation, 'allow');
+      assert.equal(decision.optionId, 'yes');
+      assert.equal(decision.policyRevision, '2026-10-16.1');
+    }
+  }
+});
+
+await test('task permission rules require an exact unambiguous native tool identity', () => {
+  const name = 'mcp__sail-browser__sail_tasks_report';
+  for (const toolCall of [
+    { name: `${name}_unsafe` },
+    { name: 'mcp__other__sail_tasks_report' },
+    { name: 'Bash', rawInput: { name } },
+    { name, command: 'unknown-command' },
+    { name, _meta: { claudeCode: { toolName: 'Bash' } } },
+    { title: name, rawInput: {} },
+  ])
+    assert.equal(classifyPermission(toolCall, name), 'unknown');
+  assert.equal(classifyPermission({ name, command: 'rm -rf victim' }, name), 'high');
+  assert.equal(classifyPermission({ name, rawInput: { text: 'x'.repeat(16384) } }, name), 'high');
+  assert.equal(
+    permissionPolicy({ profile: 'explore', title: name, toolCall: { name }, options })
+      .recommendation,
+    'deny',
+  );
+});
