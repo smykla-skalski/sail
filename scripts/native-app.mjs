@@ -64,6 +64,8 @@ export function nativeApp({
   identity: readIdentity = processIdentity,
   listing,
 }) {
+  const executablePaths = new Map();
+
   function command(program, args, options = {}) {
     const result = spawnSync(program, args, { cwd: checkout, encoding: 'utf8', ...options });
     if (result.error || result.status !== 0)
@@ -132,11 +134,12 @@ export function nativeApp({
   }
 
   function appProcesses(binary) {
-    const executable = canonicalPath(binary);
+    if (!executablePaths.has(binary)) executablePaths.set(binary, canonicalPath(binary));
+    const executable = executablePaths.get(binary);
     const processes = processTable('pid=,command=');
     return processes
       .split('\n')
-      .filter((line) => canonicalPath(line.trim().replace(/^\d+\s+/, '')) === executable)
+      .filter((line) => line.trim().replace(/^\d+\s+/, '') === executable)
       .map((line) => Number(line.trim().split(/\s+/)[0]));
   }
 
