@@ -436,12 +436,16 @@ function trustedResource(resource: string, workspace?: string): boolean {
   return candidatePath === rootPath || candidatePath.startsWith(`${rootPath}/`);
 }
 
+const field = (value: unknown, key: string): unknown =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.entries(value).find(([name]) => name === key)?.[1]
+    : undefined;
+
 function taskPermissionRisk(toolCall: unknown): CapabilityRisk | null {
   if (!toolCall || typeof toolCall !== 'object' || Array.isArray(toolCall)) return null;
-  const call = toolCall as Record<string, unknown>;
-  if (['action', 'cmd', 'command'].some((key) => key in call)) return null;
-  const meta = call._meta as { claudeCode?: { toolName?: unknown } } | undefined;
-  const names = [call.name, meta?.claudeCode?.toolName].filter((name) => name !== undefined);
+  if (['action', 'cmd', 'command'].some((key) => key in toolCall)) return null;
+  const nativeName = field(field(field(toolCall, '_meta'), 'claudeCode'), 'toolName');
+  const names = [field(toolCall, 'name'), nativeName].filter((name) => name !== undefined);
   if (!names.length || !names.every((name) => name === names[0])) return null;
   if (names[0] === 'mcp__sail-browser__sail_tasks_read') return 'low';
   if (names[0] === 'mcp__sail-browser__sail_tasks_report') return 'medium';
