@@ -5500,6 +5500,22 @@ fn register_session_detached(
     Ok(runtime)
 }
 
+fn historical_native_activity_message(runtime: &Connection, mut message: Value) -> Value {
+    let historical = message
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)
+        .zip(message.pointer("/params/update"))
+        .is_some_and(|(parent, update)| {
+            runtime
+                .native_replay_update(parent, update)
+                .unwrap_or(false)
+        });
+    if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("sailHistoricalActivity".into(), historical.into());
+    }
+    message
+}
+
 fn record_native_subagent_update(
     app: &AppHandle,
     manager: &AgentManager,
@@ -7006,7 +7022,10 @@ fn connect_blocking_inner(
                                     agent: agent_id.clone(),
                                     directory: session_directory(&reader, parent_id),
                                     worktree: Some(reader.worktree.to_string_lossy().into_owned()),
-                                    message: normalized.clone(),
+                                    message: historical_native_activity_message(
+                                        &reader,
+                                        normalized.clone(),
+                                    ),
                                 },
                             );
                         }
@@ -12811,6 +12830,11 @@ mod native_subagent_fence_tests {
         );
         let spawn = json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"historical"});
         assert!(runtime.native_replay_update("parent", &spawn).unwrap());
+        let historical = historical_native_activity_message(
+            &runtime,
+            json!({"method":"session/update","params":{"sessionId":"parent","update":spawn}}),
+        );
+        assert_eq!(historical["params"]["sailHistoricalActivity"], true);
         assert!(runtime
             .native_replay_update("historical", &json!({"sessionUpdate":"tool_call"}))
             .unwrap());
@@ -12836,6 +12860,11 @@ mod native_subagent_fence_tests {
             .unwrap()
             .live_children
             .insert("live".into(), live);
+        let current = historical_native_activity_message(
+            &runtime,
+            json!({"method":"session/update","params":{"sessionId":"parent","update":{"sessionUpdate":"subagent_spawned","subagentSessionId":"live"}}}),
+        );
+        assert_eq!(current["params"]["sailHistoricalActivity"], false);
         assert!(!runtime.native_replay_update("parent", &json!({"sessionUpdate":"subagent_state_update","subagentSessionId":"live","state":"completed"})).unwrap());
         runtime
             .native_subagents

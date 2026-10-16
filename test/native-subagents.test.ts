@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { AgentEvent } from '../src/lib/acp.ts';
 import { acpToolFailure } from '../src/lib/acp-tool-failure.ts';
 import { automaticPermissionPolicy } from '../src/lib/capability-profiles.ts';
+import { workspaceActivityItems } from '../src/lib/workspace-activity.ts';
 import {
   disconnectNativeSubagents,
   finalizeNativeSubagentRestore,
@@ -586,6 +587,29 @@ await test('a claude child spawned while its session replays stays live', () => 
   assert.equal(child?.restored, false);
   assert.equal(child?.outcome, 'working');
   assert.equal(finalizeNativeSubagentRestore(store, 'claude', '/repo', 'root', 2), store);
+});
+
+await test('historical Claude tool activity settles without counting as current work', () => {
+  const historical = {
+    ...spawnEvent('root', 'root:claude-subagent:unfinished'),
+    agent: 'claude' as const,
+  };
+  historical.message.params = { ...historical.message.params, sailHistoricalActivity: true };
+  const live = { ...spawnEvent('root', 'root:claude-subagent:live'), agent: 'claude' as const };
+  let store = updateNativeSubagents({}, historical, '/repo', 1, true);
+  store = updateNativeSubagents(store, live, '/repo', 2, true);
+  store = finalizeNativeSubagentRestore(store, 'claude', '/repo', 'root', 3);
+  const receipts = nativeSubagentReceipts(store);
+  assert.equal(
+    receipts.find((receipt) => receipt.targetId?.endsWith(':unfinished'))?.state,
+    'unavailable',
+  );
+  assert.equal(receipts.find((receipt) => receipt.targetId?.endsWith(':live'))?.state, 'working');
+  assert.deepEqual(nativeSubagentCounts(store, 'claude', 'root'), { active: 1, waiting: 0 });
+  assert.equal(
+    workspaceActivityItems({ children: receipts }).filter((item) => item.section === 'now').length,
+    1,
+  );
 });
 
 await test('an adapter without replay markers still restores its children', () => {
