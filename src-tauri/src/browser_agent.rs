@@ -1638,6 +1638,10 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         ship_it_file!("scripts/hosted_wait.py"),
     ),
     (
+        "scripts/orchestration_state.py",
+        ship_it_file!("scripts/orchestration_state.py"),
+    ),
+    (
         "scripts/replay_failures.py",
         ship_it_file!("scripts/replay_failures.py"),
     ),

@@ -48,6 +48,7 @@ export const bundledSkillReferences = {
     'scripts/delivery_benchmark.py',
     'scripts/handoff.py',
     'scripts/hosted_wait.py',
+    'scripts/orchestration_state.py',
     'scripts/replay_failures.py',
     'scripts/telemetry.py',
     'scripts/test_copilot_quota.py',

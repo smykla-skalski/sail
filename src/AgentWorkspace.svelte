@@ -3181,17 +3181,22 @@
     padding: 14px 24px;
     border-bottom: 1px solid var(--shell-divider);
   }
-  .agent-header div {
+  .agent-header .agent-heading {
     display: flex;
+    flex-wrap: wrap;
     gap: var(--space-12);
     align-items: baseline;
-  }
-  .agent-header .agent-heading {
     min-width: 0;
-    flex: 1 1 12rem;
+    max-width: 100%;
+    flex: 1 0 12rem;
   }
   .agent-heading strong {
-    flex: none;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .agent-heading > span:not(.harness-icon) {
+    min-width: 0;
+    flex: 1 1 6rem;
   }
   .agent-header .agent-usage {
     flex: none;
@@ -3225,8 +3230,14 @@
     display: flex;
     gap: var(--space-8);
     flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
     margin-left: auto;
     margin-right: 12px;
+  }
+  .agent-config > :global(.option-picker),
+  .agent-config :global(.option-trigger) {
+    max-width: 100%;
   }
   .agent-conversation {
     flex: 1;

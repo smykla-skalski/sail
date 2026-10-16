@@ -49,6 +49,7 @@ await test('every Tauri command has a generated permission and capability', () =
     'allow-acp-reset-test-runtimes',
     'allow-acp-set-idle-close-timeout',
     'allow-reset-test-settings',
+    'allow-send-test-tab',
   ]) {
     assert.ok(!productionPermissions.has(permission), `${permission} must be E2E-only`);
   }

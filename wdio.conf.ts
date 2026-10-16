@@ -13,6 +13,7 @@ import { nativePreconditionFailure } from './scripts/native-test-policy.mjs';
 import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
 import { resetAgentFixture } from './test/e2e/fixture-lifecycle.ts';
 import { assertNativeWebviews } from './test/e2e/native-preconditions.ts';
+import { protectedScript } from './test/e2e-script.ts';
 
 const limitEnvironment = { ...process.env };
 const jobs = new E2eJobQueue(undefined, () => e2eJobLimit(limitEnvironment));
@@ -26,7 +27,7 @@ const cancelOnTerminate = () => cancelQueuedJob(15);
 const port = privatePort(process.env.TAURI_WEBDRIVER_PORT);
 process.env.TAURI_WEBDRIVER_PORT = String(port);
 const serviceModule = '@wdio/tauri-service';
-const { default: TauriService } = await import(serviceModule);
+const { default: TauriService, withExecuteOptions } = await import(serviceModule);
 sweepStateRoots(tmpdir());
 const state = createStateRoot(tmpdir());
 process.once('exit', () => {
@@ -96,10 +97,11 @@ function failClosedPrecondition(
 
 const resetNativeAgentFixture = () =>
   resetAgentFixture((command, args) =>
-    browser.tauri.execute(async ({ core }, request) => core.invoke(request.command, request.args), {
-      command,
-      args: args ?? {},
-    }),
+    browser.tauri.execute(
+      async ({ core }, request) => core.invoke(request.command, request.args),
+      withExecuteOptions({ windowLabel: 'main' }),
+      { command, args: args ?? {} },
+    ),
   );
 
 const binary = resolve(
@@ -144,6 +146,10 @@ export const config = {
   },
   /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
   before: failClosedPrecondition('fixture/webview setup', async () => {
+    browser.overwriteCommand('execute', async function (original, script, ...args) {
+      const [value] = await original(protectedScript(script), ...args);
+      return value;
+    });
     await browser.switchToWindow('main');
     await browser.setWindowSize(1280, 850);
     if (process.env.SAIL_NATIVE_RUN_ID)
