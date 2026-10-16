@@ -38,7 +38,7 @@ await Promise.all(
         function commit(...parents: string[]) {
           git(origin, 'add', '.');
           const tree = git(origin, 'write-tree');
-          return git(
+          const revision = git(
             origin,
             'commit-tree',
             tree,
@@ -46,6 +46,8 @@ await Promise.all(
             '-m',
             'fixture',
           );
+          git(origin, 'update-ref', 'HEAD', revision);
+          return revision;
         }
         const eventBase = commit();
         git(origin, 'checkout', eventBase);
@@ -58,6 +60,8 @@ await Promise.all(
         else if (change === 'rust-delete') rmSync(join(origin, 'src-tauri', 'lib.rs'));
         else writeFileSync(join(origin, 'frontend.txt'), 'PR edit\n');
         const head = commit(eventBase);
+        assert.equal(git(origin, 'ls-tree', head, '--', 'src-tauri/base-only.rs'), '');
+        assert.ok(git(origin, 'ls-tree', mergeBase, '--', 'src-tauri/base-only.rs'));
         writeFileSync(join(origin, 'src-tauri', 'base-only.rs'), 'base drift\n');
         const merge = commit(mergeBase, head);
         git(origin, 'update-ref', 'refs/pull/1/merge', merge);
