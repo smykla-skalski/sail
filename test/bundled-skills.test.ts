@@ -27,14 +27,16 @@ const quotedValues = (list: string) => [...list.matchAll(/"([^"]+)"/g)].map(([, 
 
 function filesOnDisk(skill: string): string[] {
   return [
-    ...(skill === 'ship-it' ? ['plugin.json'] : []),
-    ...['references', 'scripts'].flatMap((directory) => {
-      const path = skillPath(skill, `${directory}/`);
-      if (!existsSync(path)) return [];
-      return readdirSync(path, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
-        .map((entry) => (directory === 'scripts' ? `scripts/${entry.name}` : entry.name));
-    }),
+    ...(skill === 'ship-it' ? ['plugin.json', 'sai-pin.json', 'SKILL.md'] : []),
+    ...['references', 'scripts', ...(skill === 'ship-it' ? ['agents'] : [])].flatMap(
+      (directory) => {
+        const path = skillPath(skill, `${directory}/`);
+        if (!existsSync(path)) return [];
+        return readdirSync(path, { withFileTypes: true })
+          .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+          .map((entry) => (directory === 'references' ? entry.name : `${directory}/${entry.name}`));
+      },
+    ),
   ];
 }
 
@@ -60,10 +62,12 @@ void test('the Rust bridge embeds the same ship-it references under the same nam
   const embedded = rustShipItReferences();
   assert.deepEqual(
     embedded.map(([name]) => name),
-    [...bundledSkillReferences['ship-it']].filter((name) => name !== 'plugin.json'),
+    [...bundledSkillReferences['ship-it']].filter(
+      (name) => name !== 'plugin.json' && name !== 'sai-pin.json',
+    ),
   );
   for (const [name, path] of embedded)
-    assert.equal(path, name.startsWith('scripts/') ? name : `references/${name}`);
+    assert.equal(path, name.includes('/') || name === 'SKILL.md' ? name : `references/${name}`);
 });
 
 void test('every file the ship-it workflow links to is bundled', () => {
@@ -71,7 +75,7 @@ void test('every file the ship-it workflow links to is bundled', () => {
   const documents = [
     ['SKILL.md', shipItCore],
     ...[...listed]
-      .filter((name) => name.endsWith('.md'))
+      .filter((name) => name.endsWith('.md') && name !== 'SKILL.md')
       .map((name) => [`references/${name}`, read('ship-it', `references/${name}`)]),
   ];
   for (const [document, text] of documents) {

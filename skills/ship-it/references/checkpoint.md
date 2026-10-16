@@ -1,5 +1,23 @@
 # Durable ship-it checkpoint
 
+## Worker recovery commands
+
+`bookkeeping.py record-worker-event --checkpoint FILE --event-json OBJECT` accepts exactly `dispatchId`, `kind`, `at` (RFC 3339 UTC) and `data`. Register before native launch with `owner: null`; pass the checkpoint and dispatch ID to the worker, which binds its native identity before entry or result recording. The parent can repeat the same binding after spawn returns. Persist a worker's result before native messaging; retain the same event ID and timestamp on retries. Contradictory causal timestamps fail without changing the checkpoint.
+
+| kind | data |
+| :-- | :-- |
+| `register` | `target: {issueUrl: URL}` for an existing running orchestration dispatch, or `target: {reservationId: ID}` for a pending gate reservation; `owner` is null before launch (or the native worker ID for an already observed owner); `deadlineAt` is a later UTC instant |
+| `adopt` | Same target and owner fields for a legacy running/blocked/failed child or reserved/completed gate; `deadlineAt` must be null because no deadline observation is available. Use a stable dispatch ID; adoption does not release ownership |
+| `bind-owner` | `owner` with the native worker ID; atomically fills a null orchestration child worker, otherwise must match that existing owner |
+| `started` | `{}` |
+| `result` | `eventId`, `status: completed\|blocked\|failed`, `checkpointPath` |
+| `acknowledge` | `eventId` matching the durable result |
+| `release-owner` | `hostStatus: completed\|done\|closed\|exited`, `observation` containing the native terminal evidence; an unbound failed launch instead requires `not-created` and explicit host failure evidence |
+
+`bookkeeping.py reconcile-workers --checkpoint FILE --observation-json '{"at":"2026-10-16T04:15:00Z"}'` returns one diagnostic per dispatch with its state, UTC deadline comparison, retained ownership and result receipt. Run once on parent resume before subsequent gates or delivery. It records only the latest reconciliation instant; it does not fabricate native delivery observations or update gates, counters, grants or orchestration results. The optional `workerRecovery` array retains one immutable result receipt per dispatch and at most 256 dispatches, including owner release evidence. Legacy checkpoints without it remain valid.
+
+An adopted legacy record additionally carries `adopted: true` and an unknown null deadline. Missing legacy owner records block child replacement and another native review/test reservation of the same kind until explicit adoption and host terminal reconciliation. Reusable completed gate results still return without dispatch. No migration fabricates a passing gate or refunds a reservation.
+
 Use one portable JSON checkpoint as the source of truth for a task across Claude Code, Codex, OpenCode, Copilot CLI and Sail. It is both resumable workflow state and the task context supplied to review and test gates.
 
 ## Location and identity
@@ -197,10 +215,10 @@ bookkeeping.py settle-ci-rerun --checkpoint FILE --settlement-json OBJECT
 ```
 
 - `create` takes the canonical source object (`{sourceType, repository, issue}`, `{sourceType, site, key}` or `{sourceType, repository, objective, acceptanceCriteria}`), derives `task.canonicalSource`, the checkpoint ID and the file name, defaults `--checkpoint-dir` to the data root above and writes owner-only at phase `resolve`. An existing file for the same source is reported with `created: false` and left untouched; another source at that name stops. Claims stay `null`: their protocol writes them.
-- `set-risk` takes `level`, `diffClass`, `policySource`, `matchedRules`, `requiredGates` and optional `overrideAuthorization`; a level below the recorded one needs the override, which later calls keep.
+- `set-risk` takes `level`, `diffClass`, `policySource`, `matchedRules`, `requiredGates` and optional `overrideAuthorization`; a level below the recorded one needs the override, which later calls keep. An absent or null `overrideAuthorization` keeps the recorded one; any other value that is not a non-empty string is refused.
 - `set-release-policy` takes exactly the normalized object and enums from the release contract and rejects anything else. A material change (anything but `resolvedAt`) marks passed `ci` and `hosted-review` verdicts `stale`.
-- `set-hosted-review-decision` takes `status` (`not-required|serviceable|fallback|blocked`), `reason` (at most 500 characters) and optional `decidedAt` (RFC 3339 UTC, default now), and stores exactly `status`, `reason` and `decidedAt`. The first call accepts any status. Afterward only `serviceable` to `fallback` or `blocked` is accepted, once; every other call, including a repeat of the same status, is refused and leaves the file unchanged.
-- `record-gate` takes `gate`, `status` (`passed|failed|blocked`), `revision` (the current workflow revision), `provider`, `summary` (at most 500 characters) and optional `timestamp`, `model`, `url`; it replaces a verdict with the same gate, revision and provider. It is refused while evidence is enabled, because the evidence record owns verdicts.
+- `set-hosted-review-decision` takes `status` (`not-required|serviceable|fallback|blocked`), `reason` (at most 500 characters) and optional `decidedAt` (RFC 3339 UTC, default now), and stores exactly `status`, `reason` and `decidedAt`. A present `decidedAt` that is not a strict UTC RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SSZ`, optional fractional seconds, `Z` or `+00:00`) is refused with exit 2 and the file unchanged; only an absent one defaults to now. The first call accepts any status. Afterward only `serviceable` to `fallback` or `blocked` is accepted, once; every other call, including a repeat of the same status, is refused and leaves the file unchanged.
+- `record-gate` takes `gate`, `status` (`passed|failed|blocked`), `revision` (the current workflow revision), `provider`, `summary` (at most 500 characters) and optional `timestamp`, `model`, `url`; a present `timestamp` must be a strict UTC RFC 3339 timestamp, otherwise it is refused with exit 2 and the file unchanged; it replaces a verdict with the same gate, revision and provider. It is refused while evidence is enabled, because the evidence record owns verdicts.
 - `add-grant` appends one complete grant (same object as `create --grant-json`) to an existing checkpoint for a resumed run or a later user reply. It refuses an ID already recorded, an empty `source.message` and a `scope` that is not a non-empty array of non-empty strings, and leaves every recorded grant, revoked or exhausted included, unchanged.
 - `record-acceptance-recovery` appends an entry to `convergence.acceptanceRecovery`: `id`, `failure`, `criterion`, `grantId`, `revision` (full SHA), `correction`, `verification` (the focused command) and an `attempts` array. The first call takes those fields and an optional `attempt` (`result` `passed|failed|blocked`, `revision`, `summary` of at most 500 characters); a recorded `id` takes only `{id, attempt}`, which appends a timestamped attempt and changes nothing else. It refuses a `grantId` that is unknown or not `active`, including on a later attempt, and never touches a convergence counter or reservation.
 - `set-findings` maps finding IDs to `open|fixed|blocked` or `{"disposition":"follow-up","followUpIssue":URL}`, which also appends the URL to `followUpIssues`; `blocked` needs a blocked workflow, and any unresolved finding marks a re-attestation `stale`.

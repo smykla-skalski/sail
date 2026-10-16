@@ -16,13 +16,13 @@
     }
   },
   "files": {
-    "skills/ship-it/SKILL.md": "01173d1caa43b16ba8ad189708a9be58294699af00900481067897de87027152",
+    "skills/ship-it/SKILL.md": "e71b26cca0fd842e60054e7a6825bee2f1418ff7e21a3887ee115e447954878e",
     "skills/ship-it/agents/openai.yaml": "3e0a76bdb653e3f48cd4fd19a1b8f76427d2980e68804ce12a32e43afbce704f",
     "skills/ship-it/references/authorization.md": "bf8e202326f25d50bc9012d52a5d51bbdedef2f1d8d48df6ce95b9d0c7415e88",
     "skills/ship-it/references/branch.md": "4531ab5c6b352a33b68ed4ce120bb44cc71b84347c722f9ef72a45da4c7bf6fe",
     "skills/ship-it/references/capabilities.json": "2858d8bbd6c93249f14f98e19c1ef09c208f0563289f1dceb0a24fed91af63d2",
     "skills/ship-it/references/capabilities.md": "2cefbbc8597cebeebdffa8a7c9886120a2033451bd8318a85072f67b5a48f7df",
-    "skills/ship-it/references/checkpoint.md": "e5b2816a69234b2b9f447cb23709382adb9dc6f170f4ef92f708f0102ccae341",
+    "skills/ship-it/references/checkpoint.md": "4cb237c34198b63a6b980f59bce47c4f5564b8608b14d096232213ca29bd1179",
     "skills/ship-it/references/ci-triage.md": "d629fefcd1e9546897ad8dde339179151879b5484dddfbeb450cb66971c30952",
     "skills/ship-it/references/ci-triage.schema.json": "288d7d08ec9cb6bbf8f5110ac3ed155cafef8b038f2ff847f679b4e34eab3cb5",
     "skills/ship-it/references/claims.md": "3779a17d709887397aee7294ebad72f5f1fb180e0ae42ac2029340c5c9657a69",
@@ -32,11 +32,11 @@
     "skills/ship-it/references/evidence.md": "83f1ebacce98ee2e3cc2e2a5e009b6ef1d9388995ff365d946d49081e0da7097",
     "skills/ship-it/references/explore.md": "ba4dfd8048ca2988524a949c2a40064275a49558e3da5d42148e70cae894560a",
     "skills/ship-it/references/fallbacks.md": "792902b6829fac2dffd1774aa55f7961e3892b8dd50438b4b7f4cf44dce0abe9",
-    "skills/ship-it/references/handoff.md": "79d22c391d9f9a249ee7a6578e03f7fadaa4aa1c98224d3a4db57cabce9a8ef0",
-    "skills/ship-it/references/helper-loading.md": "38812f46670607ba8a507875b870ec10f1510954d955da3930604ddf5c0dc416",
+    "skills/ship-it/references/handoff.md": "f7cecef46b3f9803fb4e794ae77bc39c206e7fe9d4bffcd63d6e2846edd436e1",
+    "skills/ship-it/references/helper-loading.md": "236b09dadf984897871bbd3837fb638d7c9c740fcd0a6d9164aa1e101c87f33f",
     "skills/ship-it/references/implementation.md": "3a822a1bb2d37fb3134fa5e2d54e71fff080d0fbec2e2a4148b8466872ae4599",
     "skills/ship-it/references/inputs.md": "31831df7caf21f1a5ac29d850e4a657871439bf6d1088cab2d60527fc9d775bd",
-    "skills/ship-it/references/orchestration.md": "34d58c0a94f76bc2c6b12c521b315d235ee4c83e3249a3119a2e515439ed6fff",
+    "skills/ship-it/references/orchestration.md": "bf775bb176d28f2d09082d830b962891d8cd20accddd98dda02f0adf51454638",
     "skills/ship-it/references/pr-loop.md": "327367440423c9841f5979e2fd0f637a91f9230ade7e0ae0f7ff826e140fbb7f",
     "skills/ship-it/references/publish.md": "d2c1478ac2a7507879d466e473c6ebe7951bdf1bb74deb4235cc6839c4dc47f2",
     "skills/ship-it/references/release-policy.json": "7cd5170f2f4a586784f585a7add4aa10aabc7dc2d50aa9f4c9577a918b82aacb",
@@ -57,18 +57,18 @@
     "skills/ship-it/references/telemetry.schema.json": "331c6495b24504e7aeb594363de4be8b6a25a91c1b819fe4572d45236447f7bd",
     "skills/ship-it/references/test.md": "89f05f7f5719964b1ab53562294cc4e6afd88825343b66240ca7847c8c347463",
     "skills/ship-it/references/validation-reuse.md": "7877d53b7d7cc4bd061d21277fc284527b9531e4c79dee109a9383cff0f4c2fc",
-    "skills/ship-it/references/worker-events.md": "6bb2af03efac9ac1e5bd5965f22538dbedbeee3dd25764790221ac2ae537396d",
+    "skills/ship-it/references/worker-events.md": "eff68304300b200657e6217ab35133216e38577f7c2e659bd871e9241b5042a4",
     "skills/ship-it/references/worker-rules.md": "4cb8f8067aa9d4bf8e55b76d31be245d7dc9731afa7ecc054e929ea4da67bcf8",
-    "skills/ship-it/scripts/bookkeeping.py": "8d878f88f8b3d1d2a5121e7e3cf718bd97c9e7a26f9da4237119bcb7654a746d",
-    "skills/ship-it/scripts/checkpoint_state.py": "59588dabeba6ba0999d3aeaea2cc5e2a3ba916134f5bf0152b7a05fb2249732d",
+    "skills/ship-it/scripts/bookkeeping.py": "feb5ac5ed916e98be9b1c33f9fd0f75eaf4129bef81b6c0d7c72562d1ead4418",
+    "skills/ship-it/scripts/checkpoint_state.py": "393e668deaeee841012634640ddd436e03f8470ed04dec17c282a551982f68fb",
     "skills/ship-it/scripts/ci_triage.py": "c9f77e154bf325e192febbeb6e36cffb2d60610c21881b5cf1067dd128325f3d",
-    "skills/ship-it/scripts/convergence.py": "70ceaea236b5431223a2a77ec19e4c1219353126e1551413896378f857dbc22a",
+    "skills/ship-it/scripts/convergence.py": "42a9c57aac5f34a26142fa5267516fd457dfdb0208538be45eed2557751543cc",
     "skills/ship-it/scripts/copilot_quota.py": "a2aba8c5839b5deb3c803f2360560c8b173ed581d5f29062bd995246ab7bdb93",
     "skills/ship-it/scripts/copilot_review.py": "7fed450c59dec273b431079f8a06068019f037fa0f3e5f547c791fbbb1765968",
     "skills/ship-it/scripts/delivery_benchmark.py": "b5996e9223155e24d550d4f9b3fd7db16fb5e50d81efa0eed824c1b4d6b9d238",
     "skills/ship-it/scripts/handoff.py": "dce346274b7bf211a9f5e9c7e1e82560e981b9ce7ae67aa321f553ac69a6fd91",
     "skills/ship-it/scripts/hosted_wait.py": "35677e3f4cd77e3ed465aa9b688bd19a63e91519ae1a869861186d98209aeff0",
-    "skills/ship-it/scripts/orchestration_state.py": "695d43c0dca6142f0d3d57e6689bddfd7497caff7d312b27d74e6a448bc2cf0c",
+    "skills/ship-it/scripts/orchestration_state.py": "63d14e489a633823a6a340092dbfaaeee45a2d32056ace9cabcb06dda76c2bba",
     "skills/ship-it/scripts/replay_failures.py": "19e295f0c08e97e2942898338ab402f823d15b6972e602746bc2f2c74a38a898",
     "skills/ship-it/scripts/telemetry.py": "3a1d949fd187cc38b114aa00a5ee40b64babbd84f12f7cbd67aaa8d4d6005b33",
     "skills/ship-it/scripts/test_copilot_quota.py": "bd54c18eb1ab01dc4c00de00d2215a4ea8166691ceae702e892551d830b9c125",
@@ -86,14 +86,18 @@
     "skills/adversarial-test/agents/openai.yaml": "319d3da31b1624ed730f52c981d5efb078a9cc79200395b03e250e8ea0475b02",
     "skills/adversarial-test/references/test-adversary.md": "234da9bb30123b275eb26e7fbc063c5a4dacad572adec269ca8a4d41ad91132f",
     "skills/adversarial-test/references/workflow.md": "96287beb1aa32970346c6c57aa4b34395581b07db51acce446eab933fb230b0a",
-    "plugin.json": "f23bbaadff587e87cc404d59b72b238444548b27a0107cd3f3b50b303ce47695"
+    "plugin.json": "f23bbaadff587e87cc404d59b72b238444548b27a0107cd3f3b50b303ce47695",
+    "skills/ship-it/references/bootstrap.md": "446249e9612ae2568d027b803c3ad9c57fe090156d4d20a9d27a3b87518ab5ae",
+    "skills/ship-it/scripts/plugin_pins.py": "b4515872bdb0f2bed304866b9caa628fb5906f2879f0e14f6baed660df27b72f",
+    "skills/ship-it/scripts/test_plugin_pins.py": "5791e6b76719a5209fbdc8de1055d7367ed7192aee55d4cdf6418da3a057fcac",
+    "skills/ship-it/scripts/worker_recovery.py": "a8cdfee15468ed80bc07053650ba665bc27d1fbf8802ed1624b2a3dca6445fde"
   },
   "metadata": {
     "plugin.json": "plugins/ship-it/plugin.json"
   },
   "upstreamOverrides": {
     "skills/ship-it/references/checkpoint.md": {
-      "revision": "07f27959840a42d7757b4819b246af4211af1c65",
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
       "path": "plugins/ship-it/skills/ship-it/references/checkpoint.md"
     },
     "skills/ship-it/references/ci-triage.md": {
@@ -105,11 +109,11 @@
       "path": "plugins/ship-it/skills/ship-it/references/convergence.md"
     },
     "skills/ship-it/references/helper-loading.md": {
-      "revision": "07f27959840a42d7757b4819b246af4211af1c65",
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
       "path": "plugins/ship-it/skills/ship-it/references/helper-loading.md"
     },
     "skills/ship-it/references/orchestration.md": {
-      "revision": "07f27959840a42d7757b4819b246af4211af1c65",
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
       "path": "plugins/ship-it/skills/ship-it/references/orchestration.md"
     },
     "skills/ship-it/references/pr-loop.md": {
@@ -129,11 +133,11 @@
       "path": "plugins/ship-it/skills/ship-it/references/worker-rules.md"
     },
     "skills/ship-it/scripts/bookkeeping.py": {
-      "revision": "e17c63adad1ba0853400c3ddc511e184599d4734",
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
       "path": "plugins/ship-it/skills/ship-it/scripts/bookkeeping.py"
     },
     "skills/ship-it/scripts/checkpoint_state.py": {
-      "revision": "07f27959840a42d7757b4819b246af4211af1c65",
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
       "path": "plugins/ship-it/skills/ship-it/scripts/checkpoint_state.py"
     },
     "skills/ship-it/scripts/ci_triage.py": {
@@ -145,7 +149,7 @@
       "path": "plugins/ship-it/skills/ship-it/scripts/hosted_wait.py"
     },
     "skills/ship-it/scripts/orchestration_state.py": {
-      "revision": "07f27959840a42d7757b4819b246af4211af1c65",
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
       "path": "plugins/ship-it/skills/ship-it/scripts/orchestration_state.py"
     },
     "skills/ship-it/scripts/telemetry.py": {
@@ -159,6 +163,38 @@
     "skills/ship-it/scripts/validation_reuse.py": {
       "revision": "07f27959840a42d7757b4819b246af4211af1c65",
       "path": "plugins/ship-it/skills/ship-it/scripts/validation_reuse.py"
+    },
+    "skills/ship-it/SKILL.md": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/SKILL.md"
+    },
+    "skills/ship-it/references/bootstrap.md": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/references/bootstrap.md"
+    },
+    "skills/ship-it/references/handoff.md": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/references/handoff.md"
+    },
+    "skills/ship-it/references/worker-events.md": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/references/worker-events.md"
+    },
+    "skills/ship-it/scripts/convergence.py": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/scripts/convergence.py"
+    },
+    "skills/ship-it/scripts/plugin_pins.py": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/scripts/plugin_pins.py"
+    },
+    "skills/ship-it/scripts/test_plugin_pins.py": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/scripts/test_plugin_pins.py"
+    },
+    "skills/ship-it/scripts/worker_recovery.py": {
+      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "path": "plugins/ship-it/skills/ship-it/scripts/worker_recovery.py"
     }
   }
 }

@@ -19,6 +19,10 @@ from typing import Any, Final
 from convergence import DEFAULTS as CONVERGENCE_DEFAULTS
 
 FULL_COMMIT_ID: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
+STRICT_UTC_TIMESTAMP: Final[re.Pattern[str]] = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?"
+    r"(?:Z|\+00:00)",
+)
 RISK_LEVELS: Final[tuple[str, ...]] = ("low", "medium", "high")
 DIFF_CLASSES: Final[frozenset[str]] = frozenset({"docs", "code"})
 GATE_STATUSES: Final[frozenset[str]] = frozenset({"passed", "failed", "blocked"})
@@ -141,6 +145,10 @@ def non_empty(value: object, field: str) -> str:
 def utc_timestamp(value: object, field: str) -> str:
     """Require an RFC 3339 timestamp whose offset is UTC."""
     text = non_empty(value, field)
+    require(
+        STRICT_UTC_TIMESTAMP.fullmatch(text) is not None,
+        f"{field} must be an RFC 3339 UTC timestamp",
+    )
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as error:
@@ -313,13 +321,13 @@ def set_risk(checkpoint: dict[str, Any], risk: dict[str, Any]) -> dict[str, Any]
         and len(set(gates)) == len(gates),
         "risk requiredGates must be unique non-empty strings",
     )
-    override = risk.get("overrideAuthorization") or current.get(
-        "overrideAuthorization",
-    )
+    override = risk.get("overrideAuthorization")
     require(
         override is None or (isinstance(override, str) and override.strip()),
         "risk overrideAuthorization must be the exact user authorization or null",
     )
+    if override is None:
+        override = current.get("overrideAuthorization")
     previous = current.get("level")
     lowered = previous in RISK_LEVELS and RISK_LEVELS.index(level) < RISK_LEVELS.index(
         previous,

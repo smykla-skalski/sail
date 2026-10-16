@@ -1540,10 +1540,14 @@ macro_rules! ship_it_file {
 // Must match src/lib/bundled-skill-catalog.ts and the files under skills/ship-it.
 const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
     ("plugin.json", include_str!("../../plugin.json")),
+    ("sai-pin.json", include_str!("../../skills/sai-pin.json")),
+    ("SKILL.md", ship_it_file!("SKILL.md")),
+    ("agents/openai.yaml", ship_it_file!("agents/openai.yaml")),
     (
         "authorization.md",
         ship_it_file!("references/authorization.md"),
     ),
+    ("bootstrap.md", ship_it_file!("references/bootstrap.md")),
     ("branch.md", ship_it_file!("references/branch.md")),
     (
         "capabilities.json",
@@ -1642,6 +1646,10 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         ship_it_file!("scripts/orchestration_state.py"),
     ),
     (
+        "scripts/plugin_pins.py",
+        ship_it_file!("scripts/plugin_pins.py"),
+    ),
+    (
         "scripts/replay_failures.py",
         ship_it_file!("scripts/replay_failures.py"),
     ),
@@ -1658,6 +1666,10 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         ship_it_file!("scripts/test_copilot_review.py"),
     ),
     (
+        "scripts/test_plugin_pins.py",
+        ship_it_file!("scripts/test_plugin_pins.py"),
+    ),
+    (
         "scripts/test_replay_failures.py",
         ship_it_file!("scripts/test_replay_failures.py"),
     ),
@@ -1672,6 +1684,10 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
     (
         "scripts/validation_reuse.py",
         ship_it_file!("scripts/validation_reuse.py"),
+    ),
+    (
+        "scripts/worker_recovery.py",
+        ship_it_file!("scripts/worker_recovery.py"),
     ),
     (
         "small-code-policy.json",
@@ -2854,7 +2870,7 @@ mod skill_tests {
             .filter_map(|reference| reference["name"].as_str().map(str::to_owned))
             .collect();
         let skill_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/ship-it");
-        let mut bundled_files: BTreeSet<String> = ["references", "scripts"]
+        let mut bundled_files: BTreeSet<String> = ["references", "scripts", "agents"]
             .into_iter()
             .flat_map(|directory| {
                 fs::read_dir(skill_root.join(directory))
@@ -2871,13 +2887,15 @@ mod skill_tests {
                         let name = entry.file_name().to_string_lossy().into_owned();
                         match (directory, name.starts_with('.')) {
                             (_, true) => None,
-                            ("scripts", false) => Some(format!("scripts/{name}")),
+                            ("scripts" | "agents", false) => Some(format!("{directory}/{name}")),
                             _ => Some(name),
                         }
                     })
             })
             .collect();
         bundled_files.insert("plugin.json".into());
+        bundled_files.insert("sai-pin.json".into());
+        bundled_files.insert("SKILL.md".into());
         assert_eq!(listed_names, bundled_files);
         let metadata = call_bridge(&json!({
             "name":"skill_reference",
