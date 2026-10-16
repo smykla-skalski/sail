@@ -7,6 +7,16 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { bundledSkillReferences } from '../src/lib/bundled-skill-catalog.ts';
 
+async function writableDirectories(directory: string): Promise<void> {
+  await chmod(directory, 0o700);
+  const entries = await readdir(directory, { withFileTypes: true });
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => writableDirectories(join(directory, entry.name))),
+  );
+}
+
 void test('cold reference delivery retains a runnable complete package after source deletion', async () => {
   const root = await mkdtemp(join(tmpdir(), 'sail-bundle-bootstrap-'));
   try {
@@ -19,20 +29,22 @@ void test('cold reference delivery retains a runnable complete package after sou
     const pin = JSON.parse(
       await readFile(new URL('../skills/sai-pin.json', import.meta.url), 'utf8'),
     );
-    for (const name of bundledSkillReferences['ship-it']) {
-      const relative =
-        name === 'sai-pin.json'
-          ? 'skills/sai-pin.json'
-          : name === 'plugin.json'
-            ? name
-            : `skills/ship-it/${name.includes('/') || name === 'SKILL.md' ? name : `references/${name}`}`;
-      const body = await readFile(new URL(`../${relative}`, import.meta.url));
-      if (name !== 'sai-pin.json')
-        assert.equal(createHash('sha256').update(body).digest('hex'), pin.files[relative], name);
-      const destination = join(source, name === 'sai-pin.json' ? name : relative);
-      await mkdir(dirname(destination), { recursive: true });
-      await writeFile(destination, body);
-    }
+    await Promise.all(
+      bundledSkillReferences['ship-it'].map(async (name) => {
+        const relative =
+          name === 'sai-pin.json'
+            ? 'skills/sai-pin.json'
+            : name === 'plugin.json'
+              ? name
+              : `skills/ship-it/${name.includes('/') || name === 'SKILL.md' ? name : `references/${name}`}`;
+        const body = await readFile(new URL(`../${relative}`, import.meta.url));
+        if (name !== 'sai-pin.json')
+          assert.equal(createHash('sha256').update(body).digest('hex'), pin.files[relative], name);
+        const destination = join(source, name === 'sai-pin.json' ? name : relative);
+        await mkdir(dirname(destination), { recursive: true });
+        await writeFile(destination, body);
+      }),
+    );
     const run = (script: string, ...args: string[]) => {
       const result = spawnSync(python, ['-B', script, ...args], { encoding: 'utf8' });
       assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
@@ -176,11 +188,6 @@ void test('cold reference delivery retains a runnable complete package after sou
     run(pinnedHelper, '--store', store, 'collect', '--limit', '3');
     await assert.rejects(readFile(join(acquired.skillRoot, 'SKILL.md')), { code: 'ENOENT' });
   } finally {
-    const writableDirectories = async (directory: string): Promise<void> => {
-      await chmod(directory, 0o700);
-      for (const entry of await readdir(directory, { withFileTypes: true }))
-        if (entry.isDirectory()) await writableDirectories(join(directory, entry.name));
-    };
     await writableDirectories(root);
     await rm(root, { recursive: true, force: true });
   }
