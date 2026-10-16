@@ -21,6 +21,7 @@ import {
   pressureReasonsForResults,
   resourceLimitKeys,
   resourceQueues,
+  setReefAdmissionEnabled,
 } from '../src/lib/resource-limits.ts';
 import {
   defaultPressureThresholds,
@@ -38,6 +39,19 @@ const healthy: MachineReading = {
   totalDisk: 100,
   availableDisk: 20,
 };
+
+void test('idle Reef admission bypasses agent/browser pressure and restores it when disabled', () => {
+  try {
+    setReefAdmissionEnabled(true);
+    assert.equal(resourceQueues.agent.reason, null);
+    assert.equal(resourceQueues.browser.reason, null);
+    assert.equal(resourceQueues.validation.reason, 'Checking machine pressure…');
+  } finally {
+    setReefAdmissionEnabled(false);
+  }
+  assert.equal(resourceQueues.agent.reason, 'Checking machine pressure…');
+  assert.equal(resourceQueues.browser.reason, 'Checking machine pressure…');
+});
 
 void test('pressure thresholds include the boundary and recover above it', () => {
   assert.match(

@@ -247,6 +247,7 @@ mod opencode_config;
 mod owned_processes;
 mod post_turn_checks;
 mod project_knowledge;
+mod reef_admission;
 mod reef_canary;
 #[cfg(unix)]
 mod scratch_cleanup;
@@ -4814,6 +4815,9 @@ pub fn run() {
             settings::migrate_settings,
             settings::save_setting,
             machine_pressure::machine_pressure,
+            reef_admission::reef_admission_request,
+            reef_admission::reef_admission_status,
+            reef_admission::reef_admission_release,
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
             settings::get_acp_turn_evidence,

@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting } from './settings.ts';
 import { ResourceQueue } from './resource-queue.ts';
+import { reefAdmission, reefAdmissionSettingKey } from './reef-admission.ts';
 import {
   defaultPressureThresholds,
   parsePressureThreshold,
@@ -44,6 +45,8 @@ let timer: ReturnType<typeof setInterval> | null = null;
 let refreshing = false;
 let updatingReason = false;
 let readingGeneration = 0;
+let reefEnabled =
+  typeof localStorage !== 'undefined' && getSetting(reefAdmissionSettingKey) === 'true';
 
 function checkNewWork(): void {
   readingGeneration++;
@@ -85,17 +88,30 @@ export const resourceQueues: Record<ResourceKind, ResourceQueue> = {
 };
 
 function pendingWork(): boolean {
-  return Object.values(resourceQueues).some((queue) => queue.status.waiting > 0);
+  return Object.entries(resourceQueues).some(
+    ([kind, queue]) => (!reefEnabled || kind === 'validation') && queue.status.waiting > 0,
+  );
 }
 
 function pendingDirectories(): string[] {
-  return [...new Set(Object.values(resourceQueues).flatMap((queue) => queue.waitingDirectories()))];
+  return [
+    ...new Set(
+      Object.entries(resourceQueues).flatMap(([kind, queue]) =>
+        !reefEnabled || kind === 'validation' ? queue.waitingDirectories() : [],
+      ),
+    ),
+  ];
 }
 
 function setPressureState(reason: string | null, directoryReasons: Map<string, string>): void {
   updatingReason = true;
   try {
-    for (const queue of Object.values(resourceQueues)) {
+    for (const [kind, queue] of Object.entries(resourceQueues)) {
+      if (reefEnabled && (kind === 'agent' || kind === 'browser')) {
+        queue.setDirectoryReasons(new Map());
+        queue.setBlockedReason(null);
+        continue;
+      }
       if (reason) queue.setBlockedReason(reason);
       queue.setDirectoryReasons(directoryReasons);
       if (!reason) queue.setBlockedReason(null);
@@ -205,12 +221,33 @@ function updateMonitor(): void {
       clearInterval(timer);
       timer = null;
     }
-    if (Object.values(resourceQueues).some((queue) => queue.reason !== checkingReason))
+    if (
+      Object.entries(resourceQueues).some(
+        ([kind, queue]) =>
+          !(reefEnabled && (kind === 'agent' || kind === 'browser')) &&
+          queue.reason !== checkingReason,
+      )
+    )
       setPressureState(checkingReason, new Map());
   }
 }
 
 for (const queue of Object.values(resourceQueues)) queue.subscribe(updateMonitor);
+
+export function setReefAdmissionEnabled(enabled: boolean): void {
+  for (const kind of ['agent', 'browser'] as const) {
+    resourceQueues[kind].setBlockedReason(checkingReason);
+  }
+  reefEnabled = enabled;
+  for (const kind of ['agent', 'browser'] as const) {
+    resourceQueues[kind].setAdmission(enabled ? reefAdmission(kind) : null);
+  }
+  readingGeneration++;
+  setPressureState(checkingReason, new Map());
+  if (pendingWork()) void refreshPressure();
+}
+
+if (reefEnabled) setReefAdmissionEnabled(true);
 
 export function setPressureThresholds(value: PressureThresholds): void {
   pressureThresholds = value;

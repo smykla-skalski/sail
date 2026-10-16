@@ -33,6 +33,7 @@ export type SettingsSnapshot = {
   agentTerminalsEnabled: boolean;
   backgroundPriorityEnabled: boolean;
   reefCanaryPercent: number | null;
+  reefAdmissionEnabled: boolean;
   agentStatusEnabled: boolean;
   agentThreadListEnabled: boolean;
   agentMessagesEnabled: boolean;
@@ -55,6 +56,7 @@ export type SettingsAction =
   | { type: 'agent-terminals'; value: boolean }
   | { type: 'background-priority'; value: boolean }
   | { type: 'reef-canary-percent'; value: number | null }
+  | { type: 'reef-admission'; value: boolean }
   | { type: 'agent-status'; value: boolean }
   | { type: 'agent-thread-list'; value: boolean }
   | { type: 'agent-messages'; value: boolean }

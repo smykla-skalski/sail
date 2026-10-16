@@ -1252,7 +1252,20 @@
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
       </section>
       <section class="settings-card">
-        <h2>Reef canary</h2>
+        <h2>Reef admission and canary</h2>
+        <label class="attention-setting">
+          <input
+            type="checkbox"
+            checked={snapshot?.reefAdmissionEnabled ?? false}
+            onchange={(event) =>
+              send({ type: 'reef-admission', value: event.currentTarget.checked })}
+          />
+          Let Reef admit new agent turns and browser tabs
+        </label>
+        <p class="settings-help">
+          Requires Reef external admission v1 and a running scheduler. Queued work waits for Reef;
+          running work continues. Sail's machine-pressure thresholds apply when this is disabled.
+        </p>
         <label class="attention-setting">
           <input
             type="checkbox"
