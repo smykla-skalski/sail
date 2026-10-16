@@ -10522,20 +10522,34 @@ time.sleep(10)
         let artifact = temp.join("artifact");
         let ready = scratch.join("ready");
         lease.prepare_process_start().unwrap();
-        let code = r#"import os,sys,time
+        let code = r#"import os,sys
 fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT)
-os.set_inheritable(fd, True)
+ready_read,ready_write=os.pipe()
+release_read,release_write=os.pipe()
+for inherited in (fd, ready_write, release_read):
+    os.set_inheritable(inherited, True)
 p=os.fork()
 if p==0:
     p2=os.fork()
     if p2>0: os._exit(0)
     os.setsid()
     os.chdir('/')
-    worker="import os,sys,time; time.sleep(1); os.write(int(sys.argv[1]), b'live')"
-    os.execve(sys.executable, [sys.executable, '-c', worker, str(fd)], {})
+    worker="""import os,sys
+fd,ready,release=map(int, sys.argv[1:])
+os.write(ready, b'1')
+if os.read(release, 1)==b'1':
+    os.write(fd, b'live')
+"""
+    os.execve(sys.executable, [sys.executable, '-c', worker, str(fd), str(ready_write), str(release_read)], {})
 os.waitpid(p, 0)
+os.close(ready_write)
+os.close(release_read)
+assert os.read(ready_read, 1)==b'1'
 open(sys.argv[2], 'w').write('ready')
-time.sleep(10)
+if sys.stdin.buffer.read(1)==b'1':
+    os.write(release_write, b'1')
+os.close(release_write)
+sys.stdin.buffer.read()
 "#;
         let mut command = Command::new("python3");
         command
@@ -10575,6 +10589,7 @@ time.sleep(10)
             Some(&temp)
         ));
         runtime.clear_idle_temp(true).unwrap();
+        runtime.input.lock().unwrap().write_all(b"1").unwrap();
         for _ in 0..200 {
             if std::fs::read(&artifact).is_ok_and(|bytes| bytes == b"live") {
                 break;
