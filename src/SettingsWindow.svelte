@@ -1269,9 +1269,7 @@
           turn admission is active; its saved percentage is preserved.
         </p>
         <p class="settings-help" role="status">
-          Active this run: {snapshot?.reefAdmissionEffective
-            ? 'Reef admission'
-            : 'local pressure'}. {#if snapshot?.reefAdmissionEnabled !== snapshot?.reefAdmissionEffective}
+          Active this run: {snapshot?.reefAdmissionEffective ? 'Reef admission' : 'local pressure'}. {#if snapshot?.reefAdmissionEnabled !== snapshot?.reefAdmissionEffective}
             Restart Sail to apply the saved admission setting.
           {/if}
         </p>
