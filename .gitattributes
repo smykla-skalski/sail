@@ -1,0 +1,5 @@
+# Preserve upstream bytes checked by skills/sai-pin.json.
+/plugin.json -text
+/skills/ship-it/** -text
+/skills/adversarial-review/** -text
+/skills/adversarial-test/** -text
