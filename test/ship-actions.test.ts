@@ -256,3 +256,43 @@ void test('worker pool usage sums live workers against run limits and counts gat
   assert.equal(shipPoolLabel(usage), '2 of 6 workers · 1 gate running');
   assert.equal(shipPoolLabel(shipPoolUsage([])), 'No workers running');
 });
+
+void test('phase transfer blocks merge until its fresh worker owns the task', () => {
+  const issue = mergeable();
+  const handoff: import('../src/lib/context-handoff.ts').ContextHandoff = {
+    id: 'run:task:pr-1',
+    boundary: 'before-pr-loop',
+    brief: 'Read durable checkpoint.',
+    provider: 'codex',
+    fromThreadId: 'old',
+    toThreadId: null,
+    context: 0,
+    compactions: 0,
+    checkpointSequence: 3,
+    revision: 'revision-one',
+    offeredAt: 10,
+    startedAt: null,
+    retriesBefore: 0,
+    lostStateFailuresBefore: 0,
+    retriesAfter: null,
+    lostStateFailuresAfter: null,
+    outcome: 'pending',
+    error: null,
+  };
+  issue.threadId = 'old';
+  issue.contextHandoffs = [handoff];
+  assert.equal(shipMergeAction(issue).enabled, false);
+  Object.assign(issue.checkpoint!, {
+    status: 'blocked',
+    blocker: 'Phase handoff paused: provider unavailable',
+  });
+  assert.deepEqual(shipMergeAction(issue), {
+    enabled: false,
+    reason: 'Phase handoff paused: provider unavailable',
+  });
+  Object.assign(issue.checkpoint!, { status: 'active', blocker: null });
+  issue.threadId = 'fresh';
+  handoff.toThreadId = 'fresh';
+  handoff.startedAt = 11;
+  assert.equal(shipMergeAction(issue).enabled, true);
+});

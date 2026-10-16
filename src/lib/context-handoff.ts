@@ -215,3 +215,16 @@ export function phaseHandoffPrompt(brief: string): string {
     brief,
   ].join('\n');
 }
+
+export function pendingPhaseHandoff(issue: {
+  threadId?: string | null;
+  contextHandoffs?: ContextHandoff[];
+}): ContextHandoff | undefined {
+  return issue.contextHandoffs?.findLast(
+    (handoff) =>
+      handoff.boundary &&
+      handoff.fromThreadId === issue.threadId &&
+      !handoff.toThreadId &&
+      handoff.outcome === 'pending',
+  );
+}

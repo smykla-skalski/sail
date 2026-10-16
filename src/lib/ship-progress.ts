@@ -12,7 +12,7 @@ import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
 import { taskEconomicsSchema, type TaskEconomics } from './task-economics.ts';
-import type { ContextHandoff } from './context-handoff.ts';
+import { pendingPhaseHandoff, type ContextHandoff } from './context-handoff.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
@@ -1031,6 +1031,8 @@ export function shipBlock(issue: ShipIssue): string | null {
 export function shipPullRequestReady(issue: ShipIssue): boolean {
   const ci = ciStatus(issue.checks);
   return (
+    issue.checkpoint?.status !== 'blocked' &&
+    !pendingPhaseHandoff(issue) &&
     !!issue.pullRequest &&
     issue.pullRequestState === 'OPEN' &&
     issue.pullRequestMergeable === true &&

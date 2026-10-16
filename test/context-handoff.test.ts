@@ -5,6 +5,7 @@ import {
   contextHandoffPrompt,
   phaseHandoffRequest,
   phaseHandoffPrompt,
+  pendingPhaseHandoff,
   contextPressureStage,
   handoffOutcome,
   parseContextHandoffThreshold,
@@ -228,6 +229,17 @@ void test('phase handoff validates destination, bounded brief and once-only rece
     error: null,
   };
   assert.equal(phaseHandoffRequest(request, checkpoint, [handoff]), null);
+  const pending = { ...handoff, toThreadId: null, startedAt: null };
+  const restarted = JSON.parse(JSON.stringify({ threadId: 'old', contextHandoffs: [pending] }));
+  assert.deepEqual(pendingPhaseHandoff(restarted), pending);
+  assert.equal(pendingPhaseHandoff({ threadId: 'fresh', contextHandoffs: [handoff] }), undefined);
+  assert.equal(
+    pendingPhaseHandoff({
+      threadId: 'old',
+      contextHandoffs: [{ ...pending, boundary: undefined }],
+    }),
+    undefined,
+  );
   assert.throws(
     () => phaseHandoffRequest({ ...request, id: 'other' }, checkpoint, [handoff]),
     /already/,

@@ -1,3 +1,4 @@
+import { pendingPhaseHandoff } from './context-handoff.ts';
 import type { ShipIssue, ShipRun } from './issue-shipping.ts';
 import { shipRunArchived } from './ship-archive.ts';
 import {
@@ -29,6 +30,9 @@ export function shipMergeRetryReason(issue: ShipIssue, now = Date.now()): string
 /** The first thing keeping a pull request from merging, in the order a user can fix it. */
 export function shipMergeBlocker(issue: ShipIssue, now = Date.now()): string | null {
   if (issue.state === 'merged') return 'Already merged.';
+  if (issue.checkpoint?.status === 'blocked')
+    return issue.checkpoint.blocker ?? 'The task checkpoint is blocked.';
+  if (pendingPhaseHandoff(issue)) return 'Waiting for the fresh phase worker to start.';
   if (!issue.pullRequest) return 'No pull request yet.';
   if (issue.pullRequestState !== 'OPEN') return 'The pull request is not open.';
   if (issue.mergeRequested && !shipMergeRetryReason(issue, now))

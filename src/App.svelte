@@ -209,6 +209,7 @@
     contextHandoffPrompt,
     phaseHandoffRequest,
     phaseHandoffPrompt,
+    pendingPhaseHandoff,
     contextPressureStage,
     parseContextHandoffThreshold,
     reconcileHandoffOutcomes,
@@ -3770,6 +3771,39 @@
     }
   }
 
+  async function startPhaseHandoff(run: ShipRun, issue: ShipIssue): Promise<void> {
+    const pending = pendingPhaseHandoff(issue);
+    if (
+      !pending ||
+      contextHandoffsInFlight.has(pending.id) ||
+      issue.checkpoint?.status === 'blocked' ||
+      issue.state !== 'working'
+    )
+      return;
+    try {
+      await handoffShipIssue(run, issue);
+    } catch (cause) {
+      const reason = `Phase handoff paused: ${describe(cause)}`;
+      await updateShipIssue(run, issue, {
+        blockedReason: reason,
+        error: reason,
+        ...(issue.checkpoint
+          ? {
+              checkpoint: updateTaskCheckpoint(
+                issue.checkpoint,
+                {
+                  status: 'blocked',
+                  blocker: reason,
+                  nextAction: 'Retry the pending phase handoff.',
+                },
+                Date.now(),
+              ),
+            }
+          : {}),
+      });
+    }
+  }
+
   function shippingPromptDispatchPending(issue: ShipIssue, key: string): boolean {
     const ownedThreads = new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])]);
     return (
@@ -5663,6 +5697,10 @@
           spawnReceipts.find((item) => item.receiptId === replacement.receiptId) ?? replacement;
       }
     }
+    if (issue.state === 'working' && pendingPhaseHandoff(issue)) {
+      await startPhaseHandoff(run, issue);
+      return;
+    }
     if (issue.state === 'failed') {
       const currentReceipt =
         receipt && !shippingWorkerSettled(receipt.state)
@@ -7230,22 +7268,7 @@
         });
         if (phaseHandoff)
           setTimeout(() => {
-            void handoffShipIssue(owner.run, owner.issue).catch(async (cause) => {
-              const reason = `Phase handoff paused: ${describe(cause)}`;
-              await updateShipIssue(owner.run, owner.issue, {
-                blockedReason: reason,
-                error: reason,
-                checkpoint: updateTaskCheckpoint(
-                  owner.issue.checkpoint ?? updated,
-                  {
-                    status: 'blocked',
-                    blocker: reason,
-                    nextAction: 'Retry the pending phase handoff.',
-                  },
-                  Date.now(),
-                ),
-              });
-            });
+            void startPhaseHandoff(owner.run, owner.issue);
           }, 0);
       } else if (!owner.issue.checkpoint) {
         await updateShipIssue(owner.run, owner.issue, { checkpoint });
