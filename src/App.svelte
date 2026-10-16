@@ -11300,6 +11300,14 @@
 
   if (import.meta.env.MODE === 'e2e') {
     Object.assign(window, {
+      __SAIL_E2E_SHIP_IDENTITY__: () => shippingInstanceId,
+      __SAIL_E2E_RESTORE_SHIP__: async () => {
+        const settings = await invoke<Record<string, string>>('load_settings');
+        const restored = loadShipRunStore(settings['sai-ship-runs'] ?? null);
+        shipRuns = restored.runs;
+        unparsedShipRuns = restored.unparsed;
+        await Promise.all(shipRuns.map((run) => refreshShippingRun(run)));
+      },
       __SAIL_E2E_SIDEBAR_INVENTORY_READY__: () =>
         agentDetectionSettled &&
         (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available) ||

@@ -28,6 +28,8 @@ const endpoint = args.find((arg) => arg.startsWith('repos/')) ?? '';
 const fixture = state();
 
 if (fixture.pulls) {
+  if (args[0] === 'api' && args.includes('--include') && args.includes('rate_limit'))
+    answer(`HTTP/2 200 OK\nDate: ${new Date().toUTCString()}\n\n{}`);
   if (args[0] === 'repo' && args[1] === 'view')
     answer({ nameWithOwner: fixture.repository ?? 'fixture/repo', isFork: false });
   if (args[0] === 'pr' && args[1] === 'list') {

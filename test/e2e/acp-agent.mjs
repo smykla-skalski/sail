@@ -457,6 +457,12 @@ for await (const line of createInterface({ input: process.stdin })) {
     authenticated = message.params.methodId === 'chat-gpt';
     send({ id: message.id, result: {} });
   } else if (message.method === 'session/new') {
+    const failNew = join(message.params.cwd, '.sail-e2e-fail-next-session');
+    if (existsSync(failNew)) {
+      unlinkSync(failNew);
+      send({ id: message.id, error: { code: -32000, message: 'Injected successor failure' } });
+      continue;
+    }
     if (!authenticated) {
       send({ id: message.id, error: { code: -32000, message: 'Authentication required' } });
       continue;
@@ -676,6 +682,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     sessions.get(sessionId).prompted = true;
     const text = message.params.prompt[0].text;
     const reportingFixture = sessions.get(sessionId);
+    if (text.startsWith('Continue the same Ship run as a fresh phase worker.'))
+      reportingFixture.reportingMode = 'recover';
     if (text.startsWith('Task reporting fixture:')) {
       reportingFixture.reportingMode = text.split(': ')[1];
       const guidance = message.params.prompt.some((part) =>
