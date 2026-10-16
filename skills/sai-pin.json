@@ -90,7 +90,7 @@
     "skills/ship-it/references/bootstrap.md": "446249e9612ae2568d027b803c3ad9c57fe090156d4d20a9d27a3b87518ab5ae",
     "skills/ship-it/scripts/plugin_pins.py": "b4515872bdb0f2bed304866b9caa628fb5906f2879f0e14f6baed660df27b72f",
     "skills/ship-it/scripts/test_plugin_pins.py": "5791e6b76719a5209fbdc8de1055d7367ed7192aee55d4cdf6418da3a057fcac",
-    "skills/ship-it/scripts/worker_recovery.py": "a8cdfee15468ed80bc07053650ba665bc27d1fbf8802ed1624b2a3dca6445fde"
+    "skills/ship-it/scripts/worker_recovery.py": "3356592274529c41c503b268af3416cbdd7d5c1dc5183df9aa7c7c837c57bde9"
   },
   "metadata": {
     "plugin.json": "plugins/ship-it/plugin.json"
@@ -193,7 +193,7 @@
       "path": "plugins/ship-it/skills/ship-it/scripts/test_plugin_pins.py"
     },
     "skills/ship-it/scripts/worker_recovery.py": {
-      "revision": "8a0dd5e9ab68777f8004b20fa76b4b1dbb8a43c3",
+      "revision": "d595c6ba323c98b27ca351d3fe38e0e322bf1157",
       "path": "plugins/ship-it/skills/ship-it/scripts/worker_recovery.py"
     }
   }

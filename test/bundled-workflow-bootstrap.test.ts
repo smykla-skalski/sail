@@ -158,12 +158,21 @@ void test('cold reference delivery retains a runnable complete package after sou
       { eventId: 'result-1', status: 'completed', checkpointPath: created.checkpoint },
       '2026-10-16T00:01:00Z',
     );
+    const awaitingDelivery = command('reconcile-workers', '--observation-json', {
+      at: '2026-10-16T00:01:30Z',
+    });
+    assert.equal(awaitingDelivery.workers[0].ownerHeld, true);
+    event(
+      'release-owner',
+      { hostStatus: 'done', observation: 'fixture native worker terminal event' },
+      '2026-10-16T00:02:00Z',
+    );
     const resumed = command('reconcile-workers', '--observation-json', {
       at: '2026-10-16T01:00:00Z',
     });
     assert.equal(resumed.workers[0].state, 'completed-but-undelivered');
     assert.equal(resumed.workers[0].deadlineExceeded, true);
-    assert.equal(resumed.workers[0].ownerHeld, true);
+    assert.equal(resumed.workers[0].ownerHeld, false);
     assert.equal(resumed.workers[0].result.eventId, 'result-1');
     event('acknowledge', { eventId: 'result-1' }, '2026-10-16T01:00:01Z');
     assert.equal(
