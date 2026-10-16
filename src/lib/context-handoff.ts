@@ -2,8 +2,8 @@ import { z } from 'zod';
 import type { TaskCheckpoint } from './task-checkpoint.ts';
 import type { SpawnReceipt } from './agent-results.ts';
 
-export const defaultContextHandoffThreshold = 85;
-export const contextCheckpointLead = 10;
+export const defaultContextHandoffThreshold = 100_000;
+export const contextCheckpointLead = 10_000;
 
 export type ContextProvider = 'claude' | 'codex' | 'opencode';
 
@@ -75,7 +75,7 @@ export function updateThreadContextPressure(
 
 export function parseContextHandoffThreshold(value: string | null): number {
   const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed >= 60 && parsed <= 95
+  return Number.isSafeInteger(parsed) && parsed >= 20_000 && parsed <= 10_000_000
     ? parsed
     : defaultContextHandoffThreshold;
 }
@@ -84,8 +84,13 @@ export function contextPressureStage(
   previous: number | undefined,
   current: number | undefined,
   threshold: number,
+  window?: number,
+  previousWindow?: number,
 ): 'checkpoint' | 'handoff' | null {
-  if (current === undefined || current < 0 || current > 100) return null;
+  if (current === undefined || !Number.isFinite(current) || current < 0) return null;
+  const effectiveThreshold = Math.min(threshold, window ?? threshold);
+  if (Math.min(threshold, previousWindow ?? threshold) !== effectiveThreshold) previous = undefined;
+  threshold = effectiveThreshold;
   const checkpoint = Math.max(1, threshold - contextCheckpointLead);
   if (current >= threshold && (previous === undefined || previous < threshold)) return 'handoff';
   if (current >= checkpoint && (previous === undefined || previous < checkpoint))

@@ -1297,7 +1297,7 @@
     ),
   });
   let contextHandoffThreshold = $state(
-    parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
+    parseContextHandoffThreshold(getSetting('sai-context-handoff-tokens')),
   );
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
@@ -2521,7 +2521,7 @@
         } else if (action.type === 'context-handoff-threshold') {
           const previousThreshold = contextHandoffThreshold;
           contextHandoffThreshold = parseContextHandoffThreshold(String(action.value));
-          setSetting('sai-context-handoff-threshold', String(contextHandoffThreshold));
+          setSetting('sai-context-handoff-tokens', String(contextHandoffThreshold));
           if (contextHandoffThreshold < previousThreshold)
             for (const run of shipRuns)
               for (const issue of run.issues)
@@ -2529,13 +2529,17 @@
                   issue.state === 'working' &&
                   issue.path &&
                   issue.threadId &&
-                  issue.contextPercent !== undefined &&
-                  issue.contextPercent < previousThreshold
+                  issue.contextTokens !== undefined &&
+                  issue.contextTokens < previousThreshold
                 )
                   void recordShipContextPressure(
                     issue.path,
                     issue.threadId,
-                    issue.contextPercent,
+                    {
+                      context: issue.contextPercent,
+                      contextTokens: issue.contextTokens,
+                      contextWindow: issue.contextWindow,
+                    },
                     Math.max(0, contextHandoffThreshold - contextCheckpointLead - 1),
                   ).catch((cause) => (error = describe(cause)));
         } else if (action.type === 'resource-limit') {
@@ -3204,24 +3208,33 @@
   async function recordShipContextPressure(
     path: string,
     threadId: string,
-    context: number | undefined,
+    usage: AgentUsage,
     previousContext?: number,
   ): Promise<void> {
     const owner = shipCheckpointOwner(shipRuns, path, threadId);
-    if (!owner || context === undefined) return;
+    const { context, contextTokens } = usage;
+    if (!owner || context === undefined || contextTokens === undefined) return;
     const primary = owner.issue.threadId === threadId;
     const pressure = updateThreadContextPressure(
-      owner.issue.contextPercentByThread,
+      owner.issue.contextTokensByThread,
       threadId,
-      context,
+      contextTokens,
       owner.issue.threadId ?? undefined,
     );
     const previous =
-      previousContext ?? pressure.previous ?? (primary ? owner.issue.contextPercent : undefined);
-    const stage = contextPressureStage(previous, context, contextHandoffThreshold);
+      previousContext ?? pressure.previous ?? (primary ? owner.issue.contextTokens : undefined);
+    const stage = contextPressureStage(
+      previous,
+      contextTokens,
+      contextHandoffThreshold,
+      usage.contextWindow,
+      primary ? owner.issue.contextWindow : undefined,
+    );
     const changes: Partial<ShipIssue> = {
-      contextPercentByThread: pressure.contexts,
-      ...(primary ? { contextPercent: context } : {}),
+      contextTokensByThread: pressure.contexts,
+      ...(primary
+        ? { contextPercent: context, contextTokens, contextWindow: usage.contextWindow }
+        : {}),
     };
     if (!primary) {
       await updateShipIssue(owner.run, owner.issue, changes);
@@ -3246,7 +3259,7 @@
         id: crypto.randomUUID(),
         target: coordinationKey(path, threadId),
         sender: 'Sail · context guard',
-        text: `Context reached ${context}%. Update the canonical task checkpoint now, before the ${contextHandoffThreshold}% handoff threshold. Record the current revision, semantic state, pending gates, blockers, and one concrete next action.`,
+        text: `Context reached ${contextTokens.toLocaleString('en-US')} tokens (${context}% of the provider-reported ${usage.contextWindow?.toLocaleString('en-US') ?? 'unknown'}-token window). Update the canonical task checkpoint now, before the ${Math.min(contextHandoffThreshold, usage.contextWindow ?? contextHandoffThreshold).toLocaleString('en-US')}-token handoff threshold. Record the current revision, semantic state, pending gates, blockers, and one concrete next action.`,
         created: Date.now(),
       });
       setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
@@ -3657,6 +3670,8 @@
                     : item,
               ),
               contextPercent: undefined,
+              contextTokens: undefined,
+              contextWindow: undefined,
               handoffRecoveryRequired: false,
               state: 'working',
               blockedReason: null,
@@ -3732,6 +3747,8 @@
                 : item,
             ),
             contextPercent: undefined,
+            contextTokens: undefined,
+            contextWindow: undefined,
             handoffRecoveryRequired: dispatchAction === 'inspect',
             state: 'working',
             error:
@@ -5687,6 +5704,8 @@
               : handoff,
           ),
           contextPercent: undefined,
+          contextTokens: undefined,
+          contextWindow: undefined,
           handoffRecoveryRequired: dispatchAction === 'inspect',
           error: dispatchAction === 'inspect' ? replacementInspectionError : null,
           refreshError: null,
@@ -7802,6 +7821,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
+        ...(report.tokenCost ? { tokenCost: report.tokenCost } : {}),
         ...shipWorkerProgressChanges(report.status, report.reason),
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
@@ -13715,7 +13735,7 @@
               item.directory === eventDirectory,
           );
           for (const thread of matchingThreads) {
-            nextUsage[threadKey(thread)] = { context: usage.context };
+            nextUsage[threadKey(thread)] = usage;
           }
           agentUsage = nextUsage;
           const matchingThread = matchingThreads[0];
@@ -13723,7 +13743,7 @@
             void recordShipContextPressure(
               matchingThread.directory,
               `acp:${event.agent}:${sessionId}`,
-              usage.context,
+              usage,
             ).catch((cause) => (error = describe(cause)));
         }
         const updateKind =

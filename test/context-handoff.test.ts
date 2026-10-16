@@ -15,18 +15,25 @@ import {
 } from '../src/lib/context-handoff.ts';
 import { initialTaskCheckpoint } from '../src/lib/task-checkpoint.ts';
 
-void test('validates the configured context threshold', () => {
-  assert.equal(parseContextHandoffThreshold('80'), 80);
-  assert.equal(parseContextHandoffThreshold('59'), 85);
-  assert.equal(parseContextHandoffThreshold('96'), 85);
-  assert.equal(parseContextHandoffThreshold('not-a-number'), 85);
+void test('validates an absolute token threshold without interpreting old percentages as tokens', () => {
+  assert.equal(parseContextHandoffThreshold('80000'), 80_000);
+  for (const value of ['85', '19999', '10000001', '-1', '1.5', 'not-a-number', '', null])
+    assert.equal(parseContextHandoffThreshold(value), 100_000);
 });
 
-void test('emits checkpoint and handoff stages only when thresholds are crossed', () => {
-  assert.equal(contextPressureStage(70, 75, 85), 'checkpoint');
-  assert.equal(contextPressureStage(75, 84, 85), null);
-  assert.equal(contextPressureStage(84, 85, 85), 'handoff');
-  assert.equal(contextPressureStage(90, 91, 85), null);
+void test('emits checkpoint and handoff stages only when absolute thresholds are crossed', () => {
+  assert.equal(contextPressureStage(89_999, 90_000, 100_000), 'checkpoint');
+  assert.equal(contextPressureStage(90_000, 99_999, 100_000), null);
+  assert.equal(contextPressureStage(99_999, 100_000, 100_000), 'handoff');
+  assert.equal(contextPressureStage(100_000, 110_000, 100_000), null);
+  for (const invalid of [-1, Infinity, NaN, undefined])
+    assert.equal(contextPressureStage(undefined, invalid, 100_000), null);
+});
+
+void test('respects a smaller reported window and reevaluates model window changes', () => {
+  assert.equal(contextPressureStage(79_999, 80_000, 100_000, 80_000, 80_000), 'handoff');
+  assert.equal(contextPressureStage(85_000, 85_000, 100_000, 80_000, 200_000), 'handoff');
+  assert.equal(contextPressureStage(99_999, 100_000, 100_000, 1_000_000, 1_000_000), 'handoff');
 });
 
 void test('records pressure even when live usage already contains the same sample', async () => {

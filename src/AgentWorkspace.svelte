@@ -118,7 +118,7 @@
   } from './lib/acp';
   import { loadOwnedTranscript, ownedTranscriptKey } from './lib/owned-transcripts';
   import type { ThreadStatus } from './lib/attention';
-  import type { AgentUsage } from './lib/agent-usage';
+  import { contextUsageLabel, type AgentUsage } from './lib/agent-usage';
   import type { SpawnReceipt } from './lib/agent-results';
   import { withAutomaticMemoryRecall } from './lib/memory-recall';
   import {
@@ -2824,7 +2824,11 @@
     <div class="agent-heading">
       <HarnessIcon {agent} /><strong>{name}</strong><span>{thread?.title ?? 'New thread'}</span>
     </div>
-    {#if usage?.context !== undefined}<span class="agent-usage">Context {usage.context}%</span>{/if}
+    {#if usage}<span
+        class="agent-usage"
+        title="Percentage of this thread’s provider-reported context window"
+        >{contextUsageLabel(usage)}</span
+      >{/if}
     {#each usage?.rates ?? [] as rate (rate.label)}<span class="agent-usage"
         >{rate.label} {rate.remaining}% left</span
       >{/each}
@@ -3170,6 +3174,8 @@
   }
   .agent-header {
     display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-8);
     align-items: center;
     justify-content: space-between;
     padding: 14px 24px;
@@ -3182,15 +3188,17 @@
   }
   .agent-header .agent-heading {
     min-width: 0;
-    flex: 1;
+    flex: 1 1 12rem;
   }
   .agent-heading strong {
     flex: none;
   }
   .agent-header .agent-usage {
     flex: none;
+    max-width: 100%;
     font-size: var(--type-12);
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .agent-header span {
     opacity: 0.65;

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { costPhases, tokenCostLabel } from './lib/ship-token-cost.ts';
   import { SvelteMap } from 'svelte/reactivity';
   import ActivityStatus from './ActivityStatus.svelte';
   import ShipActions from './ShipActions.svelte';
@@ -418,6 +419,7 @@
       /></span
     >
     <span class="ship-line" data-kind={line.kind}>{line.text}</span>
+    <span class="ship-muted">Token cost: {tokenCostLabel(entry.issue.tokenCost?.total)}</span>
   </button>
 {/snippet}
 
@@ -825,6 +827,25 @@
                 </ol>
               </details>{/if}
           </section>
+          <section aria-label="Weighted token cost" class="ship-token-cost">
+            <h4>Weighted token cost</h4>
+            <p>{tokenCostLabel(issue.tokenCost?.total)}</p>
+            <p class="ship-muted">
+              Estimated from reported host usage and billing prices. Missing usage or prices remain
+              unknown.
+            </p>
+            <details>
+              <summary>Cost by phase</summary>
+              <dl>
+                {#each costPhases as phase (phase)}
+                  <div>
+                    <dt>{phase}</dt>
+                    <dd>{tokenCostLabel(issue.tokenCost?.by_phase[phase])}</dd>
+                  </div>
+                {/each}
+              </dl>
+            </details>
+          </section>
           <h4>Accepted-task economics</h4>
           <p class:ship-error={!economics.accepted}>
             {economics.accepted
@@ -943,6 +964,21 @@
 </div>
 
 <style>
+  .ship-token-cost dl {
+    margin: 0.5rem 0;
+  }
+  .ship-token-cost dl > div {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+    justify-content: space-between;
+    padding: 0.25rem 0;
+  }
+  .ship-token-cost dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+
   .ship-panel {
     box-sizing: border-box;
     height: 100%;

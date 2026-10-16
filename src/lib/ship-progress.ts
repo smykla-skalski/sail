@@ -1,3 +1,4 @@
+import { shipTokenCostSchema } from './ship-token-cost.ts';
 import { z } from 'zod';
 import {
   defaultMergeOwner,
@@ -219,6 +220,7 @@ const reportSchema = z.union([
     .object({
       stage: z.enum(stages),
       status: z.enum(['running', 'blocked']),
+      tokenCost: shipTokenCostSchema.optional(),
       reason: z.string().max(2000).optional(),
     })
     .strict(),
@@ -1585,12 +1587,16 @@ const shipIssueSchema = z.object({
   contextCheckpointRequestedSequence: z.number().int().nonnegative().optional(),
   contextHandoffOfferedAt: z.number().int().nonnegative().optional(),
   contextHandoffOfferedSequence: z.number().int().nonnegative().optional(),
+  contextTokens: z.number().nonnegative().finite().optional(),
+  contextWindow: z.number().positive().finite().optional(),
+  contextTokensByThread: z.record(z.string().min(1), z.number().nonnegative().finite()).optional(),
   contextPercent: z.number().min(0).max(100).optional(),
   contextPercentByThread: z.record(z.string().min(1), z.number().min(0).max(100)).optional(),
   handoffRecoveryRequired: z.boolean().optional(),
   retryCount: z.number().int().nonnegative().optional(),
   lostStateFailures: z.number().int().nonnegative().optional(),
   evidenceManifests: evidenceManifestsSchema.optional(),
+  tokenCost: shipTokenCostSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
   validationPolicyRequired: z.boolean().default(true),

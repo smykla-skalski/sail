@@ -1,5 +1,16 @@
 export type RateWindow = { label: string; remaining: number; resetsAt?: number };
-export type AgentUsage = { context?: number; rates?: RateWindow[] };
+export type AgentUsage = {
+  context?: number;
+  contextTokens?: number;
+  contextWindow?: number;
+  rates?: RateWindow[];
+};
+
+export function contextUsageLabel(usage: AgentUsage): string {
+  return usage.contextWindow === undefined
+    ? 'Context window unknown'
+    : `Context ${usage.context ?? 0}% · ${usage.contextTokens?.toLocaleString('en-US')} / ${usage.contextWindow.toLocaleString('en-US')} tokens`;
+}
 
 function percentage(used: unknown, size: unknown): number | undefined {
   if (
@@ -44,9 +55,14 @@ export function acpUsage(update: unknown, previous: AgentUsage = {}): AgentUsage
   const data = record(update);
   if (data?.sessionUpdate !== 'usage_update') return null;
   const context = percentage(data.used, data.size);
+  const contextUsage = {
+    context,
+    contextTokens: context !== undefined && typeof data.used === 'number' ? data.used : undefined,
+    contextWindow: context !== undefined && typeof data.size === 'number' ? data.size : undefined,
+  };
   const metadata = record(data['_meta']);
   const rate = record(metadata?.['_claude/rateLimit']);
-  if (!rate) return { ...previous, context };
+  if (!rate) return { ...previous, ...contextUsage };
   const windows = record(rate.unifiedWindows);
   const rates: RateWindow[] = [];
   for (const [key, label] of [
@@ -63,5 +79,5 @@ export function acpUsage(update: unknown, previous: AgentUsage = {}): AgentUsage
     const window = rateWindow(rate.rateLimitType === 'five_hour' ? '5h' : '7d', rate);
     if (window) rates.push(window);
   }
-  return { context, rates };
+  return { ...contextUsage, rates };
 }
