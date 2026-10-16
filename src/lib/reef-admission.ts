@@ -1,7 +1,17 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { AdmissionProvider } from './resource-queue.ts';
 
 export const reefAdmissionSettingKey = 'sai-reef-admission-enabled';
+
+let startupEnabled = false;
+
+export async function initializeReefAdmission(): Promise<void> {
+  startupEnabled = isTauri() ? await invoke<boolean>('reef_admission_mode') : false;
+}
+
+export function reefAdmissionStartupEnabled(): boolean {
+  return startupEnabled;
+}
 
 type AdmissionStatus = { state: 'checking' | 'queued' | 'granted' | 'failed'; reason: string };
 

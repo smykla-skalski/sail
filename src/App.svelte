@@ -560,8 +560,7 @@
     trackSettingsMutation,
   } from './lib/settings';
   import { parseReefCanaryPercent, reefCanarySettingKey } from './lib/reef-canary';
-  import { reefAdmissionSettingKey } from './lib/reef-admission';
-  import { setReefAdmissionEnabled } from './lib/resource-limits';
+  import { reefAdmissionSettingKey, reefAdmissionStartupEnabled } from './lib/reef-admission';
   import {
     defaultResourceLimits,
     isCheckingMachinePressure,
@@ -2292,6 +2291,7 @@
       backgroundPriorityEnabled,
       reefCanaryPercent,
       reefAdmissionEnabled,
+      reefAdmissionEffective: reefAdmissionStartupEnabled(),
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
@@ -2503,7 +2503,6 @@
         } else if (action.type === 'reef-admission') {
           reefAdmissionEnabled = action.value;
           setSetting(reefAdmissionSettingKey, String(action.value));
-          setReefAdmissionEnabled(action.value);
         } else if (action.type === 'reef-canary-percent') {
           if (
             action.value === null ||

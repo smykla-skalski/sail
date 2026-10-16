@@ -12,6 +12,7 @@ import {
 import { migrateOpenCodeSettings } from './lib/opencode-migration';
 import { installFrontendDiagnostics, recordDiagnostic } from './lib/diagnostics';
 import { installScrollbarVisibility } from './lib/scrollbars';
+import { initializeReefAdmission } from './lib/reef-admission';
 import { installThemeTransitionGuard } from './lib/theme-transitions';
 
 installFrontendDiagnostics();
@@ -86,6 +87,7 @@ async function start() {
     mount(SettingsWindow, { target: document.getElementById('root')! });
   } else {
     await initializeSettings();
+    await initializeReefAdmission();
     migrateOpenCodeSettings({
       get: getSetting,
       set: setSetting,

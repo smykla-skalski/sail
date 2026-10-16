@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting } from './settings.ts';
 import { ResourceQueue } from './resource-queue.ts';
-import { reefAdmission, reefAdmissionSettingKey } from './reef-admission.ts';
+import { reefAdmission, reefAdmissionStartupEnabled } from './reef-admission.ts';
 import {
   defaultPressureThresholds,
   parsePressureThreshold,
@@ -45,8 +45,7 @@ let timer: ReturnType<typeof setInterval> | null = null;
 let refreshing = false;
 let updatingReason = false;
 let readingGeneration = 0;
-let reefEnabled =
-  typeof localStorage !== 'undefined' && getSetting(reefAdmissionSettingKey) === 'true';
+let reefEnabled = reefAdmissionStartupEnabled();
 
 function checkNewWork(): void {
   readingGeneration++;

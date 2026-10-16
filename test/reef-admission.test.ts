@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setImmediate } from 'node:timers/promises';
-import { reefAdmission } from '../src/lib/reef-admission.ts';
+import {
+  initializeReefAdmission,
+  reefAdmission,
+  reefAdmissionStartupEnabled,
+} from '../src/lib/reef-admission.ts';
 
 void test('unavailable Reef keeps work queued and retries into admission', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -91,6 +95,41 @@ void test('cancelling queued admission releases the backend and stops retries', 
     assert.equal(requests, 1);
     assert.ok(releases >= 1);
   } finally {
+    if (original) Object.defineProperty(globalThis, 'window', original);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
+
+void test('admission uses the process startup policy until a real restart', async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const originalTauri = Object.getOwnPropertyDescriptor(globalThis, 'isTauri');
+  Object.defineProperty(globalThis, 'isTauri', { configurable: true, value: true });
+  let processMode = true;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          assert.equal(command, 'reef_admission_mode');
+          return processMode;
+        },
+      },
+    },
+  });
+  try {
+    await initializeReefAdmission();
+    assert.equal(reefAdmissionStartupEnabled(), true);
+    // Saving a pending preference cannot change this process's active policy.
+    assert.equal(reefAdmissionStartupEnabled(), true);
+    // A webview reload reads the same process mode, not the pending preference.
+    await initializeReefAdmission();
+    assert.equal(reefAdmissionStartupEnabled(), true);
+    processMode = false;
+    await initializeReefAdmission();
+    assert.equal(reefAdmissionStartupEnabled(), false);
+  } finally {
+    if (originalTauri) Object.defineProperty(globalThis, 'isTauri', originalTauri);
+    else Reflect.deleteProperty(globalThis, 'isTauri');
     if (original) Object.defineProperty(globalThis, 'window', original);
     else Reflect.deleteProperty(globalThis, 'window');
   }

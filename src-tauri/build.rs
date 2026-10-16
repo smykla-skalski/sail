@@ -35,6 +35,7 @@ fn main() {
             "send_test_tab",
             "load_settings",
             "machine_pressure",
+            "reef_admission_mode",
             "reef_admission_request",
             "reef_admission_status",
             "reef_admission_release",

@@ -4724,6 +4724,10 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|_app| {
+            _app.manage(reef_admission::StartupMode(
+                settings::string_setting(_app.handle(), "sai-reef-admission-enabled")?.as_deref()
+                    == Some("true"),
+            ));
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
@@ -4815,6 +4819,7 @@ pub fn run() {
             settings::migrate_settings,
             settings::save_setting,
             machine_pressure::machine_pressure,
+            reef_admission::reef_admission_mode,
             reef_admission::reef_admission_request,
             reef_admission::reef_admission_status,
             reef_admission::reef_admission_release,

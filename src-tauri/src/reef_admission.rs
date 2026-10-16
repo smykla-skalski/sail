@@ -4,6 +4,13 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub struct StartupMode(pub bool);
+
+#[tauri::command]
+pub fn reef_admission_mode(mode: tauri::State<'_, StartupMode>) -> bool {
+    mode.0
+}
+
 #[derive(Clone, Serialize)]
 pub struct AdmissionStatus {
     state: String,

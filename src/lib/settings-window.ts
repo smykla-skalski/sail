@@ -34,6 +34,7 @@ export type SettingsSnapshot = {
   backgroundPriorityEnabled: boolean;
   reefCanaryPercent: number | null;
   reefAdmissionEnabled: boolean;
+  reefAdmissionEffective: boolean;
   agentStatusEnabled: boolean;
   agentThreadListEnabled: boolean;
   agentMessagesEnabled: boolean;

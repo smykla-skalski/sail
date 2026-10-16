@@ -1264,7 +1264,16 @@
         </label>
         <p class="settings-help">
           Requires Reef external admission v1 and a running scheduler. Queued work waits for Reef;
-          running work continues. Sail's machine-pressure thresholds apply when this is disabled.
+          running work continues. Restart Sail to apply changes. Sail's machine-pressure thresholds
+          apply when admission is disabled at startup. Adapter command canary is suspended while
+          turn admission is active; its saved percentage is preserved.
+        </p>
+        <p class="settings-help" role="status">
+          Active this run: {snapshot?.reefAdmissionEffective
+            ? 'Reef admission'
+            : 'local pressure'}.{#if snapshot?.reefAdmissionEnabled !== snapshot?.reefAdmissionEffective}
+            Restart Sail to apply the saved admission setting.
+          {/if}
         </p>
         <label class="attention-setting">
           <input
