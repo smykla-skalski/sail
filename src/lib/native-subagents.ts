@@ -337,7 +337,10 @@ export function updateNativeSubagents(
         ...(previous?.toolIds ? { toolIds: previous.toolIds } : {}),
         created: previous?.created ?? now,
         updated: now,
-        restored: previous?.restored || replayed,
+        restored:
+          typeof params?.sailHistoricalActivity === 'boolean'
+            ? replayed
+            : previous?.restored || replayed,
         taskIdentity: previous?.taskIdentity ?? 'observed',
         taskTurnId: previous?.taskTurnId ?? null,
         capabilityProfile: replayed

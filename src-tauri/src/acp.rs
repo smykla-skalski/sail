@@ -5515,6 +5515,11 @@ fn historical_native_activity_message(runtime: &Connection, mut message: Value) 
                 .native_replay_update(parent, update)
                 .unwrap_or(false)
         });
+    let child_tool_marker = message.pointer("/params/update").is_some_and(|update| {
+        update.get("subagent").and_then(Value::as_bool) == Some(true)
+            || (runtime.agent == "claude" && claude_adapter_subagent_signature(update))
+    }) || (runtime.agent == "codex"
+        && codex_native_activity_update(&message, runtime.owner.as_deref()).is_some());
     if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
         params.insert("sailHistoricalActivity".into(), historical.into());
         if historical {
@@ -5536,8 +5541,7 @@ fn historical_native_activity_message(runtime: &Connection, mut message: Value) 
                                 .filter(|replay| replay.sessions.contains(session))
                                 .any(|replay| {
                                     let key = (session.to_string(), tool.to_string());
-                                    if update.get("subagent").and_then(Value::as_bool) == Some(true)
-                                    {
+                                    if child_tool_marker {
                                         replay.historical_tools.insert(key.clone());
                                     }
                                     replay.historical_tools.contains(&key)
@@ -12860,6 +12864,64 @@ mod native_subagent_fence_tests {
         let children = native.lock().unwrap();
         assert!(children.0["child"].task_turn_id.is_none());
         assert_eq!(children.0["child"].outcome, "unknown");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replayed_adapter_child_tool_signatures_are_offline() {
+        for agent in ["claude", "codex"] {
+            let runtime = super::session_config_tests::test_runtime(
+                agent,
+                CapabilityProfile::Build,
+                Path::new("/repo"),
+                "parent",
+                None,
+            );
+            runtime.native_replays.lock().unwrap().insert(
+                7,
+                NativeReplay {
+                    historical_tools: HashSet::new(),
+                    sessions: HashSet::from(["parent".into()]),
+                    live_children: HashMap::new(),
+                },
+            );
+            let update = if agent == "claude" {
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"adapter-child",
+                    "rawInput":{"subagent_type":"general-purpose","run_in_background":false},
+                    "_meta":{"claudeCode":{"toolName":"Agent"}}})
+            } else {
+                json!({"sessionUpdate":"tool_call","toolCallId":"adapter-child","status":"pending",
+                    "title":"Start subagent reviewer",
+                    "rawInput":{"activityKind":"started","agentThreadId":"child","agentPath":"reviewer"}})
+            };
+            let historical = historical_native_activity_message(
+                &runtime,
+                json!({"method":"session/update","params":{"sessionId":"parent","update":update}}),
+            );
+            assert_eq!(historical["params"]["update"]["status"], "unavailable");
+            for status in ["in_progress", "completed", "failed"] {
+                let later = historical_native_activity_message(
+                    &runtime,
+                    json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                        "sessionUpdate":"tool_call_update","toolCallId":"adapter-child","status":status
+                    }}}),
+                );
+                assert_eq!(
+                    later["params"]["update"]["status"],
+                    if status == "in_progress" {
+                        "unavailable"
+                    } else {
+                        status
+                    }
+                );
+            }
+            assert!(runtime
+                .native_subagents
+                .lock()
+                .unwrap()
+                .task_connections()
+                .is_empty());
+        }
     }
 
     #[test]

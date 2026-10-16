@@ -631,6 +631,21 @@ await test('backend-confirmed live children stay active during a concurrent rest
   }
 });
 
+await test('authoritative live provenance replaces a prior historical marker', () => {
+  for (const agent of ['codex', 'claude', 'opencode'] as const) {
+    const historical = { ...spawnEvent('root', 'child'), agent };
+    historical.message.params = { ...historical.message.params, sailHistoricalActivity: true };
+    let store = updateNativeSubagents({}, historical, '/repo', 1, true);
+    store = finalizeNativeSubagentRestore(store, agent, '/repo', 'root', 2);
+    const live = { ...spawnEvent('root', 'child'), agent };
+    live.message.params = { ...live.message.params, sailHistoricalActivity: false };
+    store = updateNativeSubagents(store, live, '/repo', 3, true);
+    assert.equal(store[nativeSubagentId(agent, '/repo', 'child')].restored, false);
+    assert.equal(finalizeNativeSubagentRestore(store, agent, '/repo', 'root', 4), store);
+    assert.equal(nativeSubagentCounts(store, agent, 'root').active, 1);
+  }
+});
+
 await test('a first replay still restores historical children', () => {
   const restored = updateNativeSubagents(
     {},
