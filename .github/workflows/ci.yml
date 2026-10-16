@@ -28,15 +28,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
 
       - name: Check Rust paths
         id: detect
         shell: bash
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          if git diff --quiet "$BASE_SHA" HEAD -- src-tauri; then
+          # The event base can predate the base used to generate the merge ref.
+          git rev-parse --verify HEAD^2 > /dev/null
+          if git diff --quiet HEAD^1 HEAD -- src-tauri; then
             echo 'rust=false' >> "$GITHUB_OUTPUT"
           else
             echo 'rust=true' >> "$GITHUB_OUTPUT"
