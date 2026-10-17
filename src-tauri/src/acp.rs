@@ -192,6 +192,7 @@ impl NativeSubagentRegistry {
         }
         entry.outcome = match outcome {
             "completed" | "failed" | "working" | "interrupted" => outcome,
+            "errored" => "failed",
             "cancelled" => "interrupted",
             _ => "unknown",
         }
@@ -5184,6 +5185,70 @@ fn codex_native_activity_update(message: &Value, owner: Option<&str>) -> Option<
     Some(json!({"method":"session/update","params":{"sessionId":parent,"update":update}}))
 }
 
+fn codex_native_state_updates(
+    message: &Value,
+    owner: Option<&str>,
+    registered: impl Fn(&str, &str) -> bool,
+) -> Vec<Value> {
+    let Some(parent) = message.pointer("/params/sessionId").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(update) = message.pointer("/params/update") else {
+        return Vec::new();
+    };
+    if message.get("method").and_then(Value::as_str) != Some("session/update")
+        || !matches!(
+            update.get("sessionUpdate").and_then(Value::as_str),
+            Some("tool_call" | "tool_call_update")
+        )
+        || !matches!(
+            update.get("title").and_then(Value::as_str),
+            Some(
+                "spawnAgent"
+                    | "wait"
+                    | "waitAgent"
+                    | "closeAgent"
+                    | "resumeAgent"
+                    | "sendInput"
+                    | "followupTask"
+            )
+        )
+    {
+        return Vec::new();
+    }
+    let Some(states) = update
+        .get("rawInput")
+        .or_else(|| update.get("input"))
+        .and_then(|input| input.get("agentsStates"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    states
+        .iter()
+        .filter_map(|(wire_child, state)| {
+            let state = match state.get("status").and_then(Value::as_str)? {
+                "completed" => "completed",
+                "errored" | "shutdown" | "notFound" => "failed",
+                "interrupted" => "cancelled",
+                _ => return None,
+            };
+            let child = owner
+                .map(|owner| owned_session_id(owner, wire_child))
+                .unwrap_or_else(|| wire_child.clone());
+            let child = session_profile(parent)
+                .0
+                .map(|profile| profile_session_id(profile, &child))
+                .unwrap_or(child);
+            registered(parent, &child).then(|| json!({
+            "method":"session/update", "params":{"sessionId":parent,"update":{
+                "sessionUpdate":"subagent_state_update", "subagentSessionId":child, "state":state
+            }}
+        }))
+        })
+        .collect()
+}
+
 fn claude_native_activity_update(
     message: &Value,
     registered: impl FnOnce(&str, &str) -> bool,
@@ -5758,7 +5823,11 @@ fn record_native_subagent_update(
             }
             let generation = fence.generations.entry(directory.clone()).or_default();
             *generation = generation.saturating_add(1);
-            if matches!(outcome, "completed" | "failed" | "cancelled") {
+            if native
+                .0
+                .get(child_id)
+                .is_some_and(|child| !NativeSubagentRegistry::is_live(child))
+            {
                 // History can complete and revive a child that is still running.
                 if !runtime.replaying_live_child(parent_id, child_id) {
                     app.state::<crate::browser_agent::BrowserManager>()
@@ -7071,8 +7140,22 @@ fn connect_blocking_inner(
                 }
             }
             if agent_id == "codex" {
-                if let Some(mut normalized) =
+                let states = codex_native_state_updates(
+                    &message,
+                    reader.owner.as_deref(),
+                    |parent, child| {
+                        reader.native_subagents.lock().is_ok_and(|native| {
+                            native
+                                .0
+                                .get(child)
+                                .is_some_and(|entry| entry.parent_session_id == parent)
+                        })
+                    },
+                );
+                for mut normalized in
                     codex_native_activity_update(&message, reader.owner.as_deref())
+                        .into_iter()
+                        .chain(states)
                 {
                     if let Some(params) =
                         normalized.get_mut("params").and_then(Value::as_object_mut)
@@ -13483,8 +13566,71 @@ mod native_subagent_fence_tests {
     }
 
     #[test]
+    fn codex_error_observations_settle_only_registered_children() {
+        for (status, expected) in [
+            ("errored", "failed"),
+            ("shutdown", "failed"),
+            ("notFound", "failed"),
+            ("completed", "completed"),
+            ("interrupted", "interrupted"),
+        ] {
+            let mut registry = NativeSubagentRegistry::default();
+            registry
+                .spawn("parent", "child", PathBuf::from("/repo"), false)
+                .unwrap();
+            registry
+                .spawn("parent", "live", PathBuf::from("/repo"), false)
+                .unwrap();
+            let message = json!({"method":"session/update","params":{"sessionId":"parent","update":{
+                "sessionUpdate":"tool_call", "title":"wait", "status":"completed",
+                "rawInput":{"agentsStates":{"child":{"status":status},"live":{"status":"running"},"foreign":{"status":"errored"}}}
+            }}});
+            let updates = codex_native_state_updates(&message, None, |parent, child| {
+                registry
+                    .0
+                    .get(child)
+                    .is_some_and(|entry| entry.parent_session_id == parent)
+            });
+            assert_eq!(updates.len(), 1, "{status}");
+            let update = &updates[0]["params"]["update"];
+            registry
+                .update(
+                    "parent",
+                    update["subagentSessionId"].as_str().unwrap(),
+                    update["state"].as_str().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(registry.0["child"].outcome, expected);
+            assert!(!registry.task_connections().contains_key("child"));
+            assert!(registry.task_connections().contains_key("live"));
+        }
+    }
+
+    #[test]
+    fn codex_child_error_observations_respect_owner_and_profile() {
+        let message = |title: &str| {
+            json!({"method":"session/update","params":{"sessionId":profile_session_id(CapabilityProfile::Build, &owned_session_id("owner", "parent")),"update":{
+                "sessionUpdate":"tool_call_update", "title":title,
+                "rawInput":{"agentsStates":{"child":{"status":"errored"}}}
+            }}})
+        };
+        let child = profile_session_id(
+            CapabilityProfile::Build,
+            &owned_session_id("owner", "child"),
+        );
+        let registered = |_: &str, id: &str| id == child;
+        let updates = codex_native_state_updates(&message("wait"), Some("owner"), registered);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["params"]["update"]["subagentSessionId"], child);
+        assert!(
+            codex_native_state_updates(&message("shell"), Some("owner"), registered).is_empty()
+        );
+        assert!(codex_native_state_updates(&message("wait"), Some("other"), registered).is_empty());
+    }
+
+    #[test]
     fn settled_children_do_not_restrict_restored_parent_tasks() {
-        for outcome in ["completed", "failed", "cancelled"] {
+        for outcome in ["completed", "failed", "errored", "cancelled", "interrupted"] {
             let mut registry = NativeSubagentRegistry::default();
             registry
                 .spawn("parent", "child", PathBuf::from("/repo"), false)
