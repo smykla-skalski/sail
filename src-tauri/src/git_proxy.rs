@@ -9,6 +9,64 @@ const ROUTING: [&str; 4] = [
     "GIT_INDEX_FILE",
 ];
 
+fn environment(command: &Command, name: &str) -> Option<OsString> {
+    command
+        .get_envs()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.map(OsStr::to_os_string))
+        .unwrap_or_else(|| std::env::var_os(name))
+}
+
+#[cfg(unix)]
+fn publish_startup(path: &Path, script: &str) -> Result<(), String> {
+    let temporary = path.with_extension(uuid::Uuid::new_v4().to_string());
+    std::fs::write(&temporary, script).map_err(|error| error.to_string())?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_shells(command: &mut Command, bin: &Path) -> Result<(), String> {
+    let startup = bin.join("zsh");
+    std::fs::create_dir_all(&startup).map_err(|error| error.to_string())?;
+    let original = environment(command, "ZDOTDIR");
+    if original.as_deref() != Some(startup.as_os_str()) {
+        let home = environment(command, "HOME").ok_or("Cannot find the session home directory.")?;
+        command.env("SAIL_GIT_USER_ZDOTDIR", original.unwrap_or(home));
+    }
+    for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"] {
+        let script = format!(
+            r#"_sail_git_startup=$ZDOTDIR
+ZDOTDIR=$SAIL_GIT_USER_ZDOTDIR
+if [ -r "$ZDOTDIR/{name}" ]; then . "$ZDOTDIR/{name}"; fi
+export SAIL_GIT_USER_ZDOTDIR="${{ZDOTDIR:-$HOME}}"
+export ZDOTDIR=$_sail_git_startup
+unset _sail_git_startup
+case "$PATH" in "$SAIL_GIT_BIN"|"$SAIL_GIT_BIN":*) ;; *) export PATH="$SAIL_GIT_BIN:$PATH" ;; esac
+"#
+        );
+        publish_startup(&startup.join(name), &script)?;
+    }
+    command.env("ZDOTDIR", startup);
+    let bash_env = bin.join("bash-env");
+    let original = environment(command, "BASH_ENV");
+    if original.as_deref() != Some(bash_env.as_os_str()) {
+        command.env("SAIL_GIT_USER_BASH_ENV", original.unwrap_or_default());
+    }
+    publish_startup(
+        &bash_env,
+        r#"if [ -n "$SAIL_GIT_USER_BASH_ENV" ] && [ -r "$SAIL_GIT_USER_BASH_ENV" ]; then . "$SAIL_GIT_USER_BASH_ENV"; fi
+case "$PATH" in "$SAIL_GIT_BIN"|"$SAIL_GIT_BIN":*) ;; *) export PATH="$SAIL_GIT_BIN:$PATH" ;; esac
+"#,
+    )?;
+    command.env("BASH_ENV", bash_env);
+    command.env("SAIL_GIT_BIN", bin);
+    Ok(())
+}
+
 fn global_arguments(args: &[OsString]) -> Option<&[OsString]> {
     let mut index = 0;
     while let Some(arg) = args.get(index) {
@@ -99,12 +157,7 @@ pub(crate) fn prepare(
             }
         }
     }
-    let path = command
-        .get_envs()
-        .find(|(name, _)| *name == OsStr::new("PATH"))
-        .and_then(|(_, value)| value.map(OsStr::to_os_string))
-        .or_else(|| std::env::var_os("PATH"))
-        .unwrap_or_default();
+    let path = environment(command, "PATH").unwrap_or_default();
     let paths: Vec<_> = std::env::split_paths(&path)
         .filter(|path| path != &bin)
         .collect();
@@ -124,12 +177,14 @@ pub(crate) fn prepare(
     command.env("SAIL_GIT_WORK_TREE", worktree);
     command.env(
         "PATH",
-        std::env::join_paths(std::iter::once(bin).chain(paths))
+        std::env::join_paths(std::iter::once(bin.clone()).chain(paths))
             .map_err(|error| error.to_string())?,
     );
     for name in ROUTING {
         command.env_remove(name);
     }
+    #[cfg(unix)]
+    prepare_shells(command, &bin)?;
     Ok(())
 }
 
@@ -164,6 +219,58 @@ pub fn run() -> ! {
         Err(error) => {
             eprintln!("Sail Git: {error}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_shells_keep_the_proxy_after_loading_user_startup() {
+        let root = std::env::temp_dir().join(format!("sail-git-login-{}", uuid::Uuid::new_v4()));
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _scratch = Scratch(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let reset = "export PATH=/usr/bin:/bin\nexport SAIL_USER_PROFILE=loaded\n";
+        for name in [".zprofile", ".bash_profile"] {
+            std::fs::write(home.join(name), reset).unwrap();
+        }
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let mut command = Command::new(shell);
+            command
+                .env("HOME", &home)
+                .env("ZDOTDIR", &home)
+                .env_remove("BASH_ENV");
+            command.env("PATH", "/usr/bin:/bin");
+            prepare(&mut command, &root.join("overlay"), &root).unwrap();
+            let bin = environment(&command, "SAIL_GIT_BIN").unwrap();
+            command.args([
+                "-lc",
+                "printf '%s\\n' \"$SAIL_USER_PROFILE\"; command -v git",
+            ]);
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = format!("loaded\n{}\n", Path::new(&bin).join("git").display());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                expected,
+                "{shell}"
+            );
         }
     }
 }
