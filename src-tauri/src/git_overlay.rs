@@ -1634,6 +1634,7 @@ impl GitOverlay {
         Ok(Some(overlay))
     }
 
+    #[cfg(test)]
     pub(crate) fn apply(&self, command: &mut Command) {
         command.env("GIT_DIR", git_config_path(&self.git_dir));
         command.env("GIT_WORK_TREE", git_config_path(&self.worktree));
@@ -1644,6 +1645,7 @@ impl GitOverlay {
     /// Routes Git to this overlay only when `directory` belongs to its worktree.
     /// An explicitly selected worktree elsewhere keeps its own Git state, and
     /// overlay routing an agent forwarded in the environment is dropped.
+    #[cfg(test)]
     pub(crate) fn apply_for_directory(&self, command: &mut Command, directory: &Path) {
         let selected = crate::terminal::git_worktree_root(directory);
         if crate::acp_terminal::stable_worktree_identity(&selected)
@@ -2650,6 +2652,72 @@ mod tests {
         command.env("GIT_DIR", &alias);
         overlay.apply_for_directory(&mut command, &fixture.main);
         assert!(command.get_envs().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
+    fn fixture_git_commands_do_not_mutate_the_session_overlay() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let proxy = |directory: &Path, args: &[&str]| {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            output(&mut crate::git_proxy::command(
+                Path::new("git"),
+                &overlay.git_dir,
+                &overlay.worktree,
+                directory,
+                &args,
+            ))
+            .unwrap()
+        };
+        let config = fs::read(overlay.git_dir.join("config")).unwrap();
+        let temporary = fixture.root.join("fixture repo");
+        proxy(
+            &fixture.task,
+            &["init", "--quiet", temporary.to_str().unwrap()],
+        );
+        proxy(
+            &temporary,
+            &["remote", "add", "origin", "https://example.com/fixture.git"],
+        );
+        assert_eq!(
+            git(&temporary, &["remote", "get-url", "origin"]),
+            "https://example.com/fixture.git"
+        );
+        assert_eq!(fs::read(overlay.git_dir.join("config")).unwrap(), config);
+        let root = proxy(&fixture.task, &["rev-parse", "--absolute-git-dir"]);
+        assert_eq!(
+            Path::new(String::from_utf8(root.stdout).unwrap().trim()),
+            dunce::canonicalize(&overlay.git_dir).unwrap()
+        );
+        let root = proxy(
+            &fixture.task,
+            &[
+                "-C",
+                temporary.to_str().unwrap(),
+                "rev-parse",
+                "--show-toplevel",
+            ],
+        );
+        assert_eq!(
+            Path::new(String::from_utf8(root.stdout).unwrap().trim()),
+            dunce::canonicalize(&temporary).unwrap()
+        );
+        let nested = fixture.task.join("nested");
+        proxy(
+            &fixture.task,
+            &["init", "--quiet", nested.to_str().unwrap()],
+        );
+        proxy(
+            &nested,
+            &["remote", "add", "origin", "https://example.com/nested.git"],
+        );
+        assert_eq!(
+            git(&nested, &["remote", "get-url", "origin"]),
+            "https://example.com/nested.git"
+        );
+        assert_eq!(fs::read(overlay.git_dir.join("config")).unwrap(), config);
     }
 
     #[test]

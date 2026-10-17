@@ -1223,10 +1223,15 @@ fn spawn(
         );
         if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(&cache_directory, &worktree)?
         {
-            command.env("GIT_DIR", &overlay.git_dir);
-            command.env("GIT_WORK_TREE", &overlay.worktree);
-            command.env_remove("GIT_COMMON_DIR");
-            command.env_remove("GIT_INDEX_FILE");
+            let mut environment = std::process::Command::new("git");
+            crate::git_proxy::prepare(&mut environment, &overlay.git_dir, &overlay.worktree)?;
+            for (name, value) in environment.get_envs() {
+                if let Some(value) = value {
+                    command.env(name, value);
+                } else {
+                    command.env_remove(name);
+                }
+            }
         }
         storage_lease = Some(lease);
     }
@@ -1604,7 +1609,7 @@ pub(crate) fn git_worktree_root(directory: &Path) -> PathBuf {
         .unwrap_or_else(|| directory.to_path_buf())
 }
 
-fn git_root_path(mut stdout: Vec<u8>) -> PathBuf {
+pub(crate) fn git_root_path(mut stdout: Vec<u8>) -> PathBuf {
     if stdout.last() == Some(&b'\n') {
         stdout.pop();
     }

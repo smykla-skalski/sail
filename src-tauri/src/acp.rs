@@ -6882,7 +6882,7 @@ fn connect_blocking_inner(
         command.env(name, value);
     }
     if let Some(overlay) = overlay.as_ref() {
-        overlay.apply(&mut command);
+        crate::git_proxy::prepare(&mut command, &overlay.git_dir, &overlay.worktree)?;
     }
     command.current_dir(worktree);
     let retry = crate::background_priority::normal_priority_copy(&command);

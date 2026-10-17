@@ -233,6 +233,7 @@ mod diagnostics;
 mod e2e_config;
 mod e2e_keyboard;
 mod git_overlay;
+pub mod git_proxy;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
