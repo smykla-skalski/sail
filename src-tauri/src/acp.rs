@@ -12443,6 +12443,65 @@ sys.stdin.buffer.read()
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn codex_workspace_access_runs_heredocs_in_owned_temp() {
+        let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") else {
+            return;
+        };
+        let root = scratch("codex-heredoc");
+        let assigned = root.join("assigned");
+        let temp = root.join("session-temp");
+        for path in [&assigned, &temp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(assigned.join("left"), "read-only comparison").unwrap();
+        std::fs::write(assigned.join("right"), "read-only comparison").unwrap();
+        let access = CodexWorkspaceAccess::capture(&assigned, std::slice::from_ref(&temp)).unwrap();
+        let config: Value = serde_json::from_str(&access.profile_config().unwrap()).unwrap();
+        let python = find_executable("python3").unwrap();
+        let source = format!("{} -B - <<'PY'\nfrom pathlib import Path\nassert Path('left').read_bytes() == Path('right').read_bytes()\nprint('heredoc-ok')\nPY", shell_words::quote(python.to_str().unwrap()));
+        let run = |script: &str| {
+            let mut command = Command::new(&codex);
+            command
+                .args(["sandbox", "-P", "sail-agent", "-C"])
+                .arg(&assigned);
+            for value in config["configOverrides"].as_array().unwrap() {
+                command.arg("-c").arg(value.as_str().unwrap());
+            }
+            command.envs(crate::acp_terminal::terminal_environment(&root, &temp));
+            command
+                .args(["--", "/bin/zsh", "-fc", script])
+                .output()
+                .unwrap()
+        };
+        let output = run(&source);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "heredoc-ok"
+        );
+        let denied = root.join("outside-temp");
+        let output = run(&format!(
+            "printf denied > {}",
+            shell_words::quote(denied.to_str().unwrap())
+        ));
+        assert!(!output.status.success());
+        assert!(!denied.exists());
+        assert!(std::fs::read_dir(&temp).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("zsh")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn codex_workspace_access_runs_format_and_build_inside_the_sandbox() {
         let Some(codex) = std::env::var_os("SAIL_CODEX_SANDBOX_TEST") else {
             return;

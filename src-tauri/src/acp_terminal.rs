@@ -165,6 +165,7 @@ pub(crate) fn terminal_environment(
         .join("terminal-package-downloads");
     vec![
         ("TMPDIR", temp_directory.to_path_buf()),
+        ("TMPPREFIX", temp_directory.join("zsh")),
         ("TEMP", temp_directory.to_path_buf()),
         ("TMP", temp_directory.to_path_buf()),
         ("XDG_CACHE_HOME", data_directory.join("cache")),
@@ -1967,6 +1968,7 @@ mod tests {
         let temp = root.join("turn-temp/run-1");
         let environment = terminal_environment(root, &temp);
 
+        assert!(environment.contains(&("TMPPREFIX", temp.join("zsh"))));
         assert!(environment.contains(&("TMPDIR", temp)));
         assert!(environment.contains(&("XDG_CACHE_HOME", root.join("cache"))));
         let shared = Path::new("/sail-cache/terminal-package-downloads");

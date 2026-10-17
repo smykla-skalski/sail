@@ -1214,7 +1214,9 @@ fn spawn(
         for (key, value) in
             crate::acp_terminal::terminal_environment(&data_directory, lease.temp_directory())
         {
-            std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
+            if key != "TMPPREFIX" {
+                std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
+            }
             command.env(key, value);
         }
         command.env(
