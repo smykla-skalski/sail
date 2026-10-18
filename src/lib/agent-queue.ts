@@ -1,5 +1,38 @@
 import type { BrowserAttachment } from './browser-pick';
 import type { AcpTurnEvidence } from './acp';
+import { shellContext, type ShellRun } from './shell-command.ts';
+
+/** Moves finished commands into their session queues, leaving running commands visible. */
+export function enqueueShellResults(
+  agent: string,
+  runs: ShellRun[],
+  activeSessionId: string | null,
+  currentQueue: QueuedAgentMessage[],
+): { runs: ShellRun[]; queue: QueuedAgentMessage[] } {
+  let queue = currentQueue;
+  const pending: ShellRun[] = [];
+  for (const run of runs) {
+    if (run.status === 'running' || (run.session === null && activeSessionId !== null)) {
+      pending.push(run);
+      continue;
+    }
+    const message: QueuedAgentMessage = {
+      text: shellContext([run]),
+      images: [],
+      attachments: [],
+    };
+    const active = run.session === activeSessionId;
+    const previous = active
+      ? queue
+      : run.session
+        ? queuedAgentMessages(agent, run.directory, run.session)
+        : [];
+    const next = [...previous, message];
+    if (run.session) saveQueuedAgentMessages(agent, run.directory, run.session, next);
+    if (active) queue = next;
+  }
+  return { runs: pending, queue };
+}
 
 export function queuedTurnDisposition(
   backendStatus: 'done' | 'failed' | 'interrupted' | null,

@@ -76,6 +76,7 @@
     agentQueuePaused,
     queuedAgentMessages,
     queuedTurnDisposition,
+    enqueueShellResults,
     saveQueuedAgentMessages,
     setAgentQueuePaused,
     type QueuedAgentMessage,
@@ -149,7 +150,6 @@
     keepShellRuns,
     shellCommand,
     takeShellRuns,
-    withShellContext,
     type ShellResult,
     type ShellRun,
   } from './lib/shell-command';
@@ -350,6 +350,22 @@
   let queuePaused = $state(false);
   let queueDispatching = $state(false);
   let steering = $state(false);
+  $effect(() => {
+    if (
+      disposed ||
+      !shellRuns.some(
+        (run) => run.status !== 'running' && (run.session !== null || activeSessionId === null),
+      )
+    )
+      return;
+    const runs = shellRuns;
+    const sessionId = activeSessionId;
+    untrack(() => {
+      const result = enqueueShellResults(agent, runs, sessionId, queued);
+      shellRuns = result.runs;
+      queued = result.queue;
+    });
+  });
   function diagnostic(event: DiagnosticEvent, sessionId = activeSessionId, turnId = activeTurnId) {
     recordDiagnostic(event, {
       agent,
@@ -364,13 +380,21 @@
     const dispatchAgent = agent;
     const dispatchDirectory = directory;
     const dispatchSessionId = activeSessionId;
+    const dispatchGeneration = generation;
     queueDispatching = true;
     queued = remaining;
     diagnostic('queue_dispatch_started');
     if (activeSessionId) saveQueuedAgentMessages(agent, directory, activeSessionId, queued);
     void send(next.text, next)
       .catch((cause) => {
-        if (!dispatchSessionId) return;
+        if (!dispatchSessionId) {
+          if (generation === dispatchGeneration) {
+            queued = [next, ...queued];
+            queuePaused = true;
+            error = describe(cause);
+          }
+          return;
+        }
         const restored = [
           next,
           ...queuedAgentMessages(dispatchAgent, dispatchDirectory, dispatchSessionId),
@@ -2034,24 +2058,13 @@
       clipboardAttachments = [];
     }
     const userEntryId = `owned-prompt:${turnId}`;
-    const shellSession = activeSessionId;
-    const sentShell =
-      external && !queuedMessage
-        ? []
-        : shellRuns.filter((run) => run.session === shellSession && run.status !== 'running');
-    shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
-    const restoreShell = () => {
-      const session = deliverySessionId ?? shellSession;
-      for (const run of sentShell) run.session = session;
-      shellRuns = [...sentShell, ...shellRuns];
-    };
     flushUpdates();
     entries = [
       ...entries,
       {
         id: userEntryId,
         type: 'user',
-        text: withShellContext(sentShell, text),
+        text,
         created: Date.now(),
       },
     ];
@@ -2072,7 +2085,7 @@
       if (activityThread?.title === 'New thread')
         activityThread = { ...activityThread, title: text.slice(0, 60) || 'Attached files' };
       if (current !== generation && (!disposed || ephemeral)) {
-        restoreShell();
+        if (queuedMessage) throw new Error('Agent thread changed before message delivery.');
         return;
       }
       if (activityThread) onstatus(activityThread, 'working');
@@ -2108,8 +2121,7 @@
       if (stopRequested) {
         finalStatus = 'interrupted';
         notifyOnDone = false;
-        if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
-        restoreShell();
+        if (external) throw new Error('Agent turn was cancelled.');
         if (current === generation) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [composerDraft, draft.trim()].filter(Boolean).join('\n\n');
@@ -2133,12 +2145,10 @@
         implementationModel,
         `acp:${turnAgent}:${id}`,
       );
-      const promptText = withShellContext(
-        sentShell,
+      const promptText =
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
-          : skillText + directClaim,
-      );
+          : skillText + directClaim;
       if (stopRequested) throw new Error('Agent turn was cancelled.');
       phase = 'prompt';
       onPromptDispatch?.();
@@ -2213,7 +2223,6 @@
       const disposition = queuedTurnDisposition(backendStatus, evidence?.status ?? null);
       const delivered = disposition === 'completed';
       const mayRetry = disposition === 'unsent';
-      if (mayRetry) restoreShell();
       const interrupted =
         backendStatus === 'interrupted' ||
         evidence?.status === 'interrupted' ||
@@ -2234,24 +2243,28 @@
       }
       const following = deliverySessionId
         ? queuedAgentMessages(turnAgent, turnDirectory, deliverySessionId)
-        : [];
+        : current === generation
+          ? queued
+          : [];
       const steer =
         deliverySessionId && inFlightSteer?.sessionId === deliverySessionId ? inFlightSteer : null;
       const retryQueued =
         !delivered &&
-        !!deliverySessionId &&
+        (!!deliverySessionId || (current === generation && queuedMessage !== undefined)) &&
         ((mayRetry && (queuedMessage !== undefined || (current !== generation && disposed))) ||
           following.length > 0 ||
           steer !== null);
-      if (retryQueued && deliverySessionId) {
+      if (retryQueued) {
         if (recoveredDraft) {
           recoveredDraft = false;
         }
         const retry = !mayRetry ? [] : [{ text, images: sentImages, attachments: sentClipboard }];
         if (steer) steer.requeued = true;
         const messages = [...retry, ...(steer ? [steer.message] : []), ...following];
-        saveQueuedAgentMessages(turnAgent, turnDirectory, deliverySessionId, messages);
-        setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, true);
+        if (deliverySessionId) {
+          saveQueuedAgentMessages(turnAgent, turnDirectory, deliverySessionId, messages);
+          setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, true);
+        }
         recordDiagnostic('queue_paused', {
           agent: turnAgent,
           sessionId: deliverySessionId,
@@ -2370,6 +2383,16 @@
   }
 
   async function runShell(command: string) {
+    const current = generation;
+    if (!activeSessionId) {
+      try {
+        await ensureSession(command.slice(0, 60));
+      } catch (cause) {
+        if (current === generation) error = describe(cause);
+        return;
+      }
+    }
+    if (disposed || current !== generation) return;
     const run: ShellRun = {
       id: crypto.randomUUID(),
       directory,
@@ -2557,9 +2580,9 @@
   }
 
   function retryQueue() {
-    if (!activeSessionId || !ready || isBusy || !queued.length) return;
+    if (!ready || isBusy || !queued.length) return;
     queuePaused = false;
-    setAgentQueuePaused(agent, directory, activeSessionId, false);
+    if (activeSessionId) setAgentQueuePaused(agent, directory, activeSessionId, false);
   }
 
   async function stop() {
