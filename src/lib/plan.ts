@@ -107,17 +107,18 @@ export type PlanQuestions = z.infer<typeof PlanQuestionsSchema>;
 export type PlanSnapshot = { plan: Plan | null; questions: PlanQuestions | null };
 export type HistoryEntry = z.infer<typeof HistoryEntrySchema>;
 
-function relativeFile(file: string, directory: string): string {
-  const target = file.replaceAll('\\', '/').replaceAll(/\/+/g, '/');
-  const root = directory.replaceAll('\\', '/').replaceAll(/\/+/g, '/').replace(/\/$/, '');
-  if (target.startsWith('/') || /^[A-Za-z]:\//.test(target)) {
-    const windows = /^[A-Za-z]:\//.test(target);
-    const matches = windows
-      ? target.toLowerCase().startsWith(`${root.toLowerCase()}/`)
-      : target.startsWith(`${root}/`);
-    return matches ? target.slice(root.length + 1) : '../outside';
+function resolvedFile(file: string, directory: string): string {
+  const target = file.replaceAll('\\', '/');
+  const absolute = target.startsWith('/') || /^[A-Za-z]:\//.test(target);
+  const path = absolute ? target : `${directory.replaceAll('\\', '/')}/${target}`;
+  const parts: string[] = [];
+  for (const part of path.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
   }
-  return target.replace(/^\.\//, '');
+  const normalized = `${path.startsWith('/') ? '/' : ''}${parts.join('/')}`;
+  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 function escapePattern(value: string) {
@@ -125,10 +126,9 @@ function escapePattern(value: string) {
 }
 
 export function coveredFile(file: string, approved: string[], directory: string): boolean {
-  const target = relativeFile(file, directory);
-  if (target.startsWith('../')) return false;
+  const target = resolvedFile(file, directory);
   return approved.some((entry) => {
-    const listed = relativeFile(entry, directory).replace(/\/$/, '');
+    const listed = resolvedFile(entry, directory).replace(/\/$/, '');
     if (listed.includes('*') || listed.includes('?')) {
       const source = listed
         .split('**')

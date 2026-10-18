@@ -608,6 +608,7 @@ export function buildReminder(plan: Plan) {
       `Do NOT implement: ${excluded.map((step) => `${step.id} ${step.title}`).join('; ')}.`,
     );
   lines.push(
+    'File scope: relative paths resolve from this thread’s workspace. Other repositories and worktrees require explicit absolute paths in the approved file list. Temporary publication artifacts also need approved paths or a narrowly scoped scratch-directory glob, even when deleted after use.',
     `Loop per step: ${PLAN_TOOLS.step} in_progress → implement → verify (run the relevant test, build or check) → ${PLAN_TOOLS.step} done with check {outcome, summary, command}. Use blocked with a note if you cannot finish.`,
     `Sail does not block edits outside the approved files; it flags them to you and the user. If you find work the plan does not cover, call ${PLAN_TOOLS.amend} instead of doing it silently. When a tool result says the plan is paused, end your turn.`,
     '</approved-plan>',

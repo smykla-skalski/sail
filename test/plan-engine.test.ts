@@ -72,6 +72,35 @@ await test('propose normalizes diagrams and tolerates stringified lists', () => 
   assert.equal(input.steps[0].risk, 'low');
 });
 
+await test('cross-worktree edits and declared publication artifacts stay inside approved scope', () => {
+  const external = '/worktrees/cairn/services/proxy/src/store.rs';
+  const plan = executing();
+  plan.steps[0] = {
+    ...plan.steps[0],
+    status: 'in_progress',
+    files: [external, '/private/tmp/cairn-publish-123/*.md'],
+  };
+  const touched = recordTouch(
+    plan,
+    [external, '/private/tmp/cairn-publish-123/pr-body.md'],
+    directory,
+  );
+  assert.equal(outsideWarning(touched, directory), '');
+  const next = updateStep(touched, {
+    stepID: 's1',
+    status: 'done',
+    check: { outcome: 'pass', summary: 'focused checks passed' },
+  });
+  assert.ok(next.ok);
+  assert.equal(outsideWarning(next.value, directory), '');
+  const other = recordTouch(
+    next.value,
+    ['/worktrees/other/services/proxy/src/store.rs'],
+    directory,
+  );
+  assert.match(outsideWarning(other, directory), /outside the approved files/);
+});
+
 await test('propose rejects prose where mermaid is required', () => {
   assert.equal(ProposeInputSchema.safeParse(proposal({ sequence: ['just words'] })).success, false);
   assert.equal(ProposeInputSchema.safeParse(proposal({ overview: ['just words'] })).success, false);

@@ -3,12 +3,44 @@ import test from 'node:test';
 import {
   approveAllSteps,
   canExecutePlan,
+  coveredFile,
   executionSummary,
   skippedSteps,
   type Plan,
   type PlanDecision,
 } from '../src/lib/plan.ts';
 import { review } from '../src/lib/plan-engine.ts';
+
+await test('approved paths retain their worktree identity', () => {
+  const directory = '/worktrees/benchee';
+  const approved = ['/worktrees/cairn/services/proxy/src/store.rs'];
+  assert.equal(coveredFile(approved[0], approved, directory), true);
+  assert.equal(
+    coveredFile('/worktrees/other/services/proxy/src/store.rs', approved, directory),
+    false,
+  );
+  assert.equal(coveredFile(approved[0], ['services/proxy/src/store.rs'], directory), false);
+  assert.equal(coveredFile('/worktrees/benchee/src/main.rs', ['src/main.rs'], directory), true);
+  assert.equal(coveredFile('src/main.rs', ['/worktrees/benchee/src/main.rs'], directory), true);
+});
+
+await test('approved external directories and globs remain bounded', () => {
+  const directory = '/worktrees/benchee';
+  for (const approved of [['/worktrees/cairn/src'], ['/worktrees/cairn/src/**']]) {
+    assert.equal(coveredFile('/worktrees/cairn/src/routes/cache.rs', approved, directory), true);
+    assert.equal(coveredFile('/worktrees/cairn/src-other/cache.rs', approved, directory), false);
+    assert.equal(coveredFile('/worktrees/cairn/src/../../secret', approved, directory), false);
+    assert.equal(coveredFile('/worktrees/other/src/cache.rs', approved, directory), false);
+  }
+});
+
+await test('path aliases normalize before comparing approved files', () => {
+  assert.equal(coveredFile('/repo/src/./main.rs', ['src/main.rs'], '/repo/'), true);
+  assert.equal(coveredFile('src/../secret', ['src/**'], '/repo'), false);
+  assert.equal(coveredFile('/other/src/main.rs', ['/other//src/./main.rs'], '/repo'), true);
+  assert.equal(coveredFile('C:\\Other\\src\\MAIN.rs', ['c:/other/src/main.rs'], 'C:/Repo'), true);
+  assert.equal(coveredFile('D:/other/src/main.rs', ['C:/other/src/main.rs'], 'C:/Repo'), false);
+});
 
 const plan: Plan = {
   title: 'Plan',

@@ -2044,7 +2044,7 @@ fn plan_step_schema() -> Value {
             "title":{"type":"string","maxLength":120},
             "detail":{"type":"string","maxLength":4000,"description":"What changes and how, in markdown."},
             "rationale":{"type":"string","maxLength":2000},
-            "files":{"type":"array","items":{"type":"string"},"maxItems":50,"description":"Workspace-relative paths or globs this step edits. Edits to anything else are flagged."},
+            "files":{"type":"array","items":{"type":"string"},"maxItems":50,"description":"Paths or globs this step edits. Relative paths resolve from this thread's workspace. For another repository or worktree, list absolute paths, including the intended worktree root, before approval. Include temporary publication artifacts (such as PR body files) or a narrowly scoped scratch-directory glob before execution; their edits are tracked even after deletion. Edits to anything else are flagged."},
             "risk":{"type":"string","enum":["low","medium","high"]},
             "dependsOn":{"type":"array","items":{"type":"string"}},
             "diagram":{"type":"string","maxLength":4000,"description":"Optional mermaid source for this step. Keep each node label on one short line."},
