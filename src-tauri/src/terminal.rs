@@ -1205,6 +1205,8 @@ fn spawn(
     command.cwd(&directory);
     let mut storage_lease = None;
     if owner.is_some() {
+        let (name, value) = crate::acp_terminal::mise_runtime_environment();
+        command.env(name, value);
         let cache_directory = app
             .path()
             .app_cache_dir()

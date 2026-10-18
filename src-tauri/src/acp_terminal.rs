@@ -102,7 +102,7 @@ pub(crate) const ENVIRONMENT_ID_VARIABLE: &str = "SAIL_ENVIRONMENT_ID";
 /// launch-dependent inherited PATH never change it. Gates attest it instead of raw PATH.
 pub(crate) fn environment_identity(data_directory: &Path, tool_paths: &[PathBuf]) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"sail-agent-environment-v1\0");
+    digest.update(b"sail-agent-environment-v2\0");
     for path in std::iter::once(data_directory.join("bin")).chain(tool_paths.iter().cloned()) {
         digest.update(path.as_os_str().as_encoded_bytes());
         digest.update(b"\0");
@@ -120,6 +120,13 @@ fn is_path_variable(name: &str) -> bool {
     } else {
         name == "PATH"
     }
+}
+
+// GUI startup can leave active mise tools behind system binaries. Task shells must
+// receive the same selected tools as commands mise resolves directly.
+pub(crate) fn mise_runtime_environment() -> (&'static str, std::ffi::OsString) {
+    const NAME: &str = "MISE_ACTIVATE_AGGRESSIVE";
+    (NAME, std::env::var_os(NAME).unwrap_or_else(|| "1".into()))
 }
 
 /// An explicit PATH from the agent wins; otherwise commands get the agent runtime's PATH.
@@ -143,6 +150,8 @@ fn apply_requested_environment(
     environment_id: Option<&str>,
 ) {
     let runtime_path = terminal_path(&requested, runtime_path);
+    let (name, value) = mise_runtime_environment();
+    command.env(name, value);
     for variable in requested {
         command.env(variable.name, variable.value);
     }
@@ -1960,6 +1969,31 @@ mod tests {
             worktree_data_directory(cache, &first),
             worktree_data_directory(cache, &second)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_commands_preserve_explicit_mise_precedence() {
+        for requested in [
+            vec![],
+            vec![EnvVariable {
+                name: "MISE_ACTIVATE_AGGRESSIVE".into(),
+                value: "0".into(),
+            }],
+        ] {
+            let expected = requested
+                .first()
+                .map(|item| item.value.clone())
+                .unwrap_or_else(|| mise_runtime_environment().1.to_string_lossy().into_owned());
+            let mut command = Command::new("/bin/sh");
+            apply_requested_environment(&mut command, requested, None, None);
+            let output = command
+                .args(["-c", "/bin/sh -c 'printf %s \"$MISE_ACTIVATE_AGGRESSIVE\"'"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
     }
 
     #[test]

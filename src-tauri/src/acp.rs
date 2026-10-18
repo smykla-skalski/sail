@@ -6942,6 +6942,8 @@ fn connect_blocking_inner(
     } else {
         None
     };
+    let (name, value) = crate::acp_terminal::mise_runtime_environment();
+    command.env(name, value);
     for (name, value) in runtime_environment(
         &data_directory,
         storage_lease.temp_directory(),
