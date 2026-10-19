@@ -23,7 +23,7 @@ export interface QueuedAgentMessage {
 }
 
 const queues = new Map<string, QueuedAgentMessage[]>();
-const paused = new Set<string>();
+const paused = new Map<string, string>();
 
 export function queuedAgentMessages(
   agent: string,
@@ -44,17 +44,22 @@ export function saveQueuedAgentMessages(
   else queues.delete(key);
 }
 
-export function agentQueuePaused(agent: string, directory: string, sessionId: string): boolean {
-  return paused.has(JSON.stringify([agent, directory, sessionId]));
+/** Why the session's queue stopped, or null while it may dispatch. */
+export function agentQueuePauseReason(
+  agent: string,
+  directory: string,
+  sessionId: string,
+): string | null {
+  return paused.get(JSON.stringify([agent, directory, sessionId])) ?? null;
 }
 
 export function setAgentQueuePaused(
   agent: string,
   directory: string,
   sessionId: string,
-  value: boolean,
+  reason: string | null,
 ): void {
   const key = JSON.stringify([agent, directory, sessionId]);
-  if (value) paused.add(key);
+  if (reason !== null) paused.set(key, reason);
   else paused.delete(key);
 }

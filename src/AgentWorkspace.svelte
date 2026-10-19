@@ -73,7 +73,7 @@
     type DirectShipAuthorization,
   } from './lib/issue-shipping';
   import {
-    agentQueuePaused,
+    agentQueuePauseReason,
     queuedAgentMessages,
     queuedTurnDisposition,
     saveQueuedAgentMessages,
@@ -348,6 +348,7 @@
   });
   let queued = $state<QueuedAgentMessage[]>([]);
   let queuePaused = $state(false);
+  let queuePauseReason = $state('');
   let queueDispatching = $state(false);
   let steering = $state(false);
   function diagnostic(event: DiagnosticEvent, sessionId = activeSessionId, turnId = activeTurnId) {
@@ -375,12 +376,14 @@
           next,
           ...queuedAgentMessages(dispatchAgent, dispatchDirectory, dispatchSessionId),
         ];
+        const reason = describe(cause);
         saveQueuedAgentMessages(dispatchAgent, dispatchDirectory, dispatchSessionId, restored);
-        setAgentQueuePaused(dispatchAgent, dispatchDirectory, dispatchSessionId, true);
+        setAgentQueuePaused(dispatchAgent, dispatchDirectory, dispatchSessionId, reason);
         if (activeSessionId === dispatchSessionId) {
           queued = restored;
           queuePaused = true;
-          error = describe(cause);
+          queuePauseReason = reason;
+          error = reason;
         }
       })
       .finally(() => {
@@ -1364,6 +1367,7 @@
     if (id && id !== previousSessionId) recoveryEligible = false;
     const previousQueue = queued;
     const wasPaused = queuePaused;
+    const previousPauseReason = queuePauseReason;
     const current = ++generation;
     clearTimeout(updateTimer);
     updateTimer = undefined;
@@ -1408,12 +1412,16 @@
         : id
           ? queuedAgentMessages(agent, directory, id)
           : [];
-    queuePaused =
+    const pauseReason =
       id && id === previousSessionId
         ? wasPaused
+          ? previousPauseReason
+          : null
         : id
-          ? agentQueuePaused(agent, directory, id)
-          : false;
+          ? agentQueuePauseReason(agent, directory, id)
+          : null;
+    queuePaused = pauseReason !== null;
+    queuePauseReason = pauseReason ?? '';
     pickerOpen = null;
     creatingSession = null;
     sessionWarmupAttempted = false;
@@ -2237,6 +2245,11 @@
         : [];
       const steer =
         deliverySessionId && inFlightSteer?.sessionId === deliverySessionId ? inFlightSteer : null;
+      const failure = delivered
+        ? `Message delivered, but Sail could not finish local bookkeeping: ${describe(cause)}`
+        : disposition === 'uncertain'
+          ? `Message delivery is uncertain. Check the agent thread before retrying: ${describe(cause)}`
+          : describe(cause);
       const retryQueued =
         !delivered &&
         !!deliverySessionId &&
@@ -2251,7 +2264,7 @@
         if (steer) steer.requeued = true;
         const messages = [...retry, ...(steer ? [steer.message] : []), ...following];
         saveQueuedAgentMessages(turnAgent, turnDirectory, deliverySessionId, messages);
-        setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, true);
+        setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, failure);
         recordDiagnostic('queue_paused', {
           agent: turnAgent,
           sessionId: deliverySessionId,
@@ -2262,6 +2275,7 @@
         if (current === generation && activeSessionId === deliverySessionId) {
           queued = messages;
           queuePaused = true;
+          queuePauseReason = failure;
         }
       }
       if (current === generation) {
@@ -2273,13 +2287,10 @@
           turnId,
           queueLength: queued.length,
           errorName: cause instanceof Error ? cause.name : typeof cause,
+          message: failure,
           phase,
         });
-        error = delivered
-          ? `Message delivered, but Sail could not finish local bookkeeping: ${describe(cause)}`
-          : disposition === 'uncertain'
-            ? `Message delivery is uncertain. Check the agent thread before retrying: ${describe(cause)}`
-            : describe(cause);
+        error = failure;
         authNeeded = /auth|login|sign.?in/i.test(error);
         if (retryQueued && mayRetry) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
@@ -2321,7 +2332,8 @@
         queuePaused
       ) {
         queuePaused = false;
-        setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, false);
+        queuePauseReason = '';
+        setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, null);
       }
     }
     return finalStatus;
@@ -2559,7 +2571,8 @@
   function retryQueue() {
     if (!activeSessionId || !ready || isBusy || !queued.length) return;
     queuePaused = false;
-    setAgentQueuePaused(agent, directory, activeSessionId, false);
+    queuePauseReason = '';
+    setAgentQueuePaused(agent, directory, activeSessionId, null);
   }
 
   async function stop() {
@@ -2927,9 +2940,13 @@
         failure={failureTool}
       >
         {#snippet queuedActions()}
-          {#if queuePaused}<Button size="sm" variant="secondary" onclick={retryQueue}
-              >Retry queue</Button
-            >{/if}
+          {#if queuePaused}<div class="queue-paused">
+              <p>
+                <strong>Queue paused.</strong>
+                {queuePauseReason || 'The previous message did not reach the agent.'}
+              </p>
+              <Button size="sm" variant="secondary" onclick={retryQueue}>Retry queue</Button>
+            </div>{/if}
         {/snippet}
         {#snippet tail()}
           {#if taskSnapshot && (taskSnapshot.tasks.length || nativeEntries)}<details
@@ -3343,6 +3360,19 @@
   }
   .agent-error {
     color: var(--sui-danger-ink);
+  }
+  .queue-paused {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-8);
+    align-items: center;
+  }
+  .queue-paused p {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--sui-danger-ink);
+    font-size: var(--type-12);
   }
   .agent-warning {
     margin: 0;

@@ -636,6 +636,7 @@ describe('ACP agent threads', () => {
     await expect($('.agent-error')).toHaveText(expect.stringContaining('Fixture prompt failed'));
     await expect($('.queued-messages')).toHaveText(expect.stringContaining('After failed prompt'));
     await expect($('.queued-messages')).not.toHaveText(expect.stringContaining('Prompt failure'));
+    await expect($('.queue-paused')).toHaveText(expect.stringContaining('Fixture prompt failed'));
     await $('button=Retry queue').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-permission button').click();
