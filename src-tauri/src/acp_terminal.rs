@@ -1030,7 +1030,12 @@ pub fn handle(
                     .map_err(|error| error.to_string())?,
                 worktree,
             )? {
-                crate::git_proxy::prepare(&mut command, &overlay.git_dir, &overlay.worktree)?;
+                crate::git_proxy::prepare(
+                    &mut command,
+                    &overlay.git_dir,
+                    &overlay.worktree,
+                    &overlay.proxy_dir,
+                )?;
             }
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             storage_lease.prepare_process_start()?;

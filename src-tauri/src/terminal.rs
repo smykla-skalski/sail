@@ -1228,7 +1228,12 @@ fn spawn(
         if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(&cache_directory, &worktree)?
         {
             let mut environment = std::process::Command::new("git");
-            crate::git_proxy::prepare(&mut environment, &overlay.git_dir, &overlay.worktree)?;
+            crate::git_proxy::prepare(
+                &mut environment,
+                &overlay.git_dir,
+                &overlay.worktree,
+                &overlay.proxy_dir,
+            )?;
             for (name, value) in environment.get_envs() {
                 if let Some(value) = value {
                     command.env(name, value);

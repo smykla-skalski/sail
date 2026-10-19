@@ -185,6 +185,21 @@ pub(crate) fn restore_registered(cache: &Path) {
         let Ok(manifest) = serde_json::from_slice::<Manifest>(&contents) else {
             continue;
         };
+        let (git_dir, _, lock_path) = paths(cache, &manifest.worktree);
+        if fs::symlink_metadata(git_dir.join("sail-bin")).is_ok() {
+            let Ok(lock) = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)
+            else {
+                continue;
+            };
+            if lock.lock().is_err() || remove_legacy_proxy(&git_dir).is_err() {
+                continue;
+            }
+        }
         if let Ok(Some(overlay)) = GitOverlay::existing(cache, &manifest.worktree) {
             register(
                 &overlay.worktree,
@@ -456,6 +471,7 @@ fn forget_removed_worktree_in_cache_checked(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
+    remove_proxy(cache, &root)?;
     fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
     if present(&backup) {
         fs::remove_file(&backup).map_err(|error| error.to_string())?;
@@ -547,6 +563,7 @@ struct Promotion {
 #[derive(Clone, Debug)]
 pub(crate) struct GitOverlay {
     pub(crate) git_dir: PathBuf,
+    pub(crate) proxy_dir: PathBuf,
     pub(crate) worktree: PathBuf,
     manifest_path: PathBuf,
     manifest: Manifest,
@@ -695,6 +712,34 @@ fn paths(cache: &Path, worktree: &Path) -> (PathBuf, PathBuf, PathBuf) {
             .with_extension("json"),
         cache.join("git-overlay-locks").join(key),
     )
+}
+
+/// Holds the Git proxy and shell startup files outside the agent-writable overlay.
+fn proxy_path(cache: &Path, worktree: &Path) -> PathBuf {
+    let identity = crate::acp_terminal::worktree_data_directory(cache, worktree);
+    cache
+        .join("git-proxy-bin")
+        .join(identity.file_name().unwrap_or_default())
+}
+
+/// Removes the proxy directory earlier builds kept inside the overlay, where
+/// its symbolic link failed overlay validation. Callers hold the overlay lock.
+fn remove_legacy_proxy(git_dir: &Path) -> Result<(), String> {
+    let legacy = git_dir.join("sail-bin");
+    match fs::symlink_metadata(&legacy) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&legacy),
+        Ok(_) => fs::remove_file(&legacy),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn remove_proxy(cache: &Path, worktree: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(proxy_path(cache, worktree)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+        _ => Ok(()),
+    }
 }
 
 fn reject_links(path: &Path) -> Result<(), String> {
@@ -1428,6 +1473,7 @@ impl GitOverlay {
         validate_overlay(&git_dir, &current.common_dir)?;
         let overlay = Self {
             git_dir,
+            proxy_dir: proxy_path(cache, &worktree),
             worktree,
             manifest_path,
             manifest,
@@ -1455,6 +1501,7 @@ impl GitOverlay {
             .open(lock_path)
             .map_err(|error| error.to_string())?;
         lock.lock().map_err(|error| error.to_string())?;
+        remove_legacy_proxy(&git_dir)?;
         if let Some(existing) = Self::existing(cache, &current.worktree)? {
             recover_stale_private_locks(cache, &existing.worktree, &existing.git_dir)?;
             configure_private_git(&existing.git_dir)?;
@@ -1622,6 +1669,7 @@ impl GitOverlay {
         }
         let overlay = Self {
             git_dir: published_git_dir,
+            proxy_dir: proxy_path(cache, &current.worktree),
             worktree: current.worktree,
             manifest_path,
             manifest,
@@ -2134,6 +2182,72 @@ mod tests {
             .unwrap();
         require_shared_current_in_cache(&fixture.cache, &fixture.task).unwrap();
         assert!(overlay.manifest_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_proxy_keeps_the_overlay_valid_and_outside_agent_writable_state() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let mut command = Command::new("git");
+        crate::git_proxy::prepare(
+            &mut command,
+            &overlay.git_dir,
+            &overlay.worktree,
+            &overlay.proxy_dir,
+        )
+        .unwrap();
+        assert!(!overlay.proxy_dir.starts_with(&overlay.git_dir));
+        assert!(fs::read_dir(&overlay.proxy_dir).unwrap().next().is_some());
+        assert!(GitOverlay::existing(&fixture.cache, &fixture.task)
+            .unwrap()
+            .is_some());
+        assert!(GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_removes_the_legacy_in_overlay_git_proxy() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let legacy = overlay.git_dir.join("sail-bin").join("1");
+        fs::create_dir_all(&legacy).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), legacy.join("git")).unwrap();
+        assert!(GitOverlay::existing(&fixture.cache, &fixture.task).is_err());
+
+        let repaired = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.git_dir, overlay.git_dir);
+        assert!(!overlay.git_dir.join("sail-bin").exists());
+        assert!(GitOverlay::existing(&fixture.cache, &fixture.task)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_restore_removes_the_legacy_in_overlay_git_proxy() {
+        let fixture = OverlayFixture::new();
+        let overlay = GitOverlay::ensure(&fixture.cache, &fixture.task)
+            .unwrap()
+            .unwrap();
+        let legacy = overlay.git_dir.join("sail-bin").join("1");
+        fs::create_dir_all(&legacy).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), legacy.join("git")).unwrap();
+
+        restore_registered(&fixture.cache);
+
+        assert!(!overlay.git_dir.join("sail-bin").exists());
+        assert!(GitOverlay::existing(&fixture.cache, &fixture.task)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

@@ -122,6 +122,7 @@ pub(crate) fn prepare(
     command: &mut Command,
     git_dir: &Path,
     worktree: &Path,
+    proxy_dir: &Path,
 ) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let version = executable
@@ -131,7 +132,7 @@ pub(crate) fn prepare(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
-    let bin = git_dir.join("sail-bin").join(version.to_string());
+    let bin = proxy_dir.join(version.to_string());
     std::fs::create_dir_all(&bin).map_err(|error| error.to_string())?;
     let proxy = bin.join(if cfg!(windows) { "git.exe" } else { "git" });
     if !proxy.exists() {
@@ -169,7 +170,8 @@ pub(crate) fn prepare(
                 && !path
                     .parent()
                     .and_then(Path::parent)
-                    .is_some_and(|parent| parent.ends_with("sail-bin"))
+                    .and_then(Path::parent)
+                    .is_some_and(|root| Some(root) == proxy_dir.parent())
         })
         .ok_or("Cannot find Git for the session worktree.")?;
     command.env("SAIL_GIT_BINARY", binary);
@@ -253,7 +255,13 @@ mod tests {
                 .env("ZDOTDIR", &home)
                 .env_remove("BASH_ENV");
             command.env("PATH", "/usr/bin:/bin");
-            prepare(&mut command, &root.join("overlay"), &root).unwrap();
+            prepare(
+                &mut command,
+                &root.join("overlay"),
+                &root,
+                &root.join("proxy"),
+            )
+            .unwrap();
             let bin = environment(&command, "SAIL_GIT_BIN").unwrap();
             command.args([
                 "-lc",
