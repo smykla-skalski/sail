@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
+  import { untrack, type Snippet } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import type { WorkingDiffInfo } from './lib/diff';
   import PaneTree from './PaneTree.svelte';
@@ -11,7 +11,11 @@
   import Markdown from './Markdown.svelte';
   import type { NativePlan } from './lib/native-plan';
   import { sessionTasks } from './lib/session-tasks';
-  import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
+  import {
+    hasPendingPlanReview,
+    revealsNativePlanReview,
+    revealsPlanReview,
+  } from './lib/details-plan';
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import type { ShipActionId } from './lib/ship-actions';
@@ -422,7 +426,8 @@
   $effect(() => {
     if ('direction' in pane || !pane.agent) return;
     const open = changesPanes.includes(pane.id);
-    if (open && !previousAcpOpen) acpTab = planRevealed ? 'plan' : 'tasks';
+    if (open && !previousAcpOpen)
+      acpTab = planRevealed || hasPendingPlanReview(acpSnapshot) ? 'plan' : 'tasks';
     planRevealed = false;
     previousAcpOpen = open;
   });
@@ -439,6 +444,12 @@
     const scope = acpScope;
     if (!scope || !('id' in pane)) return;
     const paneId = pane.id;
+    untrack(() => {
+      if (!hasPendingPlanReview(acpPlans().snapshot(scope))) return;
+      planRevealed = true;
+      acpTab = 'plan';
+      onrevealplan(paneId);
+    });
     return acpPlans().subscribe((change) => {
       if (planKey(change.scope) !== planKey(scope)) return;
       acpPlanTick += 1;

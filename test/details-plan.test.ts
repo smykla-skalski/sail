@@ -1,7 +1,50 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { revealsNativePlanReview, revealsPlanReview } from '../src/lib/details-plan.ts';
+import {
+  hasPendingPlanReview,
+  revealsNativePlanReview,
+  revealsPlanReview,
+} from '../src/lib/details-plan.ts';
 import type { NativePlan } from '../src/lib/native-plan.ts';
+import { createPlanStore } from '../src/lib/acp-plans.ts';
+
+void test('restored structured reviews remain discoverable without a live event', () => {
+  let saved: string | null = null;
+  const storage = {
+    read: () => saved,
+    write: (value: string) => {
+      saved = value;
+    },
+  };
+  const scope = { agent: 'codex', directory: '/repo', sessionId: 'existing-thread' };
+  const store = createPlanStore(storage);
+  assert.equal(hasPendingPlanReview(store.snapshot(scope)), false);
+  store.runTool(scope, 'sail_plan_propose', {
+    title: 'Replacement plan',
+    summary: 'Resume work',
+    sequence: ['User->>Agent: Resume', 'Agent-->>User: Plan'],
+    overview: ['Review --> Execute'],
+    steps: [{ id: 'resume', title: 'Resume', detail: 'Continue', files: [] }],
+  });
+  assert.equal(hasPendingPlanReview(createPlanStore(storage).snapshot(scope)), true);
+  store.applyReview(scope, {
+    sessionID: scope.sessionId,
+    version: 1,
+    action: 'execute',
+    decisions: [{ stepID: 'resume', verdict: 'approve' }],
+  });
+  assert.equal(hasPendingPlanReview(createPlanStore(storage).snapshot(scope)), false);
+  store.runTool(scope, 'sail_plan_ask', {
+    questions: [{ id: 'q', question: 'Continue?', kind: 'confirm' }],
+  });
+  assert.equal(hasPendingPlanReview(createPlanStore(storage).snapshot(scope)), true);
+  assert.equal(
+    hasPendingPlanReview(
+      createPlanStore(storage).snapshot({ ...scope, sessionId: 'other-thread' }),
+    ),
+    false,
+  );
+});
 
 void test('plan progress and completion preserve the selected details tab', () => {
   assert.equal(revealsPlanReview('step'), false);

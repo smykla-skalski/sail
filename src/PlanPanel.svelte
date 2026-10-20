@@ -91,6 +91,19 @@
   let canAcceptAll = $derived(
     !!plan && diagramsValid && canExecutePlan(plan, approveAllSteps(plan, decisions)),
   );
+  let approvalBlocker = $derived(
+    !backend
+      ? 'Plan review is unavailable because the agent session is not connected.'
+      : invalidDiagrams.length
+        ? 'Correct the invalid diagrams before approving this plan. Use Fix invalid diagrams in the plan.'
+        : !diagramsValid
+          ? 'Waiting for all plan diagrams to finish validation.'
+          : !canAcceptAll
+            ? 'This plan has no unfinished steps available for approval.'
+            : !canExecute
+              ? 'Approve at least one step, or use Accept all and start.'
+              : '',
+  );
   let skipped = $derived(plan ? skippedSteps(plan, decisions) : []);
   let execution = $derived(plan ? executionSummary(plan, directory) : null);
 
@@ -880,6 +893,7 @@
       {#if reviewErrors.note}<p class="question-error" role="alert">{reviewErrors.note}</p>{/if}
     </div>
     {#if plan.state === 'review'}
+      {#if approvalBlocker}<p class="approval-blocker" role="status">{approvalBlocker}</p>{/if}
       {#if confirming}<div class="execute-confirm" role="status">
           {plan.reviewReason === 'checkpoint' ? 'Continue execution' : 'Execute approved steps'}? {skipped.length}
           step{skipped.length === 1 ? '' : 's'} will not run{skipped.length
@@ -889,18 +903,18 @@
       <div class="panel-actions split">
         <Button
           onclick={() => sendReview('execute', true)}
-          disabled={!canAcceptAll || pending}
+          disabled={!backend || !canAcceptAll || pending}
           loading={pending}>Accept all and start</Button
         >
         <Button
           variant="secondary"
           onclick={() => sendReview('revise')}
-          disabled={pending}
+          disabled={!backend || pending}
           loading={pending}>Request changes</Button
         >
         <Button
           onclick={() => (confirming ? sendReview('execute') : (confirming = true))}
-          disabled={!canExecute || pending}
+          disabled={!backend || !canExecute || pending}
           loading={pending}
           >{confirming
             ? plan.reviewReason === 'checkpoint'
@@ -929,11 +943,14 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0;
     height: 100%;
+    overflow: auto;
     background: var(--sui-surface);
     border-left: 1px solid var(--shell-divider);
   }
   .panel-heading {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -962,6 +979,7 @@
   }
   .panel-scroll {
     flex: 1;
+    min-height: 128px;
     overflow: auto;
     padding: 20px;
   }
@@ -1231,6 +1249,7 @@
     margin-top: 20px;
   }
   .panel-actions {
+    flex-shrink: 0;
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
@@ -1240,6 +1259,13 @@
   }
   .panel-actions.split {
     justify-content: space-between;
+  }
+  .approval-blocker {
+    flex-shrink: 0;
+    margin: 0;
+    padding: 8px 20px;
+    color: var(--sui-muted);
+    font-size: var(--type-12);
   }
   .panel-empty {
     margin: auto;

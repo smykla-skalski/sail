@@ -33,7 +33,11 @@
     type AgentFocusDisplay,
   } from './lib/agent-focus';
   import TasksPanel from './TasksPanel.svelte';
-  import { revealsNativePlanReview, revealsPlanReview } from './lib/details-plan';
+  import {
+    hasPendingPlanReview,
+    revealsNativePlanReview,
+    revealsPlanReview,
+  } from './lib/details-plan';
   import { sessionTasks, TASK_TOOLS, taskScopeKey } from './lib/session-tasks';
   import { createNativeTaskReconciler } from './lib/native-session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
@@ -1645,7 +1649,8 @@
       }
     }
     if (acpAgent && focusedPane === 'main') {
-      if (view === 'details' && !agentChangesOpen) sideTab = 'tasks';
+      if (view === 'details' && !agentChangesOpen)
+        sideTab = hasPendingPlanReview(acpSnapshot) ? 'plan' : 'tasks';
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     }
@@ -1709,7 +1714,7 @@
       return;
     }
     if (acpAgent) {
-      if (!agentChangesOpen) sideTab = 'tasks';
+      if (!agentChangesOpen) sideTab = hasPendingPlanReview(acpSnapshot) ? 'plan' : 'tasks';
       agentChangesOpen = !agentChangesOpen;
       if (window.matchMedia('(max-width: 850px)').matches)
         mobileView = agentChangesOpen ? 'details' : 'chat';
@@ -2196,6 +2201,13 @@
   let acpSnapshot = $derived.by((): PlanSnapshot => {
     void acpPlanTick;
     return acpPlanScope ? acpPlans().snapshot(acpPlanScope) : { plan: null, questions: null };
+  });
+  $effect(() => {
+    const scope = acpPlanScope;
+    if (!scope) return;
+    untrack(() => {
+      if (hasPendingPlanReview(acpPlans().snapshot(scope))) revealMainPlan(scope, 'proposed');
+    });
   });
   let acpPlanHistory = $derived.by(() => {
     void acpPlanTick;
