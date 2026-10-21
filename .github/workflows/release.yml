@@ -257,7 +257,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.context_auth_514 &&
       github.ref == 'refs/heads/fix/issue-514-signed-fixture-action' && github.actor == 'Automaat'
-    runs-on: macos-15
+    runs-on: macos-26
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -359,7 +359,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.context_provider_553 &&
       github.ref == 'refs/heads/feat/issue-553-provider-bridge' && github.actor == 'Automaat'
-    runs-on: macos-15
+    runs-on: macos-26
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
