@@ -22,7 +22,7 @@ jobs:
   changes:
     name: Rust change detection
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
 
@@ -133,7 +133,7 @@ jobs:
   agentmemory-stress:
     name: AgentMemory loopback stress (Ubuntu)
     if: github.event_name == 'workflow_dispatch' && inputs.agentmemory_stress
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
 
     steps:
