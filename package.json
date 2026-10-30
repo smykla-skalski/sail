@@ -21,7 +21,7 @@
     "check:skills": "node scripts/check-bundled-skills.mjs"
   },
   "dependencies": {
-    "@smykla-skalski/sui": "^0.2.1",
+    "@smykla-skalski/sui": "^0.3.0",
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-dialog": "^2.8.1",
     "@xterm/addon-fit": "^0.11.0",
