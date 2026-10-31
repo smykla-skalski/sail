@@ -59,7 +59,7 @@
     "deepmerge-ts": "^8.0.2",
     "diff": "^9.0.0",
     "encoding-sniffer": "^1.0.2",
-    "glob": "^13.0.6",
+    "glob": "^14.0.0",
     "mocha": "^11.8.0",
     "serialize-javascript": "^7.1.2"
   },
