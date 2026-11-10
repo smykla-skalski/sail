@@ -44,7 +44,7 @@
     "axe-core": "4.14.0",
     "eslint": "10.13.0",
     "eslint-plugin-svelte": "3.23.1",
-    "globals": "17.13.0",
+    "globals": "17.14.0",
     "oxlint": "1.89.0",
     "oxlint-tsgolint": "7.0.2005",
     "prettier": "3.9.10",
