@@ -41,7 +41,7 @@
     "@wdio/spec-reporter": "9.33.1",
     "@wdio/tauri-plugin": "1.5.1",
     "@wdio/tauri-service": "1.5.1",
-    "axe-core": "4.14.0",
+    "axe-core": "4.14.1",
     "eslint": "10.15.0",
     "eslint-plugin-svelte": "3.24.1",
     "globals": "17.14.0",
